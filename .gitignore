@@ -1,0 +1,47 @@
+# Build artifacts
+**/target/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Rust local caches
+/fluxd_rust/.cargo/
+
+# Chain data and logs
+/fluxd_rust/data*/
+/fluxd_rust/logs/
+*.log
+
+# Local environment files
+*.env
+*.env.*
+*.cookie
+*.tmp
+*.swp
+.DS_Store
+
+# IDE/editor
+.vscode/
+.idea/
+*.iml
+
+# Keys and certs (avoid accidental commits)
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Reference C++ daemon (not published)
+/fluxd/
+
+# Markdown policy: ignore all .md by default, whitelist public docs
+*.md
+!fluxd_rust/README.md
+!fluxd_rust/ROADMAP.md
+!fluxd_rust/docs/
+!fluxd_rust/docs/**

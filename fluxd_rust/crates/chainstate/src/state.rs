@@ -1,0 +1,1763 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use fluxd_consensus::constants::{
+    max_reorg_depth, COINBASE_MATURITY, MIN_BLOCK_VERSION, MIN_PON_BLOCK_VERSION,
+};
+use fluxd_consensus::money::MAX_MONEY;
+use fluxd_consensus::{
+    block_subsidy, exchange_fund_amount, foundation_fund_amount, is_swap_pool_interval,
+    min_dev_fund_amount, swap_pool_amount, ChainParams, ConsensusParams, Hash256,
+};
+use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
+use fluxd_fluxnode::cache::{apply_fluxnode_tx, lookup_operator_pubkey};
+use fluxd_fluxnode::storage::{FluxnodeRecord, KeyId};
+use fluxd_primitives::block::Block;
+use fluxd_primitives::address_to_script_pubkey;
+use fluxd_primitives::outpoint::OutPoint;
+use fluxd_primitives::transaction::{Transaction, TransactionEncodeError};
+use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch};
+use rayon::prelude::*;
+
+use crate::address_index::AddressIndex;
+use crate::anchors::{AnchorSet, NullifierSet};
+use crate::flatfiles::{FlatFileError, FlatFileStore, FileLocation};
+use crate::index::{status_with_block, status_with_header, ChainIndex, ChainTip, HeaderEntry};
+use crate::metrics::ConnectMetrics;
+use crate::shielded::{
+    empty_sapling_tree, empty_sprout_tree, sapling_empty_root_hash, sapling_node_from_hash,
+    sapling_root_hash, sapling_tree_from_bytes, sapling_tree_to_bytes, sprout_empty_root_hash,
+    sprout_root_hash, sprout_tree_from_bytes, sprout_tree_to_bytes, SaplingTree, SproutTree,
+};
+use crate::txindex::{TxIndex, TxLocation};
+use crate::utxo::{outpoint_key, UtxoEntry, UtxoSet};
+use crate::validation::{validate_block, ValidationError, ValidationFlags};
+use fluxd_pow::difficulty::{block_proof, HeaderInfo};
+use fluxd_pow::validation as pow_validation;
+use fluxd_script::interpreter::{verify_script, BLOCK_SCRIPT_VERIFY_FLAGS};
+use fluxd_pon::validation as pon_validation;
+
+struct ScriptCheck {
+    tx_index: usize,
+    input_index: usize,
+    script_sig: Vec<u8>,
+    script_pubkey: Vec<u8>,
+    value: i64,
+}
+
+#[derive(Debug)]
+pub enum ChainStateError {
+    Validation(ValidationError),
+    Store(StoreError),
+    FlatFile(FlatFileError),
+    MissingInput,
+    MissingHeader,
+    ValueOutOfRange,
+    CorruptIndex(&'static str),
+    InvalidHeader(&'static str),
+}
+
+impl std::fmt::Display for ChainStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChainStateError::Validation(err) => write!(f, "{err}"),
+            ChainStateError::Store(err) => write!(f, "{err}"),
+            ChainStateError::FlatFile(err) => write!(f, "{err}"),
+            ChainStateError::MissingInput => write!(f, "missing input"),
+            ChainStateError::MissingHeader => write!(f, "missing header"),
+            ChainStateError::ValueOutOfRange => write!(f, "value out of range"),
+            ChainStateError::CorruptIndex(message) => write!(f, "{message}"),
+            ChainStateError::InvalidHeader(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for ChainStateError {}
+
+impl From<ValidationError> for ChainStateError {
+    fn from(err: ValidationError) -> Self {
+        ChainStateError::Validation(err)
+    }
+}
+
+impl From<StoreError> for ChainStateError {
+    fn from(err: StoreError) -> Self {
+        ChainStateError::Store(err)
+    }
+}
+
+impl From<FlatFileError> for ChainStateError {
+    fn from(err: FlatFileError) -> Self {
+        ChainStateError::FlatFile(err)
+    }
+}
+
+impl From<TransactionEncodeError> for ChainStateError {
+    fn from(err: TransactionEncodeError) -> Self {
+        ChainStateError::Validation(ValidationError::from(err))
+    }
+}
+
+impl From<pow_validation::PowError> for ChainStateError {
+    fn from(err: pow_validation::PowError) -> Self {
+        ChainStateError::Validation(ValidationError::from(err))
+    }
+}
+
+impl From<pon_validation::PonError> for ChainStateError {
+    fn from(err: pon_validation::PonError) -> Self {
+        ChainStateError::Validation(ValidationError::from(err))
+    }
+}
+
+const HEADER_CACHE_CAPACITY: usize = 200_000;
+const MTP_WINDOW_SIZE: usize = 11;
+
+struct HeaderCache {
+    entries: HashMap<Hash256, HeaderEntry>,
+    order: VecDeque<Hash256>,
+    capacity: usize,
+}
+
+impl HeaderCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&self, hash: &Hash256) -> Option<HeaderEntry> {
+        self.entries.get(hash).cloned()
+    }
+
+    fn insert(&mut self, hash: Hash256, entry: HeaderEntry) {
+        if self.entries.contains_key(&hash) {
+            self.entries.insert(hash, entry);
+            return;
+        }
+        self.entries.insert(hash, entry);
+        self.order.push_back(hash);
+        if self.entries.len() > self.capacity {
+            while let Some(evicted) = self.order.pop_front() {
+                if self.entries.remove(&evicted).is_some() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct DifficultyWindow {
+    tip_hash: Hash256,
+    window: VecDeque<HeaderInfo>,
+    window_len: usize,
+}
+
+struct MtpWindow {
+    tip_hash: Hash256,
+    window: VecDeque<HeaderInfo>,
+}
+
+#[derive(Default)]
+pub struct HeaderValidationCache {
+    difficulty_window: Option<DifficultyWindow>,
+    mtp_window: Option<MtpWindow>,
+}
+
+impl DifficultyWindow {
+    fn bootstrap<S: KeyValueStore>(
+        state: &ChainState<S>,
+        tip_hash: Hash256,
+        params: &ConsensusParams,
+        pending: Option<&HashMap<Hash256, HeaderEntry>>,
+    ) -> Option<Self> {
+        let lwma_window = params.zawy_lwma_averaging_window.saturating_add(1);
+        let window_len = params
+            .digishield_averaging_window
+            .max(lwma_window) as usize;
+        if window_len == 0 {
+            return None;
+        }
+        let chain = collect_headers(state, &tip_hash, window_len, pending).ok()?;
+        if chain.is_empty() {
+            return None;
+        }
+        Some(Self {
+            tip_hash,
+            window: VecDeque::from(chain),
+            window_len,
+        })
+    }
+
+    fn expected_bits(
+        &mut self,
+        next_time: i64,
+        params: &ConsensusParams,
+    ) -> Result<u32, ChainStateError> {
+        let window = self.window.make_contiguous();
+        fluxd_pow::difficulty::get_next_work_required(window, Some(next_time), params)
+            .map_err(|_| ChainStateError::InvalidHeader("difficulty calculation failed"))
+    }
+
+    fn advance(&mut self, hash: Hash256, height: i32, time: u32, bits: u32) {
+        self.tip_hash = hash;
+        self.window.push_back(HeaderInfo {
+            height: height as i64,
+            time: time as i64,
+            bits,
+        });
+        while self.window.len() > self.window_len {
+            self.window.pop_front();
+        }
+    }
+}
+
+impl MtpWindow {
+    fn bootstrap<S: KeyValueStore>(
+        state: &ChainState<S>,
+        tip_hash: Hash256,
+        pending: Option<&HashMap<Hash256, HeaderEntry>>,
+    ) -> Option<Self> {
+        let chain = collect_headers(state, &tip_hash, MTP_WINDOW_SIZE, pending).ok()?;
+        if chain.is_empty() {
+            return None;
+        }
+        Some(Self {
+            tip_hash,
+            window: VecDeque::from(chain),
+        })
+    }
+
+    fn median_time_past(&self) -> i64 {
+        let mut times: Vec<i64> = self.window.iter().map(|header| header.time).collect();
+        times.sort_unstable();
+        times[times.len() / 2]
+    }
+
+    fn advance(&mut self, hash: Hash256, height: i32, time: u32, bits: u32) {
+        self.tip_hash = hash;
+        self.window.push_back(HeaderInfo {
+            height: height as i64,
+            time: time as i64,
+            bits,
+        });
+        while self.window.len() > MTP_WINDOW_SIZE {
+            self.window.pop_front();
+        }
+    }
+}
+
+pub struct ChainState<S> {
+    store: Arc<S>,
+    utxos: UtxoSet<Arc<S>>,
+    anchors_sprout: AnchorSet<Arc<S>>,
+    anchors_sapling: AnchorSet<Arc<S>>,
+    nullifiers_sprout: NullifierSet<Arc<S>>,
+    nullifiers_sapling: NullifierSet<Arc<S>>,
+    address_index: AddressIndex<Arc<S>>,
+    tx_index: TxIndex<Arc<S>>,
+    index: ChainIndex<S>,
+    blocks: FlatFileStore,
+    header_cache: Mutex<HeaderCache>,
+}
+
+impl<S: KeyValueStore> ChainState<S> {
+    pub fn new(store: Arc<S>, blocks: FlatFileStore) -> Self {
+        Self {
+            utxos: UtxoSet::new(Arc::clone(&store)),
+            anchors_sprout: AnchorSet::new(Arc::clone(&store), Column::AnchorSprout),
+            anchors_sapling: AnchorSet::new(Arc::clone(&store), Column::AnchorSapling),
+            nullifiers_sprout: NullifierSet::new(Arc::clone(&store), Column::NullifierSprout),
+            nullifiers_sapling: NullifierSet::new(Arc::clone(&store), Column::NullifierSapling),
+            address_index: AddressIndex::new(Arc::clone(&store)),
+            tx_index: TxIndex::new(Arc::clone(&store)),
+            index: ChainIndex::new(Arc::clone(&store)),
+            store,
+            blocks,
+            header_cache: Mutex::new(HeaderCache::new(HEADER_CACHE_CAPACITY)),
+        }
+    }
+
+    pub fn best_header(&self) -> Result<Option<ChainTip>, ChainStateError> {
+        Ok(self.index.best_header()?)
+    }
+
+    pub fn best_block(&self) -> Result<Option<ChainTip>, ChainStateError> {
+        Ok(self.index.best_block()?)
+    }
+
+    pub fn header_entry(
+        &self,
+        hash: &fluxd_consensus::Hash256,
+    ) -> Result<Option<HeaderEntry>, ChainStateError> {
+        if let Ok(cache) = self.header_cache.lock() {
+            if let Some(entry) = cache.get(hash) {
+                return Ok(Some(entry));
+            }
+        }
+        let entry = self.index.get_header(hash)?;
+        if let Some(entry) = entry.clone() {
+            if let Ok(mut cache) = self.header_cache.lock() {
+                cache.insert(*hash, entry);
+            }
+        }
+        Ok(entry)
+    }
+
+    pub fn insert_header(
+        &self,
+        header: &fluxd_primitives::block::BlockHeader,
+        params: &ConsensusParams,
+        batch: &mut WriteBatch,
+    ) -> Result<HeaderEntry, ChainStateError> {
+        let mut pending = HashMap::new();
+        let mut best = self
+            .index
+            .best_header()?
+            .map(|tip| (tip.hash, primitive_types::U256::from_big_endian(&tip.chainwork)));
+        let mut difficulty_window = None;
+        self.insert_header_with_pending(
+            header,
+            params,
+            batch,
+            &mut pending,
+            &mut best,
+            true,
+            &mut difficulty_window,
+        )
+    }
+
+    pub fn insert_headers_batch(
+        &self,
+        headers: &[fluxd_primitives::block::BlockHeader],
+        params: &ConsensusParams,
+        batch: &mut WriteBatch,
+    ) -> Result<Vec<(Hash256, HeaderEntry)>, ChainStateError> {
+        self.insert_headers_batch_with_pow(headers, params, batch, true)
+    }
+
+    pub fn insert_headers_batch_with_pow(
+        &self,
+        headers: &[fluxd_primitives::block::BlockHeader],
+        params: &ConsensusParams,
+        batch: &mut WriteBatch,
+        check_pow: bool,
+    ) -> Result<Vec<(Hash256, HeaderEntry)>, ChainStateError> {
+        let mut pending = HashMap::new();
+        let mut best = self
+            .index
+            .best_header()?
+            .map(|tip| (tip.hash, primitive_types::U256::from_big_endian(&tip.chainwork)));
+        let mut difficulty_window = headers
+            .first()
+            .map(|header| DifficultyWindow::bootstrap(self, header.prev_block, params, None))
+            .flatten();
+        let mut results = Vec::with_capacity(headers.len());
+        for header in headers {
+            let entry = self.insert_header_with_pending(
+                header,
+                params,
+                batch,
+                &mut pending,
+                &mut best,
+                check_pow,
+                &mut difficulty_window,
+            )?;
+            results.push((header.hash(), entry));
+        }
+        Ok(results)
+    }
+
+    pub fn validate_headers_batch_with_cache(
+        &self,
+        headers: &[fluxd_primitives::block::BlockHeader],
+        params: &ConsensusParams,
+        pending: &mut HashMap<Hash256, HeaderEntry>,
+        check_pow: bool,
+        cache: &mut HeaderValidationCache,
+    ) -> Result<Vec<(Hash256, HeaderEntry)>, ChainStateError> {
+        if headers.is_empty() {
+            return Ok(Vec::new());
+        }
+        if cache.difficulty_window.is_none() {
+            cache.difficulty_window = headers
+                .first()
+                .and_then(|header| DifficultyWindow::bootstrap(self, header.prev_block, params, Some(pending)));
+        }
+        if cache.mtp_window.is_none() {
+            cache.mtp_window = headers
+                .first()
+                .and_then(|header| MtpWindow::bootstrap(self, header.prev_block, Some(pending)));
+        }
+        let mut results = Vec::with_capacity(headers.len());
+        for header in headers {
+            let entry = self.validate_header_with_pending(
+                header,
+                params,
+                pending,
+                check_pow,
+                &mut cache.difficulty_window,
+                &mut cache.mtp_window,
+            )?;
+            results.push((header.hash(), entry));
+        }
+        Ok(results)
+    }
+
+    fn insert_header_with_pending(
+        &self,
+        header: &fluxd_primitives::block::BlockHeader,
+        params: &ConsensusParams,
+        batch: &mut WriteBatch,
+        pending: &mut HashMap<Hash256, HeaderEntry>,
+        best: &mut Option<(Hash256, primitive_types::U256)>,
+        check_pow: bool,
+        difficulty_window: &mut Option<DifficultyWindow>,
+    ) -> Result<HeaderEntry, ChainStateError> {
+        let hash = header.hash();
+        if let Some(existing) = pending.get(&hash) {
+            return Ok(existing.clone());
+        }
+        if let Some(existing) = self.index.get_header(&hash)? {
+            if header.is_pon() {
+                let prev_hash = header.prev_block;
+                let is_genesis = prev_hash == [0u8; 32] && hash == params.hash_genesis_block;
+                if !is_genesis {
+                    if let Some(prev_entry) = pending
+                        .get(&prev_hash)
+                        .cloned()
+                        .or_else(|| self.index.get_header(&prev_hash).ok().flatten())
+                    {
+                        let prev_chainwork = prev_entry.chainwork_value();
+                        let work = primitive_types::U256::from(1u64 << 40);
+                        let expected_work = prev_chainwork + work;
+                        if existing.chainwork_value() != expected_work {
+                            let mut updated = existing.clone();
+                            updated.chainwork = expected_work.to_big_endian();
+                            self.index.put_header(batch, &hash, &updated);
+                            pending.insert(hash, updated.clone());
+                            if let Ok(mut cache) = self.header_cache.lock() {
+                                cache.insert(hash, updated.clone());
+                            }
+                            let should_update_best = match best {
+                                Some((_, best_work)) => expected_work > *best_work,
+                                None => true,
+                            };
+                            if should_update_best {
+                                *best = Some((hash, expected_work));
+                                self.index.set_best_header(batch, &hash);
+                            }
+                            return Ok(updated);
+                        }
+                    }
+                }
+            }
+            let existing_work = existing.chainwork_value();
+            let should_update_best = match best {
+                Some((_, best_work)) => existing_work > *best_work,
+                None => true,
+            };
+            if should_update_best {
+                *best = Some((hash, existing_work));
+                self.index.set_best_header(batch, &hash);
+            }
+            return Ok(existing);
+        }
+
+        let prev_hash = header.prev_block;
+        let is_genesis = prev_hash == [0u8; 32] && hash == params.hash_genesis_block;
+        let prev_entry = if is_genesis {
+            None
+        } else {
+            Some(match pending.get(&prev_hash) {
+                Some(entry) => entry.clone(),
+                None => self
+                    .index
+                    .get_header(&prev_hash)?
+                    .ok_or(ChainStateError::MissingHeader)?,
+            })
+        };
+        let (height, prev_chainwork) = match prev_entry.as_ref() {
+            Some(entry) => (entry.height + 1, entry.chainwork_value()),
+            None => (0, primitive_types::U256::zero()),
+        };
+
+        if let Some(checkpoint) = params.checkpoints.iter().find(|checkpoint| checkpoint.height == height) {
+            if checkpoint.hash != hash {
+                return Err(ChainStateError::InvalidHeader(
+                    "checkpoint mismatch",
+                ));
+            }
+        }
+
+        if let Some(best_block) = self.index.best_block()? {
+            let reorg_depth = best_block.height as i64 - (height as i64 - 1);
+            if reorg_depth >= max_reorg_depth(best_block.height as i64) {
+                return Err(ChainStateError::InvalidHeader(
+                    "forked chain older than max reorganization depth",
+                ));
+            }
+
+            if let Some(checkpoint) = last_checkpoint_on_chain(self, params, best_block.height) {
+                if height < checkpoint.height {
+                    return Err(ChainStateError::InvalidHeader(
+                        "forked chain older than last checkpoint",
+                    ));
+                }
+            }
+        }
+
+        let pon_active = network_upgrade_active(height, &params.upgrades, UpgradeIndex::Pon);
+        if header.version < MIN_BLOCK_VERSION {
+            return Err(ChainStateError::InvalidHeader("block version too low"));
+        }
+        if pon_active && header.version < MIN_PON_BLOCK_VERSION {
+            return Err(ChainStateError::InvalidHeader("pon block version too low"));
+        }
+        for upgrade in &params.upgrades {
+            if height == upgrade.activation_height {
+                if let Some(expected_hash) = upgrade.hash_activation_block {
+                    if hash != expected_hash {
+                        return Err(ChainStateError::InvalidHeader(
+                            "activation block hash mismatch",
+                        ));
+                    }
+                }
+            }
+        }
+        if pon_active && !header.is_pon() {
+            return Err(ChainStateError::InvalidHeader(
+                "pon upgrade active but header is not pon",
+            ));
+        }
+        if !pon_active && header.is_pon() {
+            return Err(ChainStateError::InvalidHeader(
+                "pon upgrade inactive but header is pon",
+            ));
+        }
+        if let Some(prev_entry) = prev_entry.as_ref() {
+            let now = current_time_secs();
+            let lwma_active = network_upgrade_active(height, &params.upgrades, UpgradeIndex::Lwma);
+            let max_future = if !lwma_active {
+                2 * 60 * 60
+            } else if header.is_pon() {
+                300
+            } else {
+                360
+            };
+            if header.time as i64 > now + max_future {
+                return Err(ChainStateError::InvalidHeader(
+                    "block timestamp too far in the future",
+                ));
+            }
+            if header.is_pon() {
+                if header.time as i64 <= prev_entry.time as i64 {
+                    return Err(ChainStateError::InvalidHeader(
+                        "pon block timestamp too early",
+                    ));
+                }
+            } else {
+                let mtp_headers = collect_headers(self, &prev_hash, 11, Some(pending))?;
+                let mtp = median_time_past(&mtp_headers);
+                if header.time as i64 <= mtp {
+                    return Err(ChainStateError::InvalidHeader(
+                        "block timestamp too early",
+                    ));
+                }
+            }
+        }
+
+        if !is_genesis {
+            let expected_bits = if !pon_active {
+                match difficulty_window.as_mut() {
+                    Some(window) if window.tip_hash == prev_hash => {
+                        window.expected_bits(header.time as i64, params)?
+                    }
+                    _ => self.expected_bits(
+                        &prev_hash,
+                        height,
+                        header.time as i64,
+                        params,
+                        Some(pending),
+                    )?,
+                }
+            } else {
+                self.expected_bits(
+                    &prev_hash,
+                    height,
+                    header.time as i64,
+                    params,
+                    Some(pending),
+                )?
+            };
+            if header.bits != expected_bits {
+                eprintln!(
+                    "unexpected difficulty bits at height {}: expected {:#x}, got {:#x}",
+                    height, expected_bits, header.bits
+                );
+                return Err(ChainStateError::InvalidHeader(
+                    "unexpected difficulty bits",
+                ));
+            }
+        }
+
+        if header.is_pon() {
+            pon_validation::validate_pon_header(header, height, params)?;
+        } else if check_pow {
+            pow_validation::validate_pow_header(header, height, params)?;
+        }
+
+        let chainwork = if header.is_pon() {
+            let work = primitive_types::U256::from(1u64 << 40);
+            let work = prev_chainwork + work;
+            work.to_big_endian()
+        } else {
+            let work = block_proof(header.bits)
+                .map_err(|_| ChainStateError::InvalidHeader("invalid difficulty target"))?;
+            let work = prev_chainwork + work;
+            work.to_big_endian()
+        };
+
+        let entry = HeaderEntry {
+            prev_hash,
+            height,
+            time: header.time,
+            bits: header.bits,
+            chainwork,
+            status: status_with_header(0),
+        };
+
+        self.index.put_header(batch, &hash, &entry);
+        pending.insert(hash, entry.clone());
+        if let Ok(mut cache) = self.header_cache.lock() {
+            cache.insert(hash, entry.clone());
+        }
+
+        let new_work = primitive_types::U256::from_big_endian(&entry.chainwork);
+        let should_update_best = match best {
+            Some((_, best_work)) => new_work > *best_work,
+            None => true,
+        };
+        if should_update_best {
+            *best = Some((hash, new_work));
+            self.index.set_best_header(batch, &hash);
+        }
+
+        if !pon_active {
+            if let Some(window) = difficulty_window.as_mut() {
+                if window.tip_hash == prev_hash {
+                    window.advance(hash, height, header.time, header.bits);
+                } else {
+                    *difficulty_window = None;
+                }
+            }
+        } else {
+            *difficulty_window = None;
+        }
+
+        Ok(entry)
+    }
+
+    fn validate_header_with_pending(
+        &self,
+        header: &fluxd_primitives::block::BlockHeader,
+        params: &ConsensusParams,
+        pending: &mut HashMap<Hash256, HeaderEntry>,
+        check_pow: bool,
+        difficulty_window: &mut Option<DifficultyWindow>,
+        mtp_window: &mut Option<MtpWindow>,
+    ) -> Result<HeaderEntry, ChainStateError> {
+        let hash = header.hash();
+        if let Some(existing) = pending.get(&hash) {
+            return Ok(existing.clone());
+        }
+        if let Some(existing) = self.index.get_header(&hash)? {
+            if header.is_pon() {
+                let prev_hash = header.prev_block;
+                let is_genesis = prev_hash == [0u8; 32] && hash == params.hash_genesis_block;
+                if !is_genesis {
+                    if let Some(prev_entry) = pending
+                        .get(&prev_hash)
+                        .cloned()
+                        .or_else(|| self.index.get_header(&prev_hash).ok().flatten())
+                    {
+                        let prev_chainwork = prev_entry.chainwork_value();
+                        let work = primitive_types::U256::from(1u64 << 40);
+                        let expected_work = prev_chainwork + work;
+                        if existing.chainwork_value() != expected_work {
+                            let mut updated = existing.clone();
+                            updated.chainwork = expected_work.to_big_endian();
+                            return Ok(updated);
+                        }
+                    }
+                }
+            }
+            return Ok(existing);
+        }
+
+        let prev_hash = header.prev_block;
+        let is_genesis = prev_hash == [0u8; 32] && hash == params.hash_genesis_block;
+        let prev_entry = if is_genesis {
+            None
+        } else {
+            Some(match pending.get(&prev_hash) {
+                Some(entry) => entry.clone(),
+                None => self
+                    .index
+                    .get_header(&prev_hash)?
+                    .ok_or(ChainStateError::MissingHeader)?,
+            })
+        };
+        let (height, prev_chainwork) = match prev_entry.as_ref() {
+            Some(entry) => (entry.height + 1, entry.chainwork_value()),
+            None => (0, primitive_types::U256::zero()),
+        };
+
+        if let Some(checkpoint) = params
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.height == height)
+        {
+            if checkpoint.hash != hash {
+                return Err(ChainStateError::InvalidHeader("checkpoint mismatch"));
+            }
+        }
+
+        if let Some(best_block) = self.index.best_block()? {
+            let reorg_depth = best_block.height as i64 - (height as i64 - 1);
+            if reorg_depth >= max_reorg_depth(best_block.height as i64) {
+                return Err(ChainStateError::InvalidHeader("reorg too deep"));
+            }
+        }
+
+        let pon_active = network_upgrade_active(height, &params.upgrades, UpgradeIndex::Pon);
+        if header.is_pon() && !pon_active {
+            return Err(ChainStateError::InvalidHeader(
+                "pon upgrade inactive but header is pon",
+            ));
+        }
+        if let Some(prev_entry) = prev_entry.as_ref() {
+            let now = current_time_secs();
+            let lwma_active = network_upgrade_active(height, &params.upgrades, UpgradeIndex::Lwma);
+            let max_future = if !lwma_active {
+                2 * 60 * 60
+            } else if header.is_pon() {
+                300
+            } else {
+                360
+            };
+            if header.time as i64 > now + max_future {
+                return Err(ChainStateError::InvalidHeader(
+                    "block timestamp too far in the future",
+                ));
+            }
+            if header.is_pon() {
+                if header.time as i64 <= prev_entry.time as i64 {
+                    return Err(ChainStateError::InvalidHeader(
+                        "pon block timestamp too early",
+                    ));
+                }
+            } else {
+                let mtp = match mtp_window.as_mut() {
+                    Some(window) if window.tip_hash == prev_hash => window.median_time_past(),
+                    _ => {
+                        *mtp_window = None;
+                        let mtp_headers = collect_headers(self, &prev_hash, MTP_WINDOW_SIZE, Some(pending))?;
+                        median_time_past(&mtp_headers)
+                    }
+                };
+                if header.time as i64 <= mtp {
+                    return Err(ChainStateError::InvalidHeader(
+                        "block timestamp too early",
+                    ));
+                }
+            }
+        }
+
+        if !is_genesis {
+            let expected_bits = if !pon_active {
+                match difficulty_window.as_mut() {
+                    Some(window) if window.tip_hash == prev_hash => {
+                        window.expected_bits(header.time as i64, params)?
+                    }
+                    _ => self.expected_bits(
+                        &prev_hash,
+                        height,
+                        header.time as i64,
+                        params,
+                        Some(pending),
+                    )?,
+                }
+            } else {
+                self.expected_bits(
+                    &prev_hash,
+                    height,
+                    header.time as i64,
+                    params,
+                    Some(pending),
+                )?
+            };
+            if header.bits != expected_bits {
+                eprintln!(
+                    "unexpected difficulty bits at height {}: expected {:#x}, got {:#x}",
+                    height, expected_bits, header.bits
+                );
+                return Err(ChainStateError::InvalidHeader(
+                    "unexpected difficulty bits",
+                ));
+            }
+        }
+
+        if header.is_pon() {
+            pon_validation::validate_pon_header(header, height, params)?;
+        } else if check_pow {
+            pow_validation::validate_pow_header(header, height, params)?;
+        }
+
+        let chainwork = if header.is_pon() {
+            let work = primitive_types::U256::from(1u64 << 40);
+            let work = prev_chainwork + work;
+            work.to_big_endian()
+        } else {
+            let work = block_proof(header.bits)
+                .map_err(|_| ChainStateError::InvalidHeader("invalid difficulty target"))?;
+            let work = prev_chainwork + work;
+            work.to_big_endian()
+        };
+
+        let entry = HeaderEntry {
+            prev_hash,
+            height,
+            time: header.time,
+            bits: header.bits,
+            chainwork,
+            status: status_with_header(0),
+        };
+
+        pending.insert(hash, entry.clone());
+        if !pon_active {
+            if let Some(window) = difficulty_window.as_mut() {
+                if window.tip_hash == prev_hash {
+                    window.advance(hash, height, header.time, header.bits);
+                } else {
+                    *difficulty_window = None;
+                }
+            }
+            if let Some(window) = mtp_window.as_mut() {
+                if window.tip_hash == prev_hash {
+                    window.advance(hash, height, header.time, header.bits);
+                } else {
+                    *mtp_window = None;
+                }
+            }
+        } else {
+            *difficulty_window = None;
+            *mtp_window = None;
+        }
+
+        Ok(entry)
+    }
+
+    fn expected_bits(
+        &self,
+        prev_hash: &fluxd_consensus::Hash256,
+        height: i32,
+        next_time: i64,
+        params: &ConsensusParams,
+        pending: Option<&HashMap<Hash256, HeaderEntry>>,
+    ) -> Result<u32, ChainStateError> {
+        if height == 0 {
+            return Ok(block_bits_from_params(params));
+        }
+
+        if network_upgrade_active(height, &params.upgrades, UpgradeIndex::Pon) {
+            return expected_pon_bits(self, prev_hash, height, params, pending);
+        }
+
+        // LWMA/LWMA3 require the previous block (height - N) for the first solvetime.
+        let lwma_window = params.zawy_lwma_averaging_window.saturating_add(1);
+        let window = params
+            .digishield_averaging_window
+            .max(lwma_window) as usize;
+        let chain = collect_headers(self, prev_hash, window, pending)?;
+        fluxd_pow::difficulty::get_next_work_required(&chain, Some(next_time), params)
+            .map_err(|_| ChainStateError::InvalidHeader("difficulty calculation failed"))
+    }
+
+    pub fn connect_block(
+        &self,
+        block: &Block,
+        height: i32,
+        params: &ChainParams,
+        flags: &ValidationFlags,
+        prevalidated: bool,
+        connect_metrics: Option<&ConnectMetrics>,
+    ) -> Result<WriteBatch, ChainStateError> {
+        let consensus = &params.consensus;
+        let mut batch = WriteBatch::new();
+        let header_entry = self.insert_header(&block.header, consensus, &mut batch)?;
+        if header_entry.height != height {
+            return Err(ChainStateError::InvalidHeader(
+                "block height does not match header index",
+            ));
+        }
+
+        if let Some(best) = self.index.best_block()? {
+            if block.header.prev_block != best.hash {
+                return Err(ChainStateError::InvalidHeader(
+                    "block does not extend best block tip",
+                ));
+            }
+        } else if height != 0 {
+            return Err(ChainStateError::InvalidHeader(
+                "missing best block for non-genesis height",
+            ));
+        }
+
+        if !prevalidated {
+            validate_block(block, height, consensus, flags)?;
+        }
+        if block.header.is_pon() && network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Pon) {
+            let operator_pubkey = lookup_operator_pubkey(&self.store, &block.header.nodes_collateral)?
+                .ok_or(ChainStateError::InvalidHeader(
+                    "missing fluxnode entry for pon signature",
+                ))?;
+            pon_validation::validate_pon_signature(&block.header, consensus, &operator_pubkey)?;
+        }
+        check_coinbase_funding(&block.transactions[0], height, params)?;
+
+        let mut utxo_time = Duration::ZERO;
+        let mut index_time = Duration::ZERO;
+        let mut anchor_time = Duration::ZERO;
+        let mut flatfile_time = Duration::ZERO;
+        let mut sprout_tree = load_sprout_tree(&self.store)?;
+        let mut sapling_tree = load_sapling_tree(&self.store)?;
+        let mut seen_sprout_nullifiers = HashSet::new();
+        let mut seen_sapling_nullifiers = HashSet::new();
+        let mut txids = Vec::with_capacity(block.transactions.len());
+        let mut utxo_cache: HashMap<Vec<u8>, Option<UtxoEntry>> = HashMap::new();
+        let mut block_script_checks: Vec<ScriptCheck> = Vec::new();
+        let branch_id = current_epoch_branch_id(height, &consensus.upgrades);
+        let flux_rebrand_active = network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Flux);
+        let mut total_fees = 0i64;
+        for (index, tx) in block.transactions.iter().enumerate() {
+            let is_coinbase = index == 0;
+            let txid = tx.txid()?;
+            txids.push(txid);
+            let tx_value_out = tx_value_out(tx)?;
+            let mut tx_value_in = tx_shielded_value_in(tx)?;
+            let mut sprout_intermediates: HashMap<Hash256, SproutTree> = HashMap::new();
+
+            for joinsplit in &tx.join_splits {
+                for nullifier in &joinsplit.nullifiers {
+                    if !seen_sprout_nullifiers.insert(*nullifier) {
+                        return Err(ChainStateError::Validation(
+                            ValidationError::InvalidTransaction(
+                                "duplicate sprout nullifier in block",
+                            ),
+                        ));
+                    }
+                    if self.nullifiers_sprout.contains(nullifier)? {
+                        return Err(ChainStateError::Validation(
+                            ValidationError::InvalidTransaction("sprout nullifier already spent"),
+                        ));
+                    }
+                }
+
+                let mut tree = match sprout_intermediates.get(&joinsplit.anchor) {
+                    Some(tree) => tree.clone(),
+                    None => match self.sprout_anchor_tree(&joinsplit.anchor)? {
+                        Some(tree) => tree,
+                        None => {
+                            return Err(ChainStateError::Validation(
+                                ValidationError::InvalidTransaction("sprout anchor not found"),
+                            ))
+                        }
+                    },
+                };
+
+                for commitment in &joinsplit.commitments {
+                    tree.append(crate::shielded::SproutNode::from_hash(commitment))
+                        .map_err(|_| {
+                            ChainStateError::Validation(ValidationError::InvalidTransaction(
+                                "sprout tree append failed",
+                            ))
+                        })?;
+                }
+
+                let next_root = sprout_root_hash(&tree);
+                sprout_intermediates.insert(next_root, tree);
+            }
+
+            for spend in &tx.shielded_spends {
+                if !seen_sapling_nullifiers.insert(spend.nullifier) {
+                    return Err(ChainStateError::Validation(
+                        ValidationError::InvalidTransaction(
+                            "duplicate sapling nullifier in block",
+                        ),
+                    ));
+                }
+                if self.nullifiers_sapling.contains(&spend.nullifier)? {
+                    return Err(ChainStateError::Validation(
+                        ValidationError::InvalidTransaction("sapling nullifier already spent"),
+                    ));
+                }
+                if !self.sapling_anchor_exists(&spend.anchor)? {
+                    return Err(ChainStateError::Validation(
+                        ValidationError::InvalidTransaction("sapling anchor not found"),
+                    ));
+                }
+            }
+
+            if !is_coinbase {
+                let mut transparent_in = 0i64;
+                for (input_index, input) in tx.vin.iter().enumerate() {
+                    let outpoint_key = outpoint_key(&input.prevout);
+                    let entry = match utxo_cache.get(&outpoint_key) {
+                        Some(Some(entry)) => entry.clone(),
+                        Some(None) => {
+                            eprintln!(
+                                "missing input for tx {} input {} prevout {}:{} at height {}",
+                                hash256_to_hex(&txid),
+                                input_index,
+                                hash256_to_hex(&input.prevout.hash),
+                                input.prevout.index,
+                                height
+                            );
+                            return Err(ChainStateError::MissingInput);
+                        }
+                        None => {
+                            let utxo_start = Instant::now();
+                            let entry = self.utxos.get(&input.prevout)?;
+                            utxo_time += utxo_start.elapsed();
+                            match entry {
+                            Some(entry) => entry,
+                            None => {
+                                eprintln!(
+                                    "missing input for tx {} input {} prevout {}:{} at height {}",
+                                    hash256_to_hex(&txid),
+                                    input_index,
+                                    hash256_to_hex(&input.prevout.hash),
+                                    input.prevout.index,
+                                    height
+                                );
+                                return Err(ChainStateError::MissingInput);
+                            }
+                        }
+                        }
+                    };
+                    if entry.is_coinbase {
+                        let spend_height = height as i64 - entry.height as i64;
+                        if spend_height < COINBASE_MATURITY as i64 {
+                            return Err(ChainStateError::Validation(
+                                ValidationError::InvalidTransaction(
+                                    "premature spend of coinbase",
+                                ),
+                            ));
+                        }
+                        if consensus.coinbase_must_be_protected
+                            && !flux_rebrand_active
+                            && !tx.vout.is_empty()
+                        {
+                            return Err(ChainStateError::Validation(
+                                ValidationError::InvalidTransaction(
+                                    "coinbase spend has transparent outputs",
+                                ),
+                            ));
+                        }
+                    }
+                    if flags.check_script {
+                        block_script_checks.push(ScriptCheck {
+                            tx_index: index,
+                            input_index,
+                            script_sig: input.script_sig.clone(),
+                            script_pubkey: entry.script_pubkey.clone(),
+                            value: entry.value,
+                        });
+                    }
+                    transparent_in = transparent_in
+                        .checked_add(entry.value)
+                        .ok_or(ChainStateError::ValueOutOfRange)?;
+                    let utxo_start = Instant::now();
+                    self.utxos.delete(&mut batch, &input.prevout);
+                    utxo_time += utxo_start.elapsed();
+                    utxo_cache.insert(outpoint_key, None);
+                    let index_start = Instant::now();
+                    self.address_index
+                        .delete(&mut batch, &entry.script_pubkey, &input.prevout);
+                    index_time += index_start.elapsed();
+                }
+                tx_value_in = tx_value_in
+                    .checked_add(transparent_in)
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
+                if tx_value_in < tx_value_out {
+                    return Err(ChainStateError::ValueOutOfRange);
+                }
+                let fee = tx_value_in - tx_value_out;
+                total_fees = total_fees
+                    .checked_add(fee)
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
+            }
+
+            apply_fluxnode_tx(&self.store, &mut batch, tx, height as u32)?;
+
+            if !(tx.join_splits.is_empty() && tx.shielded_spends.is_empty()) {
+                let anchor_start = Instant::now();
+                for joinsplit in &tx.join_splits {
+                    for nullifier in &joinsplit.nullifiers {
+                        self.nullifiers_sprout.insert(&mut batch, nullifier);
+                    }
+                }
+                for spend in &tx.shielded_spends {
+                    self.nullifiers_sapling.insert(&mut batch, &spend.nullifier);
+                }
+                anchor_time += anchor_start.elapsed();
+            }
+
+            if !(tx.join_splits.is_empty() && tx.shielded_outputs.is_empty()) {
+                let anchor_start = Instant::now();
+                for joinsplit in &tx.join_splits {
+                    for commitment in &joinsplit.commitments {
+                        sprout_tree
+                            .append(crate::shielded::SproutNode::from_hash(commitment))
+                            .map_err(|_| {
+                                ChainStateError::Validation(ValidationError::InvalidTransaction(
+                                    "sprout tree append failed",
+                                ))
+                            })?;
+                    }
+                }
+                for output in &tx.shielded_outputs {
+                    let node = sapling_node_from_hash(&output.cm).ok_or_else(|| {
+                        ChainStateError::Validation(ValidationError::InvalidTransaction(
+                            "sapling note commitment invalid",
+                        ))
+                    })?;
+                    sapling_tree.append(node).map_err(|_| {
+                        ChainStateError::Validation(ValidationError::InvalidTransaction(
+                            "sapling tree append failed",
+                        ))
+                    })?;
+                }
+                anchor_time += anchor_start.elapsed();
+            }
+
+            for (out_index, output) in tx.vout.iter().enumerate() {
+                let outpoint = OutPoint {
+                    hash: txid,
+                    index: out_index as u32,
+                };
+                let entry = UtxoEntry {
+                    value: output.value,
+                    script_pubkey: output.script_pubkey.clone(),
+                    height: height as u32,
+                    is_coinbase,
+                };
+                let utxo_start = Instant::now();
+                self.utxos.put(&mut batch, &outpoint, &entry);
+                utxo_time += utxo_start.elapsed();
+                utxo_cache.insert(outpoint_key(&outpoint), Some(entry));
+                let index_start = Instant::now();
+                self.address_index
+                    .insert(&mut batch, &output.script_pubkey, &outpoint);
+                index_time += index_start.elapsed();
+            }
+        }
+
+        if flags.check_script && !block_script_checks.is_empty() {
+            let script_start = Instant::now();
+            let result = block_script_checks.par_iter().try_for_each(|check| {
+                let tx = &block.transactions[check.tx_index];
+                verify_script(
+                    &check.script_sig,
+                    &check.script_pubkey,
+                    tx,
+                    check.input_index,
+                    check.value,
+                    BLOCK_SCRIPT_VERIFY_FLAGS,
+                    branch_id,
+                )
+                .map_err(|err| (check.tx_index, check.input_index, err))
+            });
+            if let Some(metrics) = flags.metrics.as_ref() {
+                metrics.record_script(script_start.elapsed());
+            }
+            if let Err((tx_index, input_index, err)) = result {
+                if let Ok(txid) = block.transactions[tx_index].txid() {
+                    eprintln!(
+                        "script validation failed for tx {} input {}: {}",
+                        hash256_to_hex(&txid),
+                        input_index,
+                        err
+                    );
+                } else {
+                    eprintln!(
+                        "script validation failed for input {}: {}",
+                        input_index, err
+                    );
+                }
+                return Err(ChainStateError::Validation(
+                    ValidationError::InvalidTransaction("script validation failed"),
+                ));
+            }
+        }
+
+        let anchor_finalize_start = Instant::now();
+        let sprout_root = sprout_root_hash(&sprout_tree);
+        let sapling_root = sapling_root_hash(&sapling_tree);
+        if network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Acadia)
+            && block.header.final_sapling_root != sapling_root
+        {
+            return Err(ChainStateError::Validation(ValidationError::InvalidBlock(
+                "sapling root mismatch",
+            )));
+        }
+
+        let sprout_bytes = sprout_tree_to_bytes(&sprout_tree)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree"))?;
+        let sapling_bytes = sapling_tree_to_bytes(&sapling_tree)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree"))?;
+
+        self.anchors_sprout
+            .insert(&mut batch, &sprout_root, sprout_bytes.clone());
+        self.anchors_sapling
+            .insert(&mut batch, &sapling_root, sapling_bytes.clone());
+        batch.put(Column::Meta, SPROUT_TREE_KEY, sprout_bytes);
+        batch.put(Column::Meta, SAPLING_TREE_KEY, sapling_bytes);
+        anchor_time += anchor_finalize_start.elapsed();
+
+        let block_bytes = block.consensus_encode()?;
+        let flatfile_start = Instant::now();
+        let location = self.blocks.append(&block_bytes)?;
+        flatfile_time += flatfile_start.elapsed();
+        let block_hash = block.header.hash();
+        let mut logical_ts = block.header.time;
+        if block.header.prev_block != [0u8; 32] {
+            match self.block_logical_time(&block.header.prev_block) {
+                Ok(Some(prev_ts)) => {
+                    if logical_ts <= prev_ts {
+                        logical_ts = prev_ts.saturating_add(1);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!(
+                        "failed to read previous block logical timestamp: {}",
+                        err
+                    );
+                }
+            }
+        }
+        let mut ts_key = Vec::with_capacity(36);
+        ts_key.extend_from_slice(&logical_ts.to_be_bytes());
+        ts_key.extend_from_slice(&block_hash);
+        batch.put(Column::TimestampIndex, ts_key, Vec::new());
+        batch.put(
+            Column::BlockTimestamp,
+            block_hash.to_vec(),
+            logical_ts.to_be_bytes().to_vec(),
+        );
+        batch.put(Column::BlockIndex, block_hash.to_vec(), location.encode());
+        batch.put(
+            Column::BlockHeader,
+            block_hash.to_vec(),
+            block.header.consensus_encode(),
+        );
+
+        let index_start = Instant::now();
+        for (index, txid) in txids.iter().enumerate() {
+            let tx_location = TxLocation {
+                block: location,
+                index: index as u32,
+            };
+            self.tx_index.insert(&mut batch, txid, tx_location);
+        }
+        index_time += index_start.elapsed();
+
+        let mut entry = header_entry;
+        entry.status = status_with_block(entry.status);
+        let index_start = Instant::now();
+        self.index.put_header(&mut batch, &block_hash, &entry);
+        self.index.set_best_block(&mut batch, &block_hash);
+        self.index.set_height_hash(&mut batch, height, &block_hash);
+        index_time += index_start.elapsed();
+
+        let block_value = block_subsidy(height, consensus);
+        let exchange_fund = exchange_fund_amount(height, &params.funding);
+        let foundation_fund = foundation_fund_amount(height, &params.funding);
+        let swap_pool = swap_pool_amount(height as i64, &params.swap_pool);
+        let coinbase_value = tx_value_out(&block.transactions[0])?;
+        let max_reward = block_value
+            .checked_add(total_fees)
+            .and_then(|value| value.checked_add(exchange_fund))
+            .and_then(|value| value.checked_add(foundation_fund))
+            .and_then(|value| value.checked_add(swap_pool))
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        if height > 2 && coinbase_value > max_reward {
+            return Err(ChainStateError::Validation(ValidationError::InvalidBlock(
+                "coinbase pays too much",
+            )));
+        }
+
+        if let Some(metrics) = connect_metrics {
+            metrics.record_utxo(utxo_time);
+            metrics.record_index(index_time);
+            metrics.record_anchor(anchor_time);
+            metrics.record_flatfile(flatfile_time);
+        }
+
+        Ok(batch)
+    }
+
+    pub fn set_best_header(&self, hash: &Hash256) -> Result<(), ChainStateError> {
+        if self.index.get_header(hash)?.is_none() {
+            return Err(ChainStateError::MissingHeader);
+        }
+        let mut batch = WriteBatch::new();
+        self.index.set_best_header(&mut batch, hash);
+        self.store.write_batch(batch)?;
+        Ok(())
+    }
+
+    pub fn commit_batch(&self, batch: WriteBatch) -> Result<(), ChainStateError> {
+        self.store.write_batch(batch)?;
+        Ok(())
+    }
+
+    pub fn read_block(&self, location: FileLocation) -> Result<Vec<u8>, ChainStateError> {
+        Ok(self.blocks.read(location)?)
+    }
+
+    pub fn block_location(&self, hash: &[u8; 32]) -> Result<Option<FileLocation>, ChainStateError> {
+        let bytes = match self.store.get(Column::BlockIndex, hash)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        FileLocation::decode(&bytes)
+            .ok_or(ChainStateError::CorruptIndex("invalid block index entry"))
+            .map(Some)
+    }
+
+    pub fn height_hash(&self, height: i32) -> Result<Option<Hash256>, ChainStateError> {
+        Ok(self.index.height_hash(height)?)
+    }
+
+    pub fn scan_headers(&self) -> Result<Vec<(Hash256, HeaderEntry)>, ChainStateError> {
+        Ok(self.index.scan_headers()?)
+    }
+
+    pub fn block_header_bytes(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, ChainStateError> {
+        Ok(self.store.get(Column::BlockHeader, hash)?)
+    }
+
+    pub fn block_logical_time(&self, hash: &Hash256) -> Result<Option<u32>, ChainStateError> {
+        let bytes = match self.store.get(Column::BlockTimestamp, hash)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        if bytes.len() != 4 {
+            return Err(ChainStateError::CorruptIndex(
+                "invalid block timestamp entry",
+            ));
+        }
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&bytes);
+        Ok(Some(u32::from_be_bytes(buf)))
+    }
+
+    pub fn scan_timestamp_index(&self) -> Result<Vec<(u32, Hash256)>, ChainStateError> {
+        let entries = self.store.scan_prefix(Column::TimestampIndex, &[])?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (key, _) in entries {
+            if key.len() != 36 {
+                continue;
+            }
+            let mut ts_buf = [0u8; 4];
+            ts_buf.copy_from_slice(&key[0..4]);
+            let timestamp = u32::from_be_bytes(ts_buf);
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&key[4..36]);
+            out.push((timestamp, hash));
+        }
+        Ok(out)
+    }
+
+    pub fn tx_location(&self, txid: &[u8; 32]) -> Result<Option<TxLocation>, ChainStateError> {
+        self.tx_index.get(txid).map_err(ChainStateError::from)
+    }
+
+    pub fn address_outpoints(
+        &self,
+        script_pubkey: &[u8],
+    ) -> Result<Vec<OutPoint>, ChainStateError> {
+        Ok(self.address_index.scan(script_pubkey)?)
+    }
+
+    pub fn utxo_exists(&self, outpoint: &OutPoint) -> Result<bool, ChainStateError> {
+        Ok(self.store.get(Column::Utxo, &outpoint_key(outpoint))?.is_some())
+    }
+
+    pub fn utxo_entry(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, ChainStateError> {
+        Ok(self.utxos.get(outpoint)?)
+    }
+
+    pub fn fluxnode_records(&self) -> Result<Vec<FluxnodeRecord>, ChainStateError> {
+        let entries = self.store.scan_prefix(Column::Fluxnode, &[])?;
+        let mut records = Vec::with_capacity(entries.len());
+        for (_, value) in entries {
+            let record = FluxnodeRecord::decode(&value)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid fluxnode record"))?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    pub fn fluxnode_key(&self, key: KeyId) -> Result<Option<Vec<u8>>, ChainStateError> {
+        Ok(self.store.get(Column::FluxnodeKey, &key.0)?)
+    }
+
+    fn sprout_anchor_tree(&self, anchor: &fluxd_consensus::Hash256) -> Result<Option<SproutTree>, ChainStateError> {
+        if *anchor == sprout_empty_root_hash() {
+            return Ok(Some(empty_sprout_tree()));
+        }
+        let bytes = match self.anchors_sprout.get(anchor)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let tree = sprout_tree_from_bytes(&bytes)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout anchor tree"))?;
+        Ok(Some(tree))
+    }
+
+    fn sapling_anchor_exists(
+        &self,
+        anchor: &fluxd_consensus::Hash256,
+    ) -> Result<bool, ChainStateError> {
+        if *anchor == sapling_empty_root_hash() {
+            return Ok(true);
+        }
+        Ok(self.anchors_sapling.contains(anchor)?)
+    }
+}
+
+const SPROUT_TREE_KEY: &[u8] = b"sprout_tree";
+const SAPLING_TREE_KEY: &[u8] = b"sapling_tree";
+
+fn load_sprout_tree<S: KeyValueStore>(store: &S) -> Result<SproutTree, ChainStateError> {
+    match store.get(Column::Meta, SPROUT_TREE_KEY)? {
+        Some(bytes) => sprout_tree_from_bytes(&bytes)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree")),
+        None => Ok(empty_sprout_tree()),
+    }
+}
+
+fn load_sapling_tree<S: KeyValueStore>(store: &S) -> Result<SaplingTree, ChainStateError> {
+    match store.get(Column::Meta, SAPLING_TREE_KEY)? {
+        Some(bytes) => sapling_tree_from_bytes(&bytes)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree")),
+        None => Ok(empty_sapling_tree()),
+    }
+}
+
+fn money_range(value: i64) -> bool {
+    value >= 0 && value <= MAX_MONEY
+}
+
+fn tx_value_out(tx: &Transaction) -> Result<i64, ChainStateError> {
+    let mut total = 0i64;
+    for output in &tx.vout {
+        if output.value < 0 || output.value > MAX_MONEY {
+            return Err(ChainStateError::ValueOutOfRange);
+        }
+        total = total
+            .checked_add(output.value)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        if !money_range(total) {
+            return Err(ChainStateError::ValueOutOfRange);
+        }
+    }
+
+    if tx.value_balance <= 0 {
+        let balance = -tx.value_balance;
+        total = total
+            .checked_add(balance)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        if !money_range(balance) || !money_range(total) {
+            return Err(ChainStateError::ValueOutOfRange);
+        }
+    }
+
+    for joinsplit in &tx.join_splits {
+        total = total
+            .checked_add(joinsplit.vpub_old)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        if !money_range(joinsplit.vpub_old) || !money_range(total) {
+            return Err(ChainStateError::ValueOutOfRange);
+        }
+    }
+
+    Ok(total)
+}
+
+fn tx_shielded_value_in(tx: &Transaction) -> Result<i64, ChainStateError> {
+    let mut total = 0i64;
+    if tx.value_balance >= 0 {
+        total = total
+            .checked_add(tx.value_balance)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        if !money_range(tx.value_balance) || !money_range(total) {
+            return Err(ChainStateError::ValueOutOfRange);
+        }
+    }
+
+    for joinsplit in &tx.join_splits {
+        total = total
+            .checked_add(joinsplit.vpub_new)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        if !money_range(joinsplit.vpub_new) || !money_range(total) {
+            return Err(ChainStateError::ValueOutOfRange);
+        }
+    }
+    Ok(total)
+}
+
+fn block_bits_from_params(params: &ConsensusParams) -> u32 {
+    fluxd_pow::difficulty::target_to_compact(&params.pow_limit)
+}
+
+fn current_time_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn collect_headers<S: KeyValueStore>(
+    state: &ChainState<S>,
+    tip_hash: &fluxd_consensus::Hash256,
+    count: usize,
+    pending: Option<&HashMap<Hash256, HeaderEntry>>,
+) -> Result<Vec<HeaderInfo>, ChainStateError> {
+    let mut headers = Vec::new();
+    let mut current = *tip_hash;
+    for _ in 0..count {
+        let entry = header_entry_with_pending(state, pending, &current)?
+            .ok_or(ChainStateError::MissingHeader)?;
+        headers.push(HeaderInfo {
+            height: entry.height as i64,
+            time: entry.time as i64,
+            bits: entry.bits,
+        });
+        if entry.height == 0 {
+            break;
+        }
+        current = entry.prev_hash;
+    }
+    headers.reverse();
+    Ok(headers)
+}
+
+fn median_time_past(headers: &[HeaderInfo]) -> i64 {
+    let mut times: Vec<i64> = headers.iter().map(|header| header.time).collect();
+    times.sort_unstable();
+    times[times.len() / 2]
+}
+
+fn last_checkpoint_on_chain<S: KeyValueStore>(
+    state: &ChainState<S>,
+    params: &ConsensusParams,
+    best_block_height: i32,
+) -> Option<fluxd_consensus::params::Checkpoint> {
+    params
+        .checkpoints
+        .iter()
+        .rev()
+        .find(|checkpoint| {
+            checkpoint.height <= best_block_height
+                && state
+                    .header_entry(&checkpoint.hash)
+                    .ok()
+                    .flatten()
+                    .is_some()
+        })
+        .copied()
+}
+
+fn expected_pon_bits<S: KeyValueStore>(
+    state: &ChainState<S>,
+    prev_hash: &fluxd_consensus::Hash256,
+    height: i32,
+    params: &ConsensusParams,
+    pending: Option<&HashMap<Hash256, HeaderEntry>>,
+) -> Result<u32, ChainStateError> {
+    let prev_entry = header_entry_with_pending(state, pending, prev_hash)?
+        .ok_or(ChainStateError::MissingHeader)?;
+
+    let activation_height = params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+    let lookback_window = params.pon_difficulty_window as i32;
+    if height < activation_height {
+        return Ok(prev_entry.bits);
+    }
+
+    let pon_start_bits = fluxd_pow::difficulty::target_to_compact(&params.pon_start_limit);
+    if height < activation_height + lookback_window {
+        return Ok(pon_start_bits);
+    }
+
+    let window = params.pon_difficulty_window as usize;
+    let chain = collect_headers(state, prev_hash, window, pending)?;
+    if chain.len() < window {
+        return Ok(pon_start_bits);
+    }
+
+    let first = chain.first().expect("checked length");
+    let last = chain.last().expect("checked length");
+
+    let mut actual_timespan = last.time - first.time;
+    let target_timespan = (lookback_window as i64 - 1) * params.pon_target_spacing;
+    if target_timespan <= 0 {
+        return Ok(fluxd_pow::difficulty::target_to_compact(&params.pon_limit));
+    }
+
+    let min_timespan = target_timespan * 4 / 5;
+    let max_timespan = target_timespan * 5 / 4;
+    if actual_timespan < min_timespan {
+        actual_timespan = min_timespan;
+    }
+    if actual_timespan > max_timespan {
+        actual_timespan = max_timespan;
+    }
+
+    let prev_target = fluxd_pow::difficulty::compact_to_u256(prev_entry.bits)
+        .map_err(|_| ChainStateError::InvalidHeader("invalid pon target"))?;
+    if prev_target.is_zero() {
+        return Ok(fluxd_pow::difficulty::target_to_compact(&params.pon_limit));
+    }
+
+    let mut next_target = prev_target / primitive_types::U256::from(target_timespan as u64);
+    next_target *= primitive_types::U256::from(actual_timespan as u64);
+
+    let max_target = primitive_types::U256::from_little_endian(&params.pon_limit);
+    if next_target > max_target {
+        next_target = max_target;
+    }
+    if next_target.is_zero() {
+        next_target = max_target;
+    }
+
+    Ok(fluxd_pow::difficulty::u256_to_compact(next_target))
+}
+
+fn header_entry_with_pending<S: KeyValueStore>(
+    state: &ChainState<S>,
+    pending: Option<&HashMap<Hash256, HeaderEntry>>,
+    hash: &Hash256,
+) -> Result<Option<HeaderEntry>, ChainStateError> {
+    if let Some(pending) = pending {
+        if let Some(entry) = pending.get(hash) {
+            return Ok(Some(entry.clone()));
+        }
+    }
+    state.header_entry(hash)
+}
+
+fn hash256_to_hex(hash: &Hash256) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(64);
+    for byte in hash.iter().rev() {
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+fn check_coinbase_funding(
+    tx: &Transaction,
+    height: i32,
+    params: &ChainParams,
+) -> Result<(), ChainStateError> {
+    let consensus = &params.consensus;
+    let network = params.network;
+
+    if network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Pon) {
+        let min_dev = min_dev_fund_amount(height, consensus);
+        if min_dev > 0 {
+            let dev_script = address_to_script_pubkey(params.funding.dev_fund_address, network)
+                .map_err(|_| {
+                    ChainStateError::Validation(ValidationError::InvalidTransaction(
+                        "invalid dev fund address",
+                    ))
+                })?;
+            let found = tx
+                .vout
+                .iter()
+                .any(|out| out.script_pubkey == dev_script && out.value >= min_dev);
+            if !found {
+                return Err(ChainStateError::Validation(
+                    ValidationError::InvalidTransaction("coinbase missing dev fund payment"),
+                ));
+            }
+        }
+    }
+
+    let exchange_amount = exchange_fund_amount(height, &params.funding);
+    if exchange_amount > 0 {
+        let exchange_script =
+            address_to_script_pubkey(params.funding.exchange_address, network).map_err(|_| {
+                ChainStateError::Validation(ValidationError::InvalidTransaction(
+                    "invalid exchange address",
+                ))
+            })?;
+        let found = tx
+            .vout
+            .iter()
+            .any(|out| out.script_pubkey == exchange_script && out.value == exchange_amount);
+        if !found {
+            return Err(ChainStateError::Validation(
+                ValidationError::InvalidTransaction("coinbase missing exchange funding"),
+            ));
+        }
+    }
+
+    let foundation_amount = foundation_fund_amount(height, &params.funding);
+    if foundation_amount > 0 {
+        let foundation_script =
+            address_to_script_pubkey(params.funding.foundation_address, network).map_err(|_| {
+                ChainStateError::Validation(ValidationError::InvalidTransaction(
+                    "invalid foundation address",
+                ))
+            })?;
+        let found = tx
+            .vout
+            .iter()
+            .any(|out| out.script_pubkey == foundation_script && out.value == foundation_amount);
+        if !found {
+            return Err(ChainStateError::Validation(
+                ValidationError::InvalidTransaction("coinbase missing foundation funding"),
+            ));
+        }
+    }
+
+    if is_swap_pool_interval(height as i64, &params.swap_pool) {
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+        let swap_script = address_to_script_pubkey(params.swap_pool.address, network).map_err(|_| {
+            ChainStateError::Validation(ValidationError::InvalidTransaction(
+                "invalid swap pool address",
+            ))
+        })?;
+        let found = tx
+            .vout
+            .iter()
+            .any(|out| out.script_pubkey == swap_script && out.value == swap_amount);
+        if !found {
+            return Err(ChainStateError::Validation(
+                ValidationError::InvalidTransaction("coinbase missing swap pool funding"),
+            ));
+        }
+    }
+
+    Ok(())
+}

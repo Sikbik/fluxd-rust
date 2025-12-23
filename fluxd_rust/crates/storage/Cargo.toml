@@ -1,0 +1,13 @@
+[package]
+name = "fluxd-storage"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+fjall = { version = "2.11.2", optional = true }
+
+[features]
+default = []
+fjall = ["dep:fjall"]

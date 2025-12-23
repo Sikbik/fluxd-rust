@@ -1,0 +1,23 @@
+[package]
+name = "fluxd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+fluxd-chainstate = { path = "../chainstate" }
+fluxd-consensus = { path = "../consensus" }
+fluxd-fluxnode = { path = "../fluxnode" }
+fluxd-pow = { path = "../pow" }
+fluxd-primitives = { path = "../primitives" }
+fluxd-script = { path = "../script" }
+fluxd-shielded = { path = "../shielded" }
+fluxd-storage = { path = "../storage", features = ["fjall"] }
+rand = "0.8"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+crossbeam-channel = "0.5"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+primitive-types = "0.14"

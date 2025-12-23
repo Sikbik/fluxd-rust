@@ -1,0 +1,112 @@
+# Chainstate indexes
+
+fluxd-rust maintains several on-disk indexes to support fast lookups and RPCs.
+All indexes are stored in the selected backend (Fjall or memory). The columns
+below correspond to `fluxd_storage::Column`.
+
+## HeaderIndex
+
+- Key: `block_hash` (32 bytes)
+- Value: `HeaderEntry` encoded
+  - `prev_hash` (32 bytes, LE)
+  - `height` (i32)
+  - `time` (u32)
+  - `bits` (u32)
+  - `chainwork` (32 bytes)
+  - `status` (has header / has block)
+
+Used to:
+- Track header chain, timestamps, and difficulty.
+- Compute chainwork and best header selection.
+
+## HeightIndex
+
+- Key: `height` (4 bytes LE)
+- Value: `block_hash` (32 bytes)
+
+Maps main chain heights to block hashes.
+
+## BlockIndex
+
+- Key: `block_hash` (32 bytes)
+- Value: `FileLocation` (16 bytes)
+  - `file_id` (u32 LE)
+  - `offset` (u64 LE)
+  - `len` (u32 LE)
+
+Points into `blocks/dataNNNNN.dat` flatfiles.
+
+## BlockHeader
+
+- Key: `block_hash` (32 bytes)
+- Value: raw block header (consensus encoding)
+
+Used by `getblockheader` and header validation caches.
+
+## TxIndex
+
+- Key: `txid` (32 bytes)
+- Value: `TxLocation` (block location + tx index)
+
+Allows `getrawtransaction` lookups without scanning blocks.
+
+## Utxo
+
+- Key: `OutPoint` (txid + vout)
+- Value: `UtxoEntry` (value, script_pubkey, height, is_coinbase)
+
+This is the authoritative UTXO set.
+
+## AddressOutpoint
+
+- Key: `script_pubkey` bytes
+- Value: `OutPoint` entries
+
+This is a script-based address index. It is used for address-level queries and
+is always maintained in the Rust daemon.
+
+## Fluxnode
+
+- Key: fluxnode id (internal)
+- Value: `FluxnodeRecord` encoded
+
+Populated by `apply_fluxnode_tx` and used by fluxnode RPCs.
+
+## FluxnodeKey
+
+- Key: `KeyId` bytes
+- Value: raw key bytes
+
+Maps stored key ids to actual key material for fluxnode records.
+
+## TimestampIndex
+
+- Key: `logical_timestamp` (4 bytes BE) + `block_hash` (32 bytes)
+- Value: empty
+
+This supports `getblockhashes` by time range. Logical timestamps are monotonic:
+if a block time is less than or equal to the previous block logical time, it is
+bumped to `prev + 1`.
+
+## BlockTimestamp
+
+- Key: `block_hash` (32 bytes)
+- Value: `logical_timestamp` (4 bytes BE)
+
+Allows reverse lookup from block hash to logical timestamp.
+
+## Anchor and Nullifier sets
+
+- `AnchorSprout`, `AnchorSapling` - anchor trees for shielded validation.
+- `NullifierSprout`, `NullifierSapling` - spent nullifier sets.
+
+## Meta
+
+- `best_header` / `best_block` hashes
+- sprout/sapling tree roots (used to resume shielded state)
+
+## Index lifecycle
+
+Indexes are maintained during block connect. There are no runtime flags to
+disable txindex, address index, or timestamp index in the Rust daemon yet.
+For a full rebuild of indexes, perform a fresh sync by clearing the data dir.

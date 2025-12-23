@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "crates/chainstate",
+  "crates/consensus",
+  "crates/fluxnode",
+  "crates/node",
+  "crates/pon",
+  "crates/pow",
+  "crates/primitives",
+  "crates/shielded",
+  "crates/script",
+  "crates/storage",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false

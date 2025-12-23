@@ -1,0 +1,22 @@
+[package]
+name = "fluxd-shielded"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+fluxd-consensus = { path = "../consensus" }
+fluxd-primitives = { path = "../primitives" }
+fluxd-script = { path = "../script" }
+blake2b_simd = "1"
+bellman = { version = "0.14", default-features = false, features = ["groth16"] }
+bls12_381 = "0.8"
+ed25519-dalek = { version = "2", features = ["std"] }
+jubjub = "0.10"
+minreq = { version = "2.14.1", default-features = false, features = ["https"] }
+redjubjub = "0.8"
+sapling-crypto = "0.5"
+group = "0.13"
+sha2 = "0.10"
+zcash_proofs = { version = "0.26", default-features = false, features = ["multicore"] }
