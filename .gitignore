@@ -41,7 +41,7 @@
 
 # Markdown policy: ignore all .md by default, whitelist public docs
 *.md
-!fluxd_rust/README.md
+!README.md
 !fluxd_rust/ROADMAP.md
 !fluxd_rust/docs/
 !fluxd_rust/docs/**
