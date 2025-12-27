@@ -149,7 +149,10 @@ pub fn network_upgrade_active(
     network_upgrade_state(height, upgrades, idx) == UpgradeState::Active
 }
 
-pub fn current_epoch(height: i32, upgrades: &[NetworkUpgrade; MAX_NETWORK_UPGRADES]) -> UpgradeIndex {
+pub fn current_epoch(
+    height: i32,
+    upgrades: &[NetworkUpgrade; MAX_NETWORK_UPGRADES],
+) -> UpgradeIndex {
     for idx in ALL_UPGRADES.iter().rev() {
         if network_upgrade_active(height, upgrades, *idx) {
             return *idx;
@@ -158,7 +161,10 @@ pub fn current_epoch(height: i32, upgrades: &[NetworkUpgrade; MAX_NETWORK_UPGRAD
     UpgradeIndex::BaseSprout
 }
 
-pub fn current_epoch_branch_id(height: i32, upgrades: &[NetworkUpgrade; MAX_NETWORK_UPGRADES]) -> u32 {
+pub fn current_epoch_branch_id(
+    height: i32,
+    upgrades: &[NetworkUpgrade; MAX_NETWORK_UPGRADES],
+) -> u32 {
     let idx = current_epoch(height, upgrades);
     NETWORK_UPGRADE_INFO[idx.as_usize()].branch_id
 }
@@ -262,10 +268,16 @@ mod tests {
     fn branch_id_selection() {
         let params = consensus_params(Network::Mainnet);
 
-        assert_eq!(current_epoch_branch_id(0, &params.upgrades), SPROUT_BRANCH_ID);
+        assert_eq!(
+            current_epoch_branch_id(0, &params.upgrades),
+            SPROUT_BRANCH_ID
+        );
 
         let lwma_branch = NETWORK_UPGRADE_INFO[UpgradeIndex::Lwma as usize].branch_id;
-        assert_eq!(current_epoch_branch_id(125_000, &params.upgrades), lwma_branch);
+        assert_eq!(
+            current_epoch_branch_id(125_000, &params.upgrades),
+            lwma_branch
+        );
     }
 
     #[test]

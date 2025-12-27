@@ -1,40 +1,44 @@
 mod dashboard;
-mod peer_book;
 mod p2p;
+mod peer_book;
 mod rpc;
 mod stats;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::{Arc, Mutex};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded};
-use rand::seq::SliceRandom;
 use fluxd_chainstate::flatfiles::FlatFileStore;
-use fluxd_chainstate::metrics::ConnectMetrics;
 use fluxd_chainstate::index::HeaderEntry;
+use fluxd_chainstate::metrics::ConnectMetrics;
 use fluxd_chainstate::state::{ChainState, HeaderValidationCache};
 use fluxd_chainstate::validation::{validate_block, ValidationFlags, ValidationMetrics};
 use fluxd_consensus::money::{money_range, COIN, MAX_MONEY};
 use fluxd_consensus::params::{chain_params, hash256_from_hex, ChainParams, Network};
-use fluxd_consensus::{block_subsidy, exchange_fund_amount, foundation_fund_amount, swap_pool_amount};
-use fluxd_consensus::Hash256;
 use fluxd_consensus::upgrades::current_epoch_branch_id;
+use fluxd_consensus::Hash256;
+use fluxd_consensus::{
+    block_subsidy, exchange_fund_amount, foundation_fund_amount, swap_pool_amount,
+};
+use fluxd_pow::validation as pow_validation;
 use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{Transaction, TxIn, TxOut};
-use fluxd_pow::validation as pow_validation;
-use fluxd_shielded::{default_params_dir, fetch_params, load_params, verify_transaction, ShieldedParams};
+use fluxd_shielded::{
+    default_params_dir, fetch_params, load_params, verify_transaction, ShieldedParams,
+};
 use fluxd_storage::fjall::{FjallOptions, FjallStore};
 use fluxd_storage::memory::MemoryStore;
 use fluxd_storage::{KeyValueStore, StoreError, WriteBatch};
+use rand::seq::SliceRandom;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -165,10 +169,11 @@ struct HeaderDownloadState {
 }
 
 impl HeaderDownloadState {
-    fn new<S: KeyValueStore>(chainstate: &ChainState<S>, params: &ChainParams) -> Result<Self, String> {
-        let tip = chainstate
-            .best_header()
-            .map_err(|err| err.to_string())?;
+    fn new<S: KeyValueStore>(
+        chainstate: &ChainState<S>,
+        params: &ChainParams,
+    ) -> Result<Self, String> {
+        let tip = chainstate.best_header().map_err(|err| err.to_string())?;
         let (tip_hash, tip_height) = if let Some(tip) = tip {
             (tip.hash, tip.height)
         } else {
@@ -182,7 +187,11 @@ impl HeaderDownloadState {
         })
     }
 
-    fn reset<S: KeyValueStore>(&mut self, chainstate: &ChainState<S>, params: &ChainParams) -> Result<(), String> {
+    fn reset<S: KeyValueStore>(
+        &mut self,
+        chainstate: &ChainState<S>,
+        params: &ChainParams,
+    ) -> Result<(), String> {
         let next = HeaderDownloadState::new(chainstate, params)?;
         self.tip_hash = next.tip_hash;
         self.tip_height = next.tip_height;
@@ -289,14 +298,23 @@ enum Store {
 }
 
 impl KeyValueStore for Store {
-    fn get(&self, column: fluxd_storage::Column, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+    fn get(
+        &self,
+        column: fluxd_storage::Column,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
         match self {
             Store::Memory(store) => store.get(column, key),
             Store::Fjall(store) => store.get(column, key),
         }
     }
 
-    fn put(&self, column: fluxd_storage::Column, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+    fn put(
+        &self,
+        column: fluxd_storage::Column,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), StoreError> {
         match self {
             Store::Memory(store) => store.put(column, key, value),
             Store::Fjall(store) => store.put(column, key, value),
@@ -381,14 +399,9 @@ async fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let rpc_addr = config
-        .rpc_addr
-        .unwrap_or_else(|| default_rpc_addr(network));
-    let rpc_auth = rpc::load_or_create_auth(
-        config.rpc_user.clone(),
-        config.rpc_pass.clone(),
-        data_dir,
-    )?;
+    let rpc_addr = config.rpc_addr.unwrap_or_else(|| default_rpc_addr(network));
+    let rpc_auth =
+        rpc::load_or_create_auth(config.rpc_user.clone(), config.rpc_pass.clone(), data_dir)?;
     {
         let chainstate = Arc::clone(&chainstate);
         let params = params.clone();
@@ -496,9 +509,14 @@ async fn run() -> Result<(), String> {
         registry: Arc::clone(&peer_registry),
         kind: PeerKind::Header,
     };
-    let mut block_peer =
-        connect_to_peer(&params, start_height, min_peer_height, addr_book.as_ref(), &block_peer_ctx)
-            .await?;
+    let mut block_peer = connect_to_peer(
+        &params,
+        start_height,
+        min_peer_height,
+        addr_book.as_ref(),
+        &block_peer_ctx,
+    )
+    .await?;
     println!("Block peer handshake complete");
     println!("Block peer height {}", block_peer.remote_height());
     println!(
@@ -575,7 +593,6 @@ async fn run() -> Result<(), String> {
     let header_params = params.clone();
     let header_seeds = Arc::clone(&seed_addrs);
     let header_addr_book = Arc::clone(&addr_book);
-    let header_allow_addr_book = header_allow_addr_book;
     let header_peer_book_handle = Arc::clone(&header_peer_book);
     let header_commit_chainstate = Arc::clone(&chainstate);
     let header_commit_params = params.clone();
@@ -643,10 +660,11 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn scan_supply<S: KeyValueStore>(chainstate: &ChainState<S>, params: &ChainParams) -> Result<(), String> {
-    let best = chainstate
-        .best_block()
-        .map_err(|err| err.to_string())?;
+fn scan_supply<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: &ChainParams,
+) -> Result<(), String> {
+    let best = chainstate.best_block().map_err(|err| err.to_string())?;
     let Some(best) = best else {
         println!("No blocks found in the local database.");
         return Ok(());
@@ -675,7 +693,7 @@ fn scan_supply<S: KeyValueStore>(chainstate: &ChainState<S>, params: &ChainParam
         let block = Block::consensus_decode(&bytes).map_err(|err| err.to_string())?;
         let coinbase = block
             .transactions
-            .get(0)
+            .first()
             .ok_or_else(|| format!("missing coinbase at height {height}"))?;
         let coinbase_value = tx_value_out_for_supply(coinbase)?;
         total_coinbase += coinbase_value as i128;
@@ -720,9 +738,7 @@ fn scan_flatfiles<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     blocks_path: &std::path::Path,
 ) -> Result<(), String> {
-    let best = chainstate
-        .best_block()
-        .map_err(|err| err.to_string())?;
+    let best = chainstate.best_block().map_err(|err| err.to_string())?;
     let Some(best) = best else {
         println!("No blocks found in the local database.");
         return Ok(());
@@ -849,8 +865,7 @@ fn open_store(backend: Backend, db_path: &PathBuf, config: &Config) -> Result<St
                 memtable_bytes: config.db_memtable_bytes,
             };
             Ok(Store::Fjall(
-                FjallStore::open_with_options(db_path, options)
-                    .map_err(|err| err.to_string())?,
+                FjallStore::open_with_options(db_path, options).map_err(|err| err.to_string())?,
             ))
         }
     }
@@ -885,7 +900,6 @@ fn max_fetch_blocks(peer_count: usize, getdata_batch: usize, inflight_per_peer: 
     let per_peer = getdata_batch.saturating_mul(inflight_per_peer.max(1));
     peers.saturating_mul(per_peer)
 }
-
 
 async fn connect_to_peer(
     params: &ChainParams,
@@ -940,17 +954,14 @@ async fn connect_to_peers(
     let mut behind = Vec::new();
     let mut join_set = JoinSet::new();
     let mut next_index = 0usize;
-    let max_parallel = addrs
-        .len()
-        .min(count.saturating_mul(2).max(4));
+    let max_parallel = addrs.len().min(count.saturating_mul(2).max(4));
 
     while next_index < addrs.len() && join_set.len() < max_parallel {
         let addr = addrs[next_index];
         let magic = params.message_start;
         let peer_ctx = peer_ctx.clone();
-        join_set.spawn(async move {
-            connect_and_handshake(addr, magic, start_height, peer_ctx).await
-        });
+        join_set
+            .spawn(async move { connect_and_handshake(addr, magic, start_height, peer_ctx).await });
         next_index += 1;
     }
 
@@ -963,10 +974,7 @@ async fn connect_to_peers(
                 if min_height > 0 && remote_height >= 0 && remote_height < min_height {
                     eprintln!(
                         "Peer {addr} behind (height {} < {}), skipping (ver {} ua {})",
-                        remote_height,
-                        min_height,
-                        remote_version,
-                        remote_agent
+                        remote_height, min_height, remote_version, remote_agent
                     );
                     behind.push(peer);
                 } else {
@@ -999,18 +1007,17 @@ async fn connect_to_peers(
         }
     }
 
-    if peers.is_empty() {
-        if !behind.is_empty() {
-            let mut behind = behind;
-            behind.sort_by(|a, b| b.remote_height().cmp(&a.remote_height()));
-            let fallback = behind.remove(0);
-            eprintln!(
-                "All peers behind target height {}; using highest behind peer at {}",
-                min_height,
-                fallback.remote_height()
-            );
-            peers.push(fallback);
-        }
+    if peers.is_empty() && !behind.is_empty() {
+        let fallback = behind
+            .into_iter()
+            .max_by_key(|peer| peer.remote_height())
+            .expect("behind checked to be non-empty");
+        eprintln!(
+            "All peers behind target height {}; using highest behind peer at {}",
+            min_height,
+            fallback.remote_height()
+        );
+        peers.push(fallback);
     }
 
     if peers.is_empty() {
@@ -1033,8 +1040,11 @@ async fn connect_and_handshake(
         Arc::clone(&peer_ctx.registry),
         Arc::clone(&peer_ctx.net_totals),
     );
-    let peer = match tokio::time::timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS), connect)
-        .await
+    let peer = match tokio::time::timeout(
+        Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+        connect,
+    )
+    .await
     {
         Ok(Ok(peer)) => peer,
         Ok(Err(err)) => return Err(format!("failed to connect to {addr}: {err}")),
@@ -1135,16 +1145,15 @@ async fn addr_discovery_loop(
             let default_port = params.default_port;
             let peer_ctx = peer_ctx.clone();
             join_set.spawn(async move {
-                if let Err(err) =
-                    discover_addrs_from_peer(
-                        addr,
-                        magic,
-                        start_height,
-                        default_port,
-                        addr_book,
-                        peer_ctx,
-                    )
-                    .await
+                if let Err(err) = discover_addrs_from_peer(
+                    addr,
+                    magic,
+                    start_height,
+                    default_port,
+                    addr_book,
+                    peer_ctx,
+                )
+                .await
                 {
                     eprintln!("addr discovery failed for {addr}: {err}");
                 }
@@ -1163,8 +1172,7 @@ async fn discover_addrs_from_peer(
     addr_book: Arc<AddrBook>,
     peer_ctx: PeerContext,
 ) -> Result<(), String> {
-    let (_addr, mut peer) =
-        connect_and_handshake(addr, magic, start_height, peer_ctx).await?;
+    let (_addr, mut peer) = connect_and_handshake(addr, magic, start_height, peer_ctx).await?;
     peer.send_getaddr().await?;
     let deadline = Instant::now() + Duration::from_secs(ADDR_DISCOVERY_TIMEOUT_SECS);
     let mut new_addrs = Vec::new();
@@ -1178,11 +1186,8 @@ async fn discover_addrs_from_peer(
         match message {
             Ok(Ok((command, payload))) => match command.as_str() {
                 "addr" => match parse_addr(&payload) {
-                    Ok(addrs) => new_addrs.extend(
-                        addrs
-                            .into_iter()
-                            .filter(|addr| addr.port() == default_port),
-                    ),
+                    Ok(addrs) => new_addrs
+                        .extend(addrs.into_iter().filter(|addr| addr.port() == default_port)),
                     Err(err) => return Err(err),
                 },
                 "ping" => {
@@ -1247,9 +1252,7 @@ fn validation_flags(
 }
 
 fn tx_needs_shielded(tx: &Transaction) -> bool {
-    !(tx.join_splits.is_empty()
-        && tx.shielded_spends.is_empty()
-        && tx.shielded_outputs.is_empty())
+    !(tx.join_splits.is_empty() && tx.shielded_spends.is_empty() && tx.shielded_outputs.is_empty())
 }
 
 fn block_needs_shielded(block: &Block) -> bool {
@@ -1275,8 +1278,12 @@ fn ensure_genesis<S: KeyValueStore>(
     let batch = chainstate
         .connect_block(&genesis, 0, params, flags, false, connect_metrics)
         .map_err(|err| err.to_string())?;
-    let _guard = write_lock.lock().map_err(|_| "write lock poisoned".to_string())?;
-    chainstate.commit_batch(batch).map_err(|err| err.to_string())?;
+    let _guard = write_lock
+        .lock()
+        .map_err(|_| "write lock poisoned".to_string())?;
+    chainstate
+        .commit_batch(batch)
+        .map_err(|err| err.to_string())?;
     println!("Inserted genesis block");
     Ok(())
 }
@@ -1453,6 +1460,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn header_sync_loop<S: KeyValueStore + Send + Sync + 'static>(
     chainstate: Arc<ChainState<S>>,
     params: ChainParams,
@@ -1491,6 +1499,7 @@ async fn header_sync_loop<S: KeyValueStore + Send + Sync + 'static>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
     chainstate: Arc<ChainState<S>>,
     params: ChainParams,
@@ -1554,10 +1563,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
 
         loop {
             let remote_height = peer.remote_height();
-            if let Some(best_header) = chainstate
-                .best_header()
-                .map_err(|err| err.to_string())?
-            {
+            if let Some(best_header) = chainstate.best_header().map_err(|err| err.to_string())? {
                 if best_header.height > download_state.tip_height {
                     download_state.reset(chainstate.as_ref(), &params)?;
                 }
@@ -1567,9 +1573,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                 .map_err(|err| err.to_string())?
                 .map(|tip| tip.height)
                 .unwrap_or(-1);
-            let fetch_gap = download_state
-                .tip_height
-                .saturating_sub(best_block_height);
+            let fetch_gap = download_state.tip_height.saturating_sub(best_block_height);
             let behind = if remote_height > 0 {
                 remote_height > download_state.tip_height
             } else {
@@ -1735,6 +1739,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_cached_seed(
     params: &ChainParams,
     seed_addrs: &Arc<Vec<SocketAddr>>,
@@ -1752,11 +1757,7 @@ async fn connect_to_cached_seed(
         return Err("no cached seed addresses available".to_string());
     }
 
-    let is_allowed = |addr: SocketAddr| {
-        peer_book
-            .map(|book| !book.is_banned(addr))
-            .unwrap_or(true)
-    };
+    let is_allowed = |addr: SocketAddr| peer_book.map(|book| !book.is_banned(addr)).unwrap_or(true);
     let mut preferred_candidates = Vec::new();
     let mut seen = HashSet::new();
     for addr in preferred_addrs {
@@ -1819,7 +1820,7 @@ async fn connect_to_candidates(
         return Vec::new();
     }
     let probe_count = candidates.len();
-    let max_parallel = probe_count.min(8).max(1);
+    let max_parallel = probe_count.clamp(1, 8);
     let target_peers = target_peers.max(1).min(probe_count);
     let mut join_set = JoinSet::new();
     let mut next_index = 0usize;
@@ -1828,9 +1829,8 @@ async fn connect_to_candidates(
     while next_index < probe_count && join_set.len() < max_parallel {
         let addr = candidates[next_index];
         let peer_ctx = peer_ctx.clone();
-        join_set.spawn(async move {
-            connect_and_handshake(addr, magic, start_height, peer_ctx).await
-        });
+        join_set
+            .spawn(async move { connect_and_handshake(addr, magic, start_height, peer_ctx).await });
         next_index += 1;
     }
 
@@ -1878,9 +1878,7 @@ fn init_header_cursor<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     params: &ChainParams,
 ) -> Result<HeaderCursor, String> {
-    let best = chainstate
-        .best_header()
-        .map_err(|err| err.to_string())?;
+    let best = chainstate.best_header().map_err(|err| err.to_string())?;
     let (tip_hash, tip_height) = if let Some(tip) = best {
         (Some(tip.hash), Some(tip.height))
     } else {
@@ -1969,10 +1967,7 @@ fn cap_header_gap<S: KeyValueStore>(
         return Ok(());
     }
 
-    let best_header = match chainstate
-        .best_header()
-        .map_err(|err| err.to_string())?
-    {
+    let best_header = match chainstate.best_header().map_err(|err| err.to_string())? {
         Some(tip) => tip,
         None => return Ok(()),
     };
@@ -2052,7 +2047,9 @@ fn commit_headers_batch<S: KeyValueStore>(
             .insert_headers_batch(headers, &params.consensus, &mut batch)
             .map_err(|err| err.to_string())?
     };
-    chainstate.commit_batch(batch).map_err(|err| err.to_string())?;
+    chainstate
+        .commit_batch(batch)
+        .map_err(|err| err.to_string())?;
     header_metrics.record_commit(headers.len() as u64, commit_start.elapsed());
     println!("Committed {} headers", headers.len());
     if let Some((_, last_entry)) = entries.last() {
@@ -2107,22 +2104,22 @@ fn prevalidate_pow_headers<S: KeyValueStore>(
             continue;
         }
 
-        let height = if header.prev_block == [0u8; 32] && hash == params.consensus.hash_genesis_block
-        {
-            0
-        } else {
-            let prev_height = if let Some(height) = pending_heights.get(&header.prev_block) {
-                *height
-            } else if let Some(entry) = chainstate
-                .header_entry(&header.prev_block)
-                .map_err(|err| err.to_string())?
-            {
-                entry.height
+        let height =
+            if header.prev_block == [0u8; 32] && hash == params.consensus.hash_genesis_block {
+                0
             } else {
-                return Err("missing header entry while prevalidating pow".to_string());
+                let prev_height = if let Some(height) = pending_heights.get(&header.prev_block) {
+                    *height
+                } else if let Some(entry) = chainstate
+                    .header_entry(&header.prev_block)
+                    .map_err(|err| err.to_string())?
+                {
+                    entry.height
+                } else {
+                    return Err("missing header entry while prevalidating pow".to_string());
+                };
+                prev_height + 1
             };
-            prev_height + 1
-        };
 
         pending_heights.insert(hash, height);
         if !header.is_pon() {
@@ -2162,7 +2159,8 @@ fn prevalidate_pow_headers<S: KeyValueStore>(
                     break;
                 }
                 let (header, height) = jobs[index];
-                if let Err(err) = pow_validation::validate_pow_header(header, height, &params.consensus)
+                if let Err(err) =
+                    pow_validation::validate_pow_header(header, height, &params.consensus)
                 {
                     if let Ok(mut guard) = error.lock() {
                         if guard.is_none() {
@@ -2184,6 +2182,7 @@ fn prevalidate_pow_headers<S: KeyValueStore>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn header_commit_loop<S: KeyValueStore + Send + Sync + 'static>(
     mut header_rx: mpsc::Receiver<Vec<BlockHeader>>,
     chainstate: Arc<ChainState<S>>,
@@ -2223,6 +2222,7 @@ async fn header_commit_loop<S: KeyValueStore + Send + Sync + 'static>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_or_commit_headers<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     params: &ChainParams,
@@ -2390,10 +2390,7 @@ fn refresh_header_cursor<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     cursor: &Arc<Mutex<HeaderCursor>>,
 ) -> Result<(), String> {
-    let best = match chainstate
-        .best_header()
-        .map_err(|err| err.to_string())?
-    {
+    let best = match chainstate.best_header().map_err(|err| err.to_string())? {
         Some(tip) => tip,
         None => return Ok(()),
     };
@@ -2416,6 +2413,7 @@ fn refresh_header_cursor<S: KeyValueStore>(
 }
 
 #[allow(unreachable_code)]
+#[allow(clippy::too_many_arguments)]
 async fn sync_chain<S: KeyValueStore>(
     block_peer: &mut Peer,
     block_peers: &mut Vec<Peer>,
@@ -2597,6 +2595,7 @@ fn is_transient_block_error(err: &str) -> bool {
     .any(|marker| err.contains(marker))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_status_logger<S: KeyValueStore + Send + Sync + 'static>(
     chainstate: Arc<ChainState<S>>,
     sync_metrics: Arc<SyncMetrics>,
@@ -2631,8 +2630,7 @@ fn spawn_status_logger<S: KeyValueStore + Send + Sync + 'static>(
                 Ok(stats) => {
                     let header_hash = short_hash(stats.best_header_hash.as_ref());
                     let block_hash = short_hash(stats.best_block_hash.as_ref());
-                    let (headers_per_sec, blocks_per_sec) =
-                        rates_from_last(&stats, last.as_ref());
+                    let (headers_per_sec, blocks_per_sec) = rates_from_last(&stats, last.as_ref());
                     let (download_ms, verify_ms, commit_ms) =
                         stage_ms_from_last(&stats, last.as_ref());
                     let (header_req_ms, header_val_ms, header_commit_ms, header_pow_ms) =
@@ -2715,9 +2713,7 @@ fn stage_ms_from_last(
         return ("-".to_string(), "-".to_string(), "-".to_string());
     };
 
-    let download_blocks = current
-        .download_blocks
-        .saturating_sub(prev.download_blocks);
+    let download_blocks = current.download_blocks.saturating_sub(prev.download_blocks);
     let verify_blocks = current.verify_blocks.saturating_sub(prev.verify_blocks);
     let commit_blocks = current.commit_blocks.saturating_sub(prev.commit_blocks);
 
@@ -2811,9 +2807,7 @@ fn validation_ms_from_last(
         return ("-".to_string(), "-".to_string(), "-".to_string());
     };
 
-    let validate_blocks = current
-        .validate_blocks
-        .saturating_sub(prev.validate_blocks);
+    let validate_blocks = current.validate_blocks.saturating_sub(prev.validate_blocks);
     let script_blocks = current.script_blocks.saturating_sub(prev.script_blocks);
     let shielded_txs = current.shielded_txs.saturating_sub(prev.shielded_txs);
 
@@ -2855,9 +2849,7 @@ fn connect_ms_from_last(
     let utxo_blocks = current.utxo_blocks.saturating_sub(prev.utxo_blocks);
     let index_blocks = current.index_blocks.saturating_sub(prev.index_blocks);
     let anchor_blocks = current.anchor_blocks.saturating_sub(prev.anchor_blocks);
-    let flat_blocks = current
-        .flatfile_blocks
-        .saturating_sub(prev.flatfile_blocks);
+    let flat_blocks = current.flatfile_blocks.saturating_sub(prev.flatfile_blocks);
 
     let utxo_ms = if utxo_blocks == 0 {
         "-".to_string()
@@ -2880,9 +2872,7 @@ fn connect_ms_from_last(
     let flat_ms = if flat_blocks == 0 {
         "-".to_string()
     } else {
-        let delta_us = current
-            .flatfile_us
-            .saturating_sub(prev.flatfile_us) as f64;
+        let delta_us = current.flatfile_us.saturating_sub(prev.flatfile_us) as f64;
         format!("{:.2}", delta_us / 1000.0 / flat_blocks as f64)
     };
 
@@ -2914,18 +2904,12 @@ fn collect_missing_blocks<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     max_count: usize,
 ) -> Result<Vec<fluxd_consensus::Hash256>, String> {
-    let best_header = match chainstate
-        .best_header()
-        .map_err(|err| err.to_string())?
-    {
+    let best_header = match chainstate.best_header().map_err(|err| err.to_string())? {
         Some(tip) => tip,
         None => return Ok(Vec::new()),
     };
 
-    let best_block = match chainstate
-        .best_block()
-        .map_err(|err| err.to_string())?
-    {
+    let best_block = match chainstate.best_block().map_err(|err| err.to_string())? {
         Some(tip) => tip,
         None => return Ok(Vec::new()),
     };
@@ -2979,10 +2963,7 @@ fn build_locator<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     genesis_hash: &fluxd_consensus::Hash256,
 ) -> Result<Vec<fluxd_consensus::Hash256>, String> {
-    let tip = match chainstate
-        .best_header()
-        .map_err(|err| err.to_string())?
-    {
+    let tip = match chainstate.best_header().map_err(|err| err.to_string())? {
         Some(tip) => tip,
         None => return Ok(vec![*genesis_hash]),
     };
@@ -3086,17 +3067,11 @@ fn reorg_to_best_header<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     write_lock: &Mutex<()>,
 ) -> Result<(), String> {
-    let best_block = match chainstate
-        .best_block()
-        .map_err(|err| err.to_string())?
-    {
+    let best_block = match chainstate.best_block().map_err(|err| err.to_string())? {
         Some(tip) => tip,
         None => return Ok(()),
     };
-    let best_header = match chainstate
-        .best_header()
-        .map_err(|err| err.to_string())?
-    {
+    let best_header = match chainstate.best_header().map_err(|err| err.to_string())? {
         Some(tip) => tip,
         None => return Ok(()),
     };
@@ -3167,6 +3142,7 @@ async fn request_headers(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_blocks<S: KeyValueStore>(
     peer: &mut Peer,
     block_peers: &mut Vec<Peer>,
@@ -3221,6 +3197,7 @@ async fn fetch_blocks<S: KeyValueStore>(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_blocks_single<S: KeyValueStore>(
     peer: &mut Peer,
     chainstate: &ChainState<S>,
@@ -3236,8 +3213,10 @@ async fn fetch_blocks_single<S: KeyValueStore>(
     inflight_per_peer: usize,
 ) -> Result<(), String> {
     let mut pending: VecDeque<fluxd_consensus::Hash256> = hashes.iter().copied().collect();
-    let chunks: Vec<Vec<fluxd_consensus::Hash256>> =
-        hashes.chunks(getdata_batch).map(|chunk| chunk.to_vec()).collect();
+    let chunks: Vec<Vec<fluxd_consensus::Hash256>> = hashes
+        .chunks(getdata_batch)
+        .map(|chunk| chunk.to_vec())
+        .collect();
     let download_start = Instant::now();
     let mut received = fetch_blocks_on_peer_inner(peer, chunks, inflight_per_peer).await?;
     metrics.record_download(received.len() as u64, download_start.elapsed());
@@ -3258,6 +3237,7 @@ async fn fetch_blocks_single<S: KeyValueStore>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_blocks_multi<S: KeyValueStore>(
     block_peers: &mut Vec<Peer>,
     chainstate: &ChainState<S>,
@@ -3407,6 +3387,7 @@ async fn fetch_blocks_on_peer_inner(
     Ok(received)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_pending<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     params: &ChainParams,
@@ -3447,13 +3428,13 @@ fn connect_pending<S: KeyValueStore>(
         let shielded_tx = shielded_tx.clone();
         let pre_flags = Arc::clone(&pre_flags);
         let consensus = Arc::clone(&consensus);
-        let shielded_enabled = shielded_enabled;
         verify_handles.push(thread::spawn(move || {
             while let Ok(job) = verify_rx.recv() {
-                let error = match validate_block(job.block.as_ref(), job.height, &consensus, &pre_flags) {
-                    Ok(()) => None,
-                    Err(err) => Some(err.to_string()),
-                };
+                let error =
+                    match validate_block(job.block.as_ref(), job.height, &consensus, &pre_flags) {
+                        Ok(()) => None,
+                        Err(err) => Some(err.to_string()),
+                    };
                 let mut needs_shielded = false;
                 if error.is_none() && shielded_enabled && block_needs_shielded(job.block.as_ref()) {
                     needs_shielded = true;
@@ -3585,7 +3566,9 @@ fn connect_pending<S: KeyValueStore>(
             let _guard = write_lock
                 .lock()
                 .map_err(|_| "write lock poisoned".to_string())?;
-            chainstate.commit_batch(batch).map_err(|err| err.to_string())?;
+            chainstate
+                .commit_batch(batch)
+                .map_err(|err| err.to_string())?;
             metrics.record_commit(1, commit_start.elapsed());
 
             pending.pop_front();
@@ -3663,19 +3646,15 @@ async fn read_message_with_timeout_opts(
 ) -> Result<(String, Vec<u8>), String> {
     let retries = retries.max(1);
     for attempt in 0..retries {
-        let read = tokio::time::timeout(Duration::from_secs(timeout_secs), peer.read_message())
-            .await;
+        let read =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), peer.read_message()).await;
         match read {
             Ok(result) => return result,
             Err(_) if attempt + 1 == retries => {
                 return Err("peer read timed out".to_string());
             }
             Err(_) => {
-                eprintln!(
-                    "peer read timed out (attempt {}/{})",
-                    attempt + 1,
-                    retries
-                );
+                eprintln!("peer read timed out (attempt {}/{})", attempt + 1, retries);
             }
         }
     }
@@ -3843,10 +3822,7 @@ fn parse_args() -> Result<Config, String> {
                     .parse::<usize>()
                     .map_err(|_| format!("invalid inflight per peer '{value}'\n{}", usage()))?;
                 if inflight_per_peer == 0 {
-                    return Err(format!(
-                        "inflight per peer must be > 0\n{}",
-                        usage()
-                    ));
+                    return Err(format!("inflight per peer must be > 0\n{}", usage()));
                 }
             }
             "--status-interval" => {
@@ -3867,9 +3843,9 @@ fn parse_args() -> Result<Config, String> {
                 db_cache_bytes = Some(mb_to_bytes(mb));
             }
             "--db-write-buffer-mb" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("missing value for --db-write-buffer-mb\n{}", usage()))?;
+                let value = args.next().ok_or_else(|| {
+                    format!("missing value for --db-write-buffer-mb\n{}", usage())
+                })?;
                 let mb = value
                     .parse::<u64>()
                     .map_err(|_| format!("invalid db write buffer '{value}'\n{}", usage()))?;
@@ -3893,17 +3869,14 @@ fn parse_args() -> Result<Config, String> {
                     .map_err(|_| format!("invalid db memtable '{value}'\n{}", usage()))?;
                 let bytes = mb_to_bytes(mb);
                 if bytes > u64::from(u32::MAX) {
-                    return Err(format!(
-                        "db memtable too large '{value}'\n{}",
-                        usage()
-                    ));
+                    return Err(format!("db memtable too large '{value}'\n{}", usage()));
                 }
                 db_memtable_bytes = Some(bytes as u32);
             }
             "--header-verify-workers" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("missing value for --header-verify-workers\n{}", usage()))?;
+                let value = args.next().ok_or_else(|| {
+                    format!("missing value for --header-verify-workers\n{}", usage())
+                })?;
                 header_verify_workers = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid header verify workers '{value}'\n{}", usage()))?;
@@ -4020,9 +3993,7 @@ fn resolve_verify_settings(
     let verify_workers = if config.verify_workers > 0 {
         config.verify_workers
     } else {
-        cores
-            .saturating_sub(shielded_workers + 1)
-            .max(1)
+        cores.saturating_sub(shielded_workers + 1).max(1)
     };
     let inflight = getdata_batch
         .saturating_mul(inflight_per_peer.max(1))

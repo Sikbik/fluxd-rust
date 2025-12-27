@@ -43,4 +43,3 @@ fn classify_unknown() {
     let script = vec![0x6a, 0x01, 0x01];
     assert_eq!(classify_script_pubkey(&script), ScriptType::Unknown);
 }
-

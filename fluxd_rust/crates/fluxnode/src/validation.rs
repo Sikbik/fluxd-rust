@@ -37,7 +37,11 @@ pub fn should_enforce_new_collateral(height: i64, params: &ChainParams) -> bool 
 }
 
 pub fn benchmarking_key_at(time: u32, params: &ChainParams) -> TimedPublicKey {
-    select_active_key(time, params.fluxnode.benchmarking_public_keys, "benchmarking")
+    select_active_key(
+        time,
+        params.fluxnode.benchmarking_public_keys,
+        "benchmarking",
+    )
 }
 
 pub fn p2sh_keys_at(time: u32, params: &ChainParams) -> Vec<TimedPublicKey> {

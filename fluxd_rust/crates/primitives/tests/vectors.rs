@@ -8,7 +8,7 @@ fn is_hex_string(value: &str) -> bool {
 }
 
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -52,8 +52,12 @@ fn extract_first_strings(contents: &str) -> Vec<String> {
 fn load_sighash_file() -> String {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("../../../fluxd/src/test/data/sighash.json");
-    fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read sighash vectors at {}: {err}", path.display()))
+    fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read sighash vectors at {}: {err}",
+            path.display()
+        )
+    })
 }
 
 #[test]
@@ -90,8 +94,7 @@ fn sighash_vectors_roundtrip_sapling_and_joinsplit() {
         }
     }
 
-    let joinsplit_vector =
-        joinsplit_vector.expect("missing joinsplit vector in sighash.json");
+    let joinsplit_vector = joinsplit_vector.expect("missing joinsplit vector in sighash.json");
     let sapling_vector = sapling_vector.expect("missing sapling vector in sighash.json");
 
     for bytes in [joinsplit_vector, sapling_vector] {

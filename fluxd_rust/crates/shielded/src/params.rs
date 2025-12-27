@@ -131,7 +131,11 @@ fn pick_param(
     )))
 }
 
-fn download_param(params_dir: &Path, name: &str, expected_sha256: &str) -> Result<(), ShieldedError> {
+fn download_param(
+    params_dir: &Path,
+    name: &str,
+    expected_sha256: &str,
+) -> Result<(), ShieldedError> {
     let dest = params_dir.join(name);
     if dest.exists() && verify_sha256(&dest, expected_sha256).is_ok() {
         return Ok(());

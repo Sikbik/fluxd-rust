@@ -95,10 +95,7 @@ impl FlatFileStore {
         }
         let offset = state.current_len;
         let path = self.file_path(state.current_file);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         let len = bytes.len() as u32;
         file.write_all(&len.to_le_bytes())?;
         file.write_all(bytes)?;
@@ -133,10 +130,7 @@ impl FlatFileStore {
         self.dir.join(format!("data{file_id:05}.dat"))
     }
 
-    fn locate_active_file(
-        dir: &Path,
-        max_file_size: u64,
-    ) -> Result<(u32, u64), FlatFileError> {
+    fn locate_active_file(dir: &Path, max_file_size: u64) -> Result<(u32, u64), FlatFileError> {
         let mut file_id = 0u32;
         let mut last_existing: Option<(u32, u64)> = None;
         loop {

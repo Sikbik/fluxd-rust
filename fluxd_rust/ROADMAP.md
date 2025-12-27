@@ -21,7 +21,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] Fjall backend + flatfile block storage
 - [x] Header download pipeline with parallel verification
 - [x] Block download/validation pipeline with parallel script + shielded workers
-- [x] Header index, height index, block index, block header storage
+- [x] Header index, height index, block index, block header bytes (written on header accept + block connect; supports `getblockheader` during header-only sync)
 - [x] Tx index + UTXO set
 - [x] Address outpoint index (script_pubkey -> outpoints)
 - [x] Fluxnode index + basic RPCs (partial parity)

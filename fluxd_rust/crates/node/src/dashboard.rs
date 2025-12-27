@@ -16,6 +16,7 @@ use crate::Backend;
 
 const MAX_REQUEST_BYTES: usize = 8192;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
     addr: SocketAddr,
     chainstate: Arc<ChainState<S>>,
@@ -62,6 +63,7 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
     mut stream: tokio::net::TcpStream,
     chainstate: Arc<ChainState<S>>,
@@ -90,7 +92,9 @@ async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
     let path = path.split('?').next().unwrap_or(path);
 
     let (status, content_type, body) = match (method, path) {
-        ("GET", "/") | ("GET", "/index.html") => ("200 OK", "text/html; charset=utf-8", dashboard_html()),
+        ("GET", "/") | ("GET", "/index.html") => {
+            ("200 OK", "text/html; charset=utf-8", dashboard_html())
+        }
         ("GET", "/stats") => match snapshot_stats(
             &chainstate,
             network,
@@ -109,7 +113,11 @@ async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
             ),
         },
         ("GET", "/healthz") => ("200 OK", "text/plain; charset=utf-8", "ok".to_string()),
-        _ => ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string()),
+        _ => (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found".to_string(),
+        ),
     };
 
     let response = build_response(status, content_type, &body);
@@ -128,7 +136,7 @@ fn build_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
     response.push_str("\r\nContent-Type: ");
     response.push_str(content_type);
     response.push_str("\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: ");
-    response.push_str(&body.as_bytes().len().to_string());
+    response.push_str(&body.len().to_string());
     response.push_str("\r\n\r\n");
     let mut bytes = response.into_bytes();
     bytes.extend_from_slice(body.as_bytes());

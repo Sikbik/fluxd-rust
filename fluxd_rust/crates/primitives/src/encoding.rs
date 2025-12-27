@@ -1,12 +1,13 @@
 use fluxd_consensus::Hash256;
 
+#[derive(Default)]
 pub struct Encoder {
     buf: Vec<u8>,
 }
 
 impl Encoder {
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self::default()
     }
 
     pub fn into_inner(self) -> Vec<u8> {

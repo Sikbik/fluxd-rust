@@ -266,6 +266,7 @@ pub struct HeaderMetricsSnapshot {
     pub pow_headers: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn snapshot_stats<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     network: Network,
@@ -276,12 +277,8 @@ pub fn snapshot_stats<S: KeyValueStore>(
     validation_metrics: Option<&ValidationMetrics>,
     connect_metrics: Option<&ConnectMetrics>,
 ) -> Result<StatsSnapshot, String> {
-    let best_header = chainstate
-        .best_header()
-        .map_err(|err| err.to_string())?;
-    let best_block = chainstate
-        .best_block()
-        .map_err(|err| err.to_string())?;
+    let best_header = chainstate.best_header().map_err(|err| err.to_string())?;
+    let best_block = chainstate.best_block().map_err(|err| err.to_string())?;
 
     let best_header_height = best_header.as_ref().map(|tip| tip.height).unwrap_or(-1);
     let best_block_height = best_block.as_ref().map(|tip| tip.height).unwrap_or(-1);
@@ -301,11 +298,7 @@ pub fn snapshot_stats<S: KeyValueStore>(
     };
 
     let header_gap = best_header_height as i64 - best_block_height as i64;
-    let sync_state = if header_gap <= 0 {
-        "synced"
-    } else {
-        "syncing"
-    };
+    let sync_state = if header_gap <= 0 { "synced" } else { "syncing" };
 
     let uptime_secs = start_time.elapsed().as_secs();
     let unix_time_secs = SystemTime::now()

@@ -160,7 +160,7 @@ fn signature_hash_sprout(
         };
         let input = &tx.vin[actual_index];
         input.prevout.consensus_encode(&mut encoder);
-        let is_signing = input_index.map_or(false, |signing| actual_index == signing);
+        let is_signing = input_index == Some(actual_index);
         if is_signing {
             encoder.write_var_bytes(script_code);
         } else {

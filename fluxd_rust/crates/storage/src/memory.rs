@@ -3,9 +3,11 @@ use std::sync::RwLock;
 
 use crate::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
 
+type MemoryStoreMap = BTreeMap<(Column, Vec<u8>), Vec<u8>>;
+
 #[derive(Default)]
 pub struct MemoryStore {
-    inner: RwLock<BTreeMap<(Column, Vec<u8>), Vec<u8>>>,
+    inner: RwLock<MemoryStoreMap>,
 }
 
 impl MemoryStore {

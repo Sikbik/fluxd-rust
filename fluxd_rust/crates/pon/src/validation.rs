@@ -65,8 +65,8 @@ pub fn validate_pon_signature(
         return Err(PonError::InvalidHeader("pon header missing signature"));
     }
 
-    let pubkey =
-        PublicKey::from_slice(pubkey_bytes).map_err(|_| PonError::InvalidHeader("invalid pubkey"))?;
+    let pubkey = PublicKey::from_slice(pubkey_bytes)
+        .map_err(|_| PonError::InvalidHeader("invalid pubkey"))?;
     let sig = Signature::from_der(&header.block_sig)
         .map_err(|_| PonError::InvalidHeader("invalid pon signature"))?;
     let msg = Message::from_digest_slice(&header.hash())
@@ -103,7 +103,11 @@ fn check_proof_of_node(
     } else {
         let limit = U256::from_little_endian(&params.pon_limit);
         let start = U256::from_little_endian(&params.pon_start_limit);
-        if limit > start { limit } else { start }
+        if limit > start {
+            limit
+        } else {
+            start
+        }
     };
 
     if target > max_target {
@@ -128,9 +132,9 @@ fn is_testnet_bypass(header: &BlockHeader, params: &ConsensusParams) -> bool {
     if params.network != Network::Testnet && params.network != Network::Regtest {
         return false;
     }
-    let Ok(bypass_hash) = hash256_from_hex(
-        "0x544553544e4f4400000000000000000000000000000000000000000000000000",
-    ) else {
+    let Ok(bypass_hash) =
+        hash256_from_hex("0x544553544e4f4400000000000000000000000000000000000000000000000000")
+    else {
         return false;
     };
     header.nodes_collateral.hash == bypass_hash && header.nodes_collateral.index == 0

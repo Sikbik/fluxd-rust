@@ -56,7 +56,7 @@ pub struct HeaderInfo {
 }
 
 pub fn compact_to_u256(bits: u32) -> Result<U256, CompactError> {
-    let size = (bits >> 24) as u32;
+    let size = bits >> 24;
     let mut word = bits & 0x007f_ffff;
     let negative = (bits & 0x0080_0000) != 0;
 
@@ -74,9 +74,7 @@ pub fn compact_to_u256(bits: u32) -> Result<U256, CompactError> {
     };
 
     if word != 0 {
-        let overflow = size > 34
-            || (word > 0xff && size > 33)
-            || (word > 0xffff && size > 32);
+        let overflow = size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32);
         if overflow {
             return Err(CompactError::Overflow);
         }
@@ -90,7 +88,7 @@ pub fn u256_to_compact(value: U256) -> u32 {
         return 0;
     }
 
-    let mut size = ((value.bits() + 7) / 8) as u32;
+    let mut size = value.bits().div_ceil(8) as u32;
     let mut compact: u32;
 
     if size <= 3 {
@@ -205,7 +203,9 @@ pub fn get_next_work_required(
     if next_height < lwma_height {
         let last_mtp = median_time_past(chain, chain.len() - 1);
         let first_mtp = median_time_past(chain, start.saturating_sub(1));
-        Ok(digishield_next_work_required(avg, last_mtp, first_mtp, params))
+        Ok(digishield_next_work_required(
+            avg, last_mtp, first_mtp, params,
+        ))
     } else if next_height < acadia_height {
         lwma_next_work_required(chain, params)
     } else {
@@ -235,7 +235,10 @@ fn eh_epoch_end(params: &ConsensusParams, upgrade: UpgradeIndex) -> i64 {
 
 fn median_time_past(chain: &[HeaderInfo], idx: usize) -> i64 {
     let start = idx.saturating_sub(10);
-    let mut times: Vec<i64> = chain[start..=idx].iter().map(|header| header.time).collect();
+    let mut times: Vec<i64> = chain[start..=idx]
+        .iter()
+        .map(|header| header.time)
+        .collect();
     times.sort_unstable();
     times[times.len() / 2]
 }
@@ -270,7 +273,10 @@ fn digishield_next_work_required(
     u256_to_compact(next)
 }
 
-fn lwma_next_work_required(chain: &[HeaderInfo], params: &ConsensusParams) -> Result<u32, DifficultyError> {
+fn lwma_next_work_required(
+    chain: &[HeaderInfo],
+    params: &ConsensusParams,
+) -> Result<u32, DifficultyError> {
     const FTL: i64 = 360;
     let t = params.pow_target_spacing;
     let n = params.zawy_lwma_averaging_window;
@@ -317,7 +323,10 @@ fn lwma_next_work_required(chain: &[HeaderInfo], params: &ConsensusParams) -> Re
     Ok(u256_to_compact(next))
 }
 
-fn lwma3_next_work_required(chain: &[HeaderInfo], params: &ConsensusParams) -> Result<u32, DifficultyError> {
+fn lwma3_next_work_required(
+    chain: &[HeaderInfo],
+    params: &ConsensusParams,
+) -> Result<u32, DifficultyError> {
     let t = params.pow_target_spacing;
     let n = params.zawy_lwma_averaging_window;
     let k = n * (n + 1) * t / 2;

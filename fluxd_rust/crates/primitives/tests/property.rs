@@ -19,10 +19,7 @@ impl Lcg {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.state = self
-            .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
         self.state
     }
 
@@ -158,13 +155,12 @@ fn random_transaction(rng: &mut Lcg) -> Transaction {
     } else {
         fill_bytes::<64>(rng)
     };
-    let binding_sig = if version == 4
-        && !(shielded_spends.is_empty() && shielded_outputs.is_empty())
-    {
-        fill_bytes::<64>(rng)
-    } else {
-        [0u8; 64]
-    };
+    let binding_sig =
+        if version == 4 && !(shielded_spends.is_empty() && shielded_outputs.is_empty()) {
+            fill_bytes::<64>(rng)
+        } else {
+            [0u8; 64]
+        };
 
     Transaction {
         f_overwintered,

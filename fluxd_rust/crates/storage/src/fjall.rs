@@ -70,7 +70,10 @@ impl FjallStore {
         Self::open_with_config_and_options(config, PartitionCreateOptions::default())
     }
 
-    pub fn open_with_options(path: impl AsRef<Path>, options: FjallOptions) -> Result<Self, StoreError> {
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: FjallOptions,
+    ) -> Result<Self, StoreError> {
         let config = options.apply_config(Config::new(path));
         let partition_options = options.partition_options();
         Self::open_with_config_and_options(config, partition_options)
@@ -88,7 +91,10 @@ impl FjallStore {
                 .map_err(map_err)?;
             partitions.insert(column, handle);
         }
-        Ok(Self { keyspace, partitions })
+        Ok(Self {
+            keyspace,
+            partitions,
+        })
     }
 
     fn partition(&self, column: Column) -> Result<&PartitionHandle, StoreError> {

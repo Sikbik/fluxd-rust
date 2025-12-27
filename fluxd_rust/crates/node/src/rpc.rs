@@ -7,31 +7,32 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use serde_json::{json, Number, Value};
 use rand::RngCore;
+use serde_json::{json, Number, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::state::ChainState;
+use fluxd_consensus::block_subsidy;
 use fluxd_consensus::constants::PROTOCOL_VERSION;
 use fluxd_consensus::money::COIN;
 use fluxd_consensus::params::{hash256_from_hex, ChainParams, Network};
-use fluxd_consensus::block_subsidy;
 use fluxd_consensus::upgrades::{
-    current_epoch_branch_id, network_upgrade_state, UpgradeState, ALL_UPGRADES, NETWORK_UPGRADE_INFO,
+    current_epoch_branch_id, network_upgrade_state, UpgradeState, ALL_UPGRADES,
+    NETWORK_UPGRADE_INFO,
 };
 use fluxd_consensus::Hash256;
 use fluxd_fluxnode::storage::FluxnodeRecord;
 use fluxd_pow::difficulty::compact_to_u256;
-use fluxd_primitives::transaction::Transaction;
 use fluxd_primitives::script_pubkey_to_address;
+use fluxd_primitives::transaction::Transaction;
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
 
-use crate::stats::hash256_to_hex;
 use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::peer_book::HeaderPeerBook;
+use crate::stats::hash256_to_hex;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const RPC_REALM: &str = "fluxd";
@@ -93,8 +94,10 @@ pub fn load_or_create_auth(
     data_dir: &Path,
 ) -> Result<RpcAuth, String> {
     if user.is_some() || pass.is_some() {
-        let user = user.ok_or_else(|| "missing --rpc-user (required with --rpc-pass)".to_string())?;
-        let pass = pass.ok_or_else(|| "missing --rpc-pass (required with --rpc-user)".to_string())?;
+        let user =
+            user.ok_or_else(|| "missing --rpc-user (required with --rpc-pass)".to_string())?;
+        let pass =
+            pass.ok_or_else(|| "missing --rpc-pass (required with --rpc-user)".to_string())?;
         return Ok(RpcAuth { user, pass });
     }
 
@@ -118,6 +121,7 @@ pub fn load_or_create_auth(
     Ok(RpcAuth { user, pass })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     addr: SocketAddr,
     auth: RpcAuth,
@@ -147,18 +151,17 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(
-                    stream,
-                    auth,
-                    chainstate,
-                    params,
-                    data_dir,
-                    net_totals,
-                    peer_registry,
-                    header_peer_book,
-                )
-                .await
+            if let Err(err) = handle_connection(
+                stream,
+                auth,
+                chainstate,
+                params,
+                data_dir,
+                net_totals,
+                peer_registry,
+                header_peer_book,
+            )
+            .await
             {
                 eprintln!("rpc error: {err}");
             }
@@ -166,6 +169,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     mut stream: tokio::net::TcpStream,
     auth: Arc<RpcAuth>,
@@ -180,13 +184,24 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     let is_daemon = request.path.starts_with("/daemon/");
     if !is_daemon && request.method != "POST" {
         let response = build_response("405 Method Not Allowed", "text/plain", "method not allowed");
-        stream.write_all(&response).await.map_err(|err| err.to_string())?;
+        stream
+            .write_all(&response)
+            .await
+            .map_err(|err| err.to_string())?;
         return Ok(());
     }
 
-    if !auth.check(request.headers.get("authorization").map(|value| value.as_str())) {
+    if !auth.check(
+        request
+            .headers
+            .get("authorization")
+            .map(|value| value.as_str()),
+    ) {
         let response = build_unauthorized();
-        stream.write_all(&response).await.map_err(|err| err.to_string())?;
+        stream
+            .write_all(&response)
+            .await
+            .map_err(|err| err.to_string())?;
         return Ok(());
     }
 
@@ -197,7 +212,10 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
             .trim_matches('/');
         if method.is_empty() {
             let response = build_response("404 Not Found", "text/plain", "not found");
-            stream.write_all(&response).await.map_err(|err| err.to_string())?;
+            stream
+                .write_all(&response)
+                .await
+                .map_err(|err| err.to_string())?;
             return Ok(());
         }
         let rpc_response = match handle_daemon_request(
@@ -215,7 +233,10 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         };
         let body = rpc_response.to_string();
         let response = build_response("200 OK", "application/json", &body);
-        stream.write_all(&response).await.map_err(|err| err.to_string())?;
+        stream
+            .write_all(&response)
+            .await
+            .map_err(|err| err.to_string())?;
         return Ok(());
     }
 
@@ -233,10 +254,14 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     };
     let body = rpc_response.to_string();
     let response = build_response("200 OK", "application/json", &body);
-    stream.write_all(&response).await.map_err(|err| err.to_string())?;
+    stream
+        .write_all(&response)
+        .await
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     method: &str,
     request: &HttpRequest,
@@ -275,9 +300,8 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
 ) -> Result<Value, Value> {
-    let value: Value = serde_json::from_slice(body).map_err(|err| {
-        rpc_error(Value::Null, RPC_PARSE_ERROR, format!("parse error: {err}"))
-    })?;
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|err| rpc_error(Value::Null, RPC_PARSE_ERROR, format!("parse error: {err}")))?;
 
     if value.is_array() {
         return Err(rpc_error(
@@ -291,10 +315,11 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     let method = value
         .get("method")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            rpc_error(id.clone(), RPC_INVALID_REQUEST, "missing method")
-        })?;
-    let params_value = value.get("params").cloned().unwrap_or(Value::Array(Vec::new()));
+        .ok_or_else(|| rpc_error(id.clone(), RPC_INVALID_REQUEST, "missing method"))?;
+    let params_value = value
+        .get("params")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
     let params = match params_value {
         Value::Array(values) => values,
         Value::Null => Vec::new(),
@@ -328,9 +353,8 @@ fn parse_body_params(body: &[u8]) -> Result<Vec<Value>, RpcError> {
     if body.is_empty() {
         return Ok(Vec::new());
     }
-    let value: Value = serde_json::from_slice(body).map_err(|err| {
-        RpcError::new(RPC_PARSE_ERROR, format!("parse error: {err}"))
-    })?;
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|err| RpcError::new(RPC_PARSE_ERROR, format!("parse error: {err}")))?;
     match value {
         Value::Array(values) => Ok(values),
         Value::Object(mut map) => {
@@ -432,9 +456,7 @@ fn percent_decode(input: &str) -> Result<String, RpcError> {
             }
         }
     }
-    String::from_utf8(out).map_err(|_| {
-        RpcError::new(RPC_INVALID_REQUEST, "invalid utf8 in query")
-    })
+    String::from_utf8(out).map_err(|_| RpcError::new(RPC_INVALID_REQUEST, "invalid utf8 in query"))
 }
 
 fn hex_value(byte: u8) -> Result<u8, RpcError> {
@@ -449,6 +471,7 @@ fn hex_value(byte: u8) -> Result<u8, RpcError> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     method: &str,
     params: Vec<Value>,
@@ -461,7 +484,14 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
 ) -> Result<Value, RpcError> {
     match method {
         "help" => rpc_help(params),
-        "getinfo" => rpc_getinfo(chainstate, params, chain_params, data_dir, net_totals, peer_registry),
+        "getinfo" => rpc_getinfo(
+            chainstate,
+            params,
+            chain_params,
+            data_dir,
+            net_totals,
+            peer_registry,
+        ),
         "getblockcount" => rpc_getblockcount(chainstate, params),
         "getbestblockhash" => rpc_getbestblockhash(chainstate, params),
         "getblockhash" => rpc_getblockhash(chainstate, params),
@@ -517,7 +547,7 @@ fn rpc_help(params: Vec<Value>) -> Result<Value, RpcError> {
     let name = params[0]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "method name must be a string"))?;
-    if RPC_METHODS.iter().any(|method| *method == name) {
+    if RPC_METHODS.contains(&name) {
         Ok(Value::String(format!("{name} is supported")))
     } else {
         Err(RpcError::new(RPC_METHOD_NOT_FOUND, "method not found"))
@@ -653,8 +683,8 @@ fn rpc_getblockheader<S: fluxd_storage::KeyValueStore>(
         .block_header_bytes(&hash)
         .map_err(map_internal)?
         .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "block not found"))?;
-    let header =
-        fluxd_primitives::block::BlockHeader::consensus_decode(&header_bytes).map_err(map_internal)?;
+    let header = fluxd_primitives::block::BlockHeader::consensus_decode(&header_bytes)
+        .map_err(map_internal)?;
 
     if !verbose {
         return Ok(Value::String(hex_bytes(&header_bytes)));
@@ -718,11 +748,8 @@ fn rpc_getblock<S: fluxd_storage::KeyValueStore>(
         .block_location(&hash)
         .map_err(map_internal)?
         .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "block not found"))?;
-    let bytes = chainstate
-        .read_block(location)
-        .map_err(map_internal)?;
-    let block = fluxd_primitives::block::Block::consensus_decode(&bytes)
-        .map_err(map_internal)?;
+    let bytes = chainstate.read_block(location).map_err(map_internal)?;
+    let block = fluxd_primitives::block::Block::consensus_decode(&bytes).map_err(map_internal)?;
 
     if verbosity == 0 {
         return Ok(Value::String(hex_bytes(&bytes)));
@@ -958,8 +985,7 @@ fn rpc_getrawtransaction<S: fluxd_storage::KeyValueStore>(
     let bytes = chainstate
         .read_block(location.block)
         .map_err(map_internal)?;
-    let block = fluxd_primitives::block::Block::consensus_decode(&bytes)
-        .map_err(map_internal)?;
+    let block = fluxd_primitives::block::Block::consensus_decode(&bytes).map_err(map_internal)?;
     let tx_index = location.index as usize;
     let tx = block
         .transactions
@@ -979,10 +1005,19 @@ fn rpc_getrawtransaction<S: fluxd_storage::KeyValueStore>(
         let best_height = best_block_height(chainstate)?;
         let confirmations =
             confirmations_for_height(chainstate, entry.height, best_height, &block_hash)?;
-        obj.insert("blockhash".to_string(), Value::String(hash256_to_hex(&block_hash)));
-        obj.insert("confirmations".to_string(), Value::Number(confirmations.into()));
+        obj.insert(
+            "blockhash".to_string(),
+            Value::String(hash256_to_hex(&block_hash)),
+        );
+        obj.insert(
+            "confirmations".to_string(),
+            Value::Number(confirmations.into()),
+        );
         obj.insert("time".to_string(), Value::Number(block.header.time.into()));
-        obj.insert("blocktime".to_string(), Value::Number(block.header.time.into()));
+        obj.insert(
+            "blocktime".to_string(),
+            Value::Number(block.header.time.into()),
+        );
         obj.insert("height".to_string(), Value::Number(entry.height.into()));
     }
     Ok(Value::Object(obj))
@@ -1127,10 +1162,7 @@ fn rpc_viewdeterministicfluxnodelist<S: fluxd_storage::KeyValueStore>(
     let filter = if params.is_empty() {
         String::new()
     } else {
-        params[0]
-            .as_str()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
+        params[0].as_str().unwrap_or_default().to_ascii_lowercase()
     };
     let records = chainstate.fluxnode_records().map_err(map_internal)?;
     let mut out = Vec::new();
@@ -1173,11 +1205,7 @@ fn rpc_viewdeterministicfluxnodelist<S: fluxd_storage::KeyValueStore>(
         if !filter.is_empty() {
             let haystack = format!(
                 "{} {} {} {} {}",
-                outpoint_str,
-                txhash,
-                operator_pubkey_b64,
-                collateral_pubkey_b64,
-                p2sh_hex
+                outpoint_str, txhash, operator_pubkey_b64, collateral_pubkey_b64, p2sh_hex
             )
             .to_ascii_lowercase();
             if !haystack.contains(&filter) {
@@ -1270,9 +1298,9 @@ fn rpc_getblockhashes<S: fluxd_storage::KeyValueStore>(
     let mut no_orphans = false;
     let mut logical_times = false;
     if params.len() > 2 {
-        let options = params[2].as_object().ok_or_else(|| {
-            RpcError::new(RPC_INVALID_PARAMETER, "options must be an object")
-        })?;
+        let options = params[2]
+            .as_object()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "options must be an object"))?;
         if let Some(value) = options.get("noOrphans") {
             no_orphans = parse_bool(value)?;
         }
@@ -1386,10 +1414,7 @@ fn rpc_getnettotals(params: Vec<Value>, net_totals: &NetTotals) -> Result<Value,
     }))
 }
 
-fn rpc_getpeerinfo(
-    params: Vec<Value>,
-    peer_registry: &PeerRegistry,
-) -> Result<Value, RpcError> {
+fn rpc_getpeerinfo(params: Vec<Value>, peer_registry: &PeerRegistry) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
     let peers = peer_registry.snapshot();
     let mut out = Vec::with_capacity(peers.len());
@@ -1473,13 +1498,19 @@ fn tx_to_json(tx: &Transaction, network: Network) -> Result<Value, RpcError> {
     for input in &tx.vin {
         let mut map = serde_json::Map::new();
         if input.prevout.hash == [0u8; 32] && input.prevout.index == u32::MAX {
-            map.insert("coinbase".to_string(), Value::String(hex_bytes(&input.script_sig)));
+            map.insert(
+                "coinbase".to_string(),
+                Value::String(hex_bytes(&input.script_sig)),
+            );
         } else {
             map.insert(
                 "txid".to_string(),
                 Value::String(hash256_to_hex(&input.prevout.hash)),
             );
-            map.insert("vout".to_string(), Value::Number(input.prevout.index.into()));
+            map.insert(
+                "vout".to_string(),
+                Value::Number(input.prevout.index.into()),
+            );
             map.insert(
                 "scriptSig".to_string(),
                 json!({
@@ -1642,10 +1673,7 @@ fn fluxnode_tier_name(tier: u8) -> &'static str {
     }
 }
 
-fn select_fluxnode_winner<'a>(
-    records: &'a [FluxnodeRecord],
-    tier: u8,
-) -> Option<&'a FluxnodeRecord> {
+fn select_fluxnode_winner(records: &[FluxnodeRecord], tier: u8) -> Option<&FluxnodeRecord> {
     let mut candidates: Vec<&FluxnodeRecord> = records
         .iter()
         .filter(|record| {
@@ -1794,7 +1822,7 @@ fn parse_verbosity(value: &Value) -> Result<i32, RpcError> {
         .as_i64()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "verbosity must be numeric"))?;
     match verbosity {
-        0 | 1 | 2 => Ok(verbosity as i32),
+        0..=2 => Ok(verbosity as i32),
         _ => Err(RpcError::new(
             RPC_INVALID_PARAMETER,
             "verbosity must be 0, 1, or 2",
@@ -1832,9 +1860,7 @@ fn confirmations_for_height<S: fluxd_storage::KeyValueStore>(
     if height < 0 || height > best_height {
         return Ok(-1);
     }
-    let main_hash = chainstate
-        .height_hash(height)
-        .map_err(map_internal)?;
+    let main_hash = chainstate.height_hash(height).map_err(map_internal)?;
     if main_hash.as_ref() != Some(hash) {
         return Ok(-1);
     }
@@ -1850,22 +1876,20 @@ fn next_hash_for_height<S: fluxd_storage::KeyValueStore>(
     if height < 0 || height >= best_height {
         return Ok(None);
     }
-    let main_hash = chainstate
-        .height_hash(height)
-        .map_err(map_internal)?;
+    let main_hash = chainstate.height_hash(height).map_err(map_internal)?;
     if main_hash.as_ref() != Some(hash) {
         return Ok(None);
     }
-    chainstate
-        .height_hash(height + 1)
-        .map_err(map_internal)
+    chainstate.height_hash(height + 1).map_err(map_internal)
 }
 
 fn build_upgrade_info(params: &ChainParams, height: i32) -> Value {
     let mut map = serde_json::Map::new();
     for idx in ALL_UPGRADES {
         let upgrade = params.consensus.upgrades[idx.as_usize()];
-        if upgrade.activation_height == fluxd_consensus::upgrades::NetworkUpgrade::NO_ACTIVATION_HEIGHT {
+        if upgrade.activation_height
+            == fluxd_consensus::upgrades::NetworkUpgrade::NO_ACTIVATION_HEIGHT
+        {
             continue;
         }
         let info = NETWORK_UPGRADE_INFO[idx.as_usize()];
@@ -1919,9 +1943,18 @@ fn u256_to_f64(value: U256) -> f64 {
 fn node_version() -> i64 {
     let version = env!("CARGO_PKG_VERSION");
     let mut parts = version.split('.');
-    let major = parts.next().and_then(|part| part.parse::<i64>().ok()).unwrap_or(0);
-    let minor = parts.next().and_then(|part| part.parse::<i64>().ok()).unwrap_or(0);
-    let patch = parts.next().and_then(|part| part.parse::<i64>().ok()).unwrap_or(0);
+    let major = parts
+        .next()
+        .and_then(|part| part.parse::<i64>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|part| part.parse::<i64>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .next()
+        .and_then(|part| part.parse::<i64>().ok())
+        .unwrap_or(0);
     major * 10000 + minor * 100 + patch
 }
 
@@ -2024,7 +2057,10 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Result<HttpReq
     let mut temp = [0u8; 4096];
     let mut header_end = None;
     while buffer.len() < MAX_REQUEST_BYTES {
-        let read = stream.read(&mut temp).await.map_err(|err| err.to_string())?;
+        let read = stream
+            .read(&mut temp)
+            .await
+            .map_err(|err| err.to_string())?;
         if read == 0 {
             break;
         }
@@ -2070,7 +2106,10 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Result<HttpReq
         return Err("request too large".to_string());
     }
     while body.len() < content_length {
-        let read = stream.read(&mut temp).await.map_err(|err| err.to_string())?;
+        let read = stream
+            .read(&mut temp)
+            .await
+            .map_err(|err| err.to_string())?;
         if read == 0 {
             break;
         }
@@ -2131,7 +2170,9 @@ fn build_unauthorized() -> Vec<u8> {
     let body = "unauthorized";
     let mut response = String::new();
     response.push_str("HTTP/1.1 401 Unauthorized\r\n");
-    response.push_str(&format!("WWW-Authenticate: Basic realm=\"{RPC_REALM}\"\r\n"));
+    response.push_str(&format!(
+        "WWW-Authenticate: Basic realm=\"{RPC_REALM}\"\r\n"
+    ));
     response.push_str("Content-Type: text/plain\r\n");
     response.push_str(&format!("Content-Length: {}\r\n", body.len()));
     response.push_str("Connection: close\r\n\r\n");

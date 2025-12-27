@@ -118,10 +118,7 @@ impl PeerRegistry {
     }
 
     pub fn count(&self) -> usize {
-        self.peers
-            .lock()
-            .map(|peers| peers.len())
-            .unwrap_or(0)
+        self.peers.lock().map(|peers| peers.len()).unwrap_or(0)
     }
 
     pub fn snapshot(&self) -> Vec<PeerInfoSnapshot> {
@@ -164,13 +161,11 @@ pub struct NetTotals {
 
 impl NetTotals {
     pub fn add_recv(&self, bytes: usize) {
-        self.bytes_recv
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_recv.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub fn add_sent(&self, bytes: usize) {
-        self.bytes_sent
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub fn inc_connections(&self) {
@@ -178,9 +173,11 @@ impl NetTotals {
     }
 
     pub fn dec_connections(&self) {
-        self.connections.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.saturating_sub(1))
-        }).ok();
+        self.connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .ok();
     }
 
     pub fn snapshot(&self) -> NetTotalsSnapshot {
@@ -338,12 +335,18 @@ impl Peer {
         self.addr
     }
 
-    pub async fn send_getheaders(&mut self, locator: &[fluxd_consensus::Hash256]) -> Result<(), String> {
+    pub async fn send_getheaders(
+        &mut self,
+        locator: &[fluxd_consensus::Hash256],
+    ) -> Result<(), String> {
         let payload = build_getheaders_payload(locator);
         self.send_message("getheaders", &payload).await
     }
 
-    pub async fn send_getdata(&mut self, hashes: &[fluxd_consensus::Hash256]) -> Result<(), String> {
+    pub async fn send_getdata(
+        &mut self,
+        hashes: &[fluxd_consensus::Hash256],
+    ) -> Result<(), String> {
         let payload = build_getdata_payload(hashes);
         self.send_message("getdata", &payload).await
     }
@@ -351,7 +354,6 @@ impl Peer {
     pub async fn send_getaddr(&mut self) -> Result<(), String> {
         self.send_message("getaddr", &[]).await
     }
-
 }
 
 impl Drop for Peer {
@@ -465,8 +467,8 @@ fn parse_version(payload: &[u8]) -> Result<VersionInfo, String> {
     let version = decoder.read_i32_le().map_err(|err| err.to_string())?;
     let _services = decoder.read_u64_le().map_err(|err| err.to_string())?;
     let _timestamp = decoder.read_i64_le().map_err(|err| err.to_string())?;
-    let _ = read_net_addr(&mut decoder)?;
-    let _ = read_net_addr(&mut decoder)?;
+    read_net_addr(&mut decoder)?;
+    read_net_addr(&mut decoder)?;
     let _nonce = decoder.read_u64_le().map_err(|err| err.to_string())?;
     let user_agent = decoder.read_var_str().map_err(|err| err.to_string())?;
     let start_height = decoder.read_i32_le().map_err(|err| err.to_string())?;

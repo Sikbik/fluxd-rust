@@ -4,21 +4,16 @@ use std::io::Cursor;
 use fluxd_consensus::Hash256;
 use incrementalmerkletree::{frontier::CommitmentTree, Hashable, Level};
 use sapling_crypto::note::ExtractedNoteCommitment;
-use sapling_crypto::{Anchor as SaplingAnchor, CommitmentTree as SaplingCommitmentTree, Node as SaplingNode};
-use sha2::digest::generic_array::GenericArray;
+use sapling_crypto::{
+    Anchor as SaplingAnchor, CommitmentTree as SaplingCommitmentTree, Node as SaplingNode,
+};
 use sha2::compress256;
+use sha2::digest::generic_array::GenericArray;
 use zcash_primitives::merkle_tree::{read_commitment_tree, write_commitment_tree, HashSer};
 
 pub const SPROUT_TREE_DEPTH: u8 = 29;
 const SHA256_IV: [u32; 8] = [
-    0x6a09e667,
-    0xbb67ae85,
-    0x3c6ef372,
-    0xa54ff53a,
-    0x510e527f,
-    0x9b05688c,
-    0x1f83d9ab,
-    0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +24,7 @@ impl SproutNode {
         Self(hash256_le_bytes(hash))
     }
 
-    pub fn to_hash(&self) -> Hash256 {
+    pub fn to_hash(self) -> Hash256 {
         hash256_from_le_bytes(&self.0)
     }
 }

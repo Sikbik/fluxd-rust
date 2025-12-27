@@ -1,7 +1,7 @@
 //! Slot calculation and PON hash.
 
-use fluxd_consensus::Hash256;
 use fluxd_consensus::params::ConsensusParams;
+use fluxd_consensus::Hash256;
 use fluxd_primitives::encoding::{Encodable, Encoder};
 use fluxd_primitives::hash::sha256d;
 use fluxd_primitives::outpoint::OutPoint;

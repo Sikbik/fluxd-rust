@@ -55,8 +55,8 @@ impl<S: KeyValueStore> TxIndex<S> {
             Some(bytes) => bytes,
             None => return Ok(None),
         };
-        TxLocation::decode(&bytes).ok_or_else(|| {
-            StoreError::Backend("invalid tx index entry".to_string())
-        }).map(Some)
+        TxLocation::decode(&bytes)
+            .ok_or_else(|| StoreError::Backend("invalid tx index entry".to_string()))
+            .map(Some)
     }
 }

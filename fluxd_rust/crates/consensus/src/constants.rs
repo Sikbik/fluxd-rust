@@ -12,7 +12,7 @@ pub const PON_REORG_START_HEIGHT: i64 = 2_020_000;
 pub const PON_REORG_END_HEIGHT: i64 = 2_025_000;
 
 pub fn max_reorg_depth(height: i64) -> i64 {
-    if height >= PON_REORG_START_HEIGHT && height <= PON_REORG_END_HEIGHT {
+    if (PON_REORG_START_HEIGHT..=PON_REORG_END_HEIGHT).contains(&height) {
         PON_REORG_LENGTH
     } else {
         MAX_REORG_LENGTH

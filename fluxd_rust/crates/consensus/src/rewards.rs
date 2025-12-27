@@ -47,10 +47,15 @@ pub fn block_subsidy(height: i32, params: &ConsensusParams) -> Amount {
     subsidy
 }
 
-pub fn fluxnode_subsidy(height: i32, block_value: Amount, tier: i32, params: &ConsensusParams) -> Amount {
+pub fn fluxnode_subsidy(
+    height: i32,
+    block_value: Amount,
+    tier: i32,
+    params: &ConsensusParams,
+) -> Amount {
     if network_upgrade_active(height, &params.upgrades, UpgradeIndex::Pon) {
         const PON_INITIAL_TOTAL: Amount = 14 * COIN;
-        const PON_CUMULUS_BASE: Amount = 1 * COIN;
+        const PON_CUMULUS_BASE: Amount = COIN;
         const PON_NIMBUS_BASE: Amount = 35 * COIN / 10;
         const PON_STRATUS_BASE: Amount = 9 * COIN;
 

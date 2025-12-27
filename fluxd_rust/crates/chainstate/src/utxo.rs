@@ -68,12 +68,7 @@ impl<S: KeyValueStore> UtxoSet<S> {
         }
     }
 
-    pub fn put(
-        &self,
-        batch: &mut WriteBatch,
-        outpoint: &OutPoint,
-        entry: &UtxoEntry,
-    ) {
+    pub fn put(&self, batch: &mut WriteBatch, outpoint: &OutPoint, entry: &UtxoEntry) {
         batch.put(Column::Utxo, outpoint_key(outpoint), entry.encode());
     }
 

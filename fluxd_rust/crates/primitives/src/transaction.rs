@@ -53,7 +53,8 @@ pub fn is_flux_tx_p2sh_type(version: i32, include_bit_check: bool) -> bool {
         if has_conflicting_bits(version) {
             return false;
         }
-        return (version & FLUXNODE_TX_TYPE_P2SH_BIT) != 0 || version == FLUXNODE_INTERNAL_P2SH_TX_VERSION;
+        return (version & FLUXNODE_TX_TYPE_P2SH_BIT) != 0
+            || version == FLUXNODE_INTERNAL_P2SH_TX_VERSION;
     }
     version == FLUXNODE_INTERNAL_P2SH_TX_VERSION
 }
@@ -107,7 +108,10 @@ impl Decodable for TxOut {
     fn consensus_decode(decoder: &mut Decoder) -> Result<Self, DecodeError> {
         let value = decoder.read_i64_le()?;
         let script_pubkey = decoder.read_var_bytes()?;
-        Ok(Self { value, script_pubkey })
+        Ok(Self {
+            value,
+            script_pubkey,
+        })
     }
 }
 
@@ -436,7 +440,10 @@ impl Transaction {
         Ok(sha256d(&self.consensus_encode_for_hash()?))
     }
 
-    fn encode_with_mode(&self, include_signatures: bool) -> Result<Vec<u8>, TransactionEncodeError> {
+    fn encode_with_mode(
+        &self,
+        include_signatures: bool,
+    ) -> Result<Vec<u8>, TransactionEncodeError> {
         let mut encoder = Encoder::new();
         let mut header = self.version as u32;
         if self.f_overwintered {
@@ -454,12 +461,12 @@ impl Transaction {
                     "fluxnode tx must not be overwintered",
                 ));
             }
-            let fluxnode = self
-                .fluxnode
-                .as_ref()
-                .ok_or(TransactionEncodeError::InvalidTransactionFormat(
-                    "missing fluxnode payload for v5",
-                ))?;
+            let fluxnode =
+                self.fluxnode
+                    .as_ref()
+                    .ok_or(TransactionEncodeError::InvalidTransactionFormat(
+                        "missing fluxnode payload for v5",
+                    ))?;
             encode_fluxnode_v5(fluxnode, &mut encoder, include_signatures)?;
             return Ok(encoder.into_inner());
         }
@@ -470,12 +477,12 @@ impl Transaction {
                     "fluxnode tx must not be overwintered",
                 ));
             }
-            let fluxnode = self
-                .fluxnode
-                .as_ref()
-                .ok_or(TransactionEncodeError::InvalidTransactionFormat(
-                    "missing fluxnode payload for v6",
-                ))?;
+            let fluxnode =
+                self.fluxnode
+                    .as_ref()
+                    .ok_or(TransactionEncodeError::InvalidTransactionFormat(
+                        "missing fluxnode payload for v6",
+                    ))?;
             encode_fluxnode_v6(fluxnode, &mut encoder, include_signatures)?;
             return Ok(encoder.into_inner());
         }
@@ -539,7 +546,10 @@ impl Transaction {
         Self::decode_with_mode(bytes, false)
     }
 
-    fn decode_with_mode(bytes: &[u8], include_signatures: bool) -> Result<Self, TransactionDecodeError> {
+    fn decode_with_mode(
+        bytes: &[u8],
+        include_signatures: bool,
+    ) -> Result<Self, TransactionDecodeError> {
         let mut decoder = Decoder::new(bytes);
         let tx = Self::decode_from(&mut decoder, include_signatures)?;
         if !decoder.is_empty() {
@@ -561,12 +571,10 @@ impl Transaction {
             0
         };
 
-        let is_overwinter_v3 = f_overwintered
-            && version_group_id == OVERWINTER_VERSION_GROUP_ID
-            && version == 3;
-        let is_sapling_v4 = f_overwintered
-            && version_group_id == SAPLING_VERSION_GROUP_ID
-            && version == 4;
+        let is_overwinter_v3 =
+            f_overwintered && version_group_id == OVERWINTER_VERSION_GROUP_ID && version == 3;
+        let is_sapling_v4 =
+            f_overwintered && version_group_id == SAPLING_VERSION_GROUP_ID && version == 4;
 
         if f_overwintered && !(is_overwinter_v3 || is_sapling_v4) {
             return Err(TransactionDecodeError::InvalidTransactionFormat(
@@ -663,13 +671,12 @@ impl Transaction {
             (Vec::new(), [0u8; 32], [0u8; 64])
         };
 
-        let binding_sig = if is_sapling_v4
-            && !(shielded_spends.is_empty() && shielded_outputs.is_empty())
-        {
-            decoder.read_fixed::<64>()?
-        } else {
-            [0u8; 64]
-        };
+        let binding_sig =
+            if is_sapling_v4 && !(shielded_spends.is_empty() && shielded_outputs.is_empty()) {
+                decoder.read_fixed::<64>()?
+            } else {
+                [0u8; 64]
+            };
 
         Ok(Transaction {
             f_overwintered,

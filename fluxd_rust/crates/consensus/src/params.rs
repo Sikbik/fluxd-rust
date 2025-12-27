@@ -63,7 +63,8 @@ impl ConsensusParams {
     }
 
     pub fn digishield_max_actual_timespan(&self) -> i64 {
-        (self.digishield_averaging_window_timespan() * (100 + self.digishield_max_adjust_down)) / 100
+        (self.digishield_averaging_window_timespan() * (100 + self.digishield_max_adjust_down))
+            / 100
     }
 }
 
@@ -106,11 +107,11 @@ pub fn hash256_from_hex(input: &str) -> Result<Hash256, HexError> {
     }
 
     let mut bytes = [0u8; 32];
-    for i in 0..32 {
+    for (i, byte_out) in bytes.iter_mut().enumerate() {
         let start = i * 2;
-        let byte =
-            u8::from_str_radix(&hex_owned[start..start + 2], 16).map_err(|_| HexError::InvalidHex)?;
-        bytes[i] = byte;
+        let byte = u8::from_str_radix(&hex_owned[start..start + 2], 16)
+            .map_err(|_| HexError::InvalidHex)?;
+        *byte_out = byte;
     }
     bytes.reverse();
 
@@ -247,48 +248,60 @@ fn mainnet_consensus_params() -> ConsensusParams {
             protocol_version: 170_007,
             activation_height: 250_000,
             hash_activation_block: Some(
-                hash256_from_hex("0000001d65fa78f2f6c172a51b5aca59ee1927e51f728647fca21b180becfe59")
-                    .expect("mainnet acadia activation hash"),
+                hash256_from_hex(
+                    "0000001d65fa78f2f6c172a51b5aca59ee1927e51f728647fca21b180becfe59",
+                )
+                .expect("mainnet acadia activation hash"),
             ),
         },
         NetworkUpgrade {
             protocol_version: 170_012,
             activation_height: 372_500,
             hash_activation_block: Some(
-                hash256_from_hex("00000052e2ac144c2872ff641c646e41dac166ac577bc9b0837f501aba19de4a")
-                    .expect("mainnet kamiooka activation hash"),
+                hash256_from_hex(
+                    "00000052e2ac144c2872ff641c646e41dac166ac577bc9b0837f501aba19de4a",
+                )
+                .expect("mainnet kamiooka activation hash"),
             ),
         },
         NetworkUpgrade {
             protocol_version: 170_016,
             activation_height: 558_000,
             hash_activation_block: Some(
-                hash256_from_hex("000000a33d38f37f586b843a9c8cf6d1ff1269e6114b34604cabcd14c44268d4")
-                    .expect("mainnet kamata activation hash"),
+                hash256_from_hex(
+                    "000000a33d38f37f586b843a9c8cf6d1ff1269e6114b34604cabcd14c44268d4",
+                )
+                .expect("mainnet kamata activation hash"),
             ),
         },
         NetworkUpgrade {
             protocol_version: 170_017,
             activation_height: 835_554,
             hash_activation_block: Some(
-                hash256_from_hex("000000ce99aa6765bdaae673cdf41f661ff20a116eb6f2fe0843488d8061f193")
-                    .expect("mainnet flux activation hash"),
+                hash256_from_hex(
+                    "000000ce99aa6765bdaae673cdf41f661ff20a116eb6f2fe0843488d8061f193",
+                )
+                .expect("mainnet flux activation hash"),
             ),
         },
         NetworkUpgrade {
             protocol_version: 170_018,
             activation_height: 1_076_532,
             hash_activation_block: Some(
-                hash256_from_hex("000000111f8643ce24d9753dbc324220877299075a8a6102da61ef4460296325")
-                    .expect("mainnet halving activation hash"),
+                hash256_from_hex(
+                    "000000111f8643ce24d9753dbc324220877299075a8a6102da61ef4460296325",
+                )
+                .expect("mainnet halving activation hash"),
             ),
         },
         NetworkUpgrade {
             protocol_version: 170_019,
             activation_height: 1_549_500,
             hash_activation_block: Some(
-                hash256_from_hex("00000009f9178347f3dea495a089400050c3388e07f9c871fb1ebddcab1f8044")
-                    .expect("mainnet p2shnodes activation hash"),
+                hash256_from_hex(
+                    "00000009f9178347f3dea495a089400050c3388e07f9c871fb1ebddcab1f8044",
+                )
+                .expect("mainnet p2shnodes activation hash"),
             ),
         },
         NetworkUpgrade {
@@ -300,8 +313,10 @@ fn mainnet_consensus_params() -> ConsensusParams {
 
     ConsensusParams {
         network: Network::Mainnet,
-        hash_genesis_block: hash256_from_hex("00052461a5006c2e3b74ce48992a08695607912d5604c3eb8da25749b0900444")
-            .expect("mainnet genesis hash"),
+        hash_genesis_block: hash256_from_hex(
+            "00052461a5006c2e3b74ce48992a08695607912d5604c3eb8da25749b0900444",
+        )
+        .expect("mainnet genesis hash"),
         genesis_time: 1_516_980_000,
         coinbase_must_be_protected: true,
         subsidy_slow_start_interval: 5_000,
@@ -312,12 +327,18 @@ fn mainnet_consensus_params() -> ConsensusParams {
         upgrades,
         emergency: mainnet_emergency_params(),
         checkpoints: mainnet_checkpoints(),
-        pow_limit: hash256_from_hex("0007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-            .expect("mainnet pow limit"),
-        pon_limit: hash256_from_hex("0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-            .expect("mainnet pon limit"),
-        pon_start_limit: hash256_from_hex("000bffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-            .expect("mainnet pon start limit"),
+        pow_limit: hash256_from_hex(
+            "0007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("mainnet pow limit"),
+        pon_limit: hash256_from_hex(
+            "0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("mainnet pon limit"),
+        pon_start_limit: hash256_from_hex(
+            "000bffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("mainnet pon start limit"),
         pow_allow_min_difficulty_after_height: None,
         digishield_averaging_window: 17,
         digishield_max_adjust_down: 32,
@@ -328,8 +349,10 @@ fn mainnet_consensus_params() -> ConsensusParams {
         pon_subsidy_reduction_interval: 1_051_200,
         pon_max_reductions: 20,
         pon_initial_subsidy: 14,
-        minimum_chain_work: hash256_from_hex("000000000000000000000000000000000000000000000000000021f5d5da5d73")
-            .expect("mainnet minimum chain work"),
+        minimum_chain_work: hash256_from_hex(
+            "000000000000000000000000000000000000000000000000000021f5d5da5d73",
+        )
+        .expect("mainnet minimum chain work"),
         zawy_lwma_averaging_window: 60,
         eh_epoch_fade_length: 11,
         eh_epoch_1: eh_200_9,
@@ -404,8 +427,10 @@ fn testnet_consensus_params() -> ConsensusParams {
 
     ConsensusParams {
         network: Network::Testnet,
-        hash_genesis_block: hash256_from_hex("0042202a64a929fc25cc10e68615ddbe38007b1b40da08acd3f530f83c79b9d1")
-            .expect("testnet genesis hash"),
+        hash_genesis_block: hash256_from_hex(
+            "0042202a64a929fc25cc10e68615ddbe38007b1b40da08acd3f530f83c79b9d1",
+        )
+        .expect("testnet genesis hash"),
         genesis_time: 1_582_228_940,
         coinbase_must_be_protected: true,
         subsidy_slow_start_interval: 1,
@@ -416,12 +441,18 @@ fn testnet_consensus_params() -> ConsensusParams {
         upgrades,
         emergency: testnet_emergency_params(),
         checkpoints: testnet_checkpoints(),
-        pow_limit: hash256_from_hex("0effffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-            .expect("testnet pow limit"),
-        pon_limit: hash256_from_hex("0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-            .expect("testnet pon limit"),
-        pon_start_limit: hash256_from_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-            .expect("testnet pon start limit"),
+        pow_limit: hash256_from_hex(
+            "0effffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("testnet pow limit"),
+        pon_limit: hash256_from_hex(
+            "0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("testnet pon limit"),
+        pon_start_limit: hash256_from_hex(
+            "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("testnet pon start limit"),
         pow_allow_min_difficulty_after_height: Some(0),
         digishield_averaging_window: 17,
         digishield_max_adjust_down: 32,
@@ -517,8 +548,10 @@ fn regtest_consensus_params() -> ConsensusParams {
 
     ConsensusParams {
         network: Network::Regtest,
-        hash_genesis_block: hash256_from_hex("01998760a88dc2b5715f69d2f18c1d90e0b604612242d9099eaff3048dd1e0ce")
-            .expect("regtest genesis hash"),
+        hash_genesis_block: hash256_from_hex(
+            "01998760a88dc2b5715f69d2f18c1d90e0b604612242d9099eaff3048dd1e0ce",
+        )
+        .expect("regtest genesis hash"),
         genesis_time: 1_296_688_602,
         coinbase_must_be_protected: false,
         subsidy_slow_start_interval: 0,
@@ -529,12 +562,18 @@ fn regtest_consensus_params() -> ConsensusParams {
         upgrades,
         emergency: regtest_emergency_params(),
         checkpoints: regtest_checkpoints(),
-        pow_limit: hash256_from_hex("0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f")
-            .expect("regtest pow limit"),
-        pon_limit: hash256_from_hex("0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f")
-            .expect("regtest pon limit"),
-        pon_start_limit: hash256_from_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
-            .expect("regtest pon start limit"),
+        pow_limit: hash256_from_hex(
+            "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        )
+        .expect("regtest pow limit"),
+        pon_limit: hash256_from_hex(
+            "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        )
+        .expect("regtest pon limit"),
+        pon_start_limit: hash256_from_hex(
+            "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("regtest pon start limit"),
         pow_allow_min_difficulty_after_height: Some(0),
         digishield_averaging_window: 17,
         digishield_max_adjust_down: 0,
@@ -704,38 +743,119 @@ fn parse_checkpoints(entries: &[(i32, &str)]) -> Vec<Checkpoint> {
 
 fn mainnet_checkpoints() -> Vec<Checkpoint> {
     parse_checkpoints(&[
-        (0, "00052461a5006c2e3b74ce48992a08695607912d5604c3eb8da25749b0900444"),
-        (5500, "0000000e7724f8bace09dd762657169c10622af4a6a8e959152cd00b9119848e"),
-        (35000, "000000004646dd797644b9c67aff320961e95c311b4f26985424b720d09fcaa5"),
-        (70000, "00000001edcf7768ed39fac55414e53a78d077b1b41fccdaf9307d7bc219626a"),
-        (94071, "00000005ec83876bc5288badf0971ae83ac7c6a286851f7b22a75a03e73b401a"),
-        (277649, "00000004a53f9271d05071a052b3738b46663f3335d14b6aea965a3cb70c0cc8"),
-        (400000, "000000390342f0e52443ad79b43e5d85b78bf519667aeb3aa980d76caeda0369"),
-        (530000, "0000004b4459ec6904e8116d178c357b0f25a7d45c5c5836ce3714791f1ed124"),
-        (600000, "000000dea4478401e6ab95f6d05ade810115411e95e75fab9fd94a44df4b1e1d"),
-        (700000, "0000000845ef03939225cc592773fd7aef54b5232fc42790c46ef6f11ee3e8d4"),
-        (800000, "000000451b73f495b2f6ad38bd89d15495551fc15c2078ad7af3d54d06422cc6"),
-        (900000, "000001e1ad2bb5e3cabb09559b6e65b871bf1d2a51bcc141ce45fc4cbd1d9cd8"),
-        (1000000, "0000001a80e7f30d21fb14116cd01d51e1fad8ac84cc960896f4691a57368a47"),
-        (1040000, "00000007f3b465bd4b0e161e43c05a3d946144330e33ea3a91cb952e6ef86b7d"),
-        (1040577, "000000071fe89682ac260bc0a49621344eb28ae01659c9e7ce86e3762e45f52d"),
-        (1042126, "0000000295e4663178fd9e533787e74206645910a2bfb61938db5f67796eaad0"),
-        (1060000, "0000000fd721d8d381c4b24a4f78fc036955d7a0f98d2765b8c7badad8b66c1b"),
-        (1442798, "0000000cc561fecb2ecfd22ba7af09450ca8cf270f407ce8b948195ff2aa0d13"),
-        (1518503, "0000000dba41dc84c52a3933af49d316fff49a76b49d42bd5b6d20c4e451a0ef"),
-        (1791720, "0000000abc7bd62a213e0dab43c9c01220b031a568fdfb5c2ef89e6b30054bdc"),
-        (2020500, "af2a1bd59c61f64860b4b45bd65358743fda40d8420564b58c39df45be7da97c"),
-        (2021000, "d2dcec473e809575e30ec2c0f400758120f5121b8268f90cdb8a7dbefe285b0d"),
-        (2021500, "fa98471f31ffc1366330bababc090ad5cb6bd23c25bb3b61d1e1ed07a77d6126"),
-        (2022000, "40a060546a56eb7fab0fd33ab3e6de834ff0d5273847d4f231a9addecfc44f61"),
-        (2029000, "4856dc788a973db4cc537465c9ef80288e1eb065898993d72371b1ee48c248b4"),
+        (
+            0,
+            "00052461a5006c2e3b74ce48992a08695607912d5604c3eb8da25749b0900444",
+        ),
+        (
+            5500,
+            "0000000e7724f8bace09dd762657169c10622af4a6a8e959152cd00b9119848e",
+        ),
+        (
+            35000,
+            "000000004646dd797644b9c67aff320961e95c311b4f26985424b720d09fcaa5",
+        ),
+        (
+            70000,
+            "00000001edcf7768ed39fac55414e53a78d077b1b41fccdaf9307d7bc219626a",
+        ),
+        (
+            94071,
+            "00000005ec83876bc5288badf0971ae83ac7c6a286851f7b22a75a03e73b401a",
+        ),
+        (
+            277649,
+            "00000004a53f9271d05071a052b3738b46663f3335d14b6aea965a3cb70c0cc8",
+        ),
+        (
+            400000,
+            "000000390342f0e52443ad79b43e5d85b78bf519667aeb3aa980d76caeda0369",
+        ),
+        (
+            530000,
+            "0000004b4459ec6904e8116d178c357b0f25a7d45c5c5836ce3714791f1ed124",
+        ),
+        (
+            600000,
+            "000000dea4478401e6ab95f6d05ade810115411e95e75fab9fd94a44df4b1e1d",
+        ),
+        (
+            700000,
+            "0000000845ef03939225cc592773fd7aef54b5232fc42790c46ef6f11ee3e8d4",
+        ),
+        (
+            800000,
+            "000000451b73f495b2f6ad38bd89d15495551fc15c2078ad7af3d54d06422cc6",
+        ),
+        (
+            900000,
+            "000001e1ad2bb5e3cabb09559b6e65b871bf1d2a51bcc141ce45fc4cbd1d9cd8",
+        ),
+        (
+            1000000,
+            "0000001a80e7f30d21fb14116cd01d51e1fad8ac84cc960896f4691a57368a47",
+        ),
+        (
+            1040000,
+            "00000007f3b465bd4b0e161e43c05a3d946144330e33ea3a91cb952e6ef86b7d",
+        ),
+        (
+            1040577,
+            "000000071fe89682ac260bc0a49621344eb28ae01659c9e7ce86e3762e45f52d",
+        ),
+        (
+            1042126,
+            "0000000295e4663178fd9e533787e74206645910a2bfb61938db5f67796eaad0",
+        ),
+        (
+            1060000,
+            "0000000fd721d8d381c4b24a4f78fc036955d7a0f98d2765b8c7badad8b66c1b",
+        ),
+        (
+            1442798,
+            "0000000cc561fecb2ecfd22ba7af09450ca8cf270f407ce8b948195ff2aa0d13",
+        ),
+        (
+            1518503,
+            "0000000dba41dc84c52a3933af49d316fff49a76b49d42bd5b6d20c4e451a0ef",
+        ),
+        (
+            1791720,
+            "0000000abc7bd62a213e0dab43c9c01220b031a568fdfb5c2ef89e6b30054bdc",
+        ),
+        (
+            2020500,
+            "af2a1bd59c61f64860b4b45bd65358743fda40d8420564b58c39df45be7da97c",
+        ),
+        (
+            2021000,
+            "d2dcec473e809575e30ec2c0f400758120f5121b8268f90cdb8a7dbefe285b0d",
+        ),
+        (
+            2021500,
+            "fa98471f31ffc1366330bababc090ad5cb6bd23c25bb3b61d1e1ed07a77d6126",
+        ),
+        (
+            2022000,
+            "40a060546a56eb7fab0fd33ab3e6de834ff0d5273847d4f231a9addecfc44f61",
+        ),
+        (
+            2029000,
+            "4856dc788a973db4cc537465c9ef80288e1eb065898993d72371b1ee48c248b4",
+        ),
     ])
 }
 
 fn testnet_checkpoints() -> Vec<Checkpoint> {
     parse_checkpoints(&[
-        (0, "0042202a64a929fc25cc10e68615ddbe38007b1b40da08acd3f530f83c79b9d1"),
-        (320, "0237bf16aba912b0c68933809a7e7fe9553ddff1bc0782d2463fc5d161af1c46"),
+        (
+            0,
+            "0042202a64a929fc25cc10e68615ddbe38007b1b40da08acd3f530f83c79b9d1",
+        ),
+        (
+            320,
+            "0237bf16aba912b0c68933809a7e7fe9553ddff1bc0782d2463fc5d161af1c46",
+        ),
     ])
 }
 

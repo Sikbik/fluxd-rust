@@ -98,10 +98,7 @@ fn is_p2pkh(script: &[u8]) -> bool {
 }
 
 fn is_p2sh(script: &[u8]) -> bool {
-    script.len() == 23
-        && script[0] == 0xa9
-        && script[1] == 0x14
-        && script[22] == 0x87
+    script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87
 }
 
 fn base58check_decode(input: &str) -> Result<Vec<u8>, AddressError> {
@@ -181,5 +178,8 @@ fn base58_encode(data: &[u8]) -> String {
 
 fn base58_value(byte: u8) -> Option<u8> {
     const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    ALPHABET.iter().position(|value| *value == byte).map(|pos| pos as u8)
+    ALPHABET
+        .iter()
+        .position(|value| *value == byte)
+        .map(|pos| pos as u8)
 }

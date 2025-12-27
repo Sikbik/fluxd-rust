@@ -16,9 +16,7 @@ fn fjall_smoke_roundtrip() {
     dir.push(format!("fluxd_fjall_smoke_{nanos}"));
 
     let store = FjallStore::open(&dir).expect("open fjall");
-    store
-        .put(Column::Meta, b"key", b"value")
-        .expect("put");
+    store.put(Column::Meta, b"key", b"value").expect("put");
     assert_eq!(
         store.get(Column::Meta, b"key").expect("get"),
         Some(b"value".to_vec())
@@ -31,10 +29,7 @@ fn fjall_smoke_roundtrip() {
         .put(Column::Meta, b"prefix:2", b"b")
         .expect("put prefix");
     let mut keys = HashSet::new();
-    for (key, value) in store
-        .scan_prefix(Column::Meta, b"prefix:")
-        .expect("scan")
-    {
+    for (key, value) in store.scan_prefix(Column::Meta, b"prefix:").expect("scan") {
         keys.insert((key, value));
     }
     assert_eq!(

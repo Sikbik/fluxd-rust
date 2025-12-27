@@ -9,5 +9,5 @@ pub const CENT: Amount = 1_000_000;
 pub const MAX_MONEY: Amount = 440_000_000 * COIN;
 
 pub fn money_range(value: Amount) -> bool {
-    value >= 0 && value <= MAX_MONEY
+    (0..=MAX_MONEY).contains(&value)
 }

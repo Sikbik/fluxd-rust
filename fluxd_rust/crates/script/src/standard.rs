@@ -43,10 +43,7 @@ fn is_p2pkh(script: &[u8]) -> bool {
 }
 
 fn is_p2sh(script: &[u8]) -> bool {
-    script.len() == 23
-        && script[0] == OP_HASH160
-        && script[1] == 0x14
-        && script[22] == OP_EQUAL
+    script.len() == 23 && script[0] == OP_HASH160 && script[1] == 0x14 && script[22] == OP_EQUAL
 }
 
 fn is_p2wpkh(script: &[u8]) -> bool {
@@ -67,4 +64,3 @@ fn is_p2pk(script: &[u8]) -> bool {
     let expected_len = key_len as usize + 2;
     script.len() == expected_len && script[script.len() - 1] == OP_CHECKSIG
 }
-

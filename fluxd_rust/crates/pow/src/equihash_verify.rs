@@ -11,7 +11,11 @@ struct Params {
 impl Params {
     fn new(n: u32, k: u32) -> Option<Self> {
         let allow_non_octet = n == 125 && k == 4;
-        if (n % 8 == 0 || allow_non_octet) && (k >= 3) && (k < n) && (n % (k + 1) == 0) {
+        if (n.is_multiple_of(8) || allow_non_octet)
+            && (k >= 3)
+            && (k < n)
+            && n.is_multiple_of(k + 1)
+        {
             Some(Self { n, k })
         } else {
             None
@@ -23,7 +27,7 @@ impl Params {
     }
 
     fn hash_output(&self) -> u8 {
-        let byte_len = (self.n + 7) / 8;
+        let byte_len = self.n.div_ceil(8);
         (self.indices_per_hash_output() * byte_len) as u8
     }
 
@@ -36,7 +40,7 @@ impl Params {
     }
 
     fn collision_byte_length(&self) -> usize {
-        (self.collision_bit_length() + 7) / 8
+        self.collision_bit_length().div_ceil(8)
     }
 }
 
@@ -49,7 +53,7 @@ struct Node {
 impl Node {
     fn new(p: &Params, state: &Blake2bState, i: u32) -> Self {
         let hash = generate_hash(state, i / p.indices_per_hash_output(), p);
-        let byte_len = (p.n + 7) / 8;
+        let byte_len = p.n.div_ceil(8);
         let start = (i % p.indices_per_hash_output()) * byte_len;
         let end = start + byte_len;
         Self {
@@ -159,10 +163,10 @@ fn generate_hash(base_state: &Blake2bState, i: u32, params: &Params) -> Vec<u8> 
         state.update(&lei);
         let hash = state.finalize();
         let bytes = hash.as_bytes();
-        for idx in 0..16 {
+        for (idx, word_acc) in my_hash.iter_mut().enumerate() {
             let offset = idx * 4;
             let word = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("hash word"));
-            my_hash[idx] = my_hash[idx].wrapping_add(word);
+            *word_acc = word_acc.wrapping_add(word);
         }
     }
 
@@ -246,7 +250,7 @@ pub fn is_valid_solution(
 }
 
 fn expand_array(vin: &[u8], bit_len: usize, byte_pad: usize) -> Vec<u8> {
-    let out_width = (bit_len + 7) / 8 + byte_pad;
+    let out_width = bit_len.div_ceil(8) + byte_pad;
     let out_len = 8 * out_width * vin.len() / bit_len;
 
     if out_len == vin.len() {
@@ -267,11 +271,9 @@ fn expand_array(vin: &[u8], bit_len: usize, byte_pad: usize) -> Vec<u8> {
         if acc_bits >= bit_len {
             acc_bits -= bit_len;
             for x in byte_pad..out_width {
-                vout[j + x] = ((
-                    acc_value >> (acc_bits + (8 * (out_width - x - 1)))
-                ) & (
-                    (bit_len_mask >> (8 * (out_width - x - 1))) & 0xFF
-                )) as u8;
+                vout[j + x] = ((acc_value >> (acc_bits + (8 * (out_width - x - 1))))
+                    & ((bit_len_mask >> (8 * (out_width - x - 1))) & 0xFF))
+                    as u8;
             }
             j += out_width;
         }
@@ -293,7 +295,7 @@ fn indices_from_minimal(p: Params, minimal: &[u8]) -> Option<Vec<u32>> {
     }
 
     let len_indices = u32::BITS as usize * minimal.len() / (c_bit_len + 1);
-    let byte_pad = std::mem::size_of::<u32>() - ((c_bit_len + 1) + 7) / 8;
+    let byte_pad = std::mem::size_of::<u32>() - (c_bit_len + 1).div_ceil(8);
 
     let mut csr = Cursor::new(expand_array(minimal, c_bit_len + 1, byte_pad));
     let mut ret = Vec::with_capacity(len_indices);

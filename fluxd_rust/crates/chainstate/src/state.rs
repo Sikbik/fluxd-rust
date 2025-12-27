@@ -6,15 +6,15 @@ use fluxd_consensus::constants::{
     max_reorg_depth, COINBASE_MATURITY, MIN_BLOCK_VERSION, MIN_PON_BLOCK_VERSION,
 };
 use fluxd_consensus::money::MAX_MONEY;
+use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
 use fluxd_consensus::{
     block_subsidy, exchange_fund_amount, foundation_fund_amount, is_swap_pool_interval,
     min_dev_fund_amount, swap_pool_amount, ChainParams, ConsensusParams, Hash256,
 };
-use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
 use fluxd_fluxnode::cache::{apply_fluxnode_tx, lookup_operator_pubkey};
 use fluxd_fluxnode::storage::{FluxnodeRecord, KeyId};
-use fluxd_primitives::block::Block;
 use fluxd_primitives::address_to_script_pubkey;
+use fluxd_primitives::block::Block;
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
     FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
@@ -25,10 +25,8 @@ use rayon::prelude::*;
 
 use crate::address_index::AddressIndex;
 use crate::anchors::{AnchorSet, NullifierSet};
-use crate::flatfiles::{FlatFileError, FlatFileStore, FileLocation};
-use crate::index::{
-    status_with_block, status_with_header, ChainIndex, ChainTip, HeaderEntry,
-};
+use crate::flatfiles::{FileLocation, FlatFileError, FlatFileStore};
+use crate::index::{status_with_block, status_with_header, ChainIndex, ChainTip, HeaderEntry};
 use crate::metrics::ConnectMetrics;
 use crate::shielded::{
     empty_sapling_tree, empty_sprout_tree, sapling_empty_root_hash, sapling_node_from_hash,
@@ -36,13 +34,13 @@ use crate::shielded::{
     sprout_root_hash, sprout_tree_from_bytes, sprout_tree_to_bytes, SaplingTree, SproutTree,
 };
 use crate::txindex::{TxIndex, TxLocation};
-use crate::utxo::{outpoint_key, UtxoEntry, UtxoSet};
 use crate::undo::{BlockUndo, FluxnodeUndo, SpentOutput};
+use crate::utxo::{outpoint_key, UtxoEntry, UtxoSet};
 use crate::validation::{validate_block, ValidationError, ValidationFlags};
+use fluxd_pon::validation as pon_validation;
 use fluxd_pow::difficulty::{block_proof, HeaderInfo};
 use fluxd_pow::validation as pow_validation;
 use fluxd_script::interpreter::{verify_script, BLOCK_SCRIPT_VERIFY_FLAGS};
-use fluxd_pon::validation as pon_validation;
 
 struct ScriptCheck {
     tx_index: usize,
@@ -140,11 +138,9 @@ impl HeaderCache {
     }
 
     fn insert(&mut self, hash: Hash256, entry: HeaderEntry) {
-        if self.entries.contains_key(&hash) {
-            self.entries.insert(hash, entry);
+        if self.entries.insert(hash, entry).is_some() {
             return;
         }
-        self.entries.insert(hash, entry);
         self.order.push_back(hash);
         if self.entries.len() > self.capacity {
             while let Some(evicted) = self.order.pop_front() {
@@ -181,9 +177,7 @@ impl DifficultyWindow {
         pending: Option<&HashMap<Hash256, HeaderEntry>>,
     ) -> Option<Self> {
         let lwma_window = params.zawy_lwma_averaging_window.saturating_add(1);
-        let window_len = params
-            .digishield_averaging_window
-            .max(lwma_window) as usize;
+        let window_len = params.digishield_averaging_window.max(lwma_window) as usize;
         if window_len == 0 {
             return None;
         }
@@ -320,10 +314,12 @@ impl<S: KeyValueStore> ChainState<S> {
         batch: &mut WriteBatch,
     ) -> Result<HeaderEntry, ChainStateError> {
         let mut pending = HashMap::new();
-        let mut best = self
-            .index
-            .best_header()?
-            .map(|tip| (tip.hash, primitive_types::U256::from_big_endian(&tip.chainwork)));
+        let mut best = self.index.best_header()?.map(|tip| {
+            (
+                tip.hash,
+                primitive_types::U256::from_big_endian(&tip.chainwork),
+            )
+        });
         let mut difficulty_window = None;
         self.insert_header_with_pending(
             header,
@@ -353,14 +349,15 @@ impl<S: KeyValueStore> ChainState<S> {
         check_pow: bool,
     ) -> Result<Vec<(Hash256, HeaderEntry)>, ChainStateError> {
         let mut pending = HashMap::new();
-        let mut best = self
-            .index
-            .best_header()?
-            .map(|tip| (tip.hash, primitive_types::U256::from_big_endian(&tip.chainwork)));
+        let mut best = self.index.best_header()?.map(|tip| {
+            (
+                tip.hash,
+                primitive_types::U256::from_big_endian(&tip.chainwork),
+            )
+        });
         let mut difficulty_window = headers
             .first()
-            .map(|header| DifficultyWindow::bootstrap(self, header.prev_block, params, None))
-            .flatten();
+            .and_then(|header| DifficultyWindow::bootstrap(self, header.prev_block, params, None));
         let mut results = Vec::with_capacity(headers.len());
         for header in headers {
             let entry = self.insert_header_with_pending(
@@ -389,9 +386,9 @@ impl<S: KeyValueStore> ChainState<S> {
             return Ok(Vec::new());
         }
         if cache.difficulty_window.is_none() {
-            cache.difficulty_window = headers
-                .first()
-                .and_then(|header| DifficultyWindow::bootstrap(self, header.prev_block, params, Some(pending)));
+            cache.difficulty_window = headers.first().and_then(|header| {
+                DifficultyWindow::bootstrap(self, header.prev_block, params, Some(pending))
+            });
         }
         if cache.mtp_window.is_none() {
             cache.mtp_window = headers
@@ -413,6 +410,7 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(results)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_header_with_pending(
         &self,
         header: &fluxd_primitives::block::BlockHeader,
@@ -428,6 +426,11 @@ impl<S: KeyValueStore> ChainState<S> {
             return Ok(existing.clone());
         }
         if let Some(existing) = self.index.get_header(&hash)? {
+            batch.put(
+                Column::BlockHeader,
+                hash.to_vec(),
+                header.consensus_encode(),
+            );
             if header.is_pon() {
                 let prev_hash = header.prev_block;
                 let is_genesis = prev_hash == [0u8; 32] && hash == params.hash_genesis_block;
@@ -491,11 +494,13 @@ impl<S: KeyValueStore> ChainState<S> {
             None => (0, primitive_types::U256::zero()),
         };
 
-        if let Some(checkpoint) = params.checkpoints.iter().find(|checkpoint| checkpoint.height == height) {
+        if let Some(checkpoint) = params
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.height == height)
+        {
             if checkpoint.hash != hash {
-                return Err(ChainStateError::InvalidHeader(
-                    "checkpoint mismatch",
-                ));
+                return Err(ChainStateError::InvalidHeader("checkpoint mismatch"));
             }
         }
 
@@ -569,9 +574,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 let mtp_headers = collect_headers(self, &prev_hash, 11, Some(pending))?;
                 let mtp = median_time_past(&mtp_headers);
                 if header.time as i64 <= mtp {
-                    return Err(ChainStateError::InvalidHeader(
-                        "block timestamp too early",
-                    ));
+                    return Err(ChainStateError::InvalidHeader("block timestamp too early"));
                 }
             }
         }
@@ -604,9 +607,7 @@ impl<S: KeyValueStore> ChainState<S> {
                     "unexpected difficulty bits at height {}: expected {:#x}, got {:#x}",
                     height, expected_bits, header.bits
                 );
-                return Err(ChainStateError::InvalidHeader(
-                    "unexpected difficulty bits",
-                ));
+                return Err(ChainStateError::InvalidHeader("unexpected difficulty bits"));
             }
         }
 
@@ -637,6 +638,11 @@ impl<S: KeyValueStore> ChainState<S> {
         };
 
         self.index.put_header(batch, &hash, &entry);
+        batch.put(
+            Column::BlockHeader,
+            hash.to_vec(),
+            header.consensus_encode(),
+        );
         pending.insert(hash, entry.clone());
         if let Ok(mut cache) = self.header_cache.lock() {
             cache.insert(hash, entry.clone());
@@ -771,14 +777,13 @@ impl<S: KeyValueStore> ChainState<S> {
                     Some(window) if window.tip_hash == prev_hash => window.median_time_past(),
                     _ => {
                         *mtp_window = None;
-                        let mtp_headers = collect_headers(self, &prev_hash, MTP_WINDOW_SIZE, Some(pending))?;
+                        let mtp_headers =
+                            collect_headers(self, &prev_hash, MTP_WINDOW_SIZE, Some(pending))?;
                         median_time_past(&mtp_headers)
                     }
                 };
                 if header.time as i64 <= mtp {
-                    return Err(ChainStateError::InvalidHeader(
-                        "block timestamp too early",
-                    ));
+                    return Err(ChainStateError::InvalidHeader("block timestamp too early"));
                 }
             }
         }
@@ -811,9 +816,7 @@ impl<S: KeyValueStore> ChainState<S> {
                     "unexpected difficulty bits at height {}: expected {:#x}, got {:#x}",
                     height, expected_bits, header.bits
                 );
-                return Err(ChainStateError::InvalidHeader(
-                    "unexpected difficulty bits",
-                ));
+                return Err(ChainStateError::InvalidHeader("unexpected difficulty bits"));
             }
         }
 
@@ -885,9 +888,7 @@ impl<S: KeyValueStore> ChainState<S> {
 
         // LWMA/LWMA3 require the previous block (height - N) for the first solvetime.
         let lwma_window = params.zawy_lwma_averaging_window.saturating_add(1);
-        let window = params
-            .digishield_averaging_window
-            .max(lwma_window) as usize;
+        let window = params.digishield_averaging_window.max(lwma_window) as usize;
         let chain = collect_headers(self, prev_hash, window, pending)?;
         fluxd_pow::difficulty::get_next_work_required(&chain, Some(next_time), params)
             .map_err(|_| ChainStateError::InvalidHeader("difficulty calculation failed"))
@@ -926,11 +927,13 @@ impl<S: KeyValueStore> ChainState<S> {
         if !prevalidated {
             validate_block(block, height, consensus, flags)?;
         }
-        if block.header.is_pon() && network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Pon) {
-            let operator_pubkey = lookup_operator_pubkey(&self.store, &block.header.nodes_collateral)?
-                .ok_or(ChainStateError::InvalidHeader(
-                    "missing fluxnode entry for pon signature",
-                ))?;
+        if block.header.is_pon()
+            && network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Pon)
+        {
+            let operator_pubkey =
+                lookup_operator_pubkey(&self.store, &block.header.nodes_collateral)?.ok_or(
+                    ChainStateError::InvalidHeader("missing fluxnode entry for pon signature"),
+                )?;
             pon_validation::validate_pon_signature(&block.header, consensus, &operator_pubkey)?;
         }
         check_coinbase_funding(&block.transactions[0], height, params)?;
@@ -957,7 +960,8 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut utxo_cache: HashMap<Vec<u8>, Option<UtxoEntry>> = HashMap::new();
         let mut block_script_checks: Vec<ScriptCheck> = Vec::new();
         let branch_id = current_epoch_branch_id(height, &consensus.upgrades);
-        let flux_rebrand_active = network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Flux);
+        let flux_rebrand_active =
+            network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Flux);
         let mut total_fees = 0i64;
         for (index, tx) in block.transactions.iter().enumerate() {
             let is_coinbase = index == 0;
@@ -1011,9 +1015,7 @@ impl<S: KeyValueStore> ChainState<S> {
             for spend in &tx.shielded_spends {
                 if !seen_sapling_nullifiers.insert(spend.nullifier) {
                     return Err(ChainStateError::Validation(
-                        ValidationError::InvalidTransaction(
-                            "duplicate sapling nullifier in block",
-                        ),
+                        ValidationError::InvalidTransaction("duplicate sapling nullifier in block"),
                     ));
                 }
                 if self.nullifiers_sapling.contains(&spend.nullifier)? {
@@ -1050,9 +1052,9 @@ impl<S: KeyValueStore> ChainState<S> {
                             let entry = self.utxos.get(&input.prevout)?;
                             utxo_time += utxo_start.elapsed();
                             match entry {
-                            Some(entry) => entry,
-                            None => {
-                                eprintln!(
+                                Some(entry) => entry,
+                                None => {
+                                    eprintln!(
                                     "missing input for tx {} input {} prevout {}:{} at height {}",
                                     hash256_to_hex(&txid),
                                     input_index,
@@ -1060,8 +1062,8 @@ impl<S: KeyValueStore> ChainState<S> {
                                     input.prevout.index,
                                     height
                                 );
-                                return Err(ChainStateError::MissingInput);
-                            }
+                                    return Err(ChainStateError::MissingInput);
+                                }
                             }
                         }
                     };
@@ -1073,9 +1075,7 @@ impl<S: KeyValueStore> ChainState<S> {
                         let spend_height = height as i64 - entry.height as i64;
                         if spend_height < COINBASE_MATURITY as i64 {
                             return Err(ChainStateError::Validation(
-                                ValidationError::InvalidTransaction(
-                                    "premature spend of coinbase",
-                                ),
+                                ValidationError::InvalidTransaction("premature spend of coinbase"),
                             ));
                         }
                         if consensus.coinbase_must_be_protected
@@ -1154,11 +1154,10 @@ impl<S: KeyValueStore> ChainState<S> {
                     }
                 }
                 for output in &tx.shielded_outputs {
-                    let node = sapling_node_from_hash(&output.cm).ok_or_else(|| {
-                        ChainStateError::Validation(ValidationError::InvalidTransaction(
-                            "sapling note commitment invalid",
-                        ))
-                    })?;
+                    let node =
+                        sapling_node_from_hash(&output.cm).ok_or(ChainStateError::Validation(
+                            ValidationError::InvalidTransaction("sapling note commitment invalid"),
+                        ))?;
                     sapling_tree.append(node).map_err(|_| {
                         ChainStateError::Validation(ValidationError::InvalidTransaction(
                             "sapling tree append failed",
@@ -1267,10 +1266,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    eprintln!(
-                        "failed to read previous block logical timestamp: {}",
-                        err
-                    );
+                    eprintln!("failed to read previous block logical timestamp: {}", err);
                 }
             }
         }
@@ -1358,13 +1354,11 @@ impl<S: KeyValueStore> ChainState<S> {
             .block_location(hash)?
             .ok_or(ChainStateError::CorruptIndex("missing block index entry"))?;
         let bytes = self.read_block(location)?;
-        let block =
-            Block::consensus_decode(&bytes).map_err(|_| ChainStateError::CorruptIndex("invalid block bytes"))?;
-        let mut undo = self
-            .block_undo(hash)?
-            .ok_or(ChainStateError::CorruptIndex(
-                "missing block undo entry; resync required",
-            ))?;
+        let block = Block::consensus_decode(&bytes)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid block bytes"))?;
+        let mut undo = self.block_undo(hash)?.ok_or(ChainStateError::CorruptIndex(
+            "missing block undo entry; resync required",
+        ))?;
 
         let mut batch = WriteBatch::new();
 
@@ -1394,9 +1388,10 @@ impl<S: KeyValueStore> ChainState<S> {
 
             if tx_index != 0 {
                 for input in tx.vin.iter().rev() {
-                    let spent = undo.spent.pop().ok_or(ChainStateError::CorruptIndex(
-                        "block undo input mismatch",
-                    ))?;
+                    let spent = undo
+                        .spent
+                        .pop()
+                        .ok_or(ChainStateError::CorruptIndex("block undo input mismatch"))?;
                     if spent.outpoint != input.prevout {
                         return Err(ChainStateError::CorruptIndex(
                             "block undo outpoint mismatch",
@@ -1462,14 +1457,16 @@ impl<S: KeyValueStore> ChainState<S> {
         let prev_sprout_root = sprout_root_hash(&prev_sprout_tree);
         let prev_sapling_root = sapling_root_hash(&prev_sapling_tree);
 
-        self.anchors_sprout
-            .remove(&mut batch, &current_sprout_root);
+        self.anchors_sprout.remove(&mut batch, &current_sprout_root);
         self.anchors_sapling
             .remove(&mut batch, &current_sapling_root);
         self.anchors_sprout
             .insert(&mut batch, &prev_sprout_root, undo.prev_sprout_tree.clone());
-        self.anchors_sapling
-            .insert(&mut batch, &prev_sapling_root, undo.prev_sapling_tree.clone());
+        self.anchors_sapling.insert(
+            &mut batch,
+            &prev_sapling_root,
+            undo.prev_sapling_tree.clone(),
+        );
         batch.put(Column::Meta, SPROUT_TREE_KEY, undo.prev_sprout_tree);
         batch.put(Column::Meta, SAPLING_TREE_KEY, undo.prev_sapling_tree);
 
@@ -1550,11 +1547,7 @@ impl<S: KeyValueStore> ChainState<S> {
             .map_err(|_| ChainStateError::CorruptIndex("invalid block undo entry"))
     }
 
-    fn prune_block_undo(
-        &self,
-        height: i32,
-        batch: &mut WriteBatch,
-    ) -> Result<(), ChainStateError> {
+    fn prune_block_undo(&self, height: i32, batch: &mut WriteBatch) -> Result<(), ChainStateError> {
         if height < 0 {
             return Ok(());
         }
@@ -1598,7 +1591,10 @@ impl<S: KeyValueStore> ChainState<S> {
     }
 
     pub fn utxo_exists(&self, outpoint: &OutPoint) -> Result<bool, ChainStateError> {
-        Ok(self.store.get(Column::Utxo, &outpoint_key(outpoint))?.is_some())
+        Ok(self
+            .store
+            .get(Column::Utxo, &outpoint_key(outpoint))?
+            .is_some())
     }
 
     pub fn utxo_entry(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, ChainStateError> {
@@ -1620,7 +1616,10 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(self.store.get(Column::FluxnodeKey, &key.0)?)
     }
 
-    fn sprout_anchor_tree(&self, anchor: &fluxd_consensus::Hash256) -> Result<Option<SproutTree>, ChainStateError> {
+    fn sprout_anchor_tree(
+        &self,
+        anchor: &fluxd_consensus::Hash256,
+    ) -> Result<Option<SproutTree>, ChainStateError> {
         if *anchor == sprout_empty_root_hash() {
             return Ok(Some(empty_sprout_tree()));
         }
@@ -1697,7 +1696,7 @@ fn fluxnode_undo_entry<S: KeyValueStore>(
 }
 
 fn money_range(value: i64) -> bool {
-    value >= 0 && value <= MAX_MONEY
+    (0..=MAX_MONEY).contains(&value)
 }
 
 fn tx_value_out(tx: &Transaction) -> Result<i64, ChainStateError> {
@@ -1939,8 +1938,8 @@ fn check_coinbase_funding(
 
     let exchange_amount = exchange_fund_amount(height, &params.funding);
     if exchange_amount > 0 {
-        let exchange_script =
-            address_to_script_pubkey(params.funding.exchange_address, network).map_err(|_| {
+        let exchange_script = address_to_script_pubkey(params.funding.exchange_address, network)
+            .map_err(|_| {
                 ChainStateError::Validation(ValidationError::InvalidTransaction(
                     "invalid exchange address",
                 ))
@@ -1977,11 +1976,12 @@ fn check_coinbase_funding(
 
     if is_swap_pool_interval(height as i64, &params.swap_pool) {
         let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
-        let swap_script = address_to_script_pubkey(params.swap_pool.address, network).map_err(|_| {
-            ChainStateError::Validation(ValidationError::InvalidTransaction(
-                "invalid swap pool address",
-            ))
-        })?;
+        let swap_script =
+            address_to_script_pubkey(params.swap_pool.address, network).map_err(|_| {
+                ChainStateError::Validation(ValidationError::InvalidTransaction(
+                    "invalid swap pool address",
+                ))
+            })?;
         let found = tx
             .vout
             .iter()
@@ -2076,9 +2076,16 @@ mod tests {
 
         let mut header_batch = WriteBatch::new();
         chainstate
-            .insert_headers_batch_with_pow(&[header.clone()], &params.consensus, &mut header_batch, false)
+            .insert_headers_batch_with_pow(
+                std::slice::from_ref(&header),
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
             .expect("insert header");
-        chainstate.commit_batch(header_batch).expect("commit header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
 
         let coinbase = make_tx(
             vec![TxIn {
@@ -2103,7 +2110,10 @@ mod tests {
             }],
         );
         let tx1id = tx1.txid().expect("txid1");
-        let outpoint1 = OutPoint { hash: tx1id, index: 0 };
+        let outpoint1 = OutPoint {
+            hash: tx1id,
+            index: 0,
+        };
 
         let tx2 = make_tx(
             vec![TxIn {
@@ -2117,7 +2127,10 @@ mod tests {
             }],
         );
         let tx2id = tx2.txid().expect("txid2");
-        let outpoint2 = OutPoint { hash: tx2id, index: 0 };
+        let outpoint2 = OutPoint {
+            hash: tx2id,
+            index: 0,
+        };
 
         let block = Block {
             header,
@@ -2130,20 +2143,73 @@ mod tests {
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit connect");
 
-        assert!(!chainstate.utxo_exists(&seed_outpoint).expect("seed utxo exists"));
+        assert!(!chainstate
+            .utxo_exists(&seed_outpoint)
+            .expect("seed utxo exists"));
         assert!(!chainstate.utxo_exists(&outpoint1).expect("tx1 utxo exists"));
         assert!(chainstate.utxo_exists(&outpoint2).expect("tx2 utxo exists"));
 
-        let batch = chainstate.disconnect_block(&block_hash).expect("disconnect");
+        let batch = chainstate
+            .disconnect_block(&block_hash)
+            .expect("disconnect");
         chainstate.commit_batch(batch).expect("commit disconnect");
 
-        assert!(chainstate.utxo_exists(&seed_outpoint).expect("seed utxo restored"));
-        assert!(!chainstate.utxo_exists(&outpoint1).expect("tx1 output removed"));
-        assert!(!chainstate.utxo_exists(&outpoint2).expect("tx2 output removed"));
+        assert!(chainstate
+            .utxo_exists(&seed_outpoint)
+            .expect("seed utxo restored"));
+        assert!(!chainstate
+            .utxo_exists(&outpoint1)
+            .expect("tx1 output removed"));
+        assert!(!chainstate
+            .utxo_exists(&outpoint2)
+            .expect("tx2 output removed"));
 
         assert!(chainstate
             .tx_location(&tx1id)
             .expect("tx location query")
             .is_none());
+    }
+
+    #[test]
+    fn insert_headers_persists_header_bytes() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let mut params = chain_params(Network::Regtest);
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: [0u8; 32],
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: current_time_secs() as u32,
+            bits: block_bits_from_params(&params.consensus),
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let hash = header.hash();
+        params.consensus.hash_genesis_block = hash;
+        params.consensus.checkpoints =
+            vec![fluxd_consensus::params::Checkpoint { height: 0, hash }];
+
+        let mut batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                std::slice::from_ref(&header),
+                &params.consensus,
+                &mut batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate.commit_batch(batch).expect("commit header");
+
+        let stored = chainstate
+            .block_header_bytes(&hash)
+            .expect("load header bytes")
+            .expect("header bytes missing");
+        assert_eq!(stored, header.consensus_encode());
     }
 }

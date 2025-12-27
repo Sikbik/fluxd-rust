@@ -151,10 +151,8 @@ pub fn verify_script(
         }
     }
 
-    if (flags & SCRIPT_VERIFY_CLEANSTACK) != 0 {
-        if stack.len() != 1 || !cast_to_bool(&stack[0]) {
-            return Err(ScriptError::EvalFalse);
-        }
+    if (flags & SCRIPT_VERIFY_CLEANSTACK) != 0 && (stack.len() != 1 || !cast_to_bool(&stack[0])) {
+        return Err(ScriptError::EvalFalse);
     }
 
     Ok(())
@@ -169,7 +167,12 @@ struct SignatureChecker<'a> {
 }
 
 impl<'a> SignatureChecker<'a> {
-    fn check_sig(&self, sig_bytes: &[u8], pubkey_bytes: &[u8], script_code: &[u8]) -> Result<bool, ScriptError> {
+    fn check_sig(
+        &self,
+        sig_bytes: &[u8],
+        pubkey_bytes: &[u8],
+        script_code: &[u8],
+    ) -> Result<bool, ScriptError> {
         if sig_bytes.is_empty() {
             return Ok(false);
         }
@@ -206,7 +209,8 @@ impl<'a> SignatureChecker<'a> {
             return Err(ScriptError::PubkeyEncoding);
         }
 
-        let pubkey = PublicKey::from_slice(pubkey_bytes).map_err(|_| ScriptError::PubkeyEncoding)?;
+        let pubkey =
+            PublicKey::from_slice(pubkey_bytes).map_err(|_| ScriptError::PubkeyEncoding)?;
         let sighash = match signature_hash(
             self.tx,
             Some(self.input_index),
@@ -214,8 +218,7 @@ impl<'a> SignatureChecker<'a> {
             self.amount,
             SighashType(sighash_type),
             self.consensus_branch_id,
-        )
-        {
+        ) {
             Ok(hash) => hash,
             Err(_) => return Ok(false),
         };
@@ -484,7 +487,7 @@ fn eval_script(
                     continue;
                 }
                 let n = decode_script_num(&pop(stack)?)? as i64;
-                if n < 0 || n > 20 {
+                if !(0..=20).contains(&n) {
                     return Err(ScriptError::InvalidOpcode);
                 }
                 let mut pubkeys = Vec::with_capacity(n as usize);
@@ -591,9 +594,15 @@ fn is_push_only(script: &[u8]) -> bool {
         cursor += 1;
         let len = match opcode {
             0x01..=0x4b => opcode as usize,
-            OP_PUSHDATA1 => read_u8(script, &mut cursor).map(|v| v as usize).unwrap_or(usize::MAX),
-            OP_PUSHDATA2 => read_u16(script, &mut cursor).map(|v| v as usize).unwrap_or(usize::MAX),
-            OP_PUSHDATA4 => read_u32(script, &mut cursor).map(|v| v as usize).unwrap_or(usize::MAX),
+            OP_PUSHDATA1 => read_u8(script, &mut cursor)
+                .map(|v| v as usize)
+                .unwrap_or(usize::MAX),
+            OP_PUSHDATA2 => read_u16(script, &mut cursor)
+                .map(|v| v as usize)
+                .unwrap_or(usize::MAX),
+            OP_PUSHDATA4 => read_u32(script, &mut cursor)
+                .map(|v| v as usize)
+                .unwrap_or(usize::MAX),
             OP_0 | OP_1NEGATE | OP_1..=OP_16 => 0,
             _ => return false,
         };
@@ -659,7 +668,7 @@ fn script_num_to_vec(value: i64) -> Vec<u8> {
     if value == 0 {
         return Vec::new();
     }
-    let mut abs = value.abs() as u64;
+    let mut abs = value.unsigned_abs();
     let mut result = Vec::new();
     while abs > 0 {
         result.push((abs & 0xff) as u8);

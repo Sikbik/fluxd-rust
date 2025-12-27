@@ -23,8 +23,12 @@ impl std::fmt::Display for EquihashError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EquihashError::MissingSolution => write!(f, "missing equihash solution"),
-            EquihashError::UnsupportedSolutionSize => write!(f, "unsupported equihash solution size"),
-            EquihashError::DisallowedParameters => write!(f, "equihash parameters not allowed for height"),
+            EquihashError::UnsupportedSolutionSize => {
+                write!(f, "unsupported equihash solution size")
+            }
+            EquihashError::DisallowedParameters => {
+                write!(f, "equihash parameters not allowed for height")
+            }
             EquihashError::InvalidSolution => write!(f, "invalid equihash solution"),
         }
     }
@@ -44,7 +48,7 @@ pub fn validate_equihash_solution(
     let solution_params = params_from_solution_size(header.solution.len())
         .ok_or(EquihashError::UnsupportedSolutionSize)?;
     let allowed = allowed_params_for_height(height, params);
-    if !allowed.iter().any(|candidate| *candidate == solution_params) {
+    if !allowed.contains(&solution_params) {
         return Err(EquihashError::DisallowedParameters);
     }
 
@@ -190,9 +194,7 @@ fn maybe_dump_equihash_failure(
     let _ = writeln!(
         file,
         "  params: n={} k={} solution_size={}",
-        params.n,
-        params.k,
-        params.solution_size
+        params.n, params.k, params.solution_size
     );
     let _ = writeln!(file, "  input: {}", bytes_to_hex(input));
     let _ = writeln!(file, "  solution_len: {}", solution.len());

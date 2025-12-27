@@ -55,11 +55,17 @@ impl<S: KeyValueStore> ChainIndex<S> {
             Some(bytes) => bytes,
             None => return Ok(None),
         };
-        decode_header_entry(&bytes).map(Some).map_err(StoreError::Backend)
+        decode_header_entry(&bytes)
+            .map(Some)
+            .map_err(StoreError::Backend)
     }
 
     pub fn put_header(&self, batch: &mut WriteBatch, hash: &Hash256, entry: &HeaderEntry) {
-        batch.put(Column::HeaderIndex, hash.to_vec(), encode_header_entry(entry));
+        batch.put(
+            Column::HeaderIndex,
+            hash.to_vec(),
+            encode_header_entry(entry),
+        );
     }
 
     pub fn set_best_header(&self, batch: &mut WriteBatch, hash: &Hash256) {
@@ -154,9 +160,7 @@ fn decode_header_entry(bytes: &[u8]) -> Result<HeaderEntry, String> {
     let height = decoder.read_i32_le().map_err(|err| err.to_string())?;
     let time = decoder.read_u32_le().map_err(|err| err.to_string())?;
     let bits = decoder.read_u32_le().map_err(|err| err.to_string())?;
-    let chainwork = decoder
-        .read_fixed::<32>()
-        .map_err(|err| err.to_string())?;
+    let chainwork = decoder.read_fixed::<32>().map_err(|err| err.to_string())?;
     let status = decoder.read_u8().map_err(|err| err.to_string())?;
     if !decoder.is_empty() {
         return Err("trailing bytes in header entry".to_string());

@@ -1,6 +1,6 @@
 //! Proof-of-work and Equihash verification.
 
 pub mod difficulty;
-mod equihash_verify;
 pub mod equihash;
+mod equihash_verify;
 pub mod validation;

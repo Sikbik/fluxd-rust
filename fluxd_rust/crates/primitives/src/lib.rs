@@ -1,7 +1,7 @@
 //! Core block/transaction types and consensus serialization.
 
-pub mod block;
 pub mod address;
+pub mod block;
 pub mod encoding;
 pub mod hash;
 pub mod outpoint;
@@ -12,6 +12,6 @@ pub use block::{Block, BlockHeader};
 pub use hash::{sha256, sha256d};
 pub use outpoint::OutPoint;
 pub use transaction::{
-    JoinSplit, OutputDescription, SpendDescription, SproutProof, Transaction, TransactionDecodeError,
-    TransactionEncodeError, TxIn, TxOut,
+    JoinSplit, OutputDescription, SpendDescription, SproutProof, Transaction,
+    TransactionDecodeError, TransactionEncodeError, TxIn, TxOut,
 };

@@ -75,7 +75,7 @@ fn serialize_block_header_pon() {
 
     let encoded = header.consensus_encode();
     let mut expected = Vec::new();
-    expected.extend_from_slice(&(PON_VERSION as i32).to_le_bytes());
+    expected.extend_from_slice(&PON_VERSION.to_le_bytes());
     push_hash_le(&mut expected, 0x00);
     push_hash_le(&mut expected, 0x20);
     push_hash_le(&mut expected, 0x40);

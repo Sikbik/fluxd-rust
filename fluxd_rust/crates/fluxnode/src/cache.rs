@@ -106,11 +106,7 @@ fn store_fluxnode_start(
         p2sh_script: p2sh_key,
     };
 
-    batch.put(
-        Column::Fluxnode,
-        outpoint_key(collateral),
-        record.encode(),
-    );
+    batch.put(Column::Fluxnode, outpoint_key(collateral), record.encode());
     Ok(())
 }
 
@@ -124,11 +120,7 @@ fn update_fluxnode_confirm<S: KeyValueStore>(
         return Ok(());
     };
     record.last_confirmed_height = height;
-    batch.put(
-        Column::Fluxnode,
-        outpoint_key(collateral),
-        record.encode(),
-    );
+    batch.put(Column::Fluxnode, outpoint_key(collateral), record.encode());
     Ok(())
 }
 

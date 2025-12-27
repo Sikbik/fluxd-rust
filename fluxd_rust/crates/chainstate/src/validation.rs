@@ -15,20 +15,20 @@ use fluxd_consensus::params::ConsensusParams;
 use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
 use fluxd_consensus::Hash256;
 use fluxd_fluxnode::validation::{self as fluxnode_validation};
-use fluxd_pow::validation as pow_validation;
 use fluxd_pon::validation as pon_validation;
+use fluxd_pow::validation as pow_validation;
 use fluxd_primitives::block::Block;
 use fluxd_primitives::hash::sha256d;
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
-    has_flux_tx_delegates_feature, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, FluxnodeStartVariantV6,
+    has_flux_tx_delegates_feature, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6,
     Transaction, TransactionEncodeError, FLUXNODE_INTERNAL_NORMAL_TX_VERSION,
     FLUXNODE_INTERNAL_P2SH_TX_VERSION, FLUXNODE_TX_UPGRADEABLE_VERSION, FLUXNODE_TX_VERSION,
 };
 use fluxd_shielded::{verify_transaction, ShieldedError, ShieldedParams};
 use rayon::prelude::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ValidationFlags {
     pub check_pow: bool,
     pub check_pon: bool,
@@ -36,19 +36,6 @@ pub struct ValidationFlags {
     pub check_shielded: bool,
     pub shielded_params: Option<Arc<ShieldedParams>>,
     pub metrics: Option<Arc<ValidationMetrics>>,
-}
-
-impl Default for ValidationFlags {
-    fn default() -> Self {
-        Self {
-            check_pow: false,
-            check_pon: false,
-            check_script: false,
-            check_shielded: false,
-            shielded_params: None,
-            metrics: None,
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -188,9 +175,7 @@ pub fn validate_block(
     validate_header(block, height, params, flags)?;
     validate_merkle_root(block)?;
     if height > 20 && !coinbase_height_matches(&block.transactions[0], height) {
-        return Err(ValidationError::InvalidBlock(
-            "coinbase height mismatch",
-        ));
+        return Err(ValidationError::InvalidBlock("coinbase height mismatch"));
     }
 
     let branch_id = current_epoch_branch_id(height, &params.upgrades);
@@ -232,9 +217,7 @@ pub fn validate_block(
     }
     let sigops = block_sigops(block);
     if sigops > MAX_BLOCK_SIGOPS {
-        return Err(ValidationError::InvalidBlock(
-            "block sigops limit exceeded",
-        ));
+        return Err(ValidationError::InvalidBlock("block sigops limit exceeded"));
     }
 
     if flags.check_shielded && !shielded_txs.is_empty() {
@@ -243,17 +226,18 @@ pub fn validate_block(
                 "shielded parameters not loaded".to_string(),
             ))
         })?;
-        let shielded_result = shielded_txs.par_iter().try_for_each(|tx| {
-            let shielded_start = Instant::now();
-            verify_transaction(tx, branch_id, params).map_err(ValidationError::from)?;
-            if let Some(metrics) = flags.metrics.as_ref() {
-                metrics.record_shielded(shielded_start.elapsed());
-            }
-            Ok(())
-        });
-        if let Err(err) = shielded_result {
-            return Err(err);
-        }
+        let shielded_result =
+            shielded_txs
+                .par_iter()
+                .try_for_each(|tx| -> Result<(), ValidationError> {
+                    let shielded_start = Instant::now();
+                    verify_transaction(tx, branch_id, params).map_err(ValidationError::from)?;
+                    if let Some(metrics) = flags.metrics.as_ref() {
+                        metrics.record_shielded(shielded_start.elapsed());
+                    }
+                    Ok(())
+                });
+        shielded_result?;
     }
 
     if let Some(metrics) = flags.metrics.as_ref() {
@@ -270,14 +254,10 @@ fn validate_header(
 ) -> Result<(), ValidationError> {
     let pon_active = network_upgrade_active(height, &params.upgrades, UpgradeIndex::Pon);
     if block.header.version < MIN_BLOCK_VERSION {
-        return Err(ValidationError::InvalidHeader(
-            "block version too low",
-        ));
+        return Err(ValidationError::InvalidHeader("block version too low"));
     }
     if pon_active && block.header.version < MIN_PON_BLOCK_VERSION {
-        return Err(ValidationError::InvalidHeader(
-            "pon block version too low",
-        ));
+        return Err(ValidationError::InvalidHeader("pon block version too low"));
     }
     if pon_active && !block.header.is_pon() {
         return Err(ValidationError::InvalidHeader(
@@ -314,11 +294,7 @@ fn validate_header(
 }
 
 fn validate_merkle_root(block: &Block) -> Result<(), ValidationError> {
-    let txids: Result<Vec<Hash256>, _> = block
-        .transactions
-        .iter()
-        .map(|tx| tx.txid())
-        .collect();
+    let txids: Result<Vec<Hash256>, _> = block.transactions.iter().map(|tx| tx.txid()).collect();
     let (root, mutated) = merkle_root(&txids?);
     if mutated {
         return Err(ValidationError::DuplicateTransaction);
@@ -382,11 +358,7 @@ fn validate_transaction(
     }
 
     if is_fluxnode
-        && (!tx.vout.is_empty()
-            || has_joinsplit
-            || has_outputs
-            || !tx.vin.is_empty()
-            || has_spends)
+        && (!tx.vout.is_empty() || has_joinsplit || has_outputs || !tx.vin.is_empty() || has_spends)
     {
         return Err(ValidationError::InvalidTransaction(
             "fluxnode transaction must not contain regular inputs or outputs",
@@ -417,10 +389,14 @@ fn validate_transaction(
                 ));
             }
             if tx.f_overwintered && tx.version < SAPLING_MIN_TX_VERSION {
-                return Err(ValidationError::InvalidTransaction("sapling version too low"));
+                return Err(ValidationError::InvalidTransaction(
+                    "sapling version too low",
+                ));
             }
             if tx.f_overwintered && tx.version > SAPLING_MAX_TX_VERSION {
-                return Err(ValidationError::InvalidTransaction("sapling version too high"));
+                return Err(ValidationError::InvalidTransaction(
+                    "sapling version too high",
+                ));
             }
             if !tx.f_overwintered {
                 return Err(ValidationError::InvalidTransaction(
@@ -468,7 +444,7 @@ fn validate_transaction(
             ));
         }
         let script_len = tx.vin[0].script_sig.len();
-        if script_len < 2 || script_len > 100 {
+        if !(2..=100).contains(&script_len) {
             return Err(ValidationError::InvalidTransaction(
                 "coinbase scriptSig length out of range",
             ));
@@ -655,7 +631,7 @@ fn merkle_root(txids: &[Hash256]) -> (Hash256, bool) {
     let mut mutated = false;
     while layer.len() > 1 {
         let size = layer.len();
-        let mut next = Vec::with_capacity((size + 1) / 2);
+        let mut next = Vec::with_capacity(size.div_ceil(2));
         let mut i = 0usize;
         while i < size {
             let i2 = if i + 1 < size { i + 1 } else { i };
@@ -682,35 +658,6 @@ pub fn index_transactions(block: &Block) -> Result<HashMap<Hash256, usize>, Vali
     Ok(map)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::merkle_root;
-
-    fn hash(byte: u8) -> [u8; 32] {
-        [byte; 32]
-    }
-
-    #[test]
-    fn merkle_mutation_only_on_last_pair() {
-        let txids = vec![hash(1), hash(1), hash(2), hash(3)];
-        let (_, mutated) = merkle_root(&txids);
-        assert!(!mutated, "non-terminal duplicate should not mark mutation");
-    }
-
-    #[test]
-    fn merkle_mutation_detects_terminal_pair() {
-        let txids = vec![hash(1), hash(2), hash(3), hash(3)];
-        let (_, mutated) = merkle_root(&txids);
-        assert!(mutated, "terminal duplicate should mark mutation");
-    }
-
-    #[test]
-    fn merkle_mutation_ignores_odd_duplication() {
-        let txids = vec![hash(1), hash(2), hash(3)];
-        let (_, mutated) = merkle_root(&txids);
-        assert!(!mutated, "odd-length duplication should not mark mutation");
-    }
-}
 fn is_final_tx(tx: &Transaction, height: i32, block_time: i64) -> bool {
     const LOCKTIME_THRESHOLD: i64 = 500_000_000;
     if tx.lock_time == 0 {
@@ -759,7 +706,7 @@ fn script_num_to_vec(value: i64) -> Vec<u8> {
     if value == 0 {
         return Vec::new();
     }
-    let mut abs = value.abs() as u64;
+    let mut abs = value.unsigned_abs();
     let mut result = Vec::new();
     while abs > 0 {
         result.push((abs & 0xff) as u8);
@@ -801,7 +748,11 @@ fn block_sigops(block: &Block) -> u32 {
         .transactions
         .iter()
         .map(|tx| {
-            let input_ops: u32 = tx.vin.iter().map(|input| legacy_sigops(&input.script_sig)).sum();
+            let input_ops: u32 = tx
+                .vin
+                .iter()
+                .map(|input| legacy_sigops(&input.script_sig))
+                .sum();
             let output_ops: u32 = tx
                 .vout
                 .iter()
@@ -899,4 +850,34 @@ fn fluxnode_collateral_outpoint(tx: &Transaction) -> Option<(Hash256, u32)> {
         FluxnodeTx::V6(FluxnodeTxV6::Confirm(confirm)) => confirm.collateral.clone(),
     };
     Some((outpoint.hash, outpoint.index))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merkle_root;
+
+    fn hash(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    #[test]
+    fn merkle_mutation_only_on_last_pair() {
+        let txids = vec![hash(1), hash(1), hash(2), hash(3)];
+        let (_, mutated) = merkle_root(&txids);
+        assert!(!mutated, "non-terminal duplicate should not mark mutation");
+    }
+
+    #[test]
+    fn merkle_mutation_detects_terminal_pair() {
+        let txids = vec![hash(1), hash(2), hash(3), hash(3)];
+        let (_, mutated) = merkle_root(&txids);
+        assert!(mutated, "terminal duplicate should mark mutation");
+    }
+
+    #[test]
+    fn merkle_mutation_ignores_odd_duplication() {
+        let txids = vec![hash(1), hash(2), hash(3)];
+        let (_, mutated) = merkle_root(&txids);
+        assert!(!mutated, "odd-length duplication should not mark mutation");
+    }
 }

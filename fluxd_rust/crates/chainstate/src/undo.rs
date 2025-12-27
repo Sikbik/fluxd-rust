@@ -61,9 +61,8 @@ impl BlockUndo {
         for _ in 0..spent_len {
             let outpoint = OutPoint::consensus_decode(&mut decoder)?;
             let entry_bytes = decoder.read_var_bytes()?;
-            let entry = UtxoEntry::decode(&entry_bytes).map_err(|_| {
-                DecodeError::InvalidData("invalid utxo entry in undo")
-            })?;
+            let entry = UtxoEntry::decode(&entry_bytes)
+                .map_err(|_| DecodeError::InvalidData("invalid utxo entry in undo"))?;
             spent.push(SpentOutput { outpoint, entry });
         }
         let flux_len = decoder.read_u32_le()? as usize;
@@ -74,9 +73,8 @@ impl BlockUndo {
             let prev = if has_prev {
                 let record_bytes = decoder.read_var_bytes()?;
                 Some(
-                    FluxnodeRecord::decode(&record_bytes).map_err(|_| {
-                        DecodeError::InvalidData("invalid fluxnode record in undo")
-                    })?,
+                    FluxnodeRecord::decode(&record_bytes)
+                        .map_err(|_| DecodeError::InvalidData("invalid fluxnode record in undo"))?,
                 )
             } else {
                 None

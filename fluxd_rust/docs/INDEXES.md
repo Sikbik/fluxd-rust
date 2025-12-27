@@ -41,7 +41,9 @@ Points into `blocks/dataNNNNN.dat` flatfiles.
 - Key: `block_hash` (32 bytes)
 - Value: raw block header (consensus encoding)
 
+Written when a header is accepted (header sync) and when a block is connected.
 Used by `getblockheader` and header validation caches.
+Note: Pre-PoN PoW headers include the Equihash solution (~1.3KB), so this column can contribute a few GB on mainnet.
 
 ## TxIndex
 

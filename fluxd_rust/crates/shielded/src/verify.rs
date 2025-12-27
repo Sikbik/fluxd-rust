@@ -6,9 +6,7 @@ use fluxd_primitives::transaction::{JoinSplit, SproutProof, Transaction};
 use fluxd_script::sighash::{signature_hash, SighashType, SIGHASH_ALL};
 use group::{ff::PrimeField, GroupEncoding};
 use sapling_crypto::{
-    note::ExtractedNoteCommitment,
-    value::ValueCommitment,
-    SaplingVerificationContext,
+    note::ExtractedNoteCommitment, value::ValueCommitment, SaplingVerificationContext,
 };
 
 use crate::ShieldedError;
@@ -36,15 +34,8 @@ pub fn verify_transaction(
         return Ok(());
     }
 
-    let sighash = signature_hash(
-        tx,
-        None,
-        &[],
-        0,
-        SighashType(SIGHASH_ALL),
-        branch_id,
-    )
-    .map_err(|err| ShieldedError::Sighash(err.to_string()))?;
+    let sighash = signature_hash(tx, None, &[], 0, SighashType(SIGHASH_ALL), branch_id)
+        .map_err(|err| ShieldedError::Sighash(err.to_string()))?;
 
     if has_joinsplit {
         verify_joinsplit_signature(&tx.join_split_pub_key, &tx.join_split_sig, &sighash)?;
@@ -113,9 +104,7 @@ fn verify_joinsplit_proof(
                 sprout_vk,
             );
             if !ok {
-                return Err(ShieldedError::InvalidTransaction(
-                    "invalid joinsplit proof",
-                ));
+                return Err(ShieldedError::InvalidTransaction("invalid joinsplit proof"));
             }
             Ok(())
         }
@@ -207,33 +196,30 @@ fn verify_sapling(
 }
 
 fn parse_value_commitment(bytes: &[u8; 32]) -> Result<ValueCommitment, ShieldedError> {
-    Option::from(ValueCommitment::from_bytes_not_small_order(bytes)).ok_or_else(|| {
-        ShieldedError::InvalidTransaction("sapling value commitment invalid")
-    })
+    Option::from(ValueCommitment::from_bytes_not_small_order(bytes)).ok_or(
+        ShieldedError::InvalidTransaction("sapling value commitment invalid"),
+    )
 }
 
 fn parse_anchor(bytes: &[u8; 32]) -> Result<bls12_381::Scalar, ShieldedError> {
-    Option::from(jubjub::Base::from_repr(*bytes)).ok_or_else(|| {
-        ShieldedError::InvalidTransaction("sapling anchor invalid")
-    })
+    Option::from(jubjub::Base::from_repr(*bytes))
+        .ok_or(ShieldedError::InvalidTransaction("sapling anchor invalid"))
 }
 
 fn parse_rk(
     bytes: &[u8; 32],
 ) -> Result<redjubjub::VerificationKey<redjubjub::SpendAuth>, ShieldedError> {
-    redjubjub::VerificationKey::try_from(*bytes).map_err(|_| {
-        ShieldedError::InvalidTransaction("sapling spend auth key invalid")
-    })
+    redjubjub::VerificationKey::try_from(*bytes)
+        .map_err(|_| ShieldedError::InvalidTransaction("sapling spend auth key invalid"))
 }
 
 fn parse_cmu(bytes: &[u8; 32]) -> Result<ExtractedNoteCommitment, ShieldedError> {
-    Option::from(ExtractedNoteCommitment::from_bytes(bytes)).ok_or_else(|| {
-        ShieldedError::InvalidTransaction("sapling note commitment invalid")
-    })
+    Option::from(ExtractedNoteCommitment::from_bytes(bytes)).ok_or(
+        ShieldedError::InvalidTransaction("sapling note commitment invalid"),
+    )
 }
 
 fn parse_epk(bytes: &[u8; 32]) -> Result<jubjub::ExtendedPoint, ShieldedError> {
-    Option::from(jubjub::ExtendedPoint::from_bytes(bytes)).ok_or_else(|| {
-        ShieldedError::InvalidTransaction("sapling epk invalid")
-    })
+    Option::from(jubjub::ExtendedPoint::from_bytes(bytes))
+        .ok_or(ShieldedError::InvalidTransaction("sapling epk invalid"))
 }

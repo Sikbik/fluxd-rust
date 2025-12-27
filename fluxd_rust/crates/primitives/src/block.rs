@@ -159,7 +159,10 @@ impl Block {
         if !decoder.is_empty() {
             return Err(BlockDecodeError::Decode(DecodeError::TrailingBytes));
         }
-        Ok(Self { header, transactions })
+        Ok(Self {
+            header,
+            transactions,
+        })
     }
 }
 
