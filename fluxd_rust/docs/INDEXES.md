@@ -59,15 +59,15 @@ This is the authoritative UTXO set.
 
 ## AddressOutpoint
 
-- Key: `script_pubkey` bytes
-- Value: `OutPoint` entries
+- Key: `sha256(script_pubkey)` (32 bytes) + `OutPoint` (36 bytes)
+- Value: empty
 
 This is a script-based address index. It is used for address-level queries and
 is always maintained in the Rust daemon.
 
 ## Fluxnode
 
-- Key: fluxnode id (internal)
+- Key: collateral `OutPoint` (36 bytes)
 - Value: `FluxnodeRecord` encoded
 
 Populated by `apply_fluxnode_tx` and used by fluxnode RPCs.
@@ -118,7 +118,7 @@ Undo entries are pruned as the chain advances to retain only the most recent
 ## Meta
 
 - `best_header` / `best_block` hashes
-- sprout/sapling tree roots (used to resume shielded state)
+- sprout/sapling tree bytes (used to resume shielded state)
 
 ## Index lifecycle
 
