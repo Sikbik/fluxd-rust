@@ -16,14 +16,19 @@ use fluxd_fluxnode::storage::{FluxnodeRecord, KeyId};
 use fluxd_primitives::block::Block;
 use fluxd_primitives::address_to_script_pubkey;
 use fluxd_primitives::outpoint::OutPoint;
-use fluxd_primitives::transaction::{Transaction, TransactionEncodeError};
+use fluxd_primitives::transaction::{
+    FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
+    TransactionEncodeError,
+};
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch};
 use rayon::prelude::*;
 
 use crate::address_index::AddressIndex;
 use crate::anchors::{AnchorSet, NullifierSet};
 use crate::flatfiles::{FlatFileError, FlatFileStore, FileLocation};
-use crate::index::{status_with_block, status_with_header, ChainIndex, ChainTip, HeaderEntry};
+use crate::index::{
+    status_with_block, status_with_header, ChainIndex, ChainTip, HeaderEntry,
+};
 use crate::metrics::ConnectMetrics;
 use crate::shielded::{
     empty_sapling_tree, empty_sprout_tree, sapling_empty_root_hash, sapling_node_from_hash,
@@ -32,6 +37,7 @@ use crate::shielded::{
 };
 use crate::txindex::{TxIndex, TxLocation};
 use crate::utxo::{outpoint_key, UtxoEntry, UtxoSet};
+use crate::undo::{BlockUndo, FluxnodeUndo, SpentOutput};
 use crate::validation::{validate_block, ValidationError, ValidationFlags};
 use fluxd_pow::difficulty::{block_proof, HeaderInfo};
 use fluxd_pow::validation as pow_validation;
@@ -935,6 +941,16 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut flatfile_time = Duration::ZERO;
         let mut sprout_tree = load_sprout_tree(&self.store)?;
         let mut sapling_tree = load_sapling_tree(&self.store)?;
+        let prev_sprout_tree = sprout_tree_to_bytes(&sprout_tree)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree"))?;
+        let prev_sapling_tree = sapling_tree_to_bytes(&sapling_tree)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree"))?;
+        let mut undo = BlockUndo {
+            prev_sprout_tree,
+            prev_sapling_tree,
+            spent: Vec::new(),
+            fluxnode: Vec::new(),
+        };
         let mut seen_sprout_nullifiers = HashSet::new();
         let mut seen_sapling_nullifiers = HashSet::new();
         let mut txids = Vec::with_capacity(block.transactions.len());
@@ -1046,9 +1062,13 @@ impl<S: KeyValueStore> ChainState<S> {
                                 );
                                 return Err(ChainStateError::MissingInput);
                             }
-                        }
+                            }
                         }
                     };
+                    undo.spent.push(SpentOutput {
+                        outpoint: input.prevout.clone(),
+                        entry: entry.clone(),
+                    });
                     if entry.is_coinbase {
                         let spend_height = height as i64 - entry.height as i64;
                         if spend_height < COINBASE_MATURITY as i64 {
@@ -1102,6 +1122,9 @@ impl<S: KeyValueStore> ChainState<S> {
                     .ok_or(ChainStateError::ValueOutOfRange)?;
             }
 
+            if let Some(entry) = fluxnode_undo_entry(&self.store, tx)? {
+                undo.fluxnode.push(entry);
+            }
             apply_fluxnode_tx(&self.store, &mut batch, tx, height as u32)?;
 
             if !(tx.join_splits.is_empty() && tx.shielded_spends.is_empty()) {
@@ -1302,11 +1325,160 @@ impl<S: KeyValueStore> ChainState<S> {
             )));
         }
 
+        batch.put(Column::BlockUndo, block_hash.to_vec(), undo.encode());
+        self.prune_block_undo(height, &mut batch)?;
+
         if let Some(metrics) = connect_metrics {
             metrics.record_utxo(utxo_time);
             metrics.record_index(index_time);
             metrics.record_anchor(anchor_time);
             metrics.record_flatfile(flatfile_time);
+        }
+
+        Ok(batch)
+    }
+
+    pub fn disconnect_block(&self, hash: &Hash256) -> Result<WriteBatch, ChainStateError> {
+        let best_block = self
+            .index
+            .best_block()?
+            .ok_or(ChainStateError::InvalidHeader(
+                "missing best block for disconnect",
+            ))?;
+        if best_block.hash != *hash {
+            return Err(ChainStateError::InvalidHeader(
+                "block does not match best block tip",
+            ));
+        }
+        let entry = self
+            .index
+            .get_header(hash)?
+            .ok_or(ChainStateError::MissingHeader)?;
+        let location = self
+            .block_location(hash)?
+            .ok_or(ChainStateError::CorruptIndex("missing block index entry"))?;
+        let bytes = self.read_block(location)?;
+        let block =
+            Block::consensus_decode(&bytes).map_err(|_| ChainStateError::CorruptIndex("invalid block bytes"))?;
+        let mut undo = self
+            .block_undo(hash)?
+            .ok_or(ChainStateError::CorruptIndex(
+                "missing block undo entry; resync required",
+            ))?;
+
+        let mut batch = WriteBatch::new();
+
+        for tx in &block.transactions {
+            for joinsplit in &tx.join_splits {
+                for nullifier in &joinsplit.nullifiers {
+                    self.nullifiers_sprout.remove(&mut batch, nullifier);
+                }
+            }
+            for spend in &tx.shielded_spends {
+                self.nullifiers_sapling.remove(&mut batch, &spend.nullifier);
+            }
+        }
+
+        for (tx_index, tx) in block.transactions.iter().enumerate().rev() {
+            let txid = tx.txid()?;
+            for (output_index, output) in tx.vout.iter().enumerate() {
+                let outpoint = OutPoint {
+                    hash: txid,
+                    index: output_index as u32,
+                };
+                self.utxos.delete(&mut batch, &outpoint);
+                self.address_index
+                    .delete(&mut batch, &output.script_pubkey, &outpoint);
+            }
+            self.tx_index.delete(&mut batch, &txid);
+
+            if tx_index != 0 {
+                for input in tx.vin.iter().rev() {
+                    let spent = undo.spent.pop().ok_or(ChainStateError::CorruptIndex(
+                        "block undo input mismatch",
+                    ))?;
+                    if spent.outpoint != input.prevout {
+                        return Err(ChainStateError::CorruptIndex(
+                            "block undo outpoint mismatch",
+                        ));
+                    }
+                    self.utxos.put(&mut batch, &spent.outpoint, &spent.entry);
+                    self.address_index.insert(
+                        &mut batch,
+                        &spent.entry.script_pubkey,
+                        &spent.outpoint,
+                    );
+                }
+            }
+
+            if let Some(collateral) = fluxnode_collateral(tx) {
+                let entry = undo.fluxnode.pop().ok_or(ChainStateError::CorruptIndex(
+                    "block undo fluxnode mismatch",
+                ))?;
+                if &entry.collateral != collateral {
+                    return Err(ChainStateError::CorruptIndex(
+                        "block undo fluxnode collateral mismatch",
+                    ));
+                }
+                let key = outpoint_key(&entry.collateral);
+                match &entry.prev {
+                    Some(record) => {
+                        batch.put(Column::Fluxnode, key, record.encode());
+                    }
+                    None => {
+                        batch.delete(Column::Fluxnode, key);
+                    }
+                }
+            }
+        }
+
+        if !undo.spent.is_empty() {
+            return Err(ChainStateError::CorruptIndex(
+                "block undo has extra spent entries",
+            ));
+        }
+        if !undo.fluxnode.is_empty() {
+            return Err(ChainStateError::CorruptIndex(
+                "block undo has extra fluxnode entries",
+            ));
+        }
+
+        if let Some(ts) = self.block_logical_time(hash)? {
+            let mut ts_key = Vec::with_capacity(36);
+            ts_key.extend_from_slice(&ts.to_be_bytes());
+            ts_key.extend_from_slice(hash);
+            batch.delete(Column::TimestampIndex, ts_key);
+            batch.delete(Column::BlockTimestamp, hash.to_vec());
+        }
+
+        let current_sprout_tree = load_sprout_tree(&self.store)?;
+        let current_sapling_tree = load_sapling_tree(&self.store)?;
+        let current_sprout_root = sprout_root_hash(&current_sprout_tree);
+        let current_sapling_root = sapling_root_hash(&current_sapling_tree);
+        let prev_sprout_tree = sprout_tree_from_bytes(&undo.prev_sprout_tree)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout undo tree"))?;
+        let prev_sapling_tree = sapling_tree_from_bytes(&undo.prev_sapling_tree)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid sapling undo tree"))?;
+        let prev_sprout_root = sprout_root_hash(&prev_sprout_tree);
+        let prev_sapling_root = sapling_root_hash(&prev_sapling_tree);
+
+        self.anchors_sprout
+            .remove(&mut batch, &current_sprout_root);
+        self.anchors_sapling
+            .remove(&mut batch, &current_sapling_root);
+        self.anchors_sprout
+            .insert(&mut batch, &prev_sprout_root, undo.prev_sprout_tree.clone());
+        self.anchors_sapling
+            .insert(&mut batch, &prev_sapling_root, undo.prev_sapling_tree.clone());
+        batch.put(Column::Meta, SPROUT_TREE_KEY, undo.prev_sprout_tree);
+        batch.put(Column::Meta, SAPLING_TREE_KEY, undo.prev_sapling_tree);
+
+        self.index.clear_height_hash(&mut batch, entry.height);
+        self.index.set_best_block(&mut batch, &entry.prev_hash);
+        batch.delete(Column::BlockUndo, hash.to_vec());
+
+        if let Ok(mut cache) = self.header_cache.lock() {
+            cache.insert(*hash, entry.clone());
         }
 
         Ok(batch)
@@ -1366,6 +1538,35 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut buf = [0u8; 4];
         buf.copy_from_slice(&bytes);
         Ok(Some(u32::from_be_bytes(buf)))
+    }
+
+    fn block_undo(&self, hash: &Hash256) -> Result<Option<BlockUndo>, ChainStateError> {
+        let bytes = match self.store.get(Column::BlockUndo, hash)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        BlockUndo::decode(&bytes)
+            .map(Some)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid block undo entry"))
+    }
+
+    fn prune_block_undo(
+        &self,
+        height: i32,
+        batch: &mut WriteBatch,
+    ) -> Result<(), ChainStateError> {
+        if height < 0 {
+            return Ok(());
+        }
+        let max_depth = max_reorg_depth(height as i64) as i32;
+        let prune_height = height.saturating_sub(max_depth.saturating_add(1));
+        if prune_height < 0 {
+            return Ok(());
+        }
+        if let Some(hash) = self.index.height_hash(prune_height)? {
+            batch.delete(Column::BlockUndo, hash.to_vec());
+        }
+        Ok(())
     }
 
     pub fn scan_timestamp_index(&self) -> Result<Vec<(u32, Hash256)>, ChainStateError> {
@@ -1460,6 +1661,39 @@ fn load_sapling_tree<S: KeyValueStore>(store: &S) -> Result<SaplingTree, ChainSt
             .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree")),
         None => Ok(empty_sapling_tree()),
     }
+}
+
+fn fluxnode_collateral(tx: &Transaction) -> Option<&OutPoint> {
+    match tx.fluxnode.as_ref()? {
+        FluxnodeTx::V5(FluxnodeTxV5::Start(start)) => Some(&start.collateral),
+        FluxnodeTx::V5(FluxnodeTxV5::Confirm(confirm)) => Some(&confirm.collateral),
+        FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => match &start.variant {
+            FluxnodeStartVariantV6::Normal { collateral, .. } => Some(collateral),
+            FluxnodeStartVariantV6::P2sh { collateral, .. } => Some(collateral),
+        },
+        FluxnodeTx::V6(FluxnodeTxV6::Confirm(confirm)) => Some(&confirm.collateral),
+    }
+}
+
+fn fluxnode_undo_entry<S: KeyValueStore>(
+    store: &S,
+    tx: &Transaction,
+) -> Result<Option<FluxnodeUndo>, ChainStateError> {
+    let Some(collateral) = fluxnode_collateral(tx) else {
+        return Ok(None);
+    };
+    let key = outpoint_key(collateral);
+    let prev = match store.get(Column::Fluxnode, &key)? {
+        Some(bytes) => Some(
+            FluxnodeRecord::decode(&bytes)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid fluxnode record"))?,
+        ),
+        None => None,
+    };
+    Ok(Some(FluxnodeUndo {
+        collateral: collateral.clone(),
+        prev,
+    }))
 }
 
 fn money_range(value: i64) -> bool {
@@ -1760,4 +1994,156 @@ fn check_coinbase_funding(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxd_consensus::params::{chain_params, Network};
+    use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
+    use fluxd_primitives::outpoint::OutPoint;
+    use fluxd_primitives::transaction::{Transaction, TxIn, TxOut};
+    use fluxd_storage::memory::MemoryStore;
+    use fluxd_storage::WriteBatch;
+    use std::sync::Arc;
+
+    fn make_tx(vin: Vec<TxIn>, vout: Vec<TxOut>) -> Transaction {
+        Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin,
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        }
+    }
+
+    #[test]
+    fn disconnect_restores_utxo_set_for_intrablock_spends() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let seed_script = vec![0x51];
+        let seed_outpoint = OutPoint {
+            hash: [0x11; 32],
+            index: 0,
+        };
+        let seed_entry = UtxoEntry {
+            value: 50,
+            script_pubkey: seed_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let mut seed_batch = WriteBatch::new();
+        chainstate
+            .utxos
+            .put(&mut seed_batch, &seed_outpoint, &seed_entry);
+        chainstate
+            .address_index
+            .insert(&mut seed_batch, &seed_entry.script_pubkey, &seed_outpoint);
+        chainstate.commit_batch(seed_batch).expect("seed utxo");
+
+        let mut params = chain_params(Network::Regtest);
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: [0u8; 32],
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: current_time_secs() as u32,
+            bits: block_bits_from_params(&params.consensus),
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let block_hash = header.hash();
+        params.consensus.hash_genesis_block = block_hash;
+        params.consensus.checkpoints = vec![fluxd_consensus::params::Checkpoint {
+            height: 0,
+            hash: block_hash,
+        }];
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(&[header.clone()], &params.consensus, &mut header_batch, false)
+            .expect("insert header");
+        chainstate.commit_batch(header_batch).expect("commit header");
+
+        let coinbase = make_tx(
+            vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51],
+            }],
+        );
+        let tx1 = make_tx(
+            vec![TxIn {
+                prevout: seed_outpoint.clone(),
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vec![TxOut {
+                value: seed_entry.value,
+                script_pubkey: vec![0x52],
+            }],
+        );
+        let tx1id = tx1.txid().expect("txid1");
+        let outpoint1 = OutPoint { hash: tx1id, index: 0 };
+
+        let tx2 = make_tx(
+            vec![TxIn {
+                prevout: outpoint1.clone(),
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vec![TxOut {
+                value: seed_entry.value,
+                script_pubkey: vec![0x53],
+            }],
+        );
+        let tx2id = tx2.txid().expect("txid2");
+        let outpoint2 = OutPoint { hash: tx2id, index: 0 };
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase, tx1.clone(), tx2.clone()],
+        };
+
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(&block, 0, &params, &flags, true, None)
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit connect");
+
+        assert!(!chainstate.utxo_exists(&seed_outpoint).expect("seed utxo exists"));
+        assert!(!chainstate.utxo_exists(&outpoint1).expect("tx1 utxo exists"));
+        assert!(chainstate.utxo_exists(&outpoint2).expect("tx2 utxo exists"));
+
+        let batch = chainstate.disconnect_block(&block_hash).expect("disconnect");
+        chainstate.commit_batch(batch).expect("commit disconnect");
+
+        assert!(chainstate.utxo_exists(&seed_outpoint).expect("seed utxo restored"));
+        assert!(!chainstate.utxo_exists(&outpoint1).expect("tx1 output removed"));
+        assert!(!chainstate.utxo_exists(&outpoint2).expect("tx2 output removed"));
+
+        assert!(chainstate
+            .tx_location(&tx1id)
+            .expect("tx location query")
+            .is_none());
+    }
 }

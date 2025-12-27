@@ -126,6 +126,11 @@ impl<S: KeyValueStore> ChainIndex<S> {
         let key = height_key(height);
         batch.put(Column::HeightIndex, key.to_vec(), hash.to_vec());
     }
+
+    pub fn clear_height_hash(&self, batch: &mut WriteBatch, height: i32) {
+        let key = height_key(height);
+        batch.delete(Column::HeightIndex, key.to_vec());
+    }
 }
 
 pub fn height_key(height: i32) -> [u8; 4] {
@@ -181,6 +186,10 @@ pub fn status_with_header(status: u8) -> u8 {
 
 pub fn status_with_block(status: u8) -> u8 {
     status | STATUS_HAS_BLOCK
+}
+
+pub fn status_without_block(status: u8) -> u8 {
+    status & !STATUS_HAS_BLOCK
 }
 
 pub fn has_header(status: u8) -> bool {

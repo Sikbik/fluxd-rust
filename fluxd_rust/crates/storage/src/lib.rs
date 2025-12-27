@@ -38,6 +38,7 @@ pub enum Column {
     AddressOutpoint,
     TimestampIndex,
     BlockTimestamp,
+    BlockUndo,
     Meta,
 }
 
@@ -59,6 +60,7 @@ impl Column {
             Column::AddressOutpoint => "address_outpoint",
             Column::TimestampIndex => "timestamp_index",
             Column::BlockTimestamp => "block_timestamp",
+            Column::BlockUndo => "block_undo",
             Column::Meta => "meta",
         }
     }

@@ -46,6 +46,10 @@ impl<S: KeyValueStore> TxIndex<S> {
         batch.put(Column::TxIndex, txid.to_vec(), location.encode());
     }
 
+    pub fn delete(&self, batch: &mut WriteBatch, txid: &Hash256) {
+        batch.delete(Column::TxIndex, txid.to_vec());
+    }
+
     pub fn get(&self, txid: &Hash256) -> Result<Option<TxLocation>, StoreError> {
         let bytes = match self.store.get(Column::TxIndex, txid)? {
             Some(bytes) => bytes,

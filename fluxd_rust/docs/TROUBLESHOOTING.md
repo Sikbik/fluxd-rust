@@ -46,6 +46,20 @@ Mitigations:
 - Inspect the block/height in question via `getblock` or `getblockheader`.
 - If the on-disk state may be inconsistent, perform a clean resync.
 
+## Block connect mismatch / reorg fails with missing undo
+
+Symptoms:
+- Repeated `block connect mismatch ...; attempting reorg`
+- `missing block undo entry; resync required`
+
+Cause:
+- The database was created before block undo support existed, so historical blocks
+  do not have undo entries. Reorg requires undo data to safely disconnect blocks.
+
+Fix:
+- Stop the daemon, remove the data directory, and resync from scratch so undo entries
+  are generated during block connect.
+
 ## RPC auth failures
 
 Symptoms:

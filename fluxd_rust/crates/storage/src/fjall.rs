@@ -5,7 +5,7 @@ use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 
 use crate::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
 
-const ALL_COLUMNS: [Column; 16] = [
+const ALL_COLUMNS: [Column; 17] = [
     Column::BlockIndex,
     Column::HeaderIndex,
     Column::HeightIndex,
@@ -21,6 +21,7 @@ const ALL_COLUMNS: [Column; 16] = [
     Column::AddressOutpoint,
     Column::TimestampIndex,
     Column::BlockTimestamp,
+    Column::BlockUndo,
     Column::Meta,
 ];
 

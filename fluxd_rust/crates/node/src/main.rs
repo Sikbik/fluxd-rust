@@ -1644,13 +1644,32 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                         break;
                     }
                     if headers[0].prev_block != download_state.tip_hash {
-                        eprintln!(
-                            "header batch does not extend tip {}; resetting",
-                            hash256_to_hex(&download_state.tip_hash)
-                        );
-                        download_state.reset(chainstate.as_ref(), &params)?;
-                        peer_book.record_bad_chain(peer_addr, HEADER_BAD_CHAIN_BAN_SECS);
-                        break;
+                        let prev = headers[0].prev_block;
+                        let prev_entry = download_state
+                            .pending
+                            .get(&prev)
+                            .cloned()
+                            .or_else(|| chainstate.header_entry(&prev).ok().flatten());
+                        if let Some(entry) = prev_entry {
+                            eprintln!(
+                                "header batch forks from tip {}; switching to ancestor {} at height {}",
+                                hash256_to_hex(&download_state.tip_hash),
+                                hash256_to_hex(&prev),
+                                entry.height
+                            );
+                            download_state.tip_hash = prev;
+                            download_state.tip_height = entry.height;
+                            download_state.pending.clear();
+                            download_state.cache = HeaderValidationCache::default();
+                        } else {
+                            eprintln!(
+                                "header batch does not connect to known header {}; resetting",
+                                hash256_to_hex(&prev)
+                            );
+                            download_state.reset(chainstate.as_ref(), &params)?;
+                            peer_book.record_bad_chain(peer_addr, HEADER_BAD_CHAIN_BAN_SECS);
+                            break;
+                        }
                     }
                     let validate_start = Instant::now();
                     if let Err(err) = chainstate.validate_headers_batch_with_cache(
@@ -2424,6 +2443,7 @@ async fn sync_chain<S: KeyValueStore>(
     let mut last_progress_at = Instant::now();
     loop {
         cap_header_gap(chainstate, header_lead, write_lock, header_cursor)?;
+        reorg_to_best_header(chainstate, write_lock)?;
         let best_block_height = chainstate
             .best_block()
             .map_err(|err| err.to_string())?
@@ -2902,11 +2922,34 @@ fn collect_missing_blocks<S: KeyValueStore>(
         None => return Ok(Vec::new()),
     };
 
-    let best_block_height = chainstate
+    let best_block = match chainstate
         .best_block()
         .map_err(|err| err.to_string())?
-        .map(|tip| tip.height)
-        .unwrap_or(-1);
+    {
+        Some(tip) => tip,
+        None => return Ok(Vec::new()),
+    };
+
+    if best_header.hash == best_block.hash {
+        return Ok(Vec::new());
+    }
+
+    let (anchor_hash, _anchor_height) = if header_descends_from(
+        chainstate,
+        best_header.hash,
+        best_block.hash,
+        best_block.height,
+    )? {
+        (best_block.hash, best_block.height)
+    } else {
+        find_common_ancestor(
+            chainstate,
+            best_header.hash,
+            best_header.height,
+            best_block.hash,
+            best_block.height,
+        )?
+    };
 
     let mut missing: VecDeque<fluxd_consensus::Hash256> = VecDeque::new();
     let mut hash = best_header.hash;
@@ -2915,7 +2958,7 @@ fn collect_missing_blocks<S: KeyValueStore>(
             .header_entry(&hash)
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "missing header entry while scanning for blocks".to_string())?;
-        if entry.height <= best_block_height {
+        if hash == anchor_hash {
             break;
         }
         missing.push_front(hash);
@@ -3000,10 +3043,48 @@ fn header_descends_from<S: KeyValueStore>(
     }
 }
 
-fn align_header_tip_with_best_block<S: KeyValueStore>(
+fn find_common_ancestor<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mut a_hash: Hash256,
+    mut a_height: i32,
+    mut b_hash: Hash256,
+    mut b_height: i32,
+) -> Result<(Hash256, i32), String> {
+    while a_height > b_height {
+        let entry = chainstate
+            .header_entry(&a_hash)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
+        a_hash = entry.prev_hash;
+        a_height = entry.height.saturating_sub(1);
+    }
+    while b_height > a_height {
+        let entry = chainstate
+            .header_entry(&b_hash)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
+        b_hash = entry.prev_hash;
+        b_height = entry.height.saturating_sub(1);
+    }
+    while a_hash != b_hash {
+        let entry_a = chainstate
+            .header_entry(&a_hash)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
+        let entry_b = chainstate
+            .header_entry(&b_hash)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
+        a_hash = entry_a.prev_hash;
+        b_hash = entry_b.prev_hash;
+        a_height = entry_a.height.saturating_sub(1);
+    }
+    Ok((a_hash, a_height))
+}
+
+fn reorg_to_best_header<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     write_lock: &Mutex<()>,
-    cursor: &Arc<Mutex<HeaderCursor>>,
 ) -> Result<(), String> {
     let best_block = match chainstate
         .best_block()
@@ -3032,22 +3113,43 @@ fn align_header_tip_with_best_block<S: KeyValueStore>(
         return Ok(());
     }
 
-    let _guard = write_lock
-        .lock()
-        .map_err(|_| "write lock poisoned".to_string())?;
-    chainstate
-        .set_best_header(&best_block.hash)
-        .map_err(|err| err.to_string())?;
-    if let Ok(mut cursor) = cursor.lock() {
-        cursor.tip_hash = Some(best_block.hash);
-        cursor.tip_height = Some(best_block.height);
-        cursor.generation = cursor.generation.saturating_add(1);
-    }
-    println!(
-        "Best header not on best block chain; pinned to height {} ({})",
+    let (ancestor_hash, ancestor_height) = find_common_ancestor(
+        chainstate,
+        best_header.hash,
+        best_header.height,
+        best_block.hash,
         best_block.height,
-        hash256_to_hex(&best_block.hash)
-    );
+    )?;
+
+    let mut disconnected: usize = 0;
+    loop {
+        let tip = chainstate
+            .best_block()
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "missing best block during reorg".to_string())?;
+        if tip.hash == ancestor_hash {
+            break;
+        }
+        let batch = chainstate
+            .disconnect_block(&tip.hash)
+            .map_err(|err| err.to_string())?;
+        let _guard = write_lock
+            .lock()
+            .map_err(|_| "write lock poisoned".to_string())?;
+        chainstate
+            .commit_batch(batch)
+            .map_err(|err| err.to_string())?;
+        disconnected += 1;
+    }
+
+    if disconnected > 0 {
+        println!(
+            "Reorg: disconnected {} block(s) to height {} ({})",
+            disconnected,
+            ancestor_height,
+            hash256_to_hex(&ancestor_hash)
+        );
+    }
     Ok(())
 }
 
@@ -3313,7 +3415,7 @@ fn connect_pending<S: KeyValueStore>(
     verify_settings: &VerifySettings,
     connect_metrics: &ConnectMetrics,
     write_lock: &Mutex<()>,
-    header_cursor: &Arc<Mutex<HeaderCursor>>,
+    _header_cursor: &Arc<Mutex<HeaderCursor>>,
     pending: &mut VecDeque<fluxd_consensus::Hash256>,
     received: &mut HashMap<fluxd_consensus::Hash256, Block>,
 ) -> Result<(), String> {
@@ -3468,11 +3570,11 @@ fn connect_pending<S: KeyValueStore>(
                     "block height does not match header index",
                 )) => {
                     eprintln!(
-                        "block connect mismatch at height {} ({}); resyncing",
+                        "block connect mismatch at height {} ({}); attempting reorg",
                         verified_block.height,
                         hash256_to_hex(&hash)
                     );
-                    align_header_tip_with_best_block(chainstate, write_lock, header_cursor)?;
+                    reorg_to_best_header(chainstate, write_lock)?;
                     return Ok(());
                 }
                 Err(err) => return Err(err.to_string()),

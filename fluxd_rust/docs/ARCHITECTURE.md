@@ -75,6 +75,23 @@ Worker counts and queue depths are controlled via:
 - `--verify-workers` / `--verify-queue`
 - `--shielded-workers` / `--shielded-queue`
 
+## Reorg handling
+
+fluxd-rust tracks two tips:
+
+- **best header**: the most-chainwork header chain (headers-only view).
+- **best block**: the fully connected chainstate tip (indexed blocks).
+
+During sync, the daemon expects the best block chain to follow the best header chain.
+If the best header chain diverges (e.g. the node indexed blocks on a lower-work fork),
+the daemon disconnects blocks back to the common ancestor and then downloads/connects
+the blocks needed to reach the best header tip.
+
+Block disconnect is powered by per-block undo data stored in the database
+(`block_undo`). Undo entries are generated on connect and pruned to a bounded
+reorg depth. If you introduce undo/reorg support after an existing sync, a clean
+resync is required to populate undo entries for historical blocks.
+
 ## Consensus rules
 
 Consensus rules are enforced in `chainstate`, `pow`, and `pon` crates.

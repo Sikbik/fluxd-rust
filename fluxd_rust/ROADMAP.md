@@ -11,8 +11,6 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Current sprint (next 3-5)
 
-- [ ] [P0] Block undo storage + disconnect path (owner: TBD)
-- [ ] [P0] Reorg handling (disconnect + reconnect) (owner: TBD)
 - [ ] [P1] Spent index + `getspentinfo` (owner: TBD)
 - [ ] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
 - [ ] [P1] Header throughput parity with C++ (owner: TBD)
@@ -28,6 +26,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] Address outpoint index (script_pubkey -> outpoints)
 - [x] Fluxnode index + basic RPCs (partial parity)
 - [x] Timestamp index + `getblockhashes`
+- [x] Block undo storage + disconnect path
+- [x] Reorg handling (disconnect to common ancestor)
 - [x] RPC framework (JSON-RPC + `/daemon` endpoints)
 - [x] Dashboard + status metrics
 - [x] CLI supply scan (`--scan-supply`) and flatfile scan (`--scan-flatfiles`)

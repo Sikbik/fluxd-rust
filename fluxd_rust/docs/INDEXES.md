@@ -95,6 +95,21 @@ bumped to `prev + 1`.
 
 Allows reverse lookup from block hash to logical timestamp.
 
+## BlockUndo
+
+- Key: `block_hash` (32 bytes)
+- Value: `BlockUndo` encoded (versioned)
+  - previous sprout tree bytes
+  - previous sapling tree bytes
+  - spent UTXO entries (per input, in connect order)
+  - fluxnode record snapshots (per fluxnode tx, in connect order)
+
+This enables fast, correct block disconnect during reorgs by restoring the
+pre-block chainstate (UTXO set, txindex, shielded trees, and fluxnode records).
+
+Undo entries are pruned as the chain advances to retain only the most recent
+`max_reorg_depth(height)` blocks (plus the current tip), based on consensus rules.
+
 ## Anchor and Nullifier sets
 
 - `AnchorSprout`, `AnchorSapling` - anchor trees for shielded validation.
@@ -110,3 +125,6 @@ Allows reverse lookup from block hash to logical timestamp.
 Indexes are maintained during block connect. There are no runtime flags to
 disable txindex, address index, or timestamp index in the Rust daemon yet.
 For a full rebuild of indexes, perform a fresh sync by clearing the data dir.
+
+Note: `BlockUndo` is also generated during block connect. If undo/reorg support
+was introduced after an existing database was created, a clean resync is required.

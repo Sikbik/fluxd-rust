@@ -9,4 +9,5 @@ mod shielded;
 pub mod state;
 pub mod txindex;
 pub mod utxo;
+pub mod undo;
 pub mod validation;
