@@ -114,13 +114,14 @@ Undo entries are pruned as the chain advances to retain only the most recent
 
 ## Anchor and Nullifier sets
 
-- `AnchorSprout`, `AnchorSapling` - anchor trees for shielded validation.
+- `AnchorSprout` - serialized Sprout tree frontiers (required for JoinSplit anchor chaining).
+- `AnchorSapling` - Sapling anchor roots (keys only; values are empty) for existence checks.
 - `NullifierSprout`, `NullifierSapling` - spent nullifier sets.
 
 ## Meta
 
 - `best_header` / `best_block` hashes
-- sprout/sapling tree bytes (used to resume shielded state)
+- sprout/sapling tree bytes (used to resume shielded state; updated only when the tree changes)
 
 ## Index lifecycle
 

@@ -39,7 +39,7 @@ ssh <vps-user>@<vps-host> "nohup stdbuf -oL -eL <remote-repo-path>/target/releas
   --getdata-batch 128 \
   --block-peers 3 \
   --header-peers 4 \
-  --inflight-per-peer 1 \
+  --inflight-per-peer 2 \
   --header-lead 20000 \
   --status-interval 15 \
   --db-cache-mb 256 \
@@ -48,14 +48,14 @@ ssh <vps-user>@<vps-host> "nohup stdbuf -oL -eL <remote-repo-path>/target/releas
   --db-memtable-mb 32 \
   --header-verify-workers 6 \
   --verify-workers 4 \
-  --shielded-workers 1 \
+  --shielded-workers 6 \
   > <remote-log-dir>/longrun-public.log 2>&1 &"
 ```
 
 ## Stop
 
 ```bash
-ssh <vps-user>@<vps-host> "pkill -f fluxd"
+ssh <vps-user>@<vps-host> "pkill -x fluxd"
 ```
 
 ## Logs and monitoring
@@ -72,7 +72,7 @@ ssh <vps-user>@<vps-host> "tail -f <remote-log-dir>/longrun-public.log"
 ## Clean resync
 
 ```bash
-ssh <vps-user>@<vps-host> "pkill -f fluxd"
+ssh <vps-user>@<vps-host> "pkill -x fluxd"
 ssh <vps-user>@<vps-host> "rm -rf <remote-data-dir> && mkdir -p <remote-data-dir>"
 ```
 

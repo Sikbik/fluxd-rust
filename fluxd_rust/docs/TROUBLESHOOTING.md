@@ -107,7 +107,7 @@ If you made consensus changes or indexes were added after initial sync,
 clean resync is often the fastest way to restore correctness.
 
 ```bash
-pkill -f fluxd
+pkill -x fluxd
 rm -rf ./data
 ./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --fetch-params
 ```

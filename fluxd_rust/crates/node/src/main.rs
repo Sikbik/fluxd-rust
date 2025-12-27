@@ -358,7 +358,7 @@ async fn main() {
 async fn run() -> Result<(), String> {
     let start_time = Instant::now();
     let config = parse_args()?;
-    let params = chain_params(config.network);
+    let params = Arc::new(chain_params(config.network));
     let network = config.network;
     let backend = config.backend;
     let status_interval_secs = config.status_interval_secs;
@@ -395,7 +395,7 @@ async fn run() -> Result<(), String> {
     }
 
     if config.scan_supply {
-        scan_supply(chainstate.as_ref(), &params)?;
+        scan_supply(chainstate.as_ref(), params.as_ref())?;
         return Ok(());
     }
 
@@ -404,7 +404,7 @@ async fn run() -> Result<(), String> {
         rpc::load_or_create_auth(config.rpc_user.clone(), config.rpc_pass.clone(), data_dir)?;
     {
         let chainstate = Arc::clone(&chainstate);
-        let params = params.clone();
+        let params = params.as_ref().clone();
         let data_dir = data_dir.clone();
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
@@ -449,7 +449,7 @@ async fn run() -> Result<(), String> {
 
     ensure_genesis(
         &chainstate,
-        &params,
+        params.as_ref(),
         &flags,
         Some(&connect_metrics),
         &write_lock,
@@ -510,7 +510,7 @@ async fn run() -> Result<(), String> {
         kind: PeerKind::Header,
     };
     let mut block_peer = connect_to_peer(
-        &params,
+        params.as_ref(),
         start_height,
         min_peer_height,
         addr_book.as_ref(),
@@ -529,7 +529,7 @@ async fn run() -> Result<(), String> {
         Vec::new()
     } else {
         connect_to_peers(
-            &params,
+            params.as_ref(),
             block_peers_target,
             start_height,
             min_peer_height,
@@ -566,7 +566,7 @@ async fn run() -> Result<(), String> {
     let seed_addrs = Arc::new(seed_addrs);
     let addr_book_handle = Arc::clone(&addr_book);
     let addr_seeds = Arc::clone(&seed_addrs);
-    let addr_params = params.clone();
+    let addr_params = Arc::clone(&params);
     let addr_peer_ctx = header_peer_ctx.clone();
     tokio::spawn(async move {
         if let Err(err) = addr_discovery_loop(
@@ -581,7 +581,10 @@ async fn run() -> Result<(), String> {
             eprintln!("addr discovery stopped: {err}");
         }
     });
-    let header_cursor = Arc::new(Mutex::new(init_header_cursor(&chainstate, &params)?));
+    let header_cursor = Arc::new(Mutex::new(init_header_cursor(
+        chainstate.as_ref(),
+        params.as_ref(),
+    )?));
 
     let header_peers = header_peers_target.max(1);
     println!(
@@ -590,12 +593,12 @@ async fn run() -> Result<(), String> {
     );
     let (header_tx, header_rx) = mpsc::channel(HEADER_BATCH_QUEUE);
     let header_chainstate = Arc::clone(&chainstate);
-    let header_params = params.clone();
+    let header_params = Arc::clone(&params);
     let header_seeds = Arc::clone(&seed_addrs);
     let header_addr_book = Arc::clone(&addr_book);
     let header_peer_book_handle = Arc::clone(&header_peer_book);
     let header_commit_chainstate = Arc::clone(&chainstate);
-    let header_commit_params = params.clone();
+    let header_commit_params = Arc::clone(&params);
     let header_commit_lock = Arc::clone(&write_lock);
     let header_commit_cursor = Arc::clone(&header_cursor);
     let header_commit_metrics = Arc::clone(&header_metrics);
@@ -641,16 +644,16 @@ async fn run() -> Result<(), String> {
         &mut block_peer,
         &mut block_peers,
         block_peers_target,
-        &chainstate,
+        Arc::clone(&chainstate),
         Arc::clone(&sync_metrics),
-        &params,
+        Arc::clone(&params),
         addr_book.as_ref(),
         &block_peer_ctx,
         &flags,
         &verify_settings,
-        &connect_metrics,
-        &write_lock,
-        &header_cursor,
+        Arc::clone(&connect_metrics),
+        Arc::clone(&write_lock),
+        Arc::clone(&header_cursor),
         header_lead,
         getdata_batch,
         inflight_per_peer,
@@ -1112,7 +1115,7 @@ async fn resolve_seed_addresses(params: &ChainParams) -> Result<Vec<SocketAddr>,
 }
 
 async fn addr_discovery_loop(
-    params: ChainParams,
+    params: Arc<ChainParams>,
     seed_addrs: Arc<Vec<SocketAddr>>,
     addr_book: Arc<AddrBook>,
     start_height: i32,
@@ -1463,7 +1466,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn header_sync_loop<S: KeyValueStore + Send + Sync + 'static>(
     chainstate: Arc<ChainState<S>>,
-    params: ChainParams,
+    params: Arc<ChainParams>,
     seed_addrs: Arc<Vec<SocketAddr>>,
     addr_book: Arc<AddrBook>,
     allow_addr_book: bool,
@@ -1475,7 +1478,7 @@ async fn header_sync_loop<S: KeyValueStore + Send + Sync + 'static>(
     peer_ctx: PeerContext,
 ) -> Result<(), String> {
     let idle_sleep = Duration::from_secs(IDLE_SLEEP_SECS);
-    let mut download_state = HeaderDownloadState::new(chainstate.as_ref(), &params)?;
+    let mut download_state = HeaderDownloadState::new(chainstate.as_ref(), params.as_ref())?;
     loop {
         if let Err(err) = header_peer_loop(
             Arc::clone(&chainstate),
@@ -1502,7 +1505,7 @@ async fn header_sync_loop<S: KeyValueStore + Send + Sync + 'static>(
 #[allow(clippy::too_many_arguments)]
 async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
     chainstate: Arc<ChainState<S>>,
-    params: ChainParams,
+    params: Arc<ChainParams>,
     seed_addrs: Arc<Vec<SocketAddr>>,
     addr_book: Arc<AddrBook>,
     allow_addr_book: bool,
@@ -2186,7 +2189,7 @@ fn prevalidate_pow_headers<S: KeyValueStore>(
 async fn header_commit_loop<S: KeyValueStore + Send + Sync + 'static>(
     mut header_rx: mpsc::Receiver<Vec<BlockHeader>>,
     chainstate: Arc<ChainState<S>>,
-    params: ChainParams,
+    params: Arc<ChainParams>,
     write_lock: Arc<Mutex<()>>,
     header_lead: i32,
     header_verify_workers: usize,
@@ -2200,7 +2203,7 @@ async fn header_commit_loop<S: KeyValueStore + Send + Sync + 'static>(
         }
         queue_or_commit_headers(
             chainstate.as_ref(),
-            &params,
+            params.as_ref(),
             &write_lock,
             &mut pending,
             header_lead,
@@ -2210,7 +2213,7 @@ async fn header_commit_loop<S: KeyValueStore + Send + Sync + 'static>(
         )?;
         drain_ready_header_batches(
             chainstate.as_ref(),
-            &params,
+            params.as_ref(),
             &write_lock,
             &mut pending,
             header_lead,
@@ -2414,20 +2417,20 @@ fn refresh_header_cursor<S: KeyValueStore>(
 
 #[allow(unreachable_code)]
 #[allow(clippy::too_many_arguments)]
-async fn sync_chain<S: KeyValueStore>(
+async fn sync_chain<S: KeyValueStore + 'static>(
     block_peer: &mut Peer,
     block_peers: &mut Vec<Peer>,
     block_peers_target: usize,
-    chainstate: &ChainState<S>,
+    chainstate: Arc<ChainState<S>>,
     metrics: Arc<SyncMetrics>,
-    params: &ChainParams,
+    params: Arc<ChainParams>,
     addr_book: &AddrBook,
     peer_ctx: &PeerContext,
     flags: &ValidationFlags,
     verify_settings: &VerifySettings,
-    connect_metrics: &ConnectMetrics,
-    write_lock: &Mutex<()>,
-    header_cursor: &Arc<Mutex<HeaderCursor>>,
+    connect_metrics: Arc<ConnectMetrics>,
+    write_lock: Arc<Mutex<()>>,
+    header_cursor: Arc<Mutex<HeaderCursor>>,
     header_lead: i32,
     getdata_batch: usize,
     inflight_per_peer: usize,
@@ -2440,8 +2443,13 @@ async fn sync_chain<S: KeyValueStore>(
         .unwrap_or(-1);
     let mut last_progress_at = Instant::now();
     loop {
-        cap_header_gap(chainstate, header_lead, write_lock, header_cursor)?;
-        reorg_to_best_header(chainstate, write_lock)?;
+        cap_header_gap(
+            chainstate.as_ref(),
+            header_lead,
+            write_lock.as_ref(),
+            &header_cursor,
+        )?;
+        reorg_to_best_header(chainstate.as_ref(), write_lock.as_ref())?;
         let best_block_height = chainstate
             .best_block()
             .map_err(|err| err.to_string())?
@@ -2451,9 +2459,9 @@ async fn sync_chain<S: KeyValueStore>(
             last_progress_height = best_block_height;
             last_progress_at = Instant::now();
         }
-        let (gap, _) = header_gap(chainstate)?;
+        let (gap, _) = header_gap(chainstate.as_ref())?;
         let max_fetch = max_fetch_blocks(block_peers.len(), getdata_batch, inflight_per_peer);
-        let missing = collect_missing_blocks(chainstate, max_fetch)?;
+        let missing = collect_missing_blocks(chainstate.as_ref(), max_fetch)?;
         if !missing.is_empty() {
             if gap > 0 && last_progress_at.elapsed() > Duration::from_secs(BLOCK_STALL_SECS) {
                 eprintln!(
@@ -2467,7 +2475,7 @@ async fn sync_chain<S: KeyValueStore>(
                     .unwrap_or(best_block_height);
                 let start_height = best_block_height;
                 match connect_to_peer(
-                    params,
+                    params.as_ref(),
                     start_height,
                     best_header_height,
                     addr_book,
@@ -2484,7 +2492,7 @@ async fn sync_chain<S: KeyValueStore>(
                 }
                 if block_peers_target > 0 {
                     match connect_to_peers(
-                        params,
+                        params.as_ref(),
                         block_peers_target,
                         start_height,
                         best_header_height,
@@ -2506,15 +2514,15 @@ async fn sync_chain<S: KeyValueStore>(
             let fetch_result = fetch_blocks(
                 block_peer,
                 block_peers,
-                chainstate,
+                Arc::clone(&chainstate),
                 Arc::clone(&metrics),
-                params,
+                Arc::clone(&params),
                 &missing,
                 flags,
                 verify_settings,
-                connect_metrics,
-                write_lock,
-                header_cursor,
+                Arc::clone(&connect_metrics),
+                Arc::clone(&write_lock),
+                Arc::clone(&header_cursor),
                 getdata_batch,
                 inflight_per_peer,
             )
@@ -2529,7 +2537,7 @@ async fn sync_chain<S: KeyValueStore>(
                         .unwrap_or(best_block_height);
                     let start_height = best_block_height;
                     match connect_to_peer(
-                        params,
+                        params.as_ref(),
                         start_height,
                         best_header_height,
                         addr_book,
@@ -2546,7 +2554,7 @@ async fn sync_chain<S: KeyValueStore>(
                     }
                     if block_peers_target > 0 {
                         match connect_to_peers(
-                            params,
+                            params.as_ref(),
                             block_peers_target,
                             start_height,
                             best_header_height,
@@ -3143,18 +3151,18 @@ async fn request_headers(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn fetch_blocks<S: KeyValueStore>(
+async fn fetch_blocks<S: KeyValueStore + 'static>(
     peer: &mut Peer,
     block_peers: &mut Vec<Peer>,
-    chainstate: &ChainState<S>,
+    chainstate: Arc<ChainState<S>>,
     metrics: Arc<SyncMetrics>,
-    params: &ChainParams,
+    params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
     flags: &ValidationFlags,
     verify_settings: &VerifySettings,
-    connect_metrics: &ConnectMetrics,
-    write_lock: &Mutex<()>,
-    header_cursor: &Arc<Mutex<HeaderCursor>>,
+    connect_metrics: Arc<ConnectMetrics>,
+    write_lock: Arc<Mutex<()>>,
+    header_cursor: Arc<Mutex<HeaderCursor>>,
     getdata_batch: usize,
     inflight_per_peer: usize,
 ) -> Result<(), String> {
@@ -3166,7 +3174,7 @@ async fn fetch_blocks<S: KeyValueStore>(
         return fetch_blocks_single(
             peer,
             chainstate,
-            metrics.as_ref(),
+            Arc::clone(&metrics),
             params,
             hashes,
             flags,
@@ -3198,17 +3206,17 @@ async fn fetch_blocks<S: KeyValueStore>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn fetch_blocks_single<S: KeyValueStore>(
+async fn fetch_blocks_single<S: KeyValueStore + 'static>(
     peer: &mut Peer,
-    chainstate: &ChainState<S>,
-    metrics: &SyncMetrics,
-    params: &ChainParams,
+    chainstate: Arc<ChainState<S>>,
+    metrics: Arc<SyncMetrics>,
+    params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
     flags: &ValidationFlags,
     verify_settings: &VerifySettings,
-    connect_metrics: &ConnectMetrics,
-    write_lock: &Mutex<()>,
-    header_cursor: &Arc<Mutex<HeaderCursor>>,
+    connect_metrics: Arc<ConnectMetrics>,
+    write_lock: Arc<Mutex<()>>,
+    header_cursor: Arc<Mutex<HeaderCursor>>,
     getdata_batch: usize,
     inflight_per_peer: usize,
 ) -> Result<(), String> {
@@ -3221,34 +3229,48 @@ async fn fetch_blocks_single<S: KeyValueStore>(
     let mut received = fetch_blocks_on_peer_inner(peer, chunks, inflight_per_peer).await?;
     metrics.record_download(received.len() as u64, download_start.elapsed());
 
-    connect_pending(
-        chainstate,
-        params,
-        flags,
-        metrics,
-        verify_settings,
-        connect_metrics,
-        write_lock,
-        header_cursor,
-        &mut pending,
-        &mut received,
-    )?;
+    let chainstate = Arc::clone(&chainstate);
+    let params = Arc::clone(&params);
+    let metrics = Arc::clone(&metrics);
+    let flags = flags.clone();
+    let verify_settings = *verify_settings;
+    let connect_metrics = Arc::clone(&connect_metrics);
+    let write_lock = Arc::clone(&write_lock);
+    let header_cursor = Arc::clone(&header_cursor);
+    let join = tokio::task::spawn_blocking(move || {
+        connect_pending(
+            chainstate.as_ref(),
+            params.as_ref(),
+            &flags,
+            metrics.as_ref(),
+            &verify_settings,
+            connect_metrics.as_ref(),
+            write_lock.as_ref(),
+            &header_cursor,
+            &mut pending,
+            &mut received,
+        )
+    });
+    match join.await {
+        Ok(result) => result?,
+        Err(err) => return Err(format!("block connect task failed: {err}")),
+    }
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn fetch_blocks_multi<S: KeyValueStore>(
+async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     block_peers: &mut Vec<Peer>,
-    chainstate: &ChainState<S>,
+    chainstate: Arc<ChainState<S>>,
     metrics: Arc<SyncMetrics>,
-    params: &ChainParams,
+    params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
     flags: &ValidationFlags,
     verify_settings: &VerifySettings,
-    connect_metrics: &ConnectMetrics,
-    write_lock: &Mutex<()>,
-    header_cursor: &Arc<Mutex<HeaderCursor>>,
+    connect_metrics: Arc<ConnectMetrics>,
+    write_lock: Arc<Mutex<()>>,
+    header_cursor: Arc<Mutex<HeaderCursor>>,
     getdata_batch: usize,
     inflight_per_peer: usize,
 ) -> Result<(), String> {
@@ -3295,18 +3317,32 @@ async fn fetch_blocks_multi<S: KeyValueStore>(
     }
 
     *block_peers = returned_peers;
-    connect_pending(
-        chainstate,
-        params,
-        flags,
-        metrics.as_ref(),
-        verify_settings,
-        connect_metrics,
-        write_lock,
-        header_cursor,
-        &mut pending,
-        &mut received,
-    )?;
+    let chainstate = Arc::clone(&chainstate);
+    let params = Arc::clone(&params);
+    let metrics = Arc::clone(&metrics);
+    let flags = flags.clone();
+    let verify_settings = *verify_settings;
+    let connect_metrics = Arc::clone(&connect_metrics);
+    let write_lock = Arc::clone(&write_lock);
+    let header_cursor = Arc::clone(&header_cursor);
+    let join = tokio::task::spawn_blocking(move || {
+        connect_pending(
+            chainstate.as_ref(),
+            params.as_ref(),
+            &flags,
+            metrics.as_ref(),
+            &verify_settings,
+            connect_metrics.as_ref(),
+            write_lock.as_ref(),
+            &header_cursor,
+            &mut pending,
+            &mut received,
+        )
+    });
+    match join.await {
+        Ok(result) => result?,
+        Err(err) => return Err(format!("block connect task failed: {err}")),
+    }
 
     Ok(())
 }

@@ -71,6 +71,9 @@ Blocks are downloaded in parallel, but validated in strict height order:
 4. Perform shielded validation in separate workers.
 5. Connect blocks sequentially and commit a write batch.
 
+Block connect runs on blocking threads so the async runtime can keep serving RPC
+and dashboard requests during high-throughput sync.
+
 Worker counts and queue depths are controlled via:
 - `--verify-workers` / `--verify-queue`
 - `--shielded-workers` / `--shielded-queue`

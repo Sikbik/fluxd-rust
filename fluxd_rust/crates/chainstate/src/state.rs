@@ -20,7 +20,7 @@ use fluxd_primitives::transaction::{
     FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
     TransactionEncodeError,
 };
-use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch};
+use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
 use rayon::prelude::*;
 
 use crate::address_index::AddressIndex;
@@ -262,6 +262,7 @@ pub struct ChainState<S> {
     index: ChainIndex<S>,
     blocks: FlatFileStore,
     header_cache: Mutex<HeaderCache>,
+    shielded_cache: Mutex<Option<ShieldedTreesCache>>,
 }
 
 impl<S: KeyValueStore> ChainState<S> {
@@ -278,6 +279,7 @@ impl<S: KeyValueStore> ChainState<S> {
             store,
             blocks,
             header_cache: Mutex::new(HeaderCache::new(HEADER_CACHE_CAPACITY)),
+            shielded_cache: Mutex::new(None),
         }
     }
 
@@ -942,12 +944,10 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut index_time = Duration::ZERO;
         let mut anchor_time = Duration::ZERO;
         let mut flatfile_time = Duration::ZERO;
-        let mut sprout_tree = load_sprout_tree(&self.store)?;
-        let mut sapling_tree = load_sapling_tree(&self.store)?;
-        let prev_sprout_tree = sprout_tree_to_bytes(&sprout_tree)
-            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree"))?;
-        let prev_sapling_tree = sapling_tree_to_bytes(&sapling_tree)
-            .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree"))?;
+        let (prev_sprout_root, prev_sprout_tree, prev_sapling_root, prev_sapling_tree) =
+            self.shielded_cache_snapshot()?;
+        let mut sprout_tree: Option<SproutTree> = None;
+        let mut sapling_tree: Option<SaplingTree> = None;
         let mut undo = BlockUndo {
             prev_sprout_tree,
             prev_sapling_tree,
@@ -1142,27 +1142,46 @@ impl<S: KeyValueStore> ChainState<S> {
 
             if !(tx.join_splits.is_empty() && tx.shielded_outputs.is_empty()) {
                 let anchor_start = Instant::now();
-                for joinsplit in &tx.join_splits {
-                    for commitment in &joinsplit.commitments {
-                        sprout_tree
-                            .append(crate::shielded::SproutNode::from_hash(commitment))
-                            .map_err(|_| {
-                                ChainStateError::Validation(ValidationError::InvalidTransaction(
-                                    "sprout tree append failed",
-                                ))
-                            })?;
+                if !tx.join_splits.is_empty() {
+                    if sprout_tree.is_none() {
+                        sprout_tree = Some(self.shielded_cache_sprout_tree()?);
+                    }
+                    let sprout_tree = sprout_tree
+                        .as_mut()
+                        .ok_or(ChainStateError::CorruptIndex("missing sprout tree cache"))?;
+                    for joinsplit in &tx.join_splits {
+                        for commitment in &joinsplit.commitments {
+                            sprout_tree
+                                .append(crate::shielded::SproutNode::from_hash(commitment))
+                                .map_err(|_| {
+                                    ChainStateError::Validation(
+                                        ValidationError::InvalidTransaction(
+                                            "sprout tree append failed",
+                                        ),
+                                    )
+                                })?;
+                        }
                     }
                 }
-                for output in &tx.shielded_outputs {
-                    let node =
-                        sapling_node_from_hash(&output.cm).ok_or(ChainStateError::Validation(
-                            ValidationError::InvalidTransaction("sapling note commitment invalid"),
-                        ))?;
-                    sapling_tree.append(node).map_err(|_| {
-                        ChainStateError::Validation(ValidationError::InvalidTransaction(
-                            "sapling tree append failed",
-                        ))
-                    })?;
+                if !tx.shielded_outputs.is_empty() {
+                    if sapling_tree.is_none() {
+                        sapling_tree = Some(self.shielded_cache_sapling_tree()?);
+                    }
+                    let sapling_tree = sapling_tree
+                        .as_mut()
+                        .ok_or(ChainStateError::CorruptIndex("missing sapling tree cache"))?;
+                    for output in &tx.shielded_outputs {
+                        let node = sapling_node_from_hash(&output.cm).ok_or(
+                            ChainStateError::Validation(ValidationError::InvalidTransaction(
+                                "sapling note commitment invalid",
+                            )),
+                        )?;
+                        sapling_tree.append(node).map_err(|_| {
+                            ChainStateError::Validation(ValidationError::InvalidTransaction(
+                                "sapling tree append failed",
+                            ))
+                        })?;
+                    }
                 }
                 anchor_time += anchor_start.elapsed();
             }
@@ -1228,8 +1247,20 @@ impl<S: KeyValueStore> ChainState<S> {
         }
 
         let anchor_finalize_start = Instant::now();
-        let sprout_root = sprout_root_hash(&sprout_tree);
-        let sapling_root = sapling_root_hash(&sapling_tree);
+        let (sprout_root, sprout_changed) = match sprout_tree.as_ref() {
+            Some(tree) => {
+                let root = sprout_root_hash(tree);
+                (root, root != prev_sprout_root)
+            }
+            None => (prev_sprout_root, false),
+        };
+        let (sapling_root, sapling_changed) = match sapling_tree.as_ref() {
+            Some(tree) => {
+                let root = sapling_root_hash(tree);
+                (root, root != prev_sapling_root)
+            }
+            None => (prev_sapling_root, false),
+        };
         if network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Acadia)
             && block.header.final_sapling_root != sapling_root
         {
@@ -1238,17 +1269,26 @@ impl<S: KeyValueStore> ChainState<S> {
             )));
         }
 
-        let sprout_bytes = sprout_tree_to_bytes(&sprout_tree)
-            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree"))?;
-        let sapling_bytes = sapling_tree_to_bytes(&sapling_tree)
-            .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree"))?;
-
-        self.anchors_sprout
-            .insert(&mut batch, &sprout_root, sprout_bytes.clone());
-        self.anchors_sapling
-            .insert(&mut batch, &sapling_root, sapling_bytes.clone());
-        batch.put(Column::Meta, SPROUT_TREE_KEY, sprout_bytes);
-        batch.put(Column::Meta, SAPLING_TREE_KEY, sapling_bytes);
+        if sprout_changed {
+            let tree = sprout_tree
+                .as_ref()
+                .ok_or(ChainStateError::CorruptIndex("missing sprout tree state"))?;
+            let sprout_bytes = sprout_tree_to_bytes(tree)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree"))?;
+            self.anchors_sprout
+                .insert(&mut batch, &sprout_root, sprout_bytes.clone());
+            batch.put(Column::Meta, SPROUT_TREE_KEY, sprout_bytes);
+        }
+        if sapling_changed {
+            let tree = sapling_tree
+                .as_ref()
+                .ok_or(ChainStateError::CorruptIndex("missing sapling tree state"))?;
+            let sapling_bytes = sapling_tree_to_bytes(tree)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree"))?;
+            self.anchors_sapling
+                .insert(&mut batch, &sapling_root, Vec::new());
+            batch.put(Column::Meta, SAPLING_TREE_KEY, sapling_bytes);
+        }
         anchor_time += anchor_finalize_start.elapsed();
 
         let block_bytes = block.consensus_encode()?;
@@ -1446,27 +1486,34 @@ impl<S: KeyValueStore> ChainState<S> {
             batch.delete(Column::BlockTimestamp, hash.to_vec());
         }
 
-        let current_sprout_tree = load_sprout_tree(&self.store)?;
-        let current_sapling_tree = load_sapling_tree(&self.store)?;
-        let current_sprout_root = sprout_root_hash(&current_sprout_tree);
-        let current_sapling_root = sapling_root_hash(&current_sapling_tree);
-        let prev_sprout_tree = sprout_tree_from_bytes(&undo.prev_sprout_tree)
-            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout undo tree"))?;
-        let prev_sapling_tree = sapling_tree_from_bytes(&undo.prev_sapling_tree)
-            .map_err(|_| ChainStateError::CorruptIndex("invalid sapling undo tree"))?;
-        let prev_sprout_root = sprout_root_hash(&prev_sprout_tree);
-        let prev_sapling_root = sapling_root_hash(&prev_sapling_tree);
+        let (
+            current_sprout_root,
+            current_sprout_bytes,
+            current_sapling_root,
+            current_sapling_bytes,
+        ) = self.shielded_cache_snapshot()?;
+        let prev_sprout_root = if undo.prev_sprout_tree == current_sprout_bytes {
+            current_sprout_root
+        } else {
+            let prev_sprout_tree = sprout_tree_from_bytes(&undo.prev_sprout_tree)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid sprout undo tree"))?;
+            sprout_root_hash(&prev_sprout_tree)
+        };
+        let prev_sapling_root = if undo.prev_sapling_tree == current_sapling_bytes {
+            current_sapling_root
+        } else {
+            let prev_sapling_tree = sapling_tree_from_bytes(&undo.prev_sapling_tree)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid sapling undo tree"))?;
+            sapling_root_hash(&prev_sapling_tree)
+        };
 
         self.anchors_sprout.remove(&mut batch, &current_sprout_root);
         self.anchors_sapling
             .remove(&mut batch, &current_sapling_root);
         self.anchors_sprout
             .insert(&mut batch, &prev_sprout_root, undo.prev_sprout_tree.clone());
-        self.anchors_sapling.insert(
-            &mut batch,
-            &prev_sapling_root,
-            undo.prev_sapling_tree.clone(),
-        );
+        self.anchors_sapling
+            .insert(&mut batch, &prev_sapling_root, Vec::new());
         batch.put(Column::Meta, SPROUT_TREE_KEY, undo.prev_sprout_tree);
         batch.put(Column::Meta, SAPLING_TREE_KEY, undo.prev_sapling_tree);
 
@@ -1492,7 +1539,24 @@ impl<S: KeyValueStore> ChainState<S> {
     }
 
     pub fn commit_batch(&self, batch: WriteBatch) -> Result<(), ChainStateError> {
+        let mut sprout_bytes = None;
+        let mut sapling_bytes = None;
+        for op in batch.iter() {
+            if let WriteOp::Put { column, key, value } = op {
+                if *column != Column::Meta {
+                    continue;
+                }
+                if key.as_slice() == SPROUT_TREE_KEY {
+                    sprout_bytes = Some(value.clone());
+                } else if key.as_slice() == SAPLING_TREE_KEY {
+                    sapling_bytes = Some(value.clone());
+                }
+            }
+        }
         self.store.write_batch(batch)?;
+        if sprout_bytes.is_some() || sapling_bytes.is_some() {
+            self.update_shielded_cache(sprout_bytes, sapling_bytes)?;
+        }
         Ok(())
     }
 
@@ -1646,19 +1710,138 @@ impl<S: KeyValueStore> ChainState<S> {
 const SPROUT_TREE_KEY: &[u8] = b"sprout_tree";
 const SAPLING_TREE_KEY: &[u8] = b"sapling_tree";
 
-fn load_sprout_tree<S: KeyValueStore>(store: &S) -> Result<SproutTree, ChainStateError> {
-    match store.get(Column::Meta, SPROUT_TREE_KEY)? {
-        Some(bytes) => sprout_tree_from_bytes(&bytes)
-            .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree")),
-        None => Ok(empty_sprout_tree()),
+#[derive(Clone, Debug)]
+struct ShieldedTreesCache {
+    sprout_tree: SproutTree,
+    sprout_root: Hash256,
+    sprout_bytes: Vec<u8>,
+    sapling_tree: SaplingTree,
+    sapling_root: Hash256,
+    sapling_bytes: Vec<u8>,
+}
+
+impl ShieldedTreesCache {
+    fn load<S: KeyValueStore>(store: &S) -> Result<Self, ChainStateError> {
+        let (sprout_tree, sprout_bytes) = match store.get(Column::Meta, SPROUT_TREE_KEY)? {
+            Some(bytes) => (
+                sprout_tree_from_bytes(&bytes)
+                    .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree"))?,
+                bytes,
+            ),
+            None => {
+                let tree = empty_sprout_tree();
+                let bytes = sprout_tree_to_bytes(&tree)
+                    .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree"))?;
+                (tree, bytes)
+            }
+        };
+        let (sapling_tree, sapling_bytes) = match store.get(Column::Meta, SAPLING_TREE_KEY)? {
+            Some(bytes) => (
+                sapling_tree_from_bytes(&bytes)
+                    .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree"))?,
+                bytes,
+            ),
+            None => {
+                let tree = empty_sapling_tree();
+                let bytes = sapling_tree_to_bytes(&tree)
+                    .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree"))?;
+                (tree, bytes)
+            }
+        };
+        Ok(Self {
+            sprout_root: sprout_root_hash(&sprout_tree),
+            sprout_tree,
+            sprout_bytes,
+            sapling_root: sapling_root_hash(&sapling_tree),
+            sapling_tree,
+            sapling_bytes,
+        })
     }
 }
 
-fn load_sapling_tree<S: KeyValueStore>(store: &S) -> Result<SaplingTree, ChainStateError> {
-    match store.get(Column::Meta, SAPLING_TREE_KEY)? {
-        Some(bytes) => sapling_tree_from_bytes(&bytes)
-            .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree")),
-        None => Ok(empty_sapling_tree()),
+impl<S: KeyValueStore> ChainState<S> {
+    fn shielded_cache_snapshot(
+        &self,
+    ) -> Result<(Hash256, Vec<u8>, Hash256, Vec<u8>), ChainStateError> {
+        let mut cache = self
+            .shielded_cache
+            .lock()
+            .map_err(|_| ChainStateError::CorruptIndex("shielded cache poisoned"))?;
+        if cache.is_none() {
+            *cache = Some(ShieldedTreesCache::load(&self.store)?);
+        }
+        let cache = cache
+            .as_ref()
+            .ok_or(ChainStateError::CorruptIndex("missing shielded cache"))?;
+        Ok((
+            cache.sprout_root,
+            cache.sprout_bytes.clone(),
+            cache.sapling_root,
+            cache.sapling_bytes.clone(),
+        ))
+    }
+
+    fn shielded_cache_sprout_tree(&self) -> Result<SproutTree, ChainStateError> {
+        let mut cache = self
+            .shielded_cache
+            .lock()
+            .map_err(|_| ChainStateError::CorruptIndex("shielded cache poisoned"))?;
+        if cache.is_none() {
+            *cache = Some(ShieldedTreesCache::load(&self.store)?);
+        }
+        Ok(cache
+            .as_ref()
+            .ok_or(ChainStateError::CorruptIndex("missing shielded cache"))?
+            .sprout_tree
+            .clone())
+    }
+
+    fn shielded_cache_sapling_tree(&self) -> Result<SaplingTree, ChainStateError> {
+        let mut cache = self
+            .shielded_cache
+            .lock()
+            .map_err(|_| ChainStateError::CorruptIndex("shielded cache poisoned"))?;
+        if cache.is_none() {
+            *cache = Some(ShieldedTreesCache::load(&self.store)?);
+        }
+        Ok(cache
+            .as_ref()
+            .ok_or(ChainStateError::CorruptIndex("missing shielded cache"))?
+            .sapling_tree
+            .clone())
+    }
+
+    fn update_shielded_cache(
+        &self,
+        sprout_bytes: Option<Vec<u8>>,
+        sapling_bytes: Option<Vec<u8>>,
+    ) -> Result<(), ChainStateError> {
+        let mut cache = self
+            .shielded_cache
+            .lock()
+            .map_err(|_| ChainStateError::CorruptIndex("shielded cache poisoned"))?;
+        if cache.is_none() {
+            *cache = Some(ShieldedTreesCache::load(&self.store)?);
+        }
+        let cache = cache
+            .as_mut()
+            .ok_or(ChainStateError::CorruptIndex("missing shielded cache"))?;
+
+        if let Some(bytes) = sprout_bytes {
+            let tree = sprout_tree_from_bytes(&bytes)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid sprout tree"))?;
+            cache.sprout_root = sprout_root_hash(&tree);
+            cache.sprout_tree = tree;
+            cache.sprout_bytes = bytes;
+        }
+        if let Some(bytes) = sapling_bytes {
+            let tree = sapling_tree_from_bytes(&bytes)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid sapling tree"))?;
+            cache.sapling_root = sapling_root_hash(&tree);
+            cache.sapling_tree = tree;
+            cache.sapling_bytes = bytes;
+        }
+        Ok(())
     }
 }
 
