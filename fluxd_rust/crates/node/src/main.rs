@@ -6,11 +6,11 @@ mod stats;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +39,7 @@ use fluxd_storage::fjall::{FjallOptions, FjallStore};
 use fluxd_storage::memory::MemoryStore;
 use fluxd_storage::{KeyValueStore, StoreError, WriteBatch};
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -82,6 +83,11 @@ const ADDR_DISCOVERY_SAMPLE: usize = 64;
 const ADDR_DISCOVERY_PEERS: usize = 4;
 const ADDR_DISCOVERY_INTERVAL_SECS: u64 = 120;
 const ADDR_DISCOVERY_TIMEOUT_SECS: u64 = 6;
+const PEERS_FILE_NAME: &str = "peers.dat";
+const BANLIST_FILE_NAME: &str = "banlist.dat";
+const PEERS_FILE_VERSION: u32 = 1;
+const PEERS_PERSIST_INTERVAL_SECS: u64 = 60;
+const BANLIST_PERSIST_INTERVAL_SECS: u64 = 60;
 const GENESIS_TIMESTAMP: &str =
     "Zelcash06f40b01ab1f135bd96c5d72f8e37c7906dc216dcaaa36fcd00ebf9b8e109567";
 const GENESIS_PUBKEY_HEX: &str =
@@ -206,9 +212,14 @@ impl HeaderDownloadState {
 #[derive(Default)]
 struct AddrBook {
     addrs: Mutex<HashSet<SocketAddr>>,
+    revision: AtomicU64,
 }
 
 impl AddrBook {
+    fn revision(&self) -> u64 {
+        self.revision.load(AtomicOrdering::Relaxed)
+    }
+
     fn insert_many(&self, addrs: Vec<SocketAddr>) -> usize {
         if addrs.is_empty() {
             return 0;
@@ -223,6 +234,9 @@ impl AddrBook {
                     inserted += 1;
                 }
             }
+        }
+        if inserted > 0 {
+            self.revision.fetch_add(1, AtomicOrdering::Relaxed);
         }
         inserted
     }
@@ -250,6 +264,19 @@ impl AddrBook {
             Err(_) => 0,
         }
     }
+
+    fn snapshot(&self) -> Vec<SocketAddr> {
+        match self.addrs.lock() {
+            Ok(book) => book.iter().copied().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PeersFile {
+    version: u32,
+    addrs: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -387,6 +414,8 @@ async fn run() -> Result<(), String> {
     let db_path = data_dir.join("db");
     let blocks_path = data_dir.join("blocks");
 
+    fs::create_dir_all(data_dir).map_err(|err| err.to_string())?;
+
     let store = open_store(config.backend, &db_path, &config)?;
     let store = Arc::new(store);
 
@@ -401,6 +430,41 @@ async fn run() -> Result<(), String> {
     let peer_registry = Arc::new(PeerRegistry::default());
     let header_peer_book = Arc::new(HeaderPeerBook::default());
     let addr_book = Arc::new(AddrBook::default());
+    let peers_path = data_dir.join(PEERS_FILE_NAME);
+    let banlist_path = data_dir.join(BANLIST_FILE_NAME);
+
+    match load_peers_file(&peers_path) {
+        Ok(addrs) => {
+            let loaded = addr_book.insert_many(addrs);
+            if loaded > 0 {
+                println!("Loaded {loaded} peers from {}", peers_path.display());
+            }
+        }
+        Err(err) => eprintln!("failed to load peers file: {err}"),
+    }
+    match header_peer_book.load_banlist(&banlist_path) {
+        Ok(loaded) => {
+            if loaded > 0 {
+                println!("Loaded {loaded} bans from {}", banlist_path.display());
+            }
+        }
+        Err(err) => eprintln!("failed to load banlist: {err}"),
+    }
+
+    {
+        let addr_book = Arc::clone(&addr_book);
+        let peers_path = peers_path.clone();
+        tokio::spawn(async move {
+            persist_peers_loop(addr_book, peers_path).await;
+        });
+    }
+    {
+        let header_peer_book = Arc::clone(&header_peer_book);
+        let banlist_path = banlist_path.clone();
+        tokio::spawn(async move {
+            persist_banlist_loop(header_peer_book, banlist_path).await;
+        });
+    }
 
     println!(
         "Initialized chainstate on {:?} ({:?})",
@@ -919,6 +983,100 @@ fn open_store(backend: Backend, db_path: &PathBuf, config: &Config) -> Result<St
                 FjallStore::open_with_options(db_path, options).map_err(|err| err.to_string())?,
             ))
         }
+    }
+}
+
+fn load_peers_file(path: &Path) -> Result<Vec<SocketAddr>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.to_string()),
+    };
+    let file: PeersFile =
+        serde_json::from_slice(&bytes).map_err(|err| format!("invalid peers file: {err}"))?;
+    if file.version != PEERS_FILE_VERSION {
+        return Err(format!(
+            "unsupported peers file version {} (expected {})",
+            file.version, PEERS_FILE_VERSION
+        ));
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in file.addrs {
+        if out.len() >= ADDR_BOOK_MAX {
+            break;
+        }
+        let Ok(addr) = raw.parse::<SocketAddr>() else {
+            continue;
+        };
+        if addr.port() == 0 {
+            continue;
+        }
+        if seen.insert(addr) {
+            out.push(addr);
+        }
+    }
+    Ok(out)
+}
+
+fn save_peers_file(path: &Path, addrs: &[SocketAddr]) -> Result<(), String> {
+    let mut entries: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+    entries.sort();
+    entries.dedup();
+    if entries.len() > ADDR_BOOK_MAX {
+        entries.truncate(ADDR_BOOK_MAX);
+    }
+    let file = PeersFile {
+        version: PEERS_FILE_VERSION,
+        addrs: entries,
+    };
+    let json = serde_json::to_vec_pretty(&file).map_err(|err| err.to_string())?;
+    write_file_atomic(path, &json)
+}
+
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).map_err(|err| err.to_string())?;
+    if fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(path);
+        fs::rename(&tmp, path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn persist_peers_loop(addr_book: Arc<AddrBook>, path: PathBuf) {
+    let mut last_revision = addr_book.revision();
+    loop {
+        tokio::time::sleep(Duration::from_secs(PEERS_PERSIST_INTERVAL_SECS)).await;
+        let revision = addr_book.revision();
+        if revision == last_revision {
+            continue;
+        }
+        let snapshot = addr_book.snapshot();
+        if let Err(err) = save_peers_file(&path, &snapshot) {
+            eprintln!("failed to persist {}: {err}", path.display());
+            continue;
+        }
+        last_revision = revision;
+    }
+}
+
+async fn persist_banlist_loop(peer_book: Arc<HeaderPeerBook>, path: PathBuf) {
+    let mut last_revision = peer_book.banlist_revision();
+    loop {
+        tokio::time::sleep(Duration::from_secs(BANLIST_PERSIST_INTERVAL_SECS)).await;
+        let revision = peer_book.banlist_revision();
+        if revision == last_revision {
+            continue;
+        }
+        if let Err(err) = peer_book.save_banlist(&path) {
+            eprintln!("failed to persist {}: {err}", path.display());
+            continue;
+        }
+        last_revision = revision;
     }
 }
 
@@ -1747,6 +1905,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                             download_state.tip_height = entry.height;
                         }
                     }
+                    peer.bump_remote_height(download_state.tip_height);
                     probing = false;
                     last_headers_at = Instant::now();
                     println!("Received {} headers", headers.len());
@@ -1801,13 +1960,6 @@ async fn connect_to_cached_seed(
     peer_book: Option<&HeaderPeerBook>,
     peer_ctx: &PeerContext,
 ) -> Result<Peer, String> {
-    if seed_addrs.is_empty() && preferred_addrs.is_empty() {
-        if let Some(addr_book) = addr_book {
-            return connect_to_peer(params, start_height, start_height, addr_book, peer_ctx).await;
-        }
-        return Err("no cached seed addresses available".to_string());
-    }
-
     let is_allowed = |addr: SocketAddr| peer_book.map(|book| !book.is_banned(addr)).unwrap_or(true);
     let mut preferred_candidates = Vec::new();
     let mut seen = HashSet::new();
@@ -1846,7 +1998,7 @@ async fn connect_to_cached_seed(
         }
     }
     if candidates.is_empty() {
-        return Err("no cached seed addresses available".to_string());
+        return Err("no cached peer addresses available".to_string());
     }
     candidates.shuffle(&mut rand::thread_rng());
     let peers = connect_to_candidates(

@@ -71,8 +71,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Networking state and P2P parity
 
-- [ ] [P1] `peers.dat` persistence (owner: TBD)
-- [ ] [P1] `banlist.dat` persistence (owner: TBD)
+- [x] [P1] `peers.dat` persistence (owner: TBD)
+- [x] [P1] `banlist.dat` persistence (owner: TBD)
 - [ ] [P1] Peer scoring and eviction parity (owner: TBD)
 - [ ] [P1] Address manager parity (stochastic buckets, last-seen timestamps) (owner: TBD)
 - [ ] [P2] P2P message coverage parity (addr/getaddr/feefilter/mempool, etc.) (owner: TBD)

@@ -56,6 +56,14 @@ Note: do not run multiple `fluxd` instances pointing at the same `--data-dir` at
 There is no cross-process locking for the database / flatfiles, so concurrent writers can corrupt
 or stall the node.
 
+## Data dir notes
+
+The daemon writes a few non-db helper files into `--data-dir`:
+
+- `rpc.cookie` - JSON-RPC auth cookie when not using `--rpc-user`/`--rpc-pass`.
+- `peers.dat` - cached peer addresses learned from the network (used to reduce DNS seed reliance).
+- `banlist.dat` - cached peer bans (temporary).
+
 ## Stop
 
 ```bash

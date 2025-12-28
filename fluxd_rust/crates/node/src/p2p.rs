@@ -323,6 +323,10 @@ impl Peer {
         self.remote_height
     }
 
+    pub fn bump_remote_height(&mut self, height: i32) {
+        self.remote_height = self.remote_height.max(height);
+    }
+
     pub fn remote_version(&self) -> i32 {
         self.remote_version
     }
