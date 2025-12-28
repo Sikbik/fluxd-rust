@@ -128,3 +128,51 @@ pub fn swap_pool_amount(height: i64, swap_pool: &SwapPoolParams) -> Amount {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::params::{consensus_params, Network};
+    use crate::upgrades::UpgradeIndex;
+
+    #[test]
+    fn mainnet_canceled_halving_at_1_968_550() {
+        let params = consensus_params(Network::Mainnet);
+        let height = 1_968_550;
+
+        let before = block_subsidy(height - 1, &params);
+        let at = block_subsidy(height, &params);
+        let after = block_subsidy(height + 1, &params);
+
+        assert_eq!(before, at);
+        assert_eq!(after, at);
+        assert_eq!(at, 150 * COIN / 4);
+        assert_ne!(at, 150 * COIN / 8);
+    }
+
+    #[test]
+    fn mainnet_pon_activation_switches_subsidy() {
+        let params = consensus_params(Network::Mainnet);
+        let activation_height = params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+        assert_eq!(activation_height, 2_020_000);
+
+        let pow_before = block_subsidy(activation_height - 1, &params);
+        assert_eq!(pow_before, 150 * COIN / 4);
+
+        let pon_at = block_subsidy(activation_height, &params);
+        assert_eq!(pon_at, params.pon_initial_subsidy as Amount * COIN);
+        assert_eq!(pon_at, 14 * COIN);
+
+        let pon_after = block_subsidy(activation_height + 1, &params);
+        assert_eq!(pon_after, pon_at);
+    }
+
+    #[test]
+    fn mainnet_min_dev_fund_is_required_at_pon_activation() {
+        let params = consensus_params(Network::Mainnet);
+        let activation_height = params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+
+        assert_eq!(min_dev_fund_amount(activation_height - 1, &params), 0);
+        assert_eq!(min_dev_fund_amount(activation_height, &params), COIN / 2);
+    }
+}

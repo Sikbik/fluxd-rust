@@ -2620,6 +2620,8 @@ fn check_coinbase_funding(
 mod tests {
     use super::*;
     use fluxd_consensus::params::{chain_params, Network};
+    use fluxd_consensus::rewards::min_dev_fund_amount;
+    use fluxd_consensus::upgrades::UpgradeIndex;
     use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
     use fluxd_primitives::outpoint::OutPoint;
     use fluxd_primitives::transaction::{Transaction, TxIn, TxOut, SAPLING_VERSION_GROUP_ID};
@@ -2645,6 +2647,63 @@ mod tests {
             binding_sig: [0u8; 64],
             fluxnode: None,
         }
+    }
+
+    #[test]
+    fn coinbase_funding_does_not_require_dev_fund_pre_pon() {
+        let params = chain_params(Network::Mainnet);
+        let height = params.consensus.upgrades[UpgradeIndex::Pon.as_usize()].activation_height - 1;
+        let tx = make_tx(
+            vec![],
+            vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51],
+            }],
+        );
+        check_coinbase_funding(&tx, height, &params).expect("pre-pon coinbase funding ok");
+    }
+
+    #[test]
+    fn coinbase_funding_requires_dev_fund_at_pon_activation() {
+        let params = chain_params(Network::Mainnet);
+        let height = params.consensus.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+        let required = min_dev_fund_amount(height, &params.consensus);
+        assert!(required > 0);
+
+        let tx = make_tx(
+            vec![],
+            vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51],
+            }],
+        );
+        let err = check_coinbase_funding(&tx, height, &params).expect_err("missing dev fund");
+        match err {
+            ChainStateError::Validation(ValidationError::InvalidTransaction(message)) => {
+                assert_eq!(message, "coinbase missing dev fund payment");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let dev_script = fluxd_primitives::address_to_script_pubkey(
+            params.funding.dev_fund_address,
+            params.network,
+        )
+        .expect("dev fund script");
+        let tx = make_tx(
+            vec![],
+            vec![
+                TxOut {
+                    value: required,
+                    script_pubkey: dev_script,
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: vec![0x51],
+                },
+            ],
+        );
+        check_coinbase_funding(&tx, height, &params).expect("dev fund coinbase funding ok");
     }
 
     #[test]
