@@ -454,16 +454,12 @@ async fn run() -> Result<(), String> {
     {
         let addr_book = Arc::clone(&addr_book);
         let peers_path = peers_path.clone();
-        tokio::spawn(async move {
-            persist_peers_loop(addr_book, peers_path).await;
-        });
+        thread::spawn(move || persist_peers_loop(addr_book, peers_path));
     }
     {
         let header_peer_book = Arc::clone(&header_peer_book);
         let banlist_path = banlist_path.clone();
-        tokio::spawn(async move {
-            persist_banlist_loop(header_peer_book, banlist_path).await;
-        });
+        thread::spawn(move || persist_banlist_loop(header_peer_book, banlist_path));
     }
 
     println!(
@@ -491,21 +487,27 @@ async fn run() -> Result<(), String> {
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
-        tokio::spawn(async move {
-            if let Err(err) = rpc::serve_rpc(
-                rpc_addr,
-                rpc_auth,
-                chainstate,
-                params,
-                data_dir,
-                net_totals,
-                peer_registry,
-                header_peer_book,
-            )
-            .await
-            {
-                eprintln!("{err}");
-            }
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rpc runtime");
+            runtime.block_on(async move {
+                if let Err(err) = rpc::serve_rpc(
+                    rpc_addr,
+                    rpc_auth,
+                    chainstate,
+                    params,
+                    data_dir,
+                    net_totals,
+                    peer_registry,
+                    header_peer_book,
+                )
+                .await
+                {
+                    eprintln!("{err}");
+                }
+            });
         });
     }
 
@@ -586,22 +588,28 @@ async fn run() -> Result<(), String> {
         let header_metrics = Arc::clone(&header_metrics);
         let validation_metrics = Arc::clone(&validation_metrics);
         let connect_metrics = Arc::clone(&connect_metrics);
-        tokio::spawn(async move {
-            if let Err(err) = dashboard::serve_dashboard(
-                addr,
-                chainstate,
-                sync_metrics,
-                header_metrics,
-                validation_metrics,
-                connect_metrics,
-                network,
-                backend,
-                start_time,
-            )
-            .await
-            {
-                eprintln!("{err}");
-            }
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("dashboard runtime");
+            runtime.block_on(async move {
+                if let Err(err) = dashboard::serve_dashboard(
+                    addr,
+                    chainstate,
+                    sync_metrics,
+                    header_metrics,
+                    validation_metrics,
+                    connect_metrics,
+                    network,
+                    backend,
+                    start_time,
+                )
+                .await
+                {
+                    eprintln!("{err}");
+                }
+            });
         });
     }
 
@@ -1047,10 +1055,10 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn persist_peers_loop(addr_book: Arc<AddrBook>, path: PathBuf) {
+fn persist_peers_loop(addr_book: Arc<AddrBook>, path: PathBuf) {
     let mut last_revision = addr_book.revision();
     loop {
-        tokio::time::sleep(Duration::from_secs(PEERS_PERSIST_INTERVAL_SECS)).await;
+        thread::sleep(Duration::from_secs(PEERS_PERSIST_INTERVAL_SECS));
         let revision = addr_book.revision();
         if revision == last_revision {
             continue;
@@ -1064,10 +1072,10 @@ async fn persist_peers_loop(addr_book: Arc<AddrBook>, path: PathBuf) {
     }
 }
 
-async fn persist_banlist_loop(peer_book: Arc<HeaderPeerBook>, path: PathBuf) {
+fn persist_banlist_loop(peer_book: Arc<HeaderPeerBook>, path: PathBuf) {
     let mut last_revision = peer_book.banlist_revision();
     loop {
-        tokio::time::sleep(Duration::from_secs(BANLIST_PERSIST_INTERVAL_SECS)).await;
+        thread::sleep(Duration::from_secs(BANLIST_PERSIST_INTERVAL_SECS));
         let revision = peer_book.banlist_revision();
         if revision == last_revision {
             continue;
