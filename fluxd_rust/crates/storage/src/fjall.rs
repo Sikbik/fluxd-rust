@@ -3,7 +3,7 @@ use std::path::Path;
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 
-use crate::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
+use crate::{Column, KeyValueStore, PrefixVisitor, StoreError, WriteBatch, WriteOp};
 
 const ALL_COLUMNS: [Column; 17] = [
     Column::BlockIndex,
@@ -135,6 +135,20 @@ impl KeyValueStore for FjallStore {
             results.push((key.to_vec(), value.to_vec()));
         }
         Ok(results)
+    }
+
+    fn for_each_prefix<'a>(
+        &self,
+        column: Column,
+        prefix: &[u8],
+        visitor: &mut PrefixVisitor<'a>,
+    ) -> Result<(), StoreError> {
+        let partition = self.partition(column)?;
+        for entry in partition.prefix(prefix) {
+            let (key, value) = entry.map_err(map_err)?;
+            visitor(key.as_ref(), value.as_ref())?;
+        }
+        Ok(())
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use crate::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
+use crate::{Column, KeyValueStore, PrefixVisitor, StoreError, WriteBatch, WriteOp};
 
 type MemoryStoreMap = BTreeMap<(Column, Vec<u8>), Vec<u8>>;
 
@@ -47,6 +47,21 @@ impl KeyValueStore for MemoryStore {
             }
         }
         Ok(results)
+    }
+
+    fn for_each_prefix<'a>(
+        &self,
+        column: Column,
+        prefix: &[u8],
+        visitor: &mut PrefixVisitor<'a>,
+    ) -> Result<(), StoreError> {
+        let guard = self.inner.read().expect("memory store lock");
+        for ((entry_column, key), value) in guard.iter() {
+            if *entry_column == column && key.starts_with(prefix) {
+                visitor(key.as_slice(), value.as_slice())?;
+            }
+        }
+        Ok(())
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {

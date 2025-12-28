@@ -110,12 +110,19 @@ impl WriteBatch {
 }
 
 pub type ScanResult = Vec<(Vec<u8>, Vec<u8>)>;
+pub type PrefixVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
 
 pub trait KeyValueStore: Send + Sync {
     fn get(&self, column: Column, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError>;
     fn put(&self, column: Column, key: &[u8], value: &[u8]) -> Result<(), StoreError>;
     fn delete(&self, column: Column, key: &[u8]) -> Result<(), StoreError>;
     fn scan_prefix(&self, column: Column, prefix: &[u8]) -> Result<ScanResult, StoreError>;
+    fn for_each_prefix<'a>(
+        &self,
+        column: Column,
+        prefix: &[u8],
+        visitor: &mut PrefixVisitor<'a>,
+    ) -> Result<(), StoreError>;
     fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError>;
 }
 
@@ -134,6 +141,15 @@ impl<T: KeyValueStore + ?Sized> KeyValueStore for Arc<T> {
 
     fn scan_prefix(&self, column: Column, prefix: &[u8]) -> Result<ScanResult, StoreError> {
         self.as_ref().scan_prefix(column, prefix)
+    }
+
+    fn for_each_prefix<'a>(
+        &self,
+        column: Column,
+        prefix: &[u8],
+        visitor: &mut PrefixVisitor<'a>,
+    ) -> Result<(), StoreError> {
+        self.as_ref().for_each_prefix(column, prefix, visitor)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {

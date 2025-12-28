@@ -15,6 +15,7 @@ use fluxd_fluxnode::cache::{apply_fluxnode_tx, lookup_operator_pubkey};
 use fluxd_fluxnode::storage::{FluxnodeRecord, KeyId};
 use fluxd_primitives::address_to_script_pubkey;
 use fluxd_primitives::block::Block;
+use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
     FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
@@ -940,6 +941,15 @@ impl<S: KeyValueStore> ChainState<S> {
         }
         check_coinbase_funding(&block.transactions[0], height, params)?;
 
+        let mut utxo_stats = self.utxo_stats_or_compute()?;
+        let mut value_pools = self.value_pools_or_compute()?;
+        let mut utxos_created = 0u64;
+        let mut utxos_spent = 0u64;
+        let mut value_created = 0i64;
+        let mut value_spent = 0i64;
+        let mut sprout_pool_delta = 0i64;
+        let mut sapling_pool_delta = 0i64;
+
         let mut utxo_time = Duration::ZERO;
         let mut index_time = Duration::ZERO;
         let mut anchor_time = Duration::ZERO;
@@ -970,8 +980,15 @@ impl<S: KeyValueStore> ChainState<S> {
             let tx_value_out = tx_value_out(tx)?;
             let mut tx_value_in = tx_shielded_value_in(tx)?;
             let mut sprout_intermediates: HashMap<Hash256, SproutTree> = HashMap::new();
+            sapling_pool_delta = sapling_pool_delta
+                .checked_sub(tx.value_balance)
+                .ok_or(ChainStateError::ValueOutOfRange)?;
 
             for joinsplit in &tx.join_splits {
+                sprout_pool_delta = sprout_pool_delta
+                    .checked_add(joinsplit.vpub_old)
+                    .and_then(|value| value.checked_sub(joinsplit.vpub_new))
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
                 for nullifier in &joinsplit.nullifiers {
                     if !seen_sprout_nullifiers.insert(*nullifier) {
                         return Err(ChainStateError::Validation(
@@ -1071,6 +1088,12 @@ impl<S: KeyValueStore> ChainState<S> {
                         outpoint: input.prevout.clone(),
                         entry: entry.clone(),
                     });
+                    utxos_spent = utxos_spent
+                        .checked_add(1)
+                        .ok_or(ChainStateError::ValueOutOfRange)?;
+                    value_spent = value_spent
+                        .checked_add(entry.value)
+                        .ok_or(ChainStateError::ValueOutOfRange)?;
                     if entry.is_coinbase {
                         let spend_height = height as i64 - entry.height as i64;
                         if spend_height < COINBASE_MATURITY as i64 {
@@ -1197,6 +1220,12 @@ impl<S: KeyValueStore> ChainState<S> {
                     height: height as u32,
                     is_coinbase,
                 };
+                utxos_created = utxos_created
+                    .checked_add(1)
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
+                value_created = value_created
+                    .checked_add(output.value)
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
                 let utxo_start = Instant::now();
                 self.utxos.put(&mut batch, &outpoint, &entry);
                 utxo_time += utxo_start.elapsed();
@@ -1361,6 +1390,33 @@ impl<S: KeyValueStore> ChainState<S> {
             )));
         }
 
+        utxo_stats.txouts = utxo_stats
+            .txouts
+            .checked_add(utxos_created)
+            .and_then(|value| value.checked_sub(utxos_spent))
+            .ok_or(ChainStateError::CorruptIndex("utxo stats mismatch"))?;
+        utxo_stats.total_amount = utxo_stats
+            .total_amount
+            .checked_add(value_created)
+            .and_then(|value| value.checked_sub(value_spent))
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        batch.put(Column::Meta, UTXO_STATS_KEY, utxo_stats.encode());
+
+        value_pools.sprout = value_pools
+            .sprout
+            .checked_add(sprout_pool_delta)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        value_pools.sapling = value_pools
+            .sapling
+            .checked_add(sapling_pool_delta)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        if value_pools.sprout < 0 || value_pools.sapling < 0 {
+            return Err(ChainStateError::CorruptIndex(
+                "negative shielded value pool",
+            ));
+        }
+        batch.put(Column::Meta, VALUE_POOLS_KEY, value_pools.encode());
+
         batch.put(Column::BlockUndo, block_hash.to_vec(), undo.encode());
         self.prune_block_undo(height, &mut batch)?;
 
@@ -1401,6 +1457,13 @@ impl<S: KeyValueStore> ChainState<S> {
         ))?;
 
         let mut batch = WriteBatch::new();
+        let mut utxo_stats = self.utxo_stats_or_compute()?;
+        let mut value_pools = self.value_pools_or_compute()?;
+        let (sprout_pool_delta, sapling_pool_delta) = value_pool_deltas(&block)?;
+        let mut utxos_removed = 0u64;
+        let mut utxos_restored = 0u64;
+        let mut value_removed = 0i64;
+        let mut value_restored = 0i64;
 
         for tx in &block.transactions {
             for joinsplit in &tx.join_splits {
@@ -1423,6 +1486,12 @@ impl<S: KeyValueStore> ChainState<S> {
                 self.utxos.delete(&mut batch, &outpoint);
                 self.address_index
                     .delete(&mut batch, &output.script_pubkey, &outpoint);
+                utxos_removed = utxos_removed
+                    .checked_add(1)
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
+                value_removed = value_removed
+                    .checked_add(output.value)
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
             }
             self.tx_index.delete(&mut batch, &txid);
 
@@ -1443,6 +1512,12 @@ impl<S: KeyValueStore> ChainState<S> {
                         &spent.entry.script_pubkey,
                         &spent.outpoint,
                     );
+                    utxos_restored = utxos_restored
+                        .checked_add(1)
+                        .ok_or(ChainStateError::ValueOutOfRange)?;
+                    value_restored = value_restored
+                        .checked_add(spent.entry.value)
+                        .ok_or(ChainStateError::ValueOutOfRange)?;
                 }
             }
 
@@ -1520,6 +1595,33 @@ impl<S: KeyValueStore> ChainState<S> {
         self.index.clear_height_hash(&mut batch, entry.height);
         self.index.set_best_block(&mut batch, &entry.prev_hash);
         batch.delete(Column::BlockUndo, hash.to_vec());
+
+        utxo_stats.txouts = utxo_stats
+            .txouts
+            .checked_add(utxos_restored)
+            .and_then(|value| value.checked_sub(utxos_removed))
+            .ok_or(ChainStateError::CorruptIndex("utxo stats mismatch"))?;
+        utxo_stats.total_amount = utxo_stats
+            .total_amount
+            .checked_sub(value_removed)
+            .and_then(|value| value.checked_add(value_restored))
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        batch.put(Column::Meta, UTXO_STATS_KEY, utxo_stats.encode());
+
+        value_pools.sprout = value_pools
+            .sprout
+            .checked_sub(sprout_pool_delta)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        value_pools.sapling = value_pools
+            .sapling
+            .checked_sub(sapling_pool_delta)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        if value_pools.sprout < 0 || value_pools.sapling < 0 {
+            return Err(ChainStateError::CorruptIndex(
+                "negative shielded value pool",
+            ));
+        }
+        batch.put(Column::Meta, VALUE_POOLS_KEY, value_pools.encode());
 
         if let Ok(mut cache) = self.header_cache.lock() {
             cache.insert(*hash, entry.clone());
@@ -1665,6 +1767,131 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(self.utxos.get(outpoint)?)
     }
 
+    pub fn utxo_stats(&self) -> Result<Option<UtxoStats>, ChainStateError> {
+        let bytes = match self.store.get(Column::Meta, UTXO_STATS_KEY)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let stats = UtxoStats::decode(&bytes)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid utxo stats"))?;
+        Ok(Some(stats))
+    }
+
+    pub fn ensure_utxo_stats(&self) -> Result<UtxoStats, ChainStateError> {
+        if let Some(stats) = self.utxo_stats()? {
+            return Ok(stats);
+        }
+        let stats = self.compute_utxo_stats()?;
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Meta, UTXO_STATS_KEY, stats.encode());
+        self.commit_batch(batch)?;
+        Ok(stats)
+    }
+
+    pub fn utxo_stats_or_compute(&self) -> Result<UtxoStats, ChainStateError> {
+        if let Some(stats) = self.utxo_stats()? {
+            return Ok(stats);
+        }
+        self.compute_utxo_stats()
+    }
+
+    pub fn value_pools(&self) -> Result<Option<ValuePools>, ChainStateError> {
+        let bytes = match self.store.get(Column::Meta, VALUE_POOLS_KEY)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let pools = ValuePools::decode(&bytes)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid value pools"))?;
+        Ok(Some(pools))
+    }
+
+    pub fn ensure_value_pools(&self) -> Result<ValuePools, ChainStateError> {
+        if let Some(pools) = self.value_pools()? {
+            return Ok(pools);
+        }
+        let pools = self.compute_value_pools()?;
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Meta, VALUE_POOLS_KEY, pools.encode());
+        self.commit_batch(batch)?;
+        Ok(pools)
+    }
+
+    pub fn value_pools_or_compute(&self) -> Result<ValuePools, ChainStateError> {
+        if let Some(pools) = self.value_pools()? {
+            return Ok(pools);
+        }
+        self.compute_value_pools()
+    }
+
+    fn compute_utxo_stats(&self) -> Result<UtxoStats, ChainStateError> {
+        let mut txouts = 0u64;
+        let mut total_amount = 0i64;
+        let mut visitor = |_: &[u8], value: &[u8]| -> Result<(), StoreError> {
+            let entry =
+                UtxoEntry::decode(value).map_err(|err| StoreError::Backend(err.to_string()))?;
+            txouts = txouts
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Backend("utxo txouts overflow".to_string()))?;
+            total_amount = total_amount
+                .checked_add(entry.value)
+                .ok_or_else(|| StoreError::Backend("utxo total overflow".to_string()))?;
+            Ok(())
+        };
+        self.store
+            .for_each_prefix(Column::Utxo, &[], &mut visitor)?;
+        Ok(UtxoStats {
+            txouts,
+            total_amount,
+        })
+    }
+
+    fn compute_value_pools(&self) -> Result<ValuePools, ChainStateError> {
+        let best = match self.best_block()? {
+            Some(tip) => tip,
+            None => return Ok(ValuePools::default()),
+        };
+        if best.height < 0 {
+            return Ok(ValuePools::default());
+        }
+
+        let mut pools = ValuePools::default();
+        let mut last_progress = Instant::now();
+        for height in 0..=best.height {
+            let hash = self
+                .height_hash(height)?
+                .ok_or(ChainStateError::CorruptIndex("missing height index entry"))?;
+            let location = self
+                .block_location(&hash)?
+                .ok_or(ChainStateError::CorruptIndex("missing block index entry"))?;
+            let bytes = self.read_block(location)?;
+            let block = Block::consensus_decode(&bytes)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid block bytes"))?;
+            let (sprout_delta, sapling_delta) = value_pool_deltas(&block)?;
+            pools.sprout = pools
+                .sprout
+                .checked_add(sprout_delta)
+                .ok_or(ChainStateError::ValueOutOfRange)?;
+            pools.sapling = pools
+                .sapling
+                .checked_add(sapling_delta)
+                .ok_or(ChainStateError::ValueOutOfRange)?;
+            if pools.sprout < 0 || pools.sapling < 0 {
+                return Err(ChainStateError::CorruptIndex(
+                    "negative shielded value pool",
+                ));
+            }
+            if height > 0 && height % 100_000 == 0 {
+                println!(
+                    "Rebuilt value pools to height {} (elapsed {:?})",
+                    height,
+                    last_progress.elapsed()
+                );
+                last_progress = Instant::now();
+            }
+        }
+        Ok(pools)
+    }
+
     pub fn fluxnode_records(&self) -> Result<Vec<FluxnodeRecord>, ChainStateError> {
         let entries = self.store.scan_prefix(Column::Fluxnode, &[])?;
         let mut records = Vec::with_capacity(entries.len());
@@ -1709,6 +1936,61 @@ impl<S: KeyValueStore> ChainState<S> {
 
 const SPROUT_TREE_KEY: &[u8] = b"sprout_tree";
 const SAPLING_TREE_KEY: &[u8] = b"sapling_tree";
+const UTXO_STATS_KEY: &[u8] = b"utxo_stats_v1";
+const VALUE_POOLS_KEY: &[u8] = b"value_pools_v1";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UtxoStats {
+    pub txouts: u64,
+    pub total_amount: i64,
+}
+
+impl UtxoStats {
+    fn encode(self) -> Vec<u8> {
+        let mut encoder = Encoder::new();
+        encoder.write_u64_le(self.txouts);
+        encoder.write_i64_le(self.total_amount);
+        encoder.into_inner()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(bytes);
+        let txouts = decoder.read_u64_le()?;
+        let total_amount = decoder.read_i64_le()?;
+        if !decoder.is_empty() {
+            return Err(DecodeError::TrailingBytes);
+        }
+        Ok(Self {
+            txouts,
+            total_amount,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ValuePools {
+    pub sprout: i64,
+    pub sapling: i64,
+}
+
+impl ValuePools {
+    fn encode(self) -> Vec<u8> {
+        let mut encoder = Encoder::new();
+        encoder.write_i64_le(self.sprout);
+        encoder.write_i64_le(self.sapling);
+        encoder.into_inner()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(bytes);
+        let sprout = decoder.read_i64_le()?;
+        let sapling = decoder.read_i64_le()?;
+        if !decoder.is_empty() {
+            return Err(DecodeError::TrailingBytes);
+        }
+        Ok(Self { sprout, sapling })
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ShieldedTreesCache {
@@ -1938,6 +2220,23 @@ fn tx_shielded_value_in(tx: &Transaction) -> Result<i64, ChainStateError> {
         }
     }
     Ok(total)
+}
+
+fn value_pool_deltas(block: &Block) -> Result<(i64, i64), ChainStateError> {
+    let mut sprout_delta = 0i64;
+    let mut sapling_delta = 0i64;
+    for tx in &block.transactions {
+        sapling_delta = sapling_delta
+            .checked_sub(tx.value_balance)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        for joinsplit in &tx.join_splits {
+            sprout_delta = sprout_delta
+                .checked_add(joinsplit.vpub_old)
+                .and_then(|value| value.checked_sub(joinsplit.vpub_new))
+                .ok_or(ChainStateError::ValueOutOfRange)?;
+        }
+    }
+    Ok((sprout_delta, sapling_delta))
 }
 
 fn block_bits_from_params(params: &ConsensusParams) -> u32 {
@@ -2185,7 +2484,7 @@ mod tests {
     use fluxd_consensus::params::{chain_params, Network};
     use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
     use fluxd_primitives::outpoint::OutPoint;
-    use fluxd_primitives::transaction::{Transaction, TxIn, TxOut};
+    use fluxd_primitives::transaction::{Transaction, TxIn, TxOut, SAPLING_VERSION_GROUP_ID};
     use fluxd_storage::memory::MemoryStore;
     use fluxd_storage::WriteBatch;
     use std::sync::Arc;
@@ -2236,6 +2535,14 @@ mod tests {
             .address_index
             .insert(&mut seed_batch, &seed_entry.script_pubkey, &seed_outpoint);
         chainstate.commit_batch(seed_batch).expect("seed utxo");
+        let seed_stats = chainstate.utxo_stats_or_compute().expect("seed stats");
+        assert_eq!(
+            seed_stats,
+            UtxoStats {
+                txouts: 1,
+                total_amount: seed_entry.value
+            }
+        );
 
         let mut params = chain_params(Network::Regtest);
         let header = BlockHeader {
@@ -2325,6 +2632,14 @@ mod tests {
             .connect_block(&block, 0, &params, &flags, true, None)
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit connect");
+        let connected_stats = chainstate.utxo_stats().expect("utxo stats").expect("stats");
+        assert_eq!(
+            connected_stats,
+            UtxoStats {
+                txouts: 2,
+                total_amount: seed_entry.value
+            }
+        );
 
         assert!(!chainstate
             .utxo_exists(&seed_outpoint)
@@ -2336,6 +2651,14 @@ mod tests {
             .disconnect_block(&block_hash)
             .expect("disconnect");
         chainstate.commit_batch(batch).expect("commit disconnect");
+        let disconnected_stats = chainstate.utxo_stats().expect("utxo stats").expect("stats");
+        assert_eq!(
+            disconnected_stats,
+            UtxoStats {
+                txouts: 1,
+                total_amount: seed_entry.value
+            }
+        );
 
         assert!(chainstate
             .utxo_exists(&seed_outpoint)
@@ -2394,5 +2717,157 @@ mod tests {
             .expect("load header bytes")
             .expect("header bytes missing");
         assert_eq!(stored, header.consensus_encode());
+    }
+
+    #[test]
+    fn connect_updates_sapling_value_pool() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let seed_script = vec![0x51];
+        let seed_outpoint = OutPoint {
+            hash: [0x11; 32],
+            index: 0,
+        };
+        let seed_entry = UtxoEntry {
+            value: 50,
+            script_pubkey: seed_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let mut seed_batch = WriteBatch::new();
+        chainstate
+            .utxos
+            .put(&mut seed_batch, &seed_outpoint, &seed_entry);
+        chainstate
+            .address_index
+            .insert(&mut seed_batch, &seed_entry.script_pubkey, &seed_outpoint);
+        chainstate.commit_batch(seed_batch).expect("seed utxo");
+
+        let mut params = chain_params(Network::Regtest);
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: [0u8; 32],
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: current_time_secs() as u32,
+            bits: block_bits_from_params(&params.consensus),
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let block_hash = header.hash();
+        params.consensus.hash_genesis_block = block_hash;
+        params.consensus.checkpoints = vec![fluxd_consensus::params::Checkpoint {
+            height: 0,
+            hash: block_hash,
+        }];
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                std::slice::from_ref(&header),
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate.commit_batch(header_batch).expect("commit header");
+
+        let coinbase = make_tx(
+            vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51],
+            }],
+        );
+
+        let sapling_tx = Transaction {
+            f_overwintered: true,
+            version: 4,
+            version_group_id: SAPLING_VERSION_GROUP_ID,
+            vin: vec![TxIn {
+                prevout: seed_outpoint.clone(),
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: 40,
+                script_pubkey: vec![0x52],
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: -10,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase, sapling_tx],
+        };
+
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(&block, 0, &params, &flags, true, None)
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit connect");
+
+        let utxo_stats = chainstate.utxo_stats().expect("utxo stats").expect("stats");
+        assert_eq!(
+            utxo_stats,
+            UtxoStats {
+                txouts: 2,
+                total_amount: 40
+            }
+        );
+        let pools = chainstate
+            .value_pools()
+            .expect("value pools")
+            .expect("pools");
+        assert_eq!(
+            pools,
+            ValuePools {
+                sprout: 0,
+                sapling: 10
+            }
+        );
+
+        let batch = chainstate
+            .disconnect_block(&block_hash)
+            .expect("disconnect");
+        chainstate.commit_batch(batch).expect("commit disconnect");
+
+        let utxo_stats = chainstate.utxo_stats().expect("utxo stats").expect("stats");
+        assert_eq!(
+            utxo_stats,
+            UtxoStats {
+                txouts: 1,
+                total_amount: 50
+            }
+        );
+        let pools = chainstate
+            .value_pools()
+            .expect("value pools")
+            .expect("pools");
+        assert_eq!(
+            pools,
+            ValuePools {
+                sprout: 0,
+                sapling: 0
+            }
+        );
     }
 }

@@ -339,6 +339,18 @@ impl KeyValueStore for Store {
         }
     }
 
+    fn for_each_prefix<'a>(
+        &self,
+        column: fluxd_storage::Column,
+        prefix: &[u8],
+        visitor: &mut fluxd_storage::PrefixVisitor<'a>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Store::Memory(store) => store.for_each_prefix(column, prefix, visitor),
+            Store::Fjall(store) => store.for_each_prefix(column, prefix, visitor),
+        }
+    }
+
     fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {
         match self {
             Store::Memory(store) => store.write_batch(batch),
@@ -454,6 +466,36 @@ async fn run() -> Result<(), String> {
         Some(&connect_metrics),
         &write_lock,
     )?;
+
+    if chainstate
+        .utxo_stats()
+        .map_err(|err| err.to_string())?
+        .is_none()
+    {
+        println!("UTXO stats missing; rebuilding from UTXO set (one-time).");
+        let _guard = write_lock
+            .lock()
+            .map_err(|_| "write lock poisoned".to_string())?;
+        chainstate
+            .ensure_utxo_stats()
+            .map_err(|err| err.to_string())?;
+        println!("UTXO stats rebuilt.");
+    }
+
+    if chainstate
+        .value_pools()
+        .map_err(|err| err.to_string())?
+        .is_none()
+    {
+        println!("Shielded value pools missing; rebuilding from blocks (one-time).");
+        let _guard = write_lock
+            .lock()
+            .map_err(|_| "write lock poisoned".to_string())?;
+        chainstate
+            .ensure_value_pools()
+            .map_err(|err| err.to_string())?;
+        println!("Shielded value pools rebuilt.");
+    }
 
     let sync_metrics = Arc::new(SyncMetrics::default());
     let header_metrics = Arc::new(HeaderMetrics::default());

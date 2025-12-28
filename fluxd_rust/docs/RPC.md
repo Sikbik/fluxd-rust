@@ -95,6 +95,7 @@ Type notes:
 
 - `getrawtransaction <txid> [verbose]`
 - `gettxout <txid> <vout> [include_mempool]`
+- `gettxoutsetinfo`
 
 ### Mining and mempool (placeholders)
 
@@ -120,7 +121,6 @@ Type notes:
 - `getspentinfo` (not implemented)
 - `gettxoutproof` (not implemented)
 - `verifytxoutproof` (not implemented)
-- `gettxoutsetinfo` (not implemented)
 
 ## Method details
 
@@ -201,6 +201,8 @@ Returns chain metadata:
 - `chainwork`
 - `pruned` - always false.
 - `size_on_disk` - total size of `--data-dir`.
+- `valuePools` - Sprout/Sapling value pool totals (with `chainValue` and `chainValueZat`).
+- `total_supply` / `total_supply_zat` - transparent UTXOs + shielded value pools.
 - `upgrades` - network upgrades with activation heights and status.
 - `consensus` - current and next branch ids.
 
@@ -262,6 +264,25 @@ Notes:
 - Result:
   - `null` if the output is spent.
   - Otherwise: `bestblock`, `confirmations`, `value`, `scriptPubKey`, `coinbase`.
+
+### gettxoutsetinfo
+
+Returns a summary of the current transparent UTXO set.
+
+Fields:
+- `height`, `bestblock`
+- `txouts` - number of unspent outputs
+- `total_amount` - sum of all unspent output values (transparent only)
+- `sprout_pool`, `sapling_pool` - shielded pool totals
+- `shielded_amount` - `sprout_pool + sapling_pool`
+- `total_supply` - `total_amount + shielded_amount`
+- `disk_size` - byte size of the `db/` directory
+
+Notes:
+- `transactions`, `bogosize`, and `hash_serialized_2` are currently placeholders.
+- UTXO stats are maintained incrementally in the chainstate `Meta` column under `utxo_stats_v1`.
+- Shielded value pools are maintained incrementally in the chainstate `Meta` column under `value_pools_v1`.
+- `*_zat` fields are provided for exact integer values.
 
 ### getnetworkhashps / getnetworksolps / getlocalsolps
 

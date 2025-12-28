@@ -508,7 +508,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "gettxout" => rpc_gettxout(chainstate, params, chain_params),
         "gettxoutproof" => rpc_gettxoutproof(params),
         "verifytxoutproof" => rpc_verifytxoutproof(params),
-        "gettxoutsetinfo" => rpc_gettxoutsetinfo(params),
+        "gettxoutsetinfo" => rpc_gettxoutsetinfo(chainstate, params, data_dir),
         "getblockdeltas" => rpc_getblockdeltas(params),
         "getspentinfo" => rpc_getspentinfo(params),
         "getblocktemplate" => rpc_getblocktemplate(params),
@@ -844,6 +844,17 @@ fn rpc_getblockchaininfo<S: fluxd_storage::KeyValueStore>(
         "nextblock": format!("{:08x}", current_epoch_branch_id(best_block_height + 1, &chain_params.consensus.upgrades)),
     });
 
+    let value_pools = chainstate.value_pools_or_compute().map_err(map_internal)?;
+    let utxo_stats = chainstate.utxo_stats_or_compute().map_err(map_internal)?;
+    let shielded_total = value_pools
+        .sprout
+        .checked_add(value_pools.sapling)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "shielded value pool overflow"))?;
+    let total_supply = utxo_stats
+        .total_amount
+        .checked_add(shielded_total)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "total supply overflow"))?;
+
     Ok(json!({
         "chain": network_name(chain_params.network),
         "blocks": best_block_height.max(0),
@@ -854,6 +865,22 @@ fn rpc_getblockchaininfo<S: fluxd_storage::KeyValueStore>(
         "chainwork": chainwork,
         "pruned": false,
         "size_on_disk": size_on_disk,
+        "valuePools": [
+            {
+                "id": "sprout",
+                "monitored": true,
+                "chainValue": amount_to_value(value_pools.sprout),
+                "chainValueZat": value_pools.sprout,
+            },
+            {
+                "id": "sapling",
+                "monitored": true,
+                "chainValue": amount_to_value(value_pools.sapling),
+                "chainValueZat": value_pools.sapling,
+            }
+        ],
+        "total_supply": amount_to_value(total_supply),
+        "total_supply_zat": total_supply,
         "upgrades": upgrades,
         "consensus": consensus
     }))
@@ -1102,12 +1129,47 @@ fn rpc_verifytxoutproof(params: Vec<Value>) -> Result<Value, RpcError> {
     ))
 }
 
-fn rpc_gettxoutsetinfo(params: Vec<Value>) -> Result<Value, RpcError> {
-    let _ = params;
-    Err(RpcError::new(
-        RPC_INTERNAL_ERROR,
-        "gettxoutsetinfo is not implemented",
-    ))
+fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    data_dir: &Path,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    let best = chainstate.best_block().map_err(map_internal)?;
+    let (height, best_hash) = match best {
+        Some(tip) => (tip.height, tip.hash),
+        None => (0, [0u8; 32]),
+    };
+    let stats = chainstate.utxo_stats_or_compute().map_err(map_internal)?;
+    let value_pools = chainstate.value_pools_or_compute().map_err(map_internal)?;
+    let shielded_total = value_pools
+        .sprout
+        .checked_add(value_pools.sapling)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "shielded value pool overflow"))?;
+    let total_supply = stats
+        .total_amount
+        .checked_add(shielded_total)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "total supply overflow"))?;
+    let disk_size = dir_size(&data_dir.join("db")).unwrap_or(0);
+    Ok(json!({
+        "height": height.max(0),
+        "bestblock": hash256_to_hex(&best_hash),
+        "transactions": 0,
+        "txouts": stats.txouts,
+        "bogosize": 0,
+        "hash_serialized_2": "0000000000000000000000000000000000000000000000000000000000000000",
+        "disk_size": disk_size,
+        "total_amount": amount_to_value(stats.total_amount),
+        "total_amount_zat": stats.total_amount,
+        "sprout_pool": amount_to_value(value_pools.sprout),
+        "sprout_pool_zat": value_pools.sprout,
+        "sapling_pool": amount_to_value(value_pools.sapling),
+        "sapling_pool_zat": value_pools.sapling,
+        "shielded_amount": amount_to_value(shielded_total),
+        "shielded_amount_zat": shielded_total,
+        "total_supply": amount_to_value(total_supply),
+        "total_supply_zat": total_supply,
+    }))
 }
 
 fn rpc_getblockdeltas(params: Vec<Value>) -> Result<Value, RpcError> {

@@ -122,6 +122,8 @@ Undo entries are pruned as the chain advances to retain only the most recent
 
 - `best_header` / `best_block` hashes
 - sprout/sapling tree bytes (used to resume shielded state; updated only when the tree changes)
+- UTXO set stats (`utxo_stats_v1`) for `gettxoutsetinfo` (txouts + total_amount)
+- Shielded value pools (`value_pools_v1`) for Sprout/Sapling chain supply tracking
 
 ## Index lifecycle
 
