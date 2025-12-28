@@ -114,6 +114,9 @@ Key consensus behaviors:
 - Dashboard server: `/`, `/stats`, `/healthz`.
 - Status logs with throughput and timing metrics.
 
+See `docs/TELEMETRY.md` for a detailed guide to interpreting `/stats` counters (connect-stage
+breakdowns and Fjall health signals).
+
 ## Storage backends
 
 - Fjall (default): persistent key-value store with configurable caching.

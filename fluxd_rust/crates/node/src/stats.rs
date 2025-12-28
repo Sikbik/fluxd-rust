@@ -9,6 +9,7 @@ use fluxd_consensus::Hash256;
 use fluxd_storage::KeyValueStore;
 
 use crate::Backend;
+use crate::Store;
 
 #[derive(Clone, Debug)]
 pub struct StatsSnapshot {
@@ -52,6 +53,42 @@ pub struct StatsSnapshot {
     pub anchor_blocks: u64,
     pub flatfile_us: u64,
     pub flatfile_blocks: u64,
+    pub utxo_get_us: u64,
+    pub utxo_get_ops: u64,
+    pub utxo_cache_hits: u64,
+    pub utxo_cache_misses: u64,
+    pub utxo_put_us: u64,
+    pub utxo_put_ops: u64,
+    pub utxo_delete_us: u64,
+    pub utxo_delete_ops: u64,
+    pub spent_index_ops: u64,
+    pub address_index_inserts: u64,
+    pub address_index_deletes: u64,
+    pub address_delta_inserts: u64,
+    pub tx_index_ops: u64,
+    pub header_index_ops: u64,
+    pub timestamp_index_ops: u64,
+    pub undo_encode_us: u64,
+    pub undo_bytes: u64,
+    pub undo_append_us: u64,
+    pub db_write_buffer_bytes: Option<u64>,
+    pub db_journal_count: Option<u64>,
+    pub db_flushes_completed: Option<u64>,
+    pub db_active_compactions: Option<u64>,
+    pub db_compactions_completed: Option<u64>,
+    pub db_time_compacting_us: Option<u64>,
+    pub db_utxo_segments: Option<u64>,
+    pub db_utxo_flushes_completed: Option<u64>,
+    pub db_tx_index_segments: Option<u64>,
+    pub db_tx_index_flushes_completed: Option<u64>,
+    pub db_spent_index_segments: Option<u64>,
+    pub db_spent_index_flushes_completed: Option<u64>,
+    pub db_address_outpoint_segments: Option<u64>,
+    pub db_address_outpoint_flushes_completed: Option<u64>,
+    pub db_address_delta_segments: Option<u64>,
+    pub db_address_delta_flushes_completed: Option<u64>,
+    pub db_header_index_segments: Option<u64>,
+    pub db_header_index_flushes_completed: Option<u64>,
 }
 
 impl StatsSnapshot {
@@ -65,7 +102,7 @@ impl StatsSnapshot {
             None => "null".to_string(),
         };
 
-        let mut json = String::with_capacity(512);
+        let mut json = String::with_capacity(1024);
         json.push('{');
         json.push_str("\"network\":");
         json.push_str(&json_string(&self.network));
@@ -147,8 +184,88 @@ impl StatsSnapshot {
         json.push_str(&self.flatfile_us.to_string());
         json.push_str(",\"flatfile_blocks\":");
         json.push_str(&self.flatfile_blocks.to_string());
+        json.push_str(",\"utxo_get_us\":");
+        json.push_str(&self.utxo_get_us.to_string());
+        json.push_str(",\"utxo_get_ops\":");
+        json.push_str(&self.utxo_get_ops.to_string());
+        json.push_str(",\"utxo_cache_hits\":");
+        json.push_str(&self.utxo_cache_hits.to_string());
+        json.push_str(",\"utxo_cache_misses\":");
+        json.push_str(&self.utxo_cache_misses.to_string());
+        json.push_str(",\"utxo_put_us\":");
+        json.push_str(&self.utxo_put_us.to_string());
+        json.push_str(",\"utxo_put_ops\":");
+        json.push_str(&self.utxo_put_ops.to_string());
+        json.push_str(",\"utxo_delete_us\":");
+        json.push_str(&self.utxo_delete_us.to_string());
+        json.push_str(",\"utxo_delete_ops\":");
+        json.push_str(&self.utxo_delete_ops.to_string());
+        json.push_str(",\"spent_index_ops\":");
+        json.push_str(&self.spent_index_ops.to_string());
+        json.push_str(",\"address_index_inserts\":");
+        json.push_str(&self.address_index_inserts.to_string());
+        json.push_str(",\"address_index_deletes\":");
+        json.push_str(&self.address_index_deletes.to_string());
+        json.push_str(",\"address_delta_inserts\":");
+        json.push_str(&self.address_delta_inserts.to_string());
+        json.push_str(",\"tx_index_ops\":");
+        json.push_str(&self.tx_index_ops.to_string());
+        json.push_str(",\"header_index_ops\":");
+        json.push_str(&self.header_index_ops.to_string());
+        json.push_str(",\"timestamp_index_ops\":");
+        json.push_str(&self.timestamp_index_ops.to_string());
+        json.push_str(",\"undo_encode_us\":");
+        json.push_str(&self.undo_encode_us.to_string());
+        json.push_str(",\"undo_bytes\":");
+        json.push_str(&self.undo_bytes.to_string());
+        json.push_str(",\"undo_append_us\":");
+        json.push_str(&self.undo_append_us.to_string());
+
+        json.push_str(",\"db_write_buffer_bytes\":");
+        push_json_u64_opt(&mut json, self.db_write_buffer_bytes);
+        json.push_str(",\"db_journal_count\":");
+        push_json_u64_opt(&mut json, self.db_journal_count);
+        json.push_str(",\"db_flushes_completed\":");
+        push_json_u64_opt(&mut json, self.db_flushes_completed);
+        json.push_str(",\"db_active_compactions\":");
+        push_json_u64_opt(&mut json, self.db_active_compactions);
+        json.push_str(",\"db_compactions_completed\":");
+        push_json_u64_opt(&mut json, self.db_compactions_completed);
+        json.push_str(",\"db_time_compacting_us\":");
+        push_json_u64_opt(&mut json, self.db_time_compacting_us);
+        json.push_str(",\"db_utxo_segments\":");
+        push_json_u64_opt(&mut json, self.db_utxo_segments);
+        json.push_str(",\"db_utxo_flushes_completed\":");
+        push_json_u64_opt(&mut json, self.db_utxo_flushes_completed);
+        json.push_str(",\"db_tx_index_segments\":");
+        push_json_u64_opt(&mut json, self.db_tx_index_segments);
+        json.push_str(",\"db_tx_index_flushes_completed\":");
+        push_json_u64_opt(&mut json, self.db_tx_index_flushes_completed);
+        json.push_str(",\"db_spent_index_segments\":");
+        push_json_u64_opt(&mut json, self.db_spent_index_segments);
+        json.push_str(",\"db_spent_index_flushes_completed\":");
+        push_json_u64_opt(&mut json, self.db_spent_index_flushes_completed);
+        json.push_str(",\"db_address_outpoint_segments\":");
+        push_json_u64_opt(&mut json, self.db_address_outpoint_segments);
+        json.push_str(",\"db_address_outpoint_flushes_completed\":");
+        push_json_u64_opt(&mut json, self.db_address_outpoint_flushes_completed);
+        json.push_str(",\"db_address_delta_segments\":");
+        push_json_u64_opt(&mut json, self.db_address_delta_segments);
+        json.push_str(",\"db_address_delta_flushes_completed\":");
+        push_json_u64_opt(&mut json, self.db_address_delta_flushes_completed);
+        json.push_str(",\"db_header_index_segments\":");
+        push_json_u64_opt(&mut json, self.db_header_index_segments);
+        json.push_str(",\"db_header_index_flushes_completed\":");
+        push_json_u64_opt(&mut json, self.db_header_index_flushes_completed);
         json.push('}');
         json
+    }
+}
+
+fn push_json_u64_opt(json: &mut String, value: Option<u64>) {
+    match value {
+        Some(value) => json.push_str(&value.to_string()),
+        None => json.push_str("null"),
     }
 }
 
@@ -269,6 +386,7 @@ pub struct HeaderMetricsSnapshot {
 #[allow(clippy::too_many_arguments)]
 pub fn snapshot_stats<S: KeyValueStore>(
     chainstate: &ChainState<S>,
+    store: Option<&Store>,
     network: Network,
     backend: Backend,
     start_time: Instant,
@@ -316,6 +434,7 @@ pub fn snapshot_stats<S: KeyValueStore>(
     let connect = connect_metrics
         .map(ConnectMetrics::snapshot)
         .unwrap_or_default();
+    let db = store.and_then(|store| store.fjall_telemetry_snapshot());
 
     Ok(StatsSnapshot {
         network: format!("{network:?}"),
@@ -358,6 +477,46 @@ pub fn snapshot_stats<S: KeyValueStore>(
         anchor_blocks: connect.anchor_blocks,
         flatfile_us: connect.flatfile_us,
         flatfile_blocks: connect.flatfile_blocks,
+        utxo_get_us: connect.utxo_get_us,
+        utxo_get_ops: connect.utxo_get_ops,
+        utxo_cache_hits: connect.utxo_cache_hits,
+        utxo_cache_misses: connect.utxo_cache_misses,
+        utxo_put_us: connect.utxo_put_us,
+        utxo_put_ops: connect.utxo_put_ops,
+        utxo_delete_us: connect.utxo_delete_us,
+        utxo_delete_ops: connect.utxo_delete_ops,
+        spent_index_ops: connect.spent_index_ops,
+        address_index_inserts: connect.address_index_inserts,
+        address_index_deletes: connect.address_index_deletes,
+        address_delta_inserts: connect.address_delta_inserts,
+        tx_index_ops: connect.tx_index_ops,
+        header_index_ops: connect.header_index_ops,
+        timestamp_index_ops: connect.timestamp_index_ops,
+        undo_encode_us: connect.undo_encode_us,
+        undo_bytes: connect.undo_bytes,
+        undo_append_us: connect.undo_append_us,
+        db_write_buffer_bytes: db.as_ref().map(|db| db.write_buffer_bytes),
+        db_journal_count: db.as_ref().map(|db| db.journal_count),
+        db_flushes_completed: db.as_ref().map(|db| db.flushes_completed),
+        db_active_compactions: db.as_ref().map(|db| db.active_compactions),
+        db_compactions_completed: db.as_ref().map(|db| db.compactions_completed),
+        db_time_compacting_us: db.as_ref().map(|db| db.time_compacting_us),
+        db_utxo_segments: db.as_ref().map(|db| db.utxo_segments),
+        db_utxo_flushes_completed: db.as_ref().map(|db| db.utxo_flushes_completed),
+        db_tx_index_segments: db.as_ref().map(|db| db.tx_index_segments),
+        db_tx_index_flushes_completed: db.as_ref().map(|db| db.tx_index_flushes_completed),
+        db_spent_index_segments: db.as_ref().map(|db| db.spent_index_segments),
+        db_spent_index_flushes_completed: db.as_ref().map(|db| db.spent_index_flushes_completed),
+        db_address_outpoint_segments: db.as_ref().map(|db| db.address_outpoint_segments),
+        db_address_outpoint_flushes_completed: db
+            .as_ref()
+            .map(|db| db.address_outpoint_flushes_completed),
+        db_address_delta_segments: db.as_ref().map(|db| db.address_delta_segments),
+        db_address_delta_flushes_completed: db
+            .as_ref()
+            .map(|db| db.address_delta_flushes_completed),
+        db_header_index_segments: db.as_ref().map(|db| db.header_index_segments),
+        db_header_index_flushes_completed: db.as_ref().map(|db| db.header_index_flushes_completed),
     })
 }
 

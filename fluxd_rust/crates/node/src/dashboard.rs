@@ -13,6 +13,7 @@ use fluxd_chainstate::validation::ValidationMetrics;
 
 use crate::stats::{snapshot_stats, HeaderMetrics, SyncMetrics};
 use crate::Backend;
+use crate::Store;
 
 const MAX_REQUEST_BYTES: usize = 8192;
 
@@ -20,6 +21,7 @@ const MAX_REQUEST_BYTES: usize = 8192;
 pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
     addr: SocketAddr,
     chainstate: Arc<ChainState<S>>,
+    store: Arc<Store>,
     metrics: Arc<SyncMetrics>,
     header_metrics: Arc<HeaderMetrics>,
     validation_metrics: Arc<ValidationMetrics>,
@@ -39,6 +41,7 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
             .await
             .map_err(|err| format!("dashboard accept failed: {err}"))?;
         let chainstate = Arc::clone(&chainstate);
+        let store = Arc::clone(&store);
         let metrics = Arc::clone(&metrics);
         let header_metrics = Arc::clone(&header_metrics);
         let validation_metrics = Arc::clone(&validation_metrics);
@@ -47,6 +50,7 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
             if let Err(err) = handle_connection(
                 stream,
                 chainstate,
+                store,
                 metrics,
                 header_metrics,
                 validation_metrics,
@@ -67,6 +71,7 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
 async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
     mut stream: tokio::net::TcpStream,
     chainstate: Arc<ChainState<S>>,
+    store: Arc<Store>,
     metrics: Arc<SyncMetrics>,
     header_metrics: Arc<HeaderMetrics>,
     validation_metrics: Arc<ValidationMetrics>,
@@ -97,6 +102,7 @@ async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
         }
         ("GET", "/stats") => match snapshot_stats(
             &chainstate,
+            Some(store.as_ref()),
             network,
             backend,
             start_time,

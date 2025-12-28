@@ -40,7 +40,7 @@ use crate::filemeta::{
 };
 use crate::flatfiles::{FileLocation, FlatFileError, FlatFileStore};
 use crate::index::{status_with_block, status_with_header, ChainIndex, ChainTip, HeaderEntry};
-use crate::metrics::ConnectMetrics;
+use crate::metrics::{ConnectMetrics, ConnectMetricsDelta};
 use crate::shielded::{
     empty_sapling_tree, empty_sprout_tree, sapling_empty_root_hash, sapling_node_from_hash,
     sapling_root_hash, sapling_tree_from_bytes, sapling_tree_to_bytes, sprout_empty_root_hash,
@@ -63,6 +63,12 @@ struct ScriptCheck {
     script_sig: Vec<u8>,
     script_pubkey: Vec<u8>,
     value: i64,
+}
+
+#[derive(Default)]
+struct UtxoCacheStats {
+    hits: u64,
+    misses: u64,
 }
 
 #[derive(Debug)]
@@ -1441,6 +1447,23 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut index_time = Duration::ZERO;
         let mut anchor_time = Duration::ZERO;
         let mut flatfile_time = Duration::ZERO;
+        let mut utxo_get_us = 0u64;
+        let mut utxo_get_ops = 0u64;
+        let mut utxo_put_us = 0u64;
+        let mut utxo_put_ops = 0u64;
+        let mut utxo_delete_us = 0u64;
+        let mut utxo_delete_ops = 0u64;
+        let mut spent_index_ops = 0u64;
+        let mut address_index_inserts = 0u64;
+        let mut address_index_deletes = 0u64;
+        let mut address_delta_inserts = 0u64;
+        let mut tx_index_ops = 0u64;
+        let mut header_index_ops = 0u64;
+        let mut timestamp_index_ops = 0u64;
+        let mut undo_encode_us = 0u64;
+        let mut undo_bytes_total = 0u64;
+        let mut undo_append_us = 0u64;
+        let mut utxo_cache_stats = UtxoCacheStats::default();
         let (prev_sprout_root, prev_sprout_tree, prev_sapling_root, prev_sapling_tree) =
             self.shielded_cache_snapshot()?;
         let mut sprout_tree: Option<SproutTree> = None;
@@ -1579,8 +1602,12 @@ impl<S: KeyValueStore> ChainState<S> {
                         Some(entry) => entry,
                         None => {
                             let utxo_start = Instant::now();
-                            let entry = self.utxo_entry_cached(outpoint_key)?;
-                            utxo_time += utxo_start.elapsed();
+                            let entry = self
+                                .utxo_entry_cached_tracked(outpoint_key, &mut utxo_cache_stats)?;
+                            let elapsed = utxo_start.elapsed();
+                            utxo_time += elapsed;
+                            utxo_get_ops = utxo_get_ops.saturating_add(1);
+                            utxo_get_us = utxo_get_us.saturating_add(elapsed.as_micros() as u64);
                             match entry {
                                 Some(entry) => entry,
                                 None => {
@@ -1597,6 +1624,7 @@ impl<S: KeyValueStore> ChainState<S> {
                             }
                         }
                     };
+                    spent_index_ops = spent_index_ops.saturating_add(1);
                     self.spent_index.insert(
                         &mut batch,
                         &input.prevout,
@@ -1649,10 +1677,15 @@ impl<S: KeyValueStore> ChainState<S> {
                     let prevout = input.prevout.clone();
                     let utxo_start = Instant::now();
                     self.utxos.delete(&mut batch, &prevout);
-                    utxo_time += utxo_start.elapsed();
+                    let elapsed = utxo_start.elapsed();
+                    utxo_time += elapsed;
+                    utxo_delete_ops = utxo_delete_ops.saturating_add(1);
+                    utxo_delete_us = utxo_delete_us.saturating_add(elapsed.as_micros() as u64);
                     let index_start = Instant::now();
+                    address_index_deletes = address_index_deletes.saturating_add(1);
                     self.address_index
                         .delete(&mut batch, &entry.script_pubkey, &prevout);
+                    address_delta_inserts = address_delta_inserts.saturating_add(1);
                     self.address_deltas.insert(
                         &mut batch,
                         &entry.script_pubkey,
@@ -1767,11 +1800,16 @@ impl<S: KeyValueStore> ChainState<S> {
                     .ok_or(ChainStateError::ValueOutOfRange)?;
                 let utxo_start = Instant::now();
                 self.utxos.put(&mut batch, &outpoint, &entry);
-                utxo_time += utxo_start.elapsed();
+                let elapsed = utxo_start.elapsed();
+                utxo_time += elapsed;
+                utxo_put_ops = utxo_put_ops.saturating_add(1);
+                utxo_put_us = utxo_put_us.saturating_add(elapsed.as_micros() as u64);
                 created_utxos.insert(outpoint_key_bytes(&outpoint), entry);
                 let index_start = Instant::now();
+                address_index_inserts = address_index_inserts.saturating_add(1);
                 self.address_index
                     .insert(&mut batch, &output.script_pubkey, &outpoint);
+                address_delta_inserts = address_delta_inserts.saturating_add(1);
                 self.address_deltas.insert(
                     &mut batch,
                     &output.script_pubkey,
@@ -1904,12 +1942,15 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut ts_key = Vec::with_capacity(36);
         ts_key.extend_from_slice(&logical_ts.to_be_bytes());
         ts_key.extend_from_slice(&block_hash);
+        timestamp_index_ops = timestamp_index_ops.saturating_add(1);
         batch.put(Column::TimestampIndex, ts_key, Vec::new());
+        timestamp_index_ops = timestamp_index_ops.saturating_add(1);
         batch.put(
             Column::BlockTimestamp,
             block_hash.to_vec(),
             logical_ts.to_be_bytes().to_vec(),
         );
+        timestamp_index_ops = timestamp_index_ops.saturating_add(1);
         batch.put(
             Column::BlockHeader,
             block_hash.to_vec(),
@@ -1922,6 +1963,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 block: location,
                 index: index as u32,
             };
+            tx_index_ops = tx_index_ops.saturating_add(1);
             self.tx_index.insert(&mut batch, txid, tx_location);
         }
         index_time += index_start.elapsed();
@@ -1929,8 +1971,11 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut entry = header_entry;
         entry.status = status_with_block(entry.status);
         let index_start = Instant::now();
+        header_index_ops = header_index_ops.saturating_add(1);
         self.index.put_header(&mut batch, &block_hash, &entry);
+        header_index_ops = header_index_ops.saturating_add(1);
         self.index.set_best_block(&mut batch, &block_hash);
+        header_index_ops = header_index_ops.saturating_add(1);
         self.index.set_height_hash(&mut batch, height, &block_hash);
         index_time += index_start.elapsed();
 
@@ -1978,10 +2023,16 @@ impl<S: KeyValueStore> ChainState<S> {
         }
         batch.put(Column::Meta, VALUE_POOLS_KEY, value_pools.encode());
 
+        let undo_encode_start = Instant::now();
         let undo_bytes = undo.encode();
+        undo_encode_us =
+            undo_encode_us.saturating_add(undo_encode_start.elapsed().as_micros() as u64);
+        undo_bytes_total = undo_bytes_total.saturating_add(undo_bytes.len() as u64);
         let undo_flatfile_start = Instant::now();
         let undo_location = self.undo.append(&undo_bytes)?;
-        flatfile_time += undo_flatfile_start.elapsed();
+        let undo_append_elapsed = undo_flatfile_start.elapsed();
+        flatfile_time += undo_append_elapsed;
+        undo_append_us = undo_append_us.saturating_add(undo_append_elapsed.as_micros() as u64);
         let undo_file_len = undo_location
             .offset
             .checked_add(4)
@@ -2015,10 +2066,30 @@ impl<S: KeyValueStore> ChainState<S> {
         self.prune_block_undo(height, &mut batch)?;
 
         if let Some(metrics) = connect_metrics {
-            metrics.record_utxo(utxo_time);
-            metrics.record_index(index_time);
-            metrics.record_anchor(anchor_time);
-            metrics.record_flatfile(flatfile_time);
+            metrics.record_block(&ConnectMetricsDelta {
+                utxo_us: utxo_time.as_micros() as u64,
+                index_us: index_time.as_micros() as u64,
+                anchor_us: anchor_time.as_micros() as u64,
+                flatfile_us: flatfile_time.as_micros() as u64,
+                utxo_get_us,
+                utxo_get_ops,
+                utxo_cache_hits: utxo_cache_stats.hits,
+                utxo_cache_misses: utxo_cache_stats.misses,
+                utxo_put_us,
+                utxo_put_ops,
+                utxo_delete_us,
+                utxo_delete_ops,
+                spent_index_ops,
+                address_index_inserts,
+                address_index_deletes,
+                address_delta_inserts,
+                tx_index_ops,
+                header_index_ops,
+                timestamp_index_ops,
+                undo_encode_us,
+                undo_bytes: undo_bytes_total,
+                undo_append_us,
+            });
         }
 
         Ok(batch)
@@ -2587,12 +2658,35 @@ impl<S: KeyValueStore> ChainState<S> {
     }
 
     fn utxo_entry_cached(&self, key: OutPointKey) -> Result<Option<UtxoEntry>, ChainStateError> {
+        self.utxo_entry_cached_inner(key, None)
+    }
+
+    fn utxo_entry_cached_tracked(
+        &self,
+        key: OutPointKey,
+        cache_stats: &mut UtxoCacheStats,
+    ) -> Result<Option<UtxoEntry>, ChainStateError> {
+        self.utxo_entry_cached_inner(key, Some(cache_stats))
+    }
+
+    fn utxo_entry_cached_inner(
+        &self,
+        key: OutPointKey,
+        cache_stats: Option<&mut UtxoCacheStats>,
+    ) -> Result<Option<UtxoEntry>, ChainStateError> {
         if let Ok(mut cache) = self.utxo_cache.lock() {
             if let Some(bytes) = cache.get(&key) {
+                if let Some(stats) = cache_stats {
+                    stats.hits = stats.hits.saturating_add(1);
+                }
                 let entry =
                     UtxoEntry::decode(bytes).map_err(|err| StoreError::Backend(err.to_string()))?;
                 return Ok(Some(entry));
             }
+        }
+
+        if let Some(stats) = cache_stats {
+            stats.misses = stats.misses.saturating_add(1);
         }
 
         let bytes = match self.store.get(Column::Utxo, key.as_bytes())? {

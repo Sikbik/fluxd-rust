@@ -11,6 +11,28 @@ pub struct FjallStore {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct FjallTelemetrySnapshot {
+    pub write_buffer_bytes: u64,
+    pub journal_count: u64,
+    pub flushes_completed: u64,
+    pub active_compactions: u64,
+    pub compactions_completed: u64,
+    pub time_compacting_us: u64,
+    pub utxo_segments: u64,
+    pub utxo_flushes_completed: u64,
+    pub tx_index_segments: u64,
+    pub tx_index_flushes_completed: u64,
+    pub spent_index_segments: u64,
+    pub spent_index_flushes_completed: u64,
+    pub address_outpoint_segments: u64,
+    pub address_outpoint_flushes_completed: u64,
+    pub address_delta_segments: u64,
+    pub address_delta_flushes_completed: u64,
+    pub header_index_segments: u64,
+    pub header_index_flushes_completed: u64,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct FjallOptions {
     pub cache_bytes: Option<u64>,
     pub write_buffer_bytes: Option<u64>,
@@ -93,6 +115,51 @@ impl FjallStore {
         self.partitions
             .get(&column)
             .ok_or_else(|| StoreError::Backend(format!("missing partition {}", column.as_str())))
+    }
+
+    pub fn telemetry_snapshot(&self) -> FjallTelemetrySnapshot {
+        let (utxo_segments, utxo_flushes_completed) = self.partition_telemetry(Column::Utxo);
+        let (tx_index_segments, tx_index_flushes_completed) =
+            self.partition_telemetry(Column::TxIndex);
+        let (spent_index_segments, spent_index_flushes_completed) =
+            self.partition_telemetry(Column::SpentIndex);
+        let (address_outpoint_segments, address_outpoint_flushes_completed) =
+            self.partition_telemetry(Column::AddressOutpoint);
+        let (address_delta_segments, address_delta_flushes_completed) =
+            self.partition_telemetry(Column::AddressDelta);
+        let (header_index_segments, header_index_flushes_completed) =
+            self.partition_telemetry(Column::HeaderIndex);
+
+        FjallTelemetrySnapshot {
+            write_buffer_bytes: self.keyspace.write_buffer_size(),
+            journal_count: self.keyspace.journal_count() as u64,
+            flushes_completed: self.keyspace.flushes_completed() as u64,
+            active_compactions: self.keyspace.active_compactions() as u64,
+            compactions_completed: self.keyspace.compactions_completed() as u64,
+            time_compacting_us: self.keyspace.time_compacting().as_micros() as u64,
+            utxo_segments,
+            utxo_flushes_completed,
+            tx_index_segments,
+            tx_index_flushes_completed,
+            spent_index_segments,
+            spent_index_flushes_completed,
+            address_outpoint_segments,
+            address_outpoint_flushes_completed,
+            address_delta_segments,
+            address_delta_flushes_completed,
+            header_index_segments,
+            header_index_flushes_completed,
+        }
+    }
+
+    fn partition_telemetry(&self, column: Column) -> (u64, u64) {
+        match self.partition(column) {
+            Ok(partition) => (
+                partition.segment_count() as u64,
+                partition.flushes_completed() as u64,
+            ),
+            Err(_) => (0, 0),
+        }
     }
 }
 

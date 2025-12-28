@@ -329,9 +329,18 @@ enum PipelineEvent {
     Shielded(ShieldedResult),
 }
 
-enum Store {
+pub(crate) enum Store {
     Memory(MemoryStore),
     Fjall(FjallStore),
+}
+
+impl Store {
+    pub fn fjall_telemetry_snapshot(&self) -> Option<fluxd_storage::fjall::FjallTelemetrySnapshot> {
+        match self {
+            Store::Fjall(store) => Some(store.telemetry_snapshot()),
+            Store::Memory(_) => None,
+        }
+    }
 }
 
 impl KeyValueStore for Store {
@@ -592,6 +601,7 @@ async fn run() -> Result<(), String> {
     let header_metrics = Arc::new(HeaderMetrics::default());
     spawn_status_logger(
         Arc::clone(&chainstate),
+        Arc::clone(&store),
         Arc::clone(&sync_metrics),
         Arc::clone(&header_metrics),
         Arc::clone(&validation_metrics),
@@ -603,6 +613,7 @@ async fn run() -> Result<(), String> {
     );
     if let Some(addr) = dashboard_addr {
         let chainstate = Arc::clone(&chainstate);
+        let store = Arc::clone(&store);
         let sync_metrics = Arc::clone(&sync_metrics);
         let header_metrics = Arc::clone(&header_metrics);
         let validation_metrics = Arc::clone(&validation_metrics);
@@ -616,6 +627,7 @@ async fn run() -> Result<(), String> {
                 if let Err(err) = dashboard::serve_dashboard(
                     addr,
                     chainstate,
+                    store,
                     sync_metrics,
                     header_metrics,
                     validation_metrics,
@@ -2881,6 +2893,7 @@ fn is_transient_block_error(err: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn spawn_status_logger<S: KeyValueStore + Send + Sync + 'static>(
     chainstate: Arc<ChainState<S>>,
+    store: Arc<Store>,
     sync_metrics: Arc<SyncMetrics>,
     header_metrics: Arc<HeaderMetrics>,
     validation_metrics: Arc<ValidationMetrics>,
@@ -2902,6 +2915,7 @@ fn spawn_status_logger<S: KeyValueStore + Send + Sync + 'static>(
             ticker.tick().await;
             match snapshot_stats(
                 &chainstate,
+                Some(store.as_ref()),
                 network,
                 backend,
                 start_time,
