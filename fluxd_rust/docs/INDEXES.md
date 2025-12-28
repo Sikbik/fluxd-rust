@@ -77,6 +77,25 @@ This enables `getspentinfo` without scanning blocks.
 This is a script-based address index. It is used for address-level queries and
 is always maintained in the Rust daemon.
 
+Notes:
+- Only standard transparent addressable scripts are indexed (P2PKH/P2SH).
+- P2PK outputs are normalized to their corresponding P2PKH address.
+
+## AddressDelta
+
+- Key: `sha256(script_pubkey)` (32 bytes) + `height` (4 bytes BE) + `tx_index` (4 bytes BE) + `txid` (32 bytes) + `index` (4 bytes LE) + `spending` (1 byte)
+- Value: `satoshis` delta (8 bytes LE, signed)
+
+This is an Insight-style address delta index used by:
+
+- `getaddressbalance`
+- `getaddressdeltas`
+- `getaddresstxids`
+
+Notes:
+- Only standard transparent addressable scripts are indexed (P2PKH/P2SH).
+- P2PK outputs are normalized to their corresponding P2PKH address.
+
 ## Fluxnode
 
 - Key: collateral `OutPoint` (36 bytes)

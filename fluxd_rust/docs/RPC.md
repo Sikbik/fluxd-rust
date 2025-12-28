@@ -119,6 +119,11 @@ Type notes:
 
 - `getblockdeltas` (not implemented)
 - `getspentinfo`
+- `getaddressutxos`
+- `getaddressbalance`
+- `getaddressdeltas`
+- `getaddresstxids`
+- `getaddressmempool` (not implemented)
 - `gettxoutproof` (not implemented)
 - `verifytxoutproof` (not implemented)
 
@@ -288,6 +293,44 @@ Notes:
 
 - Params: either `{"txid":"...","index":n}` or positional `<txid> <index>`.
 - Result: `{ "txid": "<spending_txid>", "index": <vin>, "height": <spending_height> }`.
+
+### getaddressutxos
+
+Returns all unspent outputs for one or more transparent addresses.
+
+- Params: either `"taddr"` or `{"addresses":["taddr", ...], "chainInfo": true|false}`.
+- Result:
+  - If `chainInfo=false` (default): array of UTXO objects.
+  - If `chainInfo=true`: `{ "utxos": [...], "hash": "<best_block_hash>", "height": <best_height> }`.
+
+Each UTXO object includes: `address`, `txid`, `outputIndex`, `script`, `satoshis`, `height`.
+
+### getaddressbalance
+
+Returns the balance summary for one or more transparent addresses.
+
+- Params: either `"taddr"` or `{"addresses":["taddr", ...]}`.
+- Result: `{ "balance": <zatoshis>, "received": <zatoshis> }` where `received` is the sum of positive deltas (includes change).
+
+### getaddressdeltas
+
+Returns all balance deltas for one or more transparent addresses.
+
+- Params: either `"taddr"` or `{"addresses":["taddr", ...], "start": n, "end": n, "chainInfo": true|false}`.
+  - Height range filtering is only applied if both `start` and `end` are provided.
+- Result:
+  - Default: array of delta objects.
+  - If `chainInfo=true` and a height range is provided: `{ "deltas": [...], "start": {...}, "end": {...} }`.
+
+Each delta object includes: `address`, `blockindex` (tx index within block), `height`, `index` (vin/vout), `satoshis`, `txid`.
+
+### getaddresstxids
+
+Returns the transaction ids for one or more transparent addresses.
+
+- Params: either `"taddr"` or `{"addresses":["taddr", ...], "start": n, "end": n}`.
+  - Height range filtering is only applied if both `start` and `end` are provided.
+- Result: array of txid strings, sorted by height.
 
 ### getnetworkhashps / getnetworksolps / getlocalsolps
 

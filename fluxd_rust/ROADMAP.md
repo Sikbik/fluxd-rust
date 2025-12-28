@@ -12,7 +12,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
 ## Current sprint (next 3-5)
 
 - [x] [P1] Spent index + `getspentinfo` (owner: TBD)
-- [ ] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
+- [x] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
+- [ ] [P1] Address mempool deltas + `getaddressmempool` (owner: TBD)
 - [ ] [P1] Header throughput parity with C++ (owner: TBD)
 
 ## Completed (core)
@@ -83,8 +84,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
 ## Indexes and data services
 
 - [x] [P1] Spent index (`getspentinfo`) (owner: TBD)
-- [ ] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
-- [ ] [P1] Address unspent index (owner: TBD)
+- [x] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
+- [x] [P1] Address unspent index (`getaddressutxos`) (owner: TBD)
 - [x] [P1] UTXO set stats (`gettxoutsetinfo`) (owner: TBD)
 - [x] [P1] Shielded value pool totals (Sprout/Sapling) for supply tracking (owner: TBD)
 - [ ] [P1] Block deltas index (`getblockdeltas`) (owner: TBD)

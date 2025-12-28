@@ -83,11 +83,11 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Address index (insight)
 
-- getaddresstxids - Missing
-- getaddressbalance - Missing
-- getaddressdeltas - Missing
-- getaddressutxos - Missing
-- getaddressmempool - Missing
+- getaddresstxids - Implemented
+- getaddressbalance - Implemented
+- getaddressdeltas - Implemented
+- getaddressutxos - Implemented
+- getaddressmempool - Stub
 
 ## Node control
 

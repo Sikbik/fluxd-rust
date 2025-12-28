@@ -29,6 +29,7 @@ use fluxd_primitives::transaction::{
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
 use rayon::prelude::*;
 
+use crate::address_deltas::AddressDeltaIndex;
 use crate::address_index::AddressIndex;
 use crate::anchors::{AnchorSet, NullifierSet};
 use crate::blockindex::{BlockIndexEntry, STATUS_HAVE_DATA, STATUS_HAVE_UNDO};
@@ -359,6 +360,7 @@ pub struct ChainState<S> {
     nullifiers_sprout: NullifierSet<Arc<S>>,
     nullifiers_sapling: NullifierSet<Arc<S>>,
     address_index: AddressIndex<Arc<S>>,
+    address_deltas: AddressDeltaIndex<Arc<S>>,
     tx_index: TxIndex<Arc<S>>,
     spent_index: SpentIndex<Arc<S>>,
     index: ChainIndex<S>,
@@ -388,6 +390,7 @@ impl<S: KeyValueStore> ChainState<S> {
             nullifiers_sprout: NullifierSet::new(Arc::clone(&store), Column::NullifierSprout),
             nullifiers_sapling: NullifierSet::new(Arc::clone(&store), Column::NullifierSapling),
             address_index: AddressIndex::new(Arc::clone(&store)),
+            address_deltas: AddressDeltaIndex::new(Arc::clone(&store)),
             tx_index: TxIndex::new(Arc::clone(&store)),
             spent_index: SpentIndex::new(Arc::clone(&store)),
             index: ChainIndex::new(Arc::clone(&store)),
@@ -1567,6 +1570,10 @@ impl<S: KeyValueStore> ChainState<S> {
                             block_height: height as u32,
                         },
                     );
+                    let spent_delta = entry
+                        .value
+                        .checked_neg()
+                        .ok_or(ChainStateError::ValueOutOfRange)?;
                     utxos_spent = utxos_spent
                         .checked_add(1)
                         .ok_or(ChainStateError::ValueOutOfRange)?;
@@ -1610,6 +1617,16 @@ impl<S: KeyValueStore> ChainState<S> {
                     let index_start = Instant::now();
                     self.address_index
                         .delete(&mut batch, &entry.script_pubkey, &prevout);
+                    self.address_deltas.insert(
+                        &mut batch,
+                        &entry.script_pubkey,
+                        height as u32,
+                        index as u32,
+                        &txid,
+                        input_index as u32,
+                        true,
+                        spent_delta,
+                    );
                     index_time += index_start.elapsed();
                     undo.spent.push(SpentOutput {
                         outpoint: prevout,
@@ -1719,6 +1736,16 @@ impl<S: KeyValueStore> ChainState<S> {
                 let index_start = Instant::now();
                 self.address_index
                     .insert(&mut batch, &output.script_pubkey, &outpoint);
+                self.address_deltas.insert(
+                    &mut batch,
+                    &output.script_pubkey,
+                    height as u32,
+                    index as u32,
+                    &txid,
+                    out_index as u32,
+                    false,
+                    output.value,
+                );
                 index_time += index_start.elapsed();
             }
         }
@@ -1977,6 +2004,8 @@ impl<S: KeyValueStore> ChainState<S> {
             .index
             .get_header(hash)?
             .ok_or(ChainStateError::MissingHeader)?;
+        let height_u32 =
+            u32::try_from(entry.height).map_err(|_| ChainStateError::ValueOutOfRange)?;
         let location = self
             .block_location(hash)?
             .ok_or(ChainStateError::CorruptIndex("missing block index entry"))?;
@@ -2017,6 +2046,15 @@ impl<S: KeyValueStore> ChainState<S> {
                 self.utxos.delete(&mut batch, &outpoint);
                 self.address_index
                     .delete(&mut batch, &output.script_pubkey, &outpoint);
+                self.address_deltas.delete(
+                    &mut batch,
+                    &output.script_pubkey,
+                    height_u32,
+                    tx_index as u32,
+                    &txid,
+                    output_index as u32,
+                    false,
+                );
                 utxos_removed = utxos_removed
                     .checked_add(1)
                     .ok_or(ChainStateError::ValueOutOfRange)?;
@@ -2027,7 +2065,7 @@ impl<S: KeyValueStore> ChainState<S> {
             self.tx_index.delete(&mut batch, &txid);
 
             if tx_index != 0 {
-                for input in tx.vin.iter().rev() {
+                for (input_index, input) in tx.vin.iter().enumerate().rev() {
                     let spent = undo
                         .spent
                         .pop()
@@ -2038,6 +2076,15 @@ impl<S: KeyValueStore> ChainState<S> {
                         ));
                     }
                     self.spent_index.delete(&mut batch, &spent.outpoint);
+                    self.address_deltas.delete(
+                        &mut batch,
+                        &spent.entry.script_pubkey,
+                        height_u32,
+                        tx_index as u32,
+                        &txid,
+                        input_index as u32,
+                        true,
+                    );
                     self.utxos.put(&mut batch, &spent.outpoint, &spent.entry);
                     self.address_index.insert(
                         &mut batch,
@@ -2475,6 +2522,22 @@ impl<S: KeyValueStore> ChainState<S> {
         script_pubkey: &[u8],
     ) -> Result<Vec<OutPoint>, ChainStateError> {
         Ok(self.address_index.scan(script_pubkey)?)
+    }
+
+    pub fn address_deltas(
+        &self,
+        script_pubkey: &[u8],
+    ) -> Result<Vec<crate::address_deltas::AddressDeltaEntry>, ChainStateError> {
+        Ok(self.address_deltas.scan(script_pubkey)?)
+    }
+
+    pub fn for_each_address_delta(
+        &self,
+        script_pubkey: &[u8],
+        visitor: &mut dyn FnMut(crate::address_deltas::AddressDeltaEntry) -> Result<(), StoreError>,
+    ) -> Result<(), ChainStateError> {
+        self.address_deltas.for_each(script_pubkey, visitor)?;
+        Ok(())
     }
 
     pub fn utxo_exists(&self, outpoint: &OutPoint) -> Result<bool, ChainStateError> {

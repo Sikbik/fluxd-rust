@@ -1,5 +1,6 @@
 //! Chainstate and UTXO/anchor management.
 
+pub mod address_deltas;
 pub mod address_index;
 pub mod anchors;
 pub mod blockindex;

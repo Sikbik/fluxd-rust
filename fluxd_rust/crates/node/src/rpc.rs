@@ -25,8 +25,8 @@ use fluxd_consensus::upgrades::{
 use fluxd_consensus::Hash256;
 use fluxd_fluxnode::storage::FluxnodeRecord;
 use fluxd_pow::difficulty::compact_to_u256;
-use fluxd_primitives::script_pubkey_to_address;
 use fluxd_primitives::transaction::Transaction;
+use fluxd_primitives::{address_to_script_pubkey, script_pubkey_to_address, AddressError};
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
 
@@ -67,6 +67,11 @@ const RPC_METHODS: &[&str] = &[
     "gettxoutsetinfo",
     "getblockdeltas",
     "getspentinfo",
+    "getaddressutxos",
+    "getaddressbalance",
+    "getaddressdeltas",
+    "getaddresstxids",
+    "getaddressmempool",
     "getblocktemplate",
     "getnetworkhashps",
     "getnetworksolps",
@@ -511,6 +516,11 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "gettxoutsetinfo" => rpc_gettxoutsetinfo(chainstate, params, data_dir),
         "getblockdeltas" => rpc_getblockdeltas(params),
         "getspentinfo" => rpc_getspentinfo(chainstate, params),
+        "getaddressutxos" => rpc_getaddressutxos(chainstate, params, chain_params),
+        "getaddressbalance" => rpc_getaddressbalance(chainstate, params, chain_params),
+        "getaddressdeltas" => rpc_getaddressdeltas(chainstate, params, chain_params),
+        "getaddresstxids" => rpc_getaddresstxids(chainstate, params, chain_params),
+        "getaddressmempool" => rpc_getaddressmempool(params),
         "getblocktemplate" => rpc_getblocktemplate(params),
         "getnetworkhashps" => rpc_getnetworkhashps(params),
         "getnetworksolps" => rpc_getnetworksolps(params),
@@ -1216,6 +1226,287 @@ fn rpc_getspentinfo<S: fluxd_storage::KeyValueStore>(
     }))
 }
 
+fn rpc_getaddressutxos<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getaddressutxos expects 1 parameter",
+        ));
+    }
+    let (addresses, opts) = parse_addresses_param(&params[0])?;
+    let include_chain_info = parse_chain_info_flag(opts)?;
+    let address_scripts = decode_address_scripts(addresses, chain_params.network)?;
+
+    #[derive(Clone)]
+    struct UtxoRow {
+        address: String,
+        txid: Hash256,
+        output_index: u32,
+        script: Vec<u8>,
+        satoshis: i64,
+        height: u32,
+    }
+
+    let mut rows = Vec::new();
+    for (address, script_pubkey) in address_scripts {
+        let outpoints = chainstate
+            .address_outpoints(&script_pubkey)
+            .map_err(map_internal)?;
+        for outpoint in outpoints {
+            let entry = chainstate
+                .utxo_entry(&outpoint)
+                .map_err(map_internal)?
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing utxo entry"))?;
+            rows.push(UtxoRow {
+                address: address.clone(),
+                txid: outpoint.hash,
+                output_index: outpoint.index,
+                script: entry.script_pubkey,
+                satoshis: entry.value,
+                height: entry.height,
+            });
+        }
+    }
+
+    rows.sort_by(|a, b| {
+        a.height
+            .cmp(&b.height)
+            .then_with(|| a.txid.cmp(&b.txid))
+            .then_with(|| a.output_index.cmp(&b.output_index))
+    });
+
+    let utxos = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "address": row.address,
+                "txid": hash256_to_hex(&row.txid),
+                "outputIndex": row.output_index,
+                "script": hex_bytes(&row.script),
+                "satoshis": row.satoshis,
+                "height": row.height,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !include_chain_info {
+        return Ok(Value::Array(utxos));
+    }
+
+    let best = chainstate.best_block().map_err(map_internal)?;
+    let (height, hash) = match best {
+        Some(tip) => (tip.height, tip.hash),
+        None => (0, [0u8; 32]),
+    };
+
+    Ok(json!({
+        "utxos": utxos,
+        "hash": hash256_to_hex(&hash),
+        "height": height.max(0),
+    }))
+}
+
+fn rpc_getaddressbalance<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getaddressbalance expects 1 parameter",
+        ));
+    }
+    let (addresses, _opts) = parse_addresses_param(&params[0])?;
+    let address_scripts = decode_address_scripts(addresses, chain_params.network)?;
+
+    let mut balance = 0i64;
+    let mut received = 0i64;
+    for (_address, script_pubkey) in address_scripts {
+        let mut visitor = |delta: fluxd_chainstate::address_deltas::AddressDeltaEntry| {
+            if delta.satoshis > 0 {
+                received = received.checked_add(delta.satoshis).ok_or_else(|| {
+                    fluxd_storage::StoreError::Backend("address balance overflow".to_string())
+                })?;
+            }
+            balance = balance.checked_add(delta.satoshis).ok_or_else(|| {
+                fluxd_storage::StoreError::Backend("address balance overflow".to_string())
+            })?;
+            Ok(())
+        };
+        chainstate
+            .for_each_address_delta(&script_pubkey, &mut visitor)
+            .map_err(map_internal)?;
+    }
+
+    Ok(json!({
+        "balance": balance,
+        "received": received,
+    }))
+}
+
+fn rpc_getaddressdeltas<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getaddressdeltas expects 1 parameter",
+        ));
+    }
+    let (addresses, opts) = parse_addresses_param(&params[0])?;
+    let include_chain_info = parse_chain_info_flag(opts)?;
+    let range = parse_height_range(chainstate, opts)?;
+    let address_scripts = decode_address_scripts(addresses, chain_params.network)?;
+
+    #[derive(Clone)]
+    struct DeltaRow {
+        address: String,
+        height: u32,
+        tx_index: u32,
+        txid: Hash256,
+        index: u32,
+        satoshis: i64,
+    }
+
+    let mut rows = Vec::new();
+    for (address, script_pubkey) in address_scripts {
+        let deltas = chainstate
+            .address_deltas(&script_pubkey)
+            .map_err(map_internal)?;
+        for delta in deltas {
+            if let Some((start, end)) = range {
+                if delta.height < start || delta.height > end {
+                    continue;
+                }
+            }
+            rows.push(DeltaRow {
+                address: address.clone(),
+                height: delta.height,
+                tx_index: delta.tx_index,
+                txid: delta.txid,
+                index: delta.index,
+                satoshis: delta.satoshis,
+            });
+        }
+    }
+
+    rows.sort_by(|a, b| {
+        a.height
+            .cmp(&b.height)
+            .then_with(|| a.tx_index.cmp(&b.tx_index))
+            .then_with(|| a.txid.cmp(&b.txid))
+            .then_with(|| a.index.cmp(&b.index))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+
+    let deltas = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "address": row.address,
+                "blockindex": row.tx_index,
+                "height": row.height,
+                "index": row.index,
+                "satoshis": row.satoshis,
+                "txid": hash256_to_hex(&row.txid),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let Some((start, end)) = range else {
+        return Ok(Value::Array(deltas));
+    };
+    if !include_chain_info {
+        return Ok(Value::Array(deltas));
+    }
+
+    let start_height = i32::try_from(start).map_err(|_| {
+        RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Start or end is outside chain range",
+        )
+    })?;
+    let end_height = i32::try_from(end).map_err(|_| {
+        RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Start or end is outside chain range",
+        )
+    })?;
+    let start_hash = chainstate
+        .height_hash(start_height)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "block not found"))?;
+    let end_hash = chainstate
+        .height_hash(end_height)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "block not found"))?;
+
+    Ok(json!({
+        "deltas": deltas,
+        "start": {
+            "hash": hash256_to_hex(&start_hash),
+            "height": start,
+        },
+        "end": {
+            "hash": hash256_to_hex(&end_hash),
+            "height": end,
+        },
+    }))
+}
+
+fn rpc_getaddresstxids<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getaddresstxids expects 1 parameter",
+        ));
+    }
+    let (addresses, opts) = parse_addresses_param(&params[0])?;
+    let range = parse_height_range(chainstate, opts)?;
+    let address_scripts = decode_address_scripts(addresses, chain_params.network)?;
+
+    let mut txids = std::collections::BTreeSet::<(u32, Hash256)>::new();
+    for (_address, script_pubkey) in address_scripts {
+        let deltas = chainstate
+            .address_deltas(&script_pubkey)
+            .map_err(map_internal)?;
+        for delta in deltas {
+            if let Some((start, end)) = range {
+                if delta.height < start || delta.height > end {
+                    continue;
+                }
+            }
+            txids.insert((delta.height, delta.txid));
+        }
+    }
+
+    Ok(Value::Array(
+        txids
+            .into_iter()
+            .map(|(_height, txid)| Value::String(hash256_to_hex(&txid)))
+            .collect(),
+    ))
+}
+
+fn rpc_getaddressmempool(params: Vec<Value>) -> Result<Value, RpcError> {
+    let _ = params;
+    Err(RpcError::new(
+        RPC_INTERNAL_ERROR,
+        "getaddressmempool is not implemented",
+    ))
+}
+
 fn rpc_getblocktemplate(params: Vec<Value>) -> Result<Value, RpcError> {
     let _ = params;
     Err(RpcError::new(
@@ -1918,6 +2209,104 @@ fn parse_verbosity(value: &Value) -> Result<i32, RpcError> {
             "verbosity must be 0, 1, or 2",
         )),
     }
+}
+
+fn parse_addresses_param<'a>(
+    value: &'a Value,
+) -> Result<(Vec<String>, Option<&'a serde_json::Map<String, Value>>), RpcError> {
+    match value {
+        Value::String(address) => Ok((vec![address.clone()], None)),
+        Value::Object(map) => {
+            let addresses = map
+                .get("addresses")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| {
+                    RpcError::new(
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Addresses is expected to be an array",
+                    )
+                })?;
+            let mut out = Vec::with_capacity(addresses.len());
+            for entry in addresses {
+                let address = entry
+                    .as_str()
+                    .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+                out.push(address.to_string());
+            }
+            Ok((out, Some(map)))
+        }
+        _ => Err(RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address")),
+    }
+}
+
+fn decode_address_scripts(
+    addresses: Vec<String>,
+    network: Network,
+) -> Result<Vec<(String, Vec<u8>)>, RpcError> {
+    let mut out = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let script = address_to_script_pubkey(&address, network).map_err(|err| match err {
+            AddressError::InvalidLength
+            | AddressError::InvalidCharacter
+            | AddressError::InvalidChecksum
+            | AddressError::UnknownPrefix => {
+                RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address")
+            }
+        })?;
+        out.push((address, script));
+    }
+    Ok(out)
+}
+
+fn parse_chain_info_flag(opts: Option<&serde_json::Map<String, Value>>) -> Result<bool, RpcError> {
+    let Some(map) = opts else {
+        return Ok(false);
+    };
+    let Some(value) = map.get("chainInfo") else {
+        return Ok(false);
+    };
+    parse_bool(value)
+}
+
+fn parse_height_range<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    opts: Option<&serde_json::Map<String, Value>>,
+) -> Result<Option<(u32, u32)>, RpcError> {
+    let Some(map) = opts else {
+        return Ok(None);
+    };
+    let Some(start_value) = map.get("start") else {
+        return Ok(None);
+    };
+    let Some(end_value) = map.get("end") else {
+        return Ok(None);
+    };
+    if start_value.is_null() || end_value.is_null() {
+        return Ok(None);
+    }
+    let start = parse_u32(start_value, "start")?;
+    let end = parse_u32(end_value, "end")?;
+    if start == 0 || end == 0 {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Start and end are expected to be greater than zero",
+        ));
+    }
+    if end < start {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "End value is expected to be greater than start",
+        ));
+    }
+    let best_height = best_block_height(chainstate)?;
+    let best_u32 = u32::try_from(best_height).unwrap_or(0);
+    if start > best_u32 || end > best_u32 {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Start or end is outside chain range",
+        ));
+    }
+    Ok(Some((start, end)))
 }
 
 fn ensure_no_params(params: &[Value]) -> Result<(), RpcError> {
