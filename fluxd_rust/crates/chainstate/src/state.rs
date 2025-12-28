@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fluxd_consensus::constants::{
-    max_reorg_depth, COINBASE_MATURITY, FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC, MAX_SCRIPT_SIZE,
+    max_reorg_depth, COINBASE_MATURITY, FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V1,
+    FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V2, FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V3,
+    FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V4, FLUXNODE_DOS_REMOVE_AMOUNT,
+    FLUXNODE_DOS_REMOVE_AMOUNT_V2, FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC, MAX_SCRIPT_SIZE,
     MIN_BLOCK_VERSION, MIN_PON_BLOCK_VERSION,
 };
 use fluxd_consensus::money::MAX_MONEY;
@@ -1032,8 +1035,18 @@ impl<S: KeyValueStore> ChainState<S> {
                     )));
                 }
                 if operator_pubkeys.contains_key(&start.collateral)
-                    || self.fluxnode_exists(&start.collateral)?
+                    || !self.fluxnode_start_allowed(&start.collateral, height, params)?
                 {
+                    if let Ok(Some(record)) = self.fluxnode_record(&start.collateral) {
+                        eprintln!(
+                            "fluxnode start rejected at height {}: tx {} collateral {} (start_height {} last_confirmed {})",
+                            height,
+                            hash256_to_hex(txid),
+                            outpoint_to_string(&start.collateral),
+                            record.start_height,
+                            record.last_confirmed_height
+                        );
+                    }
                     return Err(ChainStateError::Validation(ValidationError::Fluxnode(
                         "fluxnode start collateral already registered",
                     )));
@@ -1073,8 +1086,18 @@ impl<S: KeyValueStore> ChainState<S> {
                         )));
                     }
                     if operator_pubkeys.contains_key(collateral)
-                        || self.fluxnode_exists(collateral)?
+                        || !self.fluxnode_start_allowed(collateral, height, params)?
                     {
+                        if let Ok(Some(record)) = self.fluxnode_record(collateral) {
+                            eprintln!(
+                                "fluxnode start rejected at height {}: tx {} collateral {} (start_height {} last_confirmed {})",
+                                height,
+                                hash256_to_hex(txid),
+                                outpoint_to_string(collateral),
+                                record.start_height,
+                                record.last_confirmed_height
+                            );
+                        }
                         return Err(ChainStateError::Validation(ValidationError::Fluxnode(
                             "fluxnode start collateral already registered",
                         )));
@@ -1122,8 +1145,18 @@ impl<S: KeyValueStore> ChainState<S> {
                         )));
                     }
                     if operator_pubkeys.contains_key(collateral)
-                        || self.fluxnode_exists(collateral)?
+                        || !self.fluxnode_start_allowed(collateral, height, params)?
                     {
+                        if let Ok(Some(record)) = self.fluxnode_record(collateral) {
+                            eprintln!(
+                                "fluxnode start rejected at height {}: tx {} collateral {} (start_height {} last_confirmed {})",
+                                height,
+                                hash256_to_hex(txid),
+                                outpoint_to_string(collateral),
+                                record.start_height,
+                                record.last_confirmed_height
+                            );
+                        }
                         return Err(ChainStateError::Validation(ValidationError::Fluxnode(
                             "fluxnode start collateral already registered",
                         )));
@@ -1262,9 +1295,54 @@ impl<S: KeyValueStore> ChainState<S> {
         })
     }
 
-    fn fluxnode_exists(&self, outpoint: &OutPoint) -> Result<bool, ChainStateError> {
+    fn fluxnode_record(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<FluxnodeRecord>, ChainStateError> {
         let key = outpoint_key_bytes(outpoint);
-        Ok(self.store.get(Column::Fluxnode, key.as_bytes())?.is_some())
+        let Some(bytes) = self.store.get(Column::Fluxnode, key.as_bytes())? else {
+            return Ok(None);
+        };
+        FluxnodeRecord::decode(&bytes)
+            .map(Some)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid fluxnode record"))
+    }
+
+    fn fluxnode_start_allowed(
+        &self,
+        outpoint: &OutPoint,
+        height: i32,
+        params: &ChainParams,
+    ) -> Result<bool, ChainStateError> {
+        let Ok(height_u32) = u32::try_from(height) else {
+            return Ok(true);
+        };
+        let Some(record) = self.fluxnode_record(outpoint)? else {
+            return Ok(true);
+        };
+
+        if record.last_confirmed_height == record.start_height {
+            if record.start_height == height_u32 {
+                return Ok(true);
+            }
+            let pon_active =
+                network_upgrade_active(height, &params.consensus.upgrades, UpgradeIndex::Pon);
+            let dos_remove = if pon_active {
+                FLUXNODE_DOS_REMOVE_AMOUNT_V2
+            } else {
+                FLUXNODE_DOS_REMOVE_AMOUNT
+            };
+            let dos_remove = u32::try_from(dos_remove).unwrap_or_default();
+            let removal_height = record.start_height.saturating_add(dos_remove);
+            return Ok(height_u32 > removal_height);
+        }
+
+        let expiration = fluxnode_confirm_expiration_count(height, &params.consensus);
+        let expire_height = record
+            .last_confirmed_height
+            .saturating_add(expiration)
+            .saturating_add(1);
+        Ok(height_u32 > expire_height)
     }
 
     pub fn connect_block(
@@ -3030,6 +3108,10 @@ fn hash256_to_hex(hash: &Hash256) -> String {
     out
 }
 
+fn outpoint_to_string(outpoint: &OutPoint) -> String {
+    format!("{}:{}", hash256_to_hex(&outpoint.hash), outpoint.index)
+}
+
 fn check_coinbase_funding(
     tx: &Transaction,
     height: i32,
@@ -3135,6 +3217,20 @@ fn ensure_fluxnode_collateral_mature(
         )));
     }
     Ok(())
+}
+
+fn fluxnode_confirm_expiration_count(height: i32, consensus: &ConsensusParams) -> u32 {
+    let upgrades = &consensus.upgrades;
+    let count = if network_upgrade_active(height, upgrades, UpgradeIndex::Pon) {
+        FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V4
+    } else if network_upgrade_active(height, upgrades, UpgradeIndex::Halving) {
+        FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V3
+    } else if network_upgrade_active(height, upgrades, UpgradeIndex::Flux) {
+        FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V2
+    } else {
+        FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V1
+    };
+    u32::try_from(count).unwrap_or_default()
 }
 
 fn validate_fluxnode_collateral_script(
@@ -4554,6 +4650,208 @@ mod tests {
                 &HashMap::new(),
             )
             .expect("start tx valid");
+    }
+
+    #[test]
+    fn fluxnode_start_allows_restart_after_confirm_expiration() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let collateral_secret = make_test_secret_key(1);
+        let operator_secret = make_test_secret_key(2);
+        let secp = Secp256k1::signing_only();
+        let collateral_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &collateral_secret);
+        let operator_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &operator_secret);
+
+        let collateral_outpoint = OutPoint {
+            hash: [0x44; 32],
+            index: 0,
+        };
+        let entry = UtxoEntry {
+            value: 1000,
+            script_pubkey: p2pkh_script_for_pubkey(&collateral_pubkey.serialize()),
+            height: 0,
+            is_coinbase: false,
+        };
+        store
+            .put(
+                Column::Utxo,
+                outpoint_key_bytes(&collateral_outpoint).as_bytes(),
+                &entry.encode(),
+            )
+            .expect("store utxo");
+
+        let record = FluxnodeRecord {
+            collateral: collateral_outpoint.clone(),
+            tier: 0,
+            start_height: 0,
+            last_confirmed_height: 1,
+            last_paid_height: 0,
+            operator_pubkey: KeyId([0x11; 32]),
+            collateral_pubkey: None,
+            p2sh_script: None,
+        };
+        store
+            .put(
+                Column::Fluxnode,
+                outpoint_key_bytes(&collateral_outpoint).as_bytes(),
+                &record.encode(),
+            )
+            .expect("store record");
+
+        let mut tx = Transaction {
+            f_overwintered: false,
+            version: FLUXNODE_TX_VERSION,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: Some(FluxnodeTx::V5(FluxnodeTxV5::Start(FluxnodeStartV5 {
+                collateral: collateral_outpoint.clone(),
+                collateral_pubkey: collateral_pubkey.serialize().to_vec(),
+                pubkey: operator_pubkey.serialize().to_vec(),
+                sig_time: 0,
+                sig: Vec::new(),
+            }))),
+        };
+
+        let txid = tx.txid().expect("txid");
+        let message = hash256_to_hex(&txid);
+        let digest = signed_message_hash(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).expect("msg");
+        let sig = secp.sign_ecdsa_recoverable(&msg, &collateral_secret);
+        let sig_bytes = encode_compact(&sig, true);
+        if let Some(FluxnodeTx::V5(FluxnodeTxV5::Start(start))) = tx.fluxnode.as_mut() {
+            start.sig = sig_bytes.to_vec();
+        }
+
+        let params = chain_params(Network::Regtest);
+        chainstate
+            .validate_fluxnode_tx(
+                &tx,
+                &txid,
+                FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC,
+                &params,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .expect("start tx valid after expiration");
+    }
+
+    #[test]
+    fn fluxnode_start_rejects_restart_when_still_confirmed() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let collateral_secret = make_test_secret_key(1);
+        let operator_secret = make_test_secret_key(2);
+        let secp = Secp256k1::signing_only();
+        let collateral_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &collateral_secret);
+        let operator_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &operator_secret);
+
+        let collateral_outpoint = OutPoint {
+            hash: [0x55; 32],
+            index: 0,
+        };
+        let entry = UtxoEntry {
+            value: 1000,
+            script_pubkey: p2pkh_script_for_pubkey(&collateral_pubkey.serialize()),
+            height: 0,
+            is_coinbase: false,
+        };
+        store
+            .put(
+                Column::Utxo,
+                outpoint_key_bytes(&collateral_outpoint).as_bytes(),
+                &entry.encode(),
+            )
+            .expect("store utxo");
+
+        let record = FluxnodeRecord {
+            collateral: collateral_outpoint.clone(),
+            tier: 0,
+            start_height: 0,
+            last_confirmed_height: 80,
+            last_paid_height: 0,
+            operator_pubkey: KeyId([0x11; 32]),
+            collateral_pubkey: None,
+            p2sh_script: None,
+        };
+        store
+            .put(
+                Column::Fluxnode,
+                outpoint_key_bytes(&collateral_outpoint).as_bytes(),
+                &record.encode(),
+            )
+            .expect("store record");
+
+        let mut tx = Transaction {
+            f_overwintered: false,
+            version: FLUXNODE_TX_VERSION,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: Some(FluxnodeTx::V5(FluxnodeTxV5::Start(FluxnodeStartV5 {
+                collateral: collateral_outpoint.clone(),
+                collateral_pubkey: collateral_pubkey.serialize().to_vec(),
+                pubkey: operator_pubkey.serialize().to_vec(),
+                sig_time: 0,
+                sig: Vec::new(),
+            }))),
+        };
+
+        let txid = tx.txid().expect("txid");
+        let message = hash256_to_hex(&txid);
+        let digest = signed_message_hash(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).expect("msg");
+        let sig = secp.sign_ecdsa_recoverable(&msg, &collateral_secret);
+        let sig_bytes = encode_compact(&sig, true);
+        if let Some(FluxnodeTx::V5(FluxnodeTxV5::Start(start))) = tx.fluxnode.as_mut() {
+            start.sig = sig_bytes.to_vec();
+        }
+
+        let params = chain_params(Network::Regtest);
+        let err = chainstate
+            .validate_fluxnode_tx(
+                &tx,
+                &txid,
+                FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC,
+                &params,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .expect_err("start tx rejected while confirmed");
+        match err {
+            ChainStateError::Validation(ValidationError::Fluxnode(message)) => {
+                assert_eq!(message, "fluxnode start collateral already registered");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

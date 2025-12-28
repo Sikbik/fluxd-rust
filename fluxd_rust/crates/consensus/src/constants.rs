@@ -40,6 +40,17 @@ pub const MAX_TX_SIZE_AFTER_SAPLING: u32 = MAX_BLOCK_SIZE;
 pub const COINBASE_MATURITY: i32 = 100;
 /// Minimum confirmations required for fluxnode collateral UTXOs.
 pub const FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC: i32 = 100;
+/// If the fluxnode isn't confirmed within this amount of blocks, it is moved to the DoS list.
+pub const FLUXNODE_START_TX_EXPIRATION_HEIGHT: i32 = 60;
+pub const FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2: i32 = 240;
+/// How long the fluxnode stays in the DoS list, measured from the start transaction height.
+pub const FLUXNODE_DOS_REMOVE_AMOUNT: i32 = 180;
+pub const FLUXNODE_DOS_REMOVE_AMOUNT_V2: i32 = 720;
+/// How often a confirmed fluxnode must submit an UPDATE_CONFIRM to remain active.
+pub const FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V1: i32 = 60;
+pub const FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V2: i32 = 80;
+pub const FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V3: i32 = 160;
+pub const FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V4: i32 = 640; // PON activation (targeting 30s blocks)
 /// The minimum value which is invalid for expiry height.
 pub const TX_EXPIRY_HEIGHT_THRESHOLD: u32 = 500_000_000;
 
