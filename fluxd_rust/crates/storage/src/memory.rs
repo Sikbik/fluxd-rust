@@ -69,10 +69,10 @@ impl KeyValueStore for MemoryStore {
         for op in batch.iter() {
             match op {
                 WriteOp::Put { column, key, value } => {
-                    guard.insert((*column, key.clone()), value.clone());
+                    guard.insert((*column, key.as_slice().to_vec()), value.clone());
                 }
                 WriteOp::Delete { column, key } => {
-                    guard.remove(&(*column, key.clone()));
+                    guard.remove(&(*column, key.as_slice().to_vec()));
                 }
             }
         }

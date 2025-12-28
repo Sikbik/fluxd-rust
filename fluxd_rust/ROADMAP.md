@@ -40,7 +40,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Cache Sprout/Sapling trees in memory and only write tree bytes when the tree root changes
   - [x] Store Sapling anchors as root keys only (empty values) to reduce DB write amplification
   - [x] Run block connect on blocking threads to keep RPC/dashboard responsive under high throughput
-  - [ ] Reduce per-input allocation overhead (outpoint key handling)
+  - [x] Reduce per-input allocation overhead (outpoint key handling + per-block UTXO cache)
+  - [x] Inline small keys in `WriteBatch` (UTXO/address keys stored without heap allocs)
   - [ ] Evaluate an LRU UTXO read cache for sequential block spends
   - [ ] Review index write amplification (txindex/address index) and batching opportunities
   - [x] Capture initial throughput stats (~150–180 b/s on 8-core mainnet sync with `--shielded-workers 6` and `--inflight-per-peer 2`)

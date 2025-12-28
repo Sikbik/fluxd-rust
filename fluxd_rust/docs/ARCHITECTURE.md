@@ -120,3 +120,6 @@ Key consensus behaviors:
 - Memory: in-memory store for tests and short-lived runs.
 
 The storage backend is selected via `--backend` and affects all indexes.
+
+For performance, the storage layer commits blocks using batched writes, and stores common small
+keys inline to avoid per-op heap allocations during high-throughput indexing.

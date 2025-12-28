@@ -1,6 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 pub mod memory;
 
 #[cfg(feature = "fjall")]
@@ -67,15 +69,54 @@ impl Column {
 }
 
 #[derive(Clone, Debug)]
+pub struct WriteKey(SmallVec<[u8; 72]>);
+
+impl WriteKey {
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for WriteKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for WriteKey {
+    fn from(value: Vec<u8>) -> Self {
+        Self(SmallVec::from_vec(value))
+    }
+}
+
+impl From<&[u8]> for WriteKey {
+    fn from(value: &[u8]) -> Self {
+        Self(SmallVec::from_slice(value))
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for WriteKey {
+    fn from(value: [u8; N]) -> Self {
+        Self(SmallVec::from_slice(&value))
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for WriteKey {
+    fn from(value: &[u8; N]) -> Self {
+        Self(SmallVec::from_slice(value))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum WriteOp {
     Put {
         column: Column,
-        key: Vec<u8>,
+        key: WriteKey,
         value: Vec<u8>,
     },
     Delete {
         column: Column,
-        key: Vec<u8>,
+        key: WriteKey,
     },
 }
 
@@ -89,7 +130,7 @@ impl WriteBatch {
         Self::default()
     }
 
-    pub fn put(&mut self, column: Column, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+    pub fn put(&mut self, column: Column, key: impl Into<WriteKey>, value: impl Into<Vec<u8>>) {
         self.ops.push(WriteOp::Put {
             column,
             key: key.into(),
@@ -97,7 +138,7 @@ impl WriteBatch {
         });
     }
 
-    pub fn delete(&mut self, column: Column, key: impl Into<Vec<u8>>) {
+    pub fn delete(&mut self, column: Column, key: impl Into<WriteKey>) {
         self.ops.push(WriteOp::Delete {
             column,
             key: key.into(),

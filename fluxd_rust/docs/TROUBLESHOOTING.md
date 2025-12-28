@@ -12,6 +12,8 @@ Checks:
 - Ensure peers have up-to-date heights (`getpeerinfo`).
 - Verify DNS seed resolution and connection counts.
 - Check `--header-lead` (a very low value can cap header progress).
+- Right after startup, allow time for peer discovery; early `header request timed out` messages can happen
+  before the address book has enough responsive peers.
 
 Mitigations:
 - Increase `--header-peers` and `--header-verify-workers`.
@@ -111,3 +113,5 @@ pkill -x fluxd
 rm -rf ./data
 ./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --fetch-params
 ```
+
+Also ensure there is only one `fluxd` process writing to a given `--data-dir`.

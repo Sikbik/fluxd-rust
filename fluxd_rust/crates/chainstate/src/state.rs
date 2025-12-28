@@ -36,7 +36,7 @@ use crate::shielded::{
 };
 use crate::txindex::{TxIndex, TxLocation};
 use crate::undo::{BlockUndo, FluxnodeUndo, SpentOutput};
-use crate::utxo::{outpoint_key, UtxoEntry, UtxoSet};
+use crate::utxo::{outpoint_key_bytes, OutPointKey, UtxoEntry, UtxoSet};
 use crate::validation::{validate_block, ValidationError, ValidationFlags};
 use fluxd_pon::validation as pon_validation;
 use fluxd_pow::difficulty::{block_proof, HeaderInfo};
@@ -967,7 +967,20 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut seen_sprout_nullifiers = HashSet::new();
         let mut seen_sapling_nullifiers = HashSet::new();
         let mut txids = Vec::with_capacity(block.transactions.len());
-        let mut utxo_cache: HashMap<Vec<u8>, Option<UtxoEntry>> = HashMap::new();
+        let estimated_inputs = block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|tx| tx.vin.len())
+            .sum::<usize>();
+        let estimated_outputs = block
+            .transactions
+            .iter()
+            .map(|tx| tx.vout.len())
+            .sum::<usize>();
+        let mut created_utxos: HashMap<OutPointKey, UtxoEntry> =
+            HashMap::with_capacity(estimated_outputs);
+        let mut spent_outpoints: HashSet<OutPointKey> = HashSet::with_capacity(estimated_inputs);
         let mut block_script_checks: Vec<ScriptCheck> = Vec::new();
         let branch_id = current_epoch_branch_id(height, &consensus.upgrades);
         let flux_rebrand_active =
@@ -1050,20 +1063,21 @@ impl<S: KeyValueStore> ChainState<S> {
             if !is_coinbase {
                 let mut transparent_in = 0i64;
                 for (input_index, input) in tx.vin.iter().enumerate() {
-                    let outpoint_key = outpoint_key(&input.prevout);
-                    let entry = match utxo_cache.get(&outpoint_key) {
-                        Some(Some(entry)) => entry.clone(),
-                        Some(None) => {
-                            eprintln!(
-                                "missing input for tx {} input {} prevout {}:{} at height {}",
-                                hash256_to_hex(&txid),
-                                input_index,
-                                hash256_to_hex(&input.prevout.hash),
-                                input.prevout.index,
-                                height
-                            );
-                            return Err(ChainStateError::MissingInput);
-                        }
+                    let outpoint_key = outpoint_key_bytes(&input.prevout);
+                    if !spent_outpoints.insert(outpoint_key) {
+                        eprintln!(
+                            "missing input for tx {} input {} prevout {}:{} at height {}",
+                            hash256_to_hex(&txid),
+                            input_index,
+                            hash256_to_hex(&input.prevout.hash),
+                            input.prevout.index,
+                            height
+                        );
+                        return Err(ChainStateError::MissingInput);
+                    }
+
+                    let entry = match created_utxos.remove(&outpoint_key) {
+                        Some(entry) => entry,
                         None => {
                             let utxo_start = Instant::now();
                             let entry = self.utxos.get(&input.prevout)?;
@@ -1072,22 +1086,18 @@ impl<S: KeyValueStore> ChainState<S> {
                                 Some(entry) => entry,
                                 None => {
                                     eprintln!(
-                                    "missing input for tx {} input {} prevout {}:{} at height {}",
-                                    hash256_to_hex(&txid),
-                                    input_index,
-                                    hash256_to_hex(&input.prevout.hash),
-                                    input.prevout.index,
-                                    height
-                                );
+                                        "missing input for tx {} input {} prevout {}:{} at height {}",
+                                        hash256_to_hex(&txid),
+                                        input_index,
+                                        hash256_to_hex(&input.prevout.hash),
+                                        input.prevout.index,
+                                        height
+                                    );
                                     return Err(ChainStateError::MissingInput);
                                 }
                             }
                         }
                     };
-                    undo.spent.push(SpentOutput {
-                        outpoint: input.prevout.clone(),
-                        entry: entry.clone(),
-                    });
                     utxos_spent = utxos_spent
                         .checked_add(1)
                         .ok_or(ChainStateError::ValueOutOfRange)?;
@@ -1124,14 +1134,18 @@ impl<S: KeyValueStore> ChainState<S> {
                     transparent_in = transparent_in
                         .checked_add(entry.value)
                         .ok_or(ChainStateError::ValueOutOfRange)?;
+                    let prevout = input.prevout.clone();
                     let utxo_start = Instant::now();
-                    self.utxos.delete(&mut batch, &input.prevout);
+                    self.utxos.delete(&mut batch, &prevout);
                     utxo_time += utxo_start.elapsed();
-                    utxo_cache.insert(outpoint_key, None);
                     let index_start = Instant::now();
                     self.address_index
-                        .delete(&mut batch, &entry.script_pubkey, &input.prevout);
+                        .delete(&mut batch, &entry.script_pubkey, &prevout);
                     index_time += index_start.elapsed();
+                    undo.spent.push(SpentOutput {
+                        outpoint: prevout,
+                        entry,
+                    });
                 }
                 tx_value_in = tx_value_in
                     .checked_add(transparent_in)
@@ -1229,7 +1243,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 let utxo_start = Instant::now();
                 self.utxos.put(&mut batch, &outpoint, &entry);
                 utxo_time += utxo_start.elapsed();
-                utxo_cache.insert(outpoint_key(&outpoint), Some(entry));
+                created_utxos.insert(outpoint_key_bytes(&outpoint), entry);
                 let index_start = Instant::now();
                 self.address_index
                     .insert(&mut batch, &output.script_pubkey, &outpoint);
@@ -1530,13 +1544,13 @@ impl<S: KeyValueStore> ChainState<S> {
                         "block undo fluxnode collateral mismatch",
                     ));
                 }
-                let key = outpoint_key(&entry.collateral);
+                let key = outpoint_key_bytes(&entry.collateral);
                 match &entry.prev {
                     Some(record) => {
-                        batch.put(Column::Fluxnode, key, record.encode());
+                        batch.put(Column::Fluxnode, key.as_bytes(), record.encode());
                     }
                     None => {
-                        batch.delete(Column::Fluxnode, key);
+                        batch.delete(Column::Fluxnode, key.as_bytes());
                     }
                 }
             }
@@ -1757,10 +1771,8 @@ impl<S: KeyValueStore> ChainState<S> {
     }
 
     pub fn utxo_exists(&self, outpoint: &OutPoint) -> Result<bool, ChainStateError> {
-        Ok(self
-            .store
-            .get(Column::Utxo, &outpoint_key(outpoint))?
-            .is_some())
+        let key = outpoint_key_bytes(outpoint);
+        Ok(self.store.get(Column::Utxo, key.as_bytes())?.is_some())
     }
 
     pub fn utxo_entry(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, ChainStateError> {
@@ -2146,8 +2158,8 @@ fn fluxnode_undo_entry<S: KeyValueStore>(
     let Some(collateral) = fluxnode_collateral(tx) else {
         return Ok(None);
     };
-    let key = outpoint_key(collateral);
-    let prev = match store.get(Column::Fluxnode, &key)? {
+    let key = outpoint_key_bytes(collateral);
+    let prev = match store.get(Column::Fluxnode, key.as_bytes())? {
         Some(bytes) => Some(
             FluxnodeRecord::decode(&bytes)
                 .map_err(|_| ChainStateError::CorruptIndex("invalid fluxnode record"))?,
@@ -2775,7 +2787,9 @@ mod tests {
                 false,
             )
             .expect("insert header");
-        chainstate.commit_batch(header_batch).expect("commit header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
 
         let coinbase = make_tx(
             vec![TxIn {

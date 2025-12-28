@@ -4,6 +4,8 @@ use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch};
 
+pub const OUTPOINT_KEY_LEN: usize = 36;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UtxoEntry {
     pub value: i64,
@@ -40,11 +42,28 @@ impl UtxoEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct OutPointKey([u8; OUTPOINT_KEY_LEN]);
+
+impl OutPointKey {
+    pub fn new(outpoint: &OutPoint) -> Self {
+        let mut bytes = [0u8; OUTPOINT_KEY_LEN];
+        bytes[..32].copy_from_slice(&outpoint.hash);
+        bytes[32..].copy_from_slice(&outpoint.index.to_le_bytes());
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 pub fn outpoint_key(outpoint: &OutPoint) -> Vec<u8> {
-    let mut key = Vec::with_capacity(36);
-    key.extend_from_slice(&outpoint.hash);
-    key.extend_from_slice(&outpoint.index.to_le_bytes());
-    key
+    OutPointKey::new(outpoint).0.to_vec()
+}
+
+pub fn outpoint_key_bytes(outpoint: &OutPoint) -> OutPointKey {
+    OutPointKey::new(outpoint)
 }
 
 pub struct UtxoSet<S> {
@@ -59,8 +78,8 @@ impl<S> UtxoSet<S> {
 
 impl<S: KeyValueStore> UtxoSet<S> {
     pub fn get(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, StoreError> {
-        let key = outpoint_key(outpoint);
-        match self.store.get(Column::Utxo, &key)? {
+        let key = outpoint_key_bytes(outpoint);
+        match self.store.get(Column::Utxo, key.as_bytes())? {
             Some(bytes) => Ok(Some(
                 UtxoEntry::decode(&bytes).map_err(|err| StoreError::Backend(err.to_string()))?,
             )),
@@ -69,10 +88,12 @@ impl<S: KeyValueStore> UtxoSet<S> {
     }
 
     pub fn put(&self, batch: &mut WriteBatch, outpoint: &OutPoint, entry: &UtxoEntry) {
-        batch.put(Column::Utxo, outpoint_key(outpoint), entry.encode());
+        let key = outpoint_key_bytes(outpoint);
+        batch.put(Column::Utxo, key.as_bytes(), entry.encode());
     }
 
     pub fn delete(&self, batch: &mut WriteBatch, outpoint: &OutPoint) {
-        batch.delete(Column::Utxo, outpoint_key(outpoint));
+        let key = outpoint_key_bytes(outpoint);
+        batch.delete(Column::Utxo, key.as_bytes());
     }
 }

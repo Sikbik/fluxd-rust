@@ -52,6 +52,10 @@ ssh <vps-user>@<vps-host> "nohup stdbuf -oL -eL <remote-repo-path>/target/releas
   > <remote-log-dir>/longrun-public.log 2>&1 &"
 ```
 
+Note: do not run multiple `fluxd` instances pointing at the same `--data-dir` at the same time.
+There is no cross-process locking for the database / flatfiles, so concurrent writers can corrupt
+or stall the node.
+
 ## Stop
 
 ```bash

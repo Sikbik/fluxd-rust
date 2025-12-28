@@ -5,7 +5,7 @@ use fluxd_primitives::hash::sha256;
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch};
 
-use crate::utxo::outpoint_key;
+use crate::utxo::outpoint_key_bytes;
 
 const SCRIPT_HASH_LEN: usize = 32;
 const OUTPOINT_KEY_LEN: usize = 36;
@@ -14,10 +14,15 @@ pub fn script_hash(script_pubkey: &[u8]) -> Hash256 {
     sha256(script_pubkey)
 }
 
-pub fn address_outpoint_key(script_pubkey: &[u8], outpoint: &OutPoint) -> Vec<u8> {
-    let mut key = Vec::with_capacity(SCRIPT_HASH_LEN + OUTPOINT_KEY_LEN);
-    key.extend_from_slice(&script_hash(script_pubkey));
-    key.extend_from_slice(&outpoint_key(outpoint));
+pub fn address_outpoint_key(
+    script_pubkey: &[u8],
+    outpoint: &OutPoint,
+) -> [u8; SCRIPT_HASH_LEN + OUTPOINT_KEY_LEN] {
+    let mut key = [0u8; SCRIPT_HASH_LEN + OUTPOINT_KEY_LEN];
+    let script = script_hash(script_pubkey);
+    key[..SCRIPT_HASH_LEN].copy_from_slice(&script);
+    let outpoint_key = outpoint_key_bytes(outpoint);
+    key[SCRIPT_HASH_LEN..].copy_from_slice(outpoint_key.as_bytes());
     key
 }
 

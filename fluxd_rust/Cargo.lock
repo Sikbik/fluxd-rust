@@ -750,6 +750,7 @@ name = "fluxd-storage"
 version = "0.1.0"
 dependencies = [
  "fjall",
+ "smallvec",
 ]
 
 [[package]]
