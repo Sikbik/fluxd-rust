@@ -247,3 +247,190 @@ fn hex_to_bytes(input: &str) -> Result<Vec<u8>, PonError> {
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxd_consensus::params::{consensus_params, ConsensusParams, EmergencyParams, Network};
+    use fluxd_primitives::block::{BlockHeader, PON_VERSION};
+    use fluxd_primitives::encoding::Encoder;
+    use secp256k1::SecretKey;
+
+    const TEST_EMERGENCY_PUBKEYS: [&str; 2] = [
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    ];
+
+    fn make_test_secret_key(last_byte: u8) -> SecretKey {
+        let mut bytes = [0u8; 32];
+        bytes[31] = last_byte;
+        SecretKey::from_slice(&bytes).expect("secret key")
+    }
+
+    fn make_emergency_header(params: &ConsensusParams) -> BlockHeader {
+        BlockHeader {
+            version: PON_VERSION,
+            prev_block: [0x22; 32],
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: 1_700_000_000,
+            bits: 0x1d00ffff,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint {
+                hash: params.emergency.collateral_hash,
+                index: 0,
+            },
+            block_sig: Vec::new(),
+        }
+    }
+
+    fn encode_multisig(signatures: &[Vec<u8>]) -> Vec<u8> {
+        let mut encoder = Encoder::new();
+        encoder.write_varint(signatures.len() as u64);
+        for sig in signatures {
+            encoder.write_var_bytes(sig);
+        }
+        encoder.into_inner()
+    }
+
+    #[test]
+    fn check_proof_of_node_accepts_small_hash_under_limit() {
+        let params = consensus_params(Network::Mainnet);
+        let activation = params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+        let height = activation + params.pon_difficulty_window as i32 + 1;
+        let bits = fluxd_pow::difficulty::target_to_compact(&params.pon_limit);
+
+        let easy_hash = [0u8; 32];
+        check_proof_of_node(&easy_hash, bits, height, &params).expect("proof ok");
+
+        let hard_hash = [0xff; 32];
+        let err = check_proof_of_node(&hard_hash, bits, height, &params).expect_err("proof fails");
+        match err {
+            PonError::InvalidHeader(message) => {
+                assert_eq!(message, "pon hash does not meet target")
+            }
+        }
+    }
+
+    #[test]
+    fn check_proof_of_node_rejects_target_above_start_limit_during_initial_window() {
+        let params = consensus_params(Network::Mainnet);
+        let activation = params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+        let height = activation;
+        let bits = fluxd_pow::difficulty::target_to_compact(&params.pon_limit);
+
+        let hash = [0u8; 32];
+        let err = check_proof_of_node(&hash, bits, height, &params).expect_err("too easy");
+        match err {
+            PonError::InvalidHeader(message) => assert_eq!(message, "pon target above limit"),
+        }
+    }
+
+    #[test]
+    fn validate_pon_signature_accepts_valid_signature() {
+        let params = consensus_params(Network::Mainnet);
+
+        let secret = make_test_secret_key(3);
+        let secp = Secp256k1::signing_only();
+        let pubkey = PublicKey::from_secret_key(&secp, &secret);
+
+        let mut header = BlockHeader {
+            version: PON_VERSION,
+            prev_block: [0x11; 32],
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: 1_700_000_001,
+            bits: 0x1d00ffff,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint {
+                hash: [0x33; 32],
+                index: 5,
+            },
+            block_sig: Vec::new(),
+        };
+
+        let msg = Message::from_digest_slice(&header.hash()).expect("msg");
+        let sig = secp.sign_ecdsa(&msg, &secret).serialize_der().to_vec();
+        header.block_sig = sig;
+
+        validate_pon_signature(&header, &params, &pubkey.serialize()).expect("signature ok");
+
+        let other_secret = make_test_secret_key(4);
+        let other_pubkey = PublicKey::from_secret_key(&secp, &other_secret);
+        let err = validate_pon_signature(&header, &params, &other_pubkey.serialize())
+            .expect_err("wrong pubkey");
+        match err {
+            PonError::InvalidHeader(message) => {
+                assert_eq!(message, "pon signature verification failed")
+            }
+        }
+    }
+
+    #[test]
+    fn emergency_block_requires_activation_height_and_valid_multisig() {
+        let mut params = consensus_params(Network::Regtest);
+        params.network = Network::Mainnet;
+        params.emergency = EmergencyParams {
+            public_keys: &TEST_EMERGENCY_PUBKEYS,
+            collateral_hash: [0x11; 32],
+            min_signatures: 2,
+        };
+        params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = 100;
+
+        let mut header = make_emergency_header(&params);
+        let msg = Message::from_digest_slice(&header.hash()).expect("msg");
+
+        let sk1 = make_test_secret_key(1);
+        let sk2 = make_test_secret_key(2);
+        let secp = Secp256k1::signing_only();
+
+        let sig1 = secp.sign_ecdsa(&msg, &sk1).serialize_der().to_vec();
+        let sig2 = secp.sign_ecdsa(&msg, &sk2).serialize_der().to_vec();
+
+        header.block_sig = encode_multisig(&[sig1.clone(), sig2.clone()]);
+        validate_pon_header(
+            &header,
+            params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height,
+            &params,
+        )
+        .expect("emergency ok");
+
+        let err = validate_pon_header(
+            &header,
+            params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height - 1,
+            &params,
+        )
+        .expect_err("emergency too early");
+        match err {
+            PonError::InvalidHeader(message) => assert_eq!(message, "emergency block not allowed"),
+        }
+
+        header.block_sig = encode_multisig(&[sig1.clone()]);
+        let err = validate_pon_header(
+            &header,
+            params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height,
+            &params,
+        )
+        .expect_err("insufficient signatures");
+        match err {
+            PonError::InvalidHeader(message) => {
+                assert_eq!(message, "emergency block has insufficient signatures")
+            }
+        }
+
+        header.block_sig = encode_multisig(&[sig1.clone(), sig1]);
+        let err = validate_pon_header(
+            &header,
+            params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height,
+            &params,
+        )
+        .expect_err("duplicate key");
+        match err {
+            PonError::InvalidHeader(message) => {
+                assert_eq!(message, "emergency block signature verification failed")
+            }
+        }
+    }
+}

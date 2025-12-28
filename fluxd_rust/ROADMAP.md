@@ -52,6 +52,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P0] Upgrade activation heights and block hashes cross-checked against C++ (owner: TBD)
   - [x] Mainnet upgrade schedule regression tests (protocol version, height, activation hash)
 - [ ] [P0] PoN rules parity (header validation, signature rules, economics) (owner: TBD)
+  - [x] PoN slot number and hash determinism regression tests
+  - [x] PoN signature validation regression test (secp256k1)
+  - [x] Emergency block multisig encoding/verification regression test
+  - [x] Proof-of-node target bound regression tests
 - [ ] [P0] Block reward schedule parity (including canceled halving at 1,968,550) (owner: TBD)
   - [x] Regression tests for 1,968,550 canceled halving and PoN activation subsidy/dev-fund
   - [x] Regression tests for PoN annual subsidy reductions and cap
@@ -65,6 +69,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Digishield vector tests (Flux mainnet params)
   - [x] LWMA vector test (Flux mainnet params)
   - [x] PoN difficulty adjustment regression tests (start-limit, fast/slow, stability)
+  - [x] LWMA3 stability regression test (perfect timing)
+  - [x] LWMA/LWMA3 selection regression tests (transition heights)
+  - [x] Equihash epoch-fade reset regression test (pow-limit at epoch end + 60)
+  - [x] ZelHash ramp regression tests (toward LWMA3)
 - [ ] [P0] Checkpoint handling parity and tests (owner: TBD)
   - [x] Mainnet checkpoint list regression test (values + ordering)
 - [ ] [P0] Expanded block index fields (status/validity/tx counts/undo offsets) (owner: TBD)

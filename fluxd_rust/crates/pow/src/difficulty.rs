@@ -392,6 +392,7 @@ fn lwma3_next_work_required(
 mod tests {
     use super::*;
     use fluxd_consensus::params::{consensus_params, Network};
+    use fluxd_consensus::upgrades::UpgradeIndex;
 
     #[test]
     fn digishield_vectors_match_cpp() {
@@ -434,5 +435,156 @@ mod tests {
 
         let bits = lwma_next_work_required(&chain, &params).expect("lwma bits");
         assert_eq!(bits, 0x1d00fffe);
+    }
+
+    fn make_chain(
+        base_height: i64,
+        count: usize,
+        base_time: i64,
+        spacing: i64,
+        bits: u32,
+    ) -> Vec<HeaderInfo> {
+        (0..count)
+            .map(|offset| HeaderInfo {
+                height: base_height + offset as i64,
+                time: base_time + (offset as i64) * spacing,
+                bits,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lwma3_keeps_difficulty_stable_under_perfect_timing() {
+        let params = consensus_params(Network::Mainnet);
+        let n = params.zawy_lwma_averaging_window as usize;
+
+        let last_height = 1_000i64;
+        let base_height = last_height - params.zawy_lwma_averaging_window;
+        let chain = make_chain(
+            base_height,
+            n + 1,
+            1_000_000,
+            params.pow_target_spacing,
+            0x1d00ffff,
+        );
+
+        let bits = lwma3_next_work_required(&chain, &params).expect("lwma3 bits");
+        assert_eq!(bits, 0x1d00fffe);
+    }
+
+    #[test]
+    fn get_next_work_required_resets_at_equihash_144_5_epoch_end() {
+        let params = consensus_params(Network::Mainnet);
+        let pow_limit_bits = target_to_compact(&params.pow_limit);
+        let epoch_end = eh_epoch_end(&params, UpgradeIndex::Equi144_5);
+
+        let chain = vec![HeaderInfo {
+            height: epoch_end,
+            time: 1_000_000,
+            bits: 0x1d00ffff,
+        }];
+        let bits = get_next_work_required(&chain, None, &params).expect("next work");
+        assert_eq!(bits, pow_limit_bits);
+
+        let chain = vec![HeaderInfo {
+            height: epoch_end + 60,
+            time: 1_000_000,
+            bits: 0x1d00ffff,
+        }];
+        let bits = get_next_work_required(&chain, None, &params).expect("next work");
+        assert_eq!(bits, pow_limit_bits);
+    }
+
+    #[test]
+    fn get_next_work_required_uses_lwma_between_lwma_and_acadia() {
+        let params = consensus_params(Network::Mainnet);
+        let n = params.zawy_lwma_averaging_window as usize;
+
+        let lwma_height = params.upgrades[UpgradeIndex::Lwma.as_usize()].activation_height as i64;
+        let last_height = lwma_height + 10;
+        let base_height = last_height - params.zawy_lwma_averaging_window;
+        let chain = make_chain(
+            base_height,
+            n + 1,
+            1_000_000,
+            params.pow_target_spacing,
+            0x1d00ffff,
+        );
+
+        let expected = lwma_next_work_required(&chain, &params).expect("lwma expected");
+        let actual = get_next_work_required(
+            &chain,
+            Some(chain.last().unwrap().time + params.pow_target_spacing),
+            &params,
+        )
+        .expect("next work");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn get_next_work_required_uses_lwma3_after_acadia() {
+        let params = consensus_params(Network::Mainnet);
+        let n = params.zawy_lwma_averaging_window as usize;
+
+        let acadia_height =
+            params.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height as i64;
+        let last_height = acadia_height + 10;
+        let base_height = last_height - params.zawy_lwma_averaging_window;
+        let chain = make_chain(
+            base_height,
+            n + 1,
+            1_000_000,
+            params.pow_target_spacing,
+            0x1d00ffff,
+        );
+
+        let expected = lwma3_next_work_required(&chain, &params).expect("lwma3 expected");
+        let actual = get_next_work_required(
+            &chain,
+            Some(chain.last().unwrap().time + params.pow_target_spacing),
+            &params,
+        )
+        .expect("next work");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn get_next_work_required_zelhash_ramp_transitions_toward_lwma3() {
+        let params = consensus_params(Network::Mainnet);
+        let pow_limit_bits = target_to_compact(&params.pow_limit);
+        let epoch_end = eh_epoch_end(&params, UpgradeIndex::Kamiooka);
+        let n = params.zawy_lwma_averaging_window as usize;
+
+        let last_height = epoch_end + 61;
+        let base_height = last_height - params.zawy_lwma_averaging_window;
+        let chain = make_chain(
+            base_height,
+            n + 1,
+            1_000_000,
+            params.pow_target_spacing,
+            0x1d00ffff,
+        );
+
+        let lwma3_bits = lwma3_next_work_required(&chain, &params).expect("lwma3 bits");
+        let bits_at_step_zero = get_next_work_required(&chain, None, &params).expect("next work");
+        assert_eq!(bits_at_step_zero, lwma3_bits);
+
+        let last_height = epoch_end;
+        let base_height = last_height - params.zawy_lwma_averaging_window;
+        let chain = make_chain(
+            base_height,
+            n + 1,
+            1_000_000,
+            params.pow_target_spacing,
+            0x1d00ffff,
+        );
+        let bits_at_start = get_next_work_required(&chain, None, &params).expect("next work");
+
+        let start_target = compact_to_u256(bits_at_start).expect("target");
+        let zero_target = compact_to_u256(bits_at_step_zero).expect("target");
+        assert!(start_target >= zero_target);
+
+        let pow_limit_target = compact_to_u256(pow_limit_bits).expect("target");
+        assert!(start_target <= pow_limit_target);
     }
 }
