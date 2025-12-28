@@ -50,6 +50,7 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
                 min_height,
                 Some(addr_book.as_ref()),
                 &peer_ctx,
+                None,
             )
             .await
             {

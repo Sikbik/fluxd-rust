@@ -171,6 +171,20 @@ const HEADER_CACHE_CAPACITY: usize = 200_000;
 const UTXO_CACHE_CAPACITY: usize = 200_000;
 const MTP_WINDOW_SIZE: usize = 11;
 
+fn invert_lowest_one(value: i32) -> i32 {
+    value & value.saturating_sub(1)
+}
+
+fn get_skip_height(height: i32) -> i32 {
+    if height < 2 {
+        0
+    } else if (height & 1) != 0 {
+        invert_lowest_one(invert_lowest_one(height - 1)) + 1
+    } else {
+        invert_lowest_one(height)
+    }
+}
+
 struct HeaderCache {
     entries: HashMap<Hash256, HeaderEntry>,
     order: VecDeque<Hash256>,
@@ -465,6 +479,41 @@ impl<S: KeyValueStore> ChainState<S> {
             }
         }
         Ok(entry)
+    }
+
+    pub fn header_ancestor_hash(
+        &self,
+        hash: &fluxd_consensus::Hash256,
+        target_height: i32,
+    ) -> Result<Option<fluxd_consensus::Hash256>, ChainStateError> {
+        if target_height < 0 {
+            return Ok(None);
+        }
+        let Some(mut entry) = self.header_entry(hash)? else {
+            return Ok(None);
+        };
+        let mut current_hash = *hash;
+        let mut current_height = entry.height;
+        if target_height > current_height {
+            return Ok(None);
+        }
+
+        while current_height > target_height {
+            let skip_height = get_skip_height(current_height);
+            let next_hash = if entry.skip_hash != [0u8; 32] && skip_height >= target_height {
+                entry.skip_hash
+            } else {
+                entry.prev_hash
+            };
+            current_hash = next_hash;
+            entry = match self.header_entry(&current_hash)? {
+                Some(entry) => entry,
+                None => return Ok(None),
+            };
+            current_height = entry.height;
+        }
+
+        Ok(Some(current_hash))
     }
 
     pub fn insert_header(
@@ -788,8 +837,16 @@ impl<S: KeyValueStore> ChainState<S> {
             work.to_big_endian()
         };
 
+        let skip_hash = if height <= 0 {
+            [0u8; 32]
+        } else {
+            let skip_height = get_skip_height(height);
+            self.header_ancestor_hash(&prev_hash, skip_height)?
+                .unwrap_or([0u8; 32])
+        };
         let entry = HeaderEntry {
             prev_hash,
+            skip_hash,
             height,
             time: header.time,
             bits: header.bits,
@@ -999,6 +1056,7 @@ impl<S: KeyValueStore> ChainState<S> {
 
         let entry = HeaderEntry {
             prev_hash,
+            skip_hash: [0u8; 32],
             height,
             time: header.time,
             bits: header.bits,
@@ -1416,23 +1474,44 @@ impl<S: KeyValueStore> ChainState<S> {
             if record.start_height == height_u32 {
                 return Ok(true);
             }
-            let pon_active =
-                network_upgrade_active(height, &params.consensus.upgrades, UpgradeIndex::Pon);
-            let dos_remove = if pon_active {
-                FLUXNODE_DOS_REMOVE_AMOUNT_V2
+            let dos_remove_v1 = u32::try_from(FLUXNODE_DOS_REMOVE_AMOUNT).unwrap_or_default();
+            let dos_remove_v2 = u32::try_from(FLUXNODE_DOS_REMOVE_AMOUNT_V2).unwrap_or_default();
+            let removal_height_v1 = record.start_height.saturating_add(dos_remove_v1);
+            let upgrade_height = i32::try_from(removal_height_v1).unwrap_or(i32::MAX);
+            let pon_active_at_unban = network_upgrade_active(
+                upgrade_height,
+                &params.consensus.upgrades,
+                UpgradeIndex::Pon,
+            );
+            let removal_height = if pon_active_at_unban {
+                record.start_height.saturating_add(dos_remove_v2)
             } else {
-                FLUXNODE_DOS_REMOVE_AMOUNT
+                removal_height_v1
             };
-            let dos_remove = u32::try_from(dos_remove).unwrap_or_default();
-            let removal_height = record.start_height.saturating_add(dos_remove);
             return Ok(height_u32 > removal_height);
         }
 
-        let expiration = fluxnode_confirm_expiration_count(height, &params.consensus);
-        let expire_height = record
+        let mut expiration = fluxnode_confirm_expiration_count(
+            i32::try_from(record.last_confirmed_height).unwrap_or(i32::MAX),
+            &params.consensus,
+        );
+        let mut expire_height = record
             .last_confirmed_height
             .saturating_add(expiration)
             .saturating_add(1);
+        loop {
+            let candidate_height = i32::try_from(expire_height).unwrap_or(i32::MAX);
+            let next_expiration =
+                fluxnode_confirm_expiration_count(candidate_height, &params.consensus);
+            if next_expiration == expiration {
+                break;
+            }
+            expiration = next_expiration;
+            expire_height = record
+                .last_confirmed_height
+                .saturating_add(expiration)
+                .saturating_add(1);
+        }
         Ok(height_u32 > expire_height)
     }
 
@@ -4187,6 +4266,7 @@ mod tests {
     fn make_header_entry(prev_hash: Hash256, height: i32, time: u32, bits: u32) -> HeaderEntry {
         HeaderEntry {
             prev_hash,
+            skip_hash: [0u8; 32],
             height,
             time,
             bits,
@@ -5246,6 +5326,106 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fluxnode_start_allows_restart_after_pre_pon_dos_removal() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let collateral_secret = make_test_secret_key(1);
+        let operator_secret = make_test_secret_key(2);
+        let secp = Secp256k1::signing_only();
+        let collateral_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &collateral_secret);
+        let operator_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &operator_secret);
+
+        let collateral_outpoint = OutPoint {
+            hash: [0x66; 32],
+            index: 0,
+        };
+        let entry = UtxoEntry {
+            value: 1000,
+            script_pubkey: p2pkh_script_for_pubkey(&collateral_pubkey.serialize()),
+            height: 2_019_000,
+            is_coinbase: false,
+        };
+        store
+            .put(
+                Column::Utxo,
+                outpoint_key_bytes(&collateral_outpoint).as_bytes(),
+                &entry.encode(),
+            )
+            .expect("store utxo");
+
+        let start_height = 2_019_752u32;
+        let record = FluxnodeRecord {
+            collateral: collateral_outpoint.clone(),
+            tier: 0,
+            start_height,
+            last_confirmed_height: start_height,
+            last_paid_height: 0,
+            operator_pubkey: KeyId([0x11; 32]),
+            collateral_pubkey: None,
+            p2sh_script: None,
+        };
+        store
+            .put(
+                Column::Fluxnode,
+                outpoint_key_bytes(&collateral_outpoint).as_bytes(),
+                &record.encode(),
+            )
+            .expect("store record");
+
+        let mut tx = Transaction {
+            f_overwintered: false,
+            version: FLUXNODE_TX_VERSION,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: Some(FluxnodeTx::V5(FluxnodeTxV5::Start(FluxnodeStartV5 {
+                collateral: collateral_outpoint.clone(),
+                collateral_pubkey: collateral_pubkey.serialize().to_vec(),
+                pubkey: operator_pubkey.serialize().to_vec(),
+                sig_time: 0,
+                sig: Vec::new(),
+            }))),
+        };
+
+        let txid = tx.txid().expect("txid");
+        let message = hash256_to_hex(&txid);
+        let digest = signed_message_hash(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).expect("msg");
+        let sig = secp.sign_ecdsa_recoverable(&msg, &collateral_secret);
+        let sig_bytes = encode_compact(&sig, true);
+        if let Some(FluxnodeTx::V5(FluxnodeTxV5::Start(start))) = tx.fluxnode.as_mut() {
+            start.sig = sig_bytes.to_vec();
+        }
+
+        let params = chain_params(Network::Mainnet);
+        chainstate
+            .validate_fluxnode_tx(
+                &tx,
+                &txid,
+                2_020_002,
+                &params,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .expect("start tx valid after pre-PON DoS removal");
     }
 
     #[test]

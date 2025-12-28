@@ -13,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,10 @@ const HEADER_TIMEOUT_RETRIES_IDLE: usize = 3;
 const HEADER_STALL_SECS_IDLE: u64 = 90;
 const HEADER_IDLE_REPROBE_SECS: u64 = 120;
 const BLOCK_STALL_SECS: u64 = 90;
+const BLOCK_PEER_REFILL_SECS: u64 = 30;
+const BLOCK_PEER_BAN_SECS_NOTFOUND: u64 = 300;
+const BLOCK_PEER_BAN_SECS_TIMEOUT: u64 = 120;
+const BLOCK_PEER_BAN_SECS_PROTOCOL: u64 = 900;
 const HEADER_PEER_PROBE_COUNT: usize = 40;
 const HEADER_BATCH_QUEUE: usize = 32;
 const HEADER_LOCATOR_MAX_WALK: usize = 1024;
@@ -111,6 +115,17 @@ const GENESIS_REGTEST_NONCE_HEX: &str =
 const GENESIS_REGTEST_SOLUTION_HEX: &str =
     "02853a9dd062e2356909a0d2b9f0e4873dbf092edd3f00eea317e21222d1f2c414b926ee";
 const GENESIS_REGTEST_BITS: u32 = 0x200f0f0f;
+
+fn log_block_requests() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FLUXD_LOG_BLOCK_REQUESTS").is_some())
+}
+
+fn maybe_log_block_request(count: usize) {
+    if log_block_requests() {
+        println!("Requesting {} block(s)", count);
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -676,6 +691,7 @@ async fn run() -> Result<(), String> {
         min_peer_height,
         addr_book.as_ref(),
         &block_peer_ctx,
+        Some(header_peer_book.as_ref()),
     )
     .await?;
     println!("Block peer handshake complete");
@@ -696,6 +712,7 @@ async fn run() -> Result<(), String> {
             min_peer_height,
             Some(addr_book.as_ref()),
             &block_peer_ctx,
+            Some(header_peer_book.as_ref()),
         )
         .await?
     };
@@ -842,6 +859,7 @@ async fn run() -> Result<(), String> {
         Arc::clone(&params),
         addr_book.as_ref(),
         &block_peer_ctx,
+        Some(header_peer_book.as_ref()),
         &flags,
         &verify_settings,
         Arc::clone(&connect_metrics),
@@ -1214,6 +1232,7 @@ async fn connect_to_peer(
     min_height: i32,
     addr_book: &AddrBook,
     peer_ctx: &PeerContext,
+    peer_book: Option<&HeaderPeerBook>,
 ) -> Result<Peer, String> {
     let peers = connect_to_peers(
         params,
@@ -1222,6 +1241,7 @@ async fn connect_to_peer(
         min_height,
         Some(addr_book),
         peer_ctx,
+        peer_book,
     )
     .await?;
     peers
@@ -1237,34 +1257,52 @@ async fn connect_to_peers(
     min_height: i32,
     addr_book: Option<&AddrBook>,
     peer_ctx: &PeerContext,
+    peer_book: Option<&HeaderPeerBook>,
 ) -> Result<Vec<Peer>, String> {
     if count == 0 {
         return Ok(Vec::new());
     }
 
-    let mut addrs = resolve_seed_addresses(params).await?;
-    if let Some(addr_book) = addr_book {
-        let mut seen: HashSet<SocketAddr> = addrs.iter().copied().collect();
-        for addr in addr_book.sample(ADDR_BOOK_SAMPLE) {
-            if seen.insert(addr) {
-                addrs.push(addr);
+    let is_allowed = |addr: SocketAddr| peer_book.map(|book| !book.is_banned(addr)).unwrap_or(true);
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(peer_book) = peer_book {
+        let mut preferred = peer_book.preferred(HEADER_PEER_PROBE_COUNT);
+        preferred.shuffle(&mut rand::thread_rng());
+        for addr in preferred {
+            if seen.insert(addr) && is_allowed(addr) {
+                candidates.push(addr);
             }
         }
     }
-    if addrs.is_empty() {
-        return Err("no seed addresses resolved".to_string());
+
+    let mut addrs = resolve_seed_addresses(params).await?;
+    if let Some(addr_book) = addr_book {
+        for addr in addr_book.sample(ADDR_BOOK_SAMPLE) {
+            addrs.push(addr);
+        }
     }
-    println!("Resolved {} seed addresses", addrs.len());
     addrs.shuffle(&mut rand::thread_rng());
+    for addr in addrs {
+        if seen.insert(addr) && is_allowed(addr) {
+            candidates.push(addr);
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err("no peer addresses available".to_string());
+    }
+    println!("Peer candidates {}", candidates.len());
 
     let mut peers = Vec::new();
     let mut behind = Vec::new();
     let mut join_set = JoinSet::new();
     let mut next_index = 0usize;
-    let max_parallel = addrs.len().min(count.saturating_mul(2).max(4));
+    let max_parallel = candidates.len().min(count.saturating_mul(2).max(4));
 
-    while next_index < addrs.len() && join_set.len() < max_parallel {
-        let addr = addrs[next_index];
+    while next_index < candidates.len() && join_set.len() < max_parallel {
+        let addr = candidates[next_index];
         let magic = params.message_start;
         let peer_ctx = peer_ctx.clone();
         join_set
@@ -1303,8 +1341,8 @@ async fn connect_to_peers(
             }
         }
 
-        if next_index < addrs.len() {
-            let addr = addrs[next_index];
+        if next_index < candidates.len() {
+            let addr = candidates[next_index];
             let magic = params.message_start;
             let peer_ctx = peer_ctx.clone();
             join_set.spawn(async move {
@@ -2731,6 +2769,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
     params: Arc<ChainParams>,
     addr_book: &AddrBook,
     peer_ctx: &PeerContext,
+    peer_book: Option<&HeaderPeerBook>,
     flags: &ValidationFlags,
     verify_settings: &VerifySettings,
     connect_metrics: Arc<ConnectMetrics>,
@@ -2747,6 +2786,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
         .map(|tip| tip.height)
         .unwrap_or(-1);
     let mut last_progress_at = Instant::now();
+    let mut last_peer_refill_at = Instant::now() - Duration::from_secs(BLOCK_PEER_REFILL_SECS);
     loop {
         cap_header_gap(
             chainstate.as_ref(),
@@ -2764,8 +2804,45 @@ async fn sync_chain<S: KeyValueStore + 'static>(
             last_progress_height = best_block_height;
             last_progress_at = Instant::now();
         }
-        let (gap, _) = header_gap(chainstate.as_ref())?;
-        let max_fetch = max_fetch_blocks(block_peers.len(), getdata_batch, inflight_per_peer);
+        let (gap, best_header_height) = header_gap(chainstate.as_ref())?;
+        if block_peers_target > 0
+            && block_peers.len() < block_peers_target
+            && last_peer_refill_at.elapsed() > Duration::from_secs(BLOCK_PEER_REFILL_SECS)
+        {
+            let needed = block_peers_target.saturating_sub(block_peers.len());
+            let start_height = best_block_height;
+            let mut existing: HashSet<SocketAddr> =
+                block_peers.iter().map(|peer| peer.addr()).collect();
+            existing.insert(block_peer.addr());
+            match connect_to_peers(
+                params.as_ref(),
+                needed,
+                start_height,
+                best_header_height,
+                Some(addr_book),
+                peer_ctx,
+                peer_book,
+            )
+            .await
+            {
+                Ok(mut new_peers) => {
+                    new_peers.retain(|peer| existing.insert(peer.addr()));
+                    if !new_peers.is_empty() {
+                        println!("Connected {} additional block peer(s)", new_peers.len());
+                        block_peers.extend(new_peers);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("refill block peers failed: {err}");
+                }
+            }
+            last_peer_refill_at = Instant::now();
+        }
+        let max_fetch = max_fetch_blocks(
+            block_peers.len().saturating_add(1),
+            getdata_batch,
+            inflight_per_peer,
+        );
         let missing = collect_missing_blocks(chainstate.as_ref(), max_fetch)?;
         if !missing.is_empty() {
             if gap > 0 && last_progress_at.elapsed() > Duration::from_secs(BLOCK_STALL_SECS) {
@@ -2785,6 +2862,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                     best_header_height,
                     addr_book,
                     peer_ctx,
+                    peer_book,
                 )
                 .await
                 {
@@ -2803,6 +2881,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                         best_header_height,
                         Some(addr_book),
                         peer_ctx,
+                        peer_book,
                     )
                     .await
                     {
@@ -2819,6 +2898,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
             let fetch_result = fetch_blocks(
                 block_peer,
                 block_peers,
+                peer_book,
                 Arc::clone(&chainstate),
                 Arc::clone(&mempool),
                 Arc::clone(&metrics),
@@ -2848,6 +2928,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                         best_header_height,
                         addr_book,
                         peer_ctx,
+                        peer_book,
                     )
                     .await
                     {
@@ -2866,6 +2947,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                             best_header_height,
                             Some(addr_book),
                             peer_ctx,
+                            peer_book,
                         )
                         .await
                         {
@@ -2907,6 +2989,20 @@ fn is_transient_block_error(err: &str) -> bool {
     ]
     .iter()
     .any(|marker| err.contains(marker))
+}
+
+fn block_peer_ban_secs(err: &str) -> Option<u64> {
+    let err = err.to_lowercase();
+    if err.contains("notfound") {
+        return Some(BLOCK_PEER_BAN_SECS_NOTFOUND);
+    }
+    if err.contains("stalled") || err.contains("timeout") || err.contains("timed out") {
+        return Some(BLOCK_PEER_BAN_SECS_TIMEOUT);
+    }
+    if err.contains("invalid magic") || err.contains("payload") {
+        return Some(BLOCK_PEER_BAN_SECS_PROTOCOL);
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3220,6 +3316,10 @@ fn collect_missing_blocks<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     max_count: usize,
 ) -> Result<Vec<fluxd_consensus::Hash256>, String> {
+    if max_count == 0 {
+        return Ok(Vec::new());
+    }
+
     let best_header = match chainstate.best_header().map_err(|err| err.to_string())? {
         Some(tip) => tip,
         None => return Ok(Vec::new()),
@@ -3234,7 +3334,7 @@ fn collect_missing_blocks<S: KeyValueStore>(
         return Ok(Vec::new());
     }
 
-    let (anchor_hash, _anchor_height) = if header_descends_from(
+    let (anchor_hash, anchor_height) = if header_descends_from(
         chainstate,
         best_header.hash,
         best_block.hash,
@@ -3251,27 +3351,37 @@ fn collect_missing_blocks<S: KeyValueStore>(
         )?
     };
 
-    let mut missing: VecDeque<fluxd_consensus::Hash256> = VecDeque::new();
-    let mut hash = best_header.hash;
+    let start_height = anchor_height.saturating_add(1);
+    if start_height > best_header.height {
+        return Ok(Vec::new());
+    }
+
+    let end_height = start_height
+        .saturating_add(max_count as i32)
+        .saturating_sub(1)
+        .min(best_header.height);
+    let end_hash = chainstate
+        .header_ancestor_hash(&best_header.hash, end_height)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "missing header entry while scanning for blocks".to_string())?;
+
+    let mut missing = Vec::with_capacity(max_count.min(256));
+    let mut hash = end_hash;
     loop {
+        if hash == anchor_hash {
+            break;
+        }
+        missing.push(hash);
         let entry = chainstate
             .header_entry(&hash)
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "missing header entry while scanning for blocks".to_string())?;
-        if hash == anchor_hash {
-            break;
-        }
-        missing.push_front(hash);
-        if entry.height == 0 {
+        if entry.height <= 0 {
             break;
         }
         hash = entry.prev_hash;
     }
-
-    let mut missing: Vec<fluxd_consensus::Hash256> = missing.into_iter().collect();
-    if max_count > 0 && missing.len() > max_count {
-        missing.truncate(max_count);
-    }
+    missing.reverse();
     Ok(missing)
 }
 
@@ -3318,65 +3428,64 @@ fn build_locator<S: KeyValueStore>(
 
 fn header_descends_from<S: KeyValueStore>(
     chainstate: &ChainState<S>,
-    mut hash: fluxd_consensus::Hash256,
+    hash: fluxd_consensus::Hash256,
     ancestor_hash: fluxd_consensus::Hash256,
     ancestor_height: i32,
 ) -> Result<bool, String> {
     if hash == ancestor_hash {
         return Ok(true);
     }
-    loop {
-        let entry = chainstate
-            .header_entry(&hash)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| "missing header entry while checking ancestry".to_string())?;
-        if entry.height <= ancestor_height {
-            return Ok(false);
-        }
-        hash = entry.prev_hash;
-        if hash == ancestor_hash {
-            return Ok(true);
-        }
+
+    let entry = chainstate
+        .header_entry(&hash)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "missing header entry while checking ancestry".to_string())?;
+    if entry.height < ancestor_height {
+        return Ok(false);
     }
+    let ancestor = chainstate
+        .header_ancestor_hash(&hash, ancestor_height)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "missing header entry while checking ancestry".to_string())?;
+    Ok(ancestor == ancestor_hash)
 }
 
 fn find_common_ancestor<S: KeyValueStore>(
     chainstate: &ChainState<S>,
-    mut a_hash: Hash256,
-    mut a_height: i32,
-    mut b_hash: Hash256,
-    mut b_height: i32,
+    a_hash: Hash256,
+    a_height: i32,
+    b_hash: Hash256,
+    b_height: i32,
 ) -> Result<(Hash256, i32), String> {
-    while a_height > b_height {
-        let entry = chainstate
-            .header_entry(&a_hash)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
-        a_hash = entry.prev_hash;
-        a_height = entry.height.saturating_sub(1);
+    let max_height = a_height.min(b_height);
+    if max_height < 0 {
+        return Err("missing header entry while finding ancestor".to_string());
     }
-    while b_height > a_height {
-        let entry = chainstate
-            .header_entry(&b_hash)
+
+    let mut low: i32 = 0;
+    let mut high: i32 = max_height;
+    while low < high {
+        let mid = low + (high - low + 1) / 2;
+        let mid_a = chainstate
+            .header_ancestor_hash(&a_hash, mid)
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
-        b_hash = entry.prev_hash;
-        b_height = entry.height.saturating_sub(1);
+        let mid_b = chainstate
+            .header_ancestor_hash(&b_hash, mid)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
+        if mid_a == mid_b {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
     }
-    while a_hash != b_hash {
-        let entry_a = chainstate
-            .header_entry(&a_hash)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
-        let entry_b = chainstate
-            .header_entry(&b_hash)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
-        a_hash = entry_a.prev_hash;
-        b_hash = entry_b.prev_hash;
-        a_height = entry_a.height.saturating_sub(1);
-    }
-    Ok((a_hash, a_height))
+
+    let ancestor = chainstate
+        .header_ancestor_hash(&a_hash, low)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "missing header entry while finding ancestor".to_string())?;
+    Ok((ancestor, low))
 }
 
 fn reorg_to_best_header<S: KeyValueStore>(
@@ -3462,6 +3571,7 @@ async fn request_headers(
 async fn fetch_blocks<S: KeyValueStore + 'static>(
     peer: &mut Peer,
     block_peers: &mut Vec<Peer>,
+    peer_book: Option<&HeaderPeerBook>,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<mempool::Mempool>>,
     metrics: Arc<SyncMetrics>,
@@ -3480,7 +3590,8 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
     }
 
     if block_peers.is_empty() {
-        return fetch_blocks_single(
+        let addr = peer.addr();
+        let result = fetch_blocks_single(
             peer,
             chainstate,
             mempool,
@@ -3496,10 +3607,24 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
             inflight_per_peer,
         )
         .await;
+        if let Some(peer_book) = peer_book {
+            match &result {
+                Ok(()) => peer_book.record_success(addr),
+                Err(err) => {
+                    peer_book.record_failure(addr);
+                    if let Some(secs) = block_peer_ban_secs(err) {
+                        peer_book.ban_for(addr, secs);
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     fetch_blocks_multi(
+        peer,
         block_peers,
+        peer_book,
         chainstate,
         mempool,
         metrics,
@@ -3575,7 +3700,9 @@ async fn fetch_blocks_single<S: KeyValueStore + 'static>(
 
 #[allow(clippy::too_many_arguments)]
 async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
+    block_peer: &mut Peer,
     block_peers: &mut Vec<Peer>,
+    peer_book: Option<&HeaderPeerBook>,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<mempool::Mempool>>,
     metrics: Arc<SyncMetrics>,
@@ -3596,42 +3723,116 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     let mut pending: VecDeque<fluxd_consensus::Hash256> = hashes.iter().copied().collect();
     let mut received: HashMap<fluxd_consensus::Hash256, ReceivedBlock> = HashMap::new();
 
-    let peers = std::mem::take(block_peers);
-    let mut assignments: Vec<Vec<Vec<fluxd_consensus::Hash256>>> = vec![Vec::new(); peers.len()];
-    for (index, chunk) in hashes.chunks(getdata_batch).enumerate() {
-        assignments[index % peers.len()].push(chunk.to_vec());
-    }
+    let mut peers = std::mem::take(block_peers);
+    let mut rounds = 0usize;
+    let max_rounds = 3usize;
 
-    let mut tasks = Vec::new();
-    let mut idle_peers = Vec::new();
-    for (peer, chunks) in peers.into_iter().zip(assignments) {
-        if chunks.is_empty() {
-            idle_peers.push(peer);
-            continue;
+    while rounds < max_rounds {
+        let remaining: Vec<fluxd_consensus::Hash256> = hashes
+            .iter()
+            .copied()
+            .filter(|hash| !received.contains_key(hash))
+            .collect();
+        if remaining.is_empty() {
+            break;
         }
-        let metrics = Arc::clone(&metrics);
-        tasks.push(tokio::spawn(async move {
-            fetch_blocks_on_peer(peer, chunks, inflight_per_peer, metrics).await
-        }));
-    }
+        rounds = rounds.saturating_add(1);
 
-    let mut returned_peers = idle_peers;
-    for task in tasks {
-        match task.await {
-            Ok(Ok((peer, blocks))) => {
-                returned_peers.push(peer);
-                received.extend(blocks);
+        let chunks: Vec<Vec<fluxd_consensus::Hash256>> = remaining
+            .chunks(getdata_batch)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let queue = Arc::new(Mutex::new(VecDeque::from(chunks)));
+
+        let before = received.len();
+        let download_start = Instant::now();
+        let mut join_set = JoinSet::new();
+        for peer in peers.drain(..) {
+            let queue = Arc::clone(&queue);
+            join_set.spawn(async move {
+                let mut peer = peer;
+                let outcome =
+                    fetch_blocks_on_peer_queue_inner(&mut peer, &queue, inflight_per_peer).await;
+                (peer, outcome)
+            });
+        }
+
+        let queue_for_block_peer = Arc::clone(&queue);
+        let block_peer_task =
+            fetch_blocks_on_peer_queue_inner(block_peer, &queue_for_block_peer, inflight_per_peer);
+        let peer_tasks = async move {
+            let mut out = Vec::new();
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok(entry) => out.push(entry),
+                    Err(err) => eprintln!("block peer join failed: {err}"),
+                }
             }
-            Ok(Err(err)) => {
+            out
+        };
+
+        let (block_peer_outcome, peer_outcomes) = tokio::join!(block_peer_task, peer_tasks);
+
+        let block_peer_addr = block_peer.addr();
+        if !block_peer_outcome.received.is_empty() {
+            received.extend(block_peer_outcome.received);
+            if let Some(peer_book) = peer_book {
+                peer_book.record_success(block_peer_addr);
+            }
+        }
+        if let Some(err) = block_peer_outcome.error {
+            eprintln!("block peer fetch failed: {err}");
+            if let Some(peer_book) = peer_book {
+                peer_book.record_failure(block_peer_addr);
+                if let Some(secs) = block_peer_ban_secs(&err) {
+                    peer_book.ban_for(block_peer_addr, secs);
+                }
+            }
+        }
+
+        let mut next_peers = Vec::new();
+        for (peer, outcome) in peer_outcomes {
+            let addr = peer.addr();
+            if !outcome.received.is_empty() {
+                received.extend(outcome.received);
+                if let Some(peer_book) = peer_book {
+                    peer_book.record_success(addr);
+                }
+            }
+            if let Some(err) = outcome.error {
                 eprintln!("block peer fetch failed: {err}");
+                if let Some(peer_book) = peer_book {
+                    peer_book.record_failure(addr);
+                    if let Some(secs) = block_peer_ban_secs(&err) {
+                        peer_book.ban_for(addr, secs);
+                    }
+                }
+                continue;
             }
-            Err(err) => {
-                eprintln!("block peer join failed: {err}");
-            }
+            next_peers.push(peer);
+        }
+        peers = next_peers;
+
+        let downloaded = received.len().saturating_sub(before);
+        if downloaded > 0 {
+            metrics.record_download(downloaded as u64, download_start.elapsed());
+        }
+
+        if downloaded == 0 {
+            break;
         }
     }
 
-    *block_peers = returned_peers;
+    *block_peers = peers;
+
+    if received.is_empty() {
+        return Err("no blocks received from any peer".to_string());
+    }
+    if let Some(next) = pending.front().copied() {
+        if !received.contains_key(&next) {
+            return Err("peer download missing next tip block".to_string());
+        }
+    }
     let chainstate = Arc::clone(&chainstate);
     let params = Arc::clone(&params);
     let mempool = Arc::clone(&mempool);
@@ -3664,16 +3865,127 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     Ok(())
 }
 
-async fn fetch_blocks_on_peer(
-    mut peer: Peer,
-    chunks: Vec<Vec<fluxd_consensus::Hash256>>,
+struct BlockPeerFetchOutcome {
+    received: HashMap<fluxd_consensus::Hash256, ReceivedBlock>,
+    error: Option<String>,
+}
+
+async fn fetch_blocks_on_peer_queue_inner(
+    peer: &mut Peer,
+    queue: &Arc<Mutex<VecDeque<Vec<fluxd_consensus::Hash256>>>>,
     inflight_per_peer: usize,
-    metrics: Arc<SyncMetrics>,
-) -> Result<(Peer, HashMap<fluxd_consensus::Hash256, ReceivedBlock>), String> {
-    let download_start = Instant::now();
-    let received = fetch_blocks_on_peer_inner(&mut peer, chunks, inflight_per_peer).await?;
-    metrics.record_download(received.len() as u64, download_start.elapsed());
-    Ok((peer, received))
+) -> BlockPeerFetchOutcome {
+    let mut received: HashMap<fluxd_consensus::Hash256, ReceivedBlock> = HashMap::new();
+    let mut inflight: Vec<HashSet<fluxd_consensus::Hash256>> = Vec::new();
+
+    let pop_chunk = || -> Option<Vec<fluxd_consensus::Hash256>> {
+        let Ok(mut guard) = queue.lock() else {
+            return None;
+        };
+        guard.pop_front()
+    };
+
+    let inflight_target = inflight_per_peer.max(1);
+    while inflight.len() < inflight_target {
+        let Some(chunk) = pop_chunk() else {
+            break;
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        maybe_log_block_request(chunk.len());
+        if let Err(err) = peer.send_getdata_blocks(&chunk).await {
+            return BlockPeerFetchOutcome {
+                received,
+                error: Some(err),
+            };
+        }
+        inflight.push(chunk.into_iter().collect());
+    }
+
+    let mut last_block_at = Instant::now();
+    while !inflight.is_empty() {
+        if last_block_at.elapsed() > Duration::from_secs(BLOCK_IDLE_SECS) {
+            return BlockPeerFetchOutcome {
+                received,
+                error: Some("block peer stalled (no blocks received)".to_string()),
+            };
+        }
+        let (command, payload) = match read_message_with_timeout_opts(
+            peer,
+            BLOCK_READ_TIMEOUT_SECS,
+            BLOCK_READ_TIMEOUT_RETRIES,
+        )
+        .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                return BlockPeerFetchOutcome {
+                    received,
+                    error: Some(err),
+                };
+            }
+        };
+        match command.as_str() {
+            "block" => {
+                let bytes = payload;
+                let block = match Block::consensus_decode(&bytes) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        return BlockPeerFetchOutcome {
+                            received,
+                            error: Some(err.to_string()),
+                        };
+                    }
+                };
+                let hash = block.header.hash();
+                if let Some(pos) = inflight.iter_mut().position(|set| set.contains(&hash)) {
+                    let set = &mut inflight[pos];
+                    set.remove(&hash);
+                    if set.is_empty() {
+                        inflight.remove(pos);
+                        while inflight.len() < inflight_target {
+                            let Some(chunk) = pop_chunk() else {
+                                break;
+                            };
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            maybe_log_block_request(chunk.len());
+                            if let Err(err) = peer.send_getdata_blocks(&chunk).await {
+                                return BlockPeerFetchOutcome {
+                                    received,
+                                    error: Some(err),
+                                };
+                            }
+                            inflight.push(chunk.into_iter().collect());
+                        }
+                    }
+                }
+                received.insert(hash, ReceivedBlock { block, bytes });
+                last_block_at = Instant::now();
+            }
+            "notfound" => {
+                return BlockPeerFetchOutcome {
+                    received,
+                    error: Some("peer returned notfound for block request".to_string()),
+                };
+            }
+            _ => {
+                if let Err(err) = handle_aux_message(peer, &command, &payload).await {
+                    return BlockPeerFetchOutcome {
+                        received,
+                        error: Some(err),
+                    };
+                }
+            }
+        }
+    }
+
+    BlockPeerFetchOutcome {
+        received,
+        error: None,
+    }
 }
 
 async fn fetch_blocks_on_peer_inner(
@@ -3692,7 +4004,7 @@ async fn fetch_blocks_on_peer_inner(
     let inflight_target = inflight_per_peer.max(1);
     while next_index < chunks.len() && inflight.len() < inflight_target {
         let chunk = &chunks[next_index];
-        println!("Requesting {} block(s)", chunk.len());
+        maybe_log_block_request(chunk.len());
         peer.send_getdata_blocks(chunk).await?;
         inflight.push(chunk.iter().copied().collect());
         next_index += 1;
@@ -3721,7 +4033,7 @@ async fn fetch_blocks_on_peer_inner(
                         inflight.remove(pos);
                         if next_index < chunks.len() {
                             let chunk = &chunks[next_index];
-                            println!("Requesting {} block(s)", chunk.len());
+                            maybe_log_block_request(chunk.len());
                             peer.send_getdata_blocks(chunk).await?;
                             inflight.push(chunk.iter().copied().collect());
                             next_index += 1;

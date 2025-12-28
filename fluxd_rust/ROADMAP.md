@@ -14,7 +14,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Spent index + `getspentinfo` (owner: TBD)
 - [x] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
 - [x] [P1] Address mempool deltas + `getaddressmempool` (owner: TBD)
-- [ ] [P1] Header throughput parity with C++ (owner: TBD)
+- [x] [P1] Remove header-gap bottleneck (fast header ancestry + block queue selection) (owner: TBD)
+- [ ] [P1] Header-first sync speed parity with C++ (owner: TBD)
 
 ## Completed (core)
 

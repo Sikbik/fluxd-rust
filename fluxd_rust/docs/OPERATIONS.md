@@ -75,6 +75,12 @@ ssh <vps-user>@<vps-host> "pkill -x fluxd"
 - Log file: `<remote-log-dir>/longrun-public.log`
 - Dashboard: `http://<host>:8080/` and `/healthz`
 
+By default, per-request block download logs are disabled (to avoid log spam). To enable them:
+
+```bash
+export FLUXD_LOG_BLOCK_REQUESTS=1
+```
+
 Example:
 
 ```bash

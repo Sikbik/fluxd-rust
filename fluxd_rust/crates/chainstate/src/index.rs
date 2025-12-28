@@ -13,6 +13,7 @@ const STATUS_HAS_BLOCK: u8 = 1 << 1;
 #[derive(Clone, Debug)]
 pub struct HeaderEntry {
     pub prev_hash: Hash256,
+    pub skip_hash: Hash256,
     pub height: i32,
     pub time: u32,
     pub bits: u32,
@@ -147,6 +148,7 @@ fn encode_header_entry(entry: &HeaderEntry) -> Vec<u8> {
     encoder.write_u32_le(entry.bits);
     encoder.write_bytes(&entry.chainwork);
     encoder.write_u8(entry.status);
+    encoder.write_hash_le(&entry.skip_hash);
     encoder.into_inner()
 }
 
@@ -158,11 +160,18 @@ fn decode_header_entry(bytes: &[u8]) -> Result<HeaderEntry, String> {
     let bits = decoder.read_u32_le().map_err(|err| err.to_string())?;
     let chainwork = decoder.read_fixed::<32>().map_err(|err| err.to_string())?;
     let status = decoder.read_u8().map_err(|err| err.to_string())?;
-    if !decoder.is_empty() {
-        return Err("trailing bytes in header entry".to_string());
-    }
+    let skip_hash = if decoder.is_empty() {
+        [0u8; 32]
+    } else {
+        let hash = decoder.read_hash_le().map_err(|err| err.to_string())?;
+        if !decoder.is_empty() {
+            return Err("trailing bytes in header entry".to_string());
+        }
+        hash
+    };
     Ok(HeaderEntry {
         prev_hash,
+        skip_hash,
         height,
         time,
         bits,
