@@ -2031,13 +2031,14 @@ async fn connect_to_candidates(
         return Vec::new();
     }
     let probe_count = candidates.len();
-    let max_parallel = probe_count.clamp(1, 8);
     let target_peers = target_peers.max(1).min(probe_count);
+    let attempt_target = probe_count.min(target_peers.saturating_mul(8).max(target_peers));
+    let max_parallel = attempt_target.clamp(1, 8);
     let mut join_set = JoinSet::new();
     let mut next_index = 0usize;
     let mut peers = Vec::new();
 
-    while next_index < probe_count && join_set.len() < max_parallel {
+    while next_index < attempt_target && join_set.len() < max_parallel {
         let addr = candidates[next_index];
         let peer_ctx = peer_ctx.clone();
         join_set
@@ -2052,11 +2053,7 @@ async fn connect_to_candidates(
             Err(err) => eprintln!("peer task failed: {err}"),
         }
 
-        if peers.len() >= target_peers {
-            break;
-        }
-
-        if next_index < probe_count {
+        if next_index < attempt_target {
             let addr = candidates[next_index];
             let peer_ctx = peer_ctx.clone();
             join_set.spawn(async move {

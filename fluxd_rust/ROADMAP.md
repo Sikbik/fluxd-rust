@@ -73,6 +73,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 - [x] [P1] `peers.dat` persistence (owner: TBD)
 - [x] [P1] `banlist.dat` persistence (owner: TBD)
+- [x] [P1] Header peer probing (probe more candidates before selecting best height peer) (owner: TBD)
 - [ ] [P1] Peer scoring and eviction parity (owner: TBD)
 - [ ] [P1] Address manager parity (stochastic buckets, last-seen timestamps) (owner: TBD)
 - [ ] [P2] P2P message coverage parity (addr/getaddr/feefilter/mempool, etc.) (owner: TBD)
