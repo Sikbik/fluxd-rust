@@ -387,3 +387,52 @@ fn lwma3_next_work_required(
 
     Ok(u256_to_compact(next))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxd_consensus::params::{consensus_params, Network};
+
+    #[test]
+    fn digishield_vectors_match_cpp() {
+        let params = consensus_params(Network::Mainnet);
+
+        let avg = compact_to_u256(0x1d00ffff).expect("avg target");
+        let bits = digishield_next_work_required(avg, 1262152739, 1262149169, &params);
+        assert_eq!(bits, 0x1d012fee);
+
+        let avg = compact_to_u256(0x1f07ffff).expect("avg target");
+        let bits = digishield_next_work_required(avg, 1233061996, 1231006505, &params);
+        assert_eq!(bits, 0x1f07ffff);
+
+        let avg = compact_to_u256(0x1c05a3f4).expect("avg target");
+        let bits = digishield_next_work_required(avg, 1279297671, 1279296753, &params);
+        assert_eq!(bits, 0x1c04ddc3);
+
+        let avg = compact_to_u256(0x1c387f6f).expect("avg target");
+        let bits = digishield_next_work_required(avg, 1269211443, 1269205629, &params);
+        assert_eq!(bits, 0x1c4a8e0f);
+    }
+
+    #[test]
+    fn lwma_vector_matches_cpp() {
+        let params = consensus_params(Network::Mainnet);
+
+        // C++ `LWMACalculateNextWorkRequired_test` uses a Bitcoin-style target with perfectly-spaced
+        // blocks, but the LWMA algorithm needs at least `N + 1` blocks of history.
+        let n = params.zawy_lwma_averaging_window;
+        let last_height = n + 1;
+
+        let mut chain = Vec::new();
+        for height in 0..=last_height {
+            chain.push(HeaderInfo {
+                height,
+                time: 1269211443 + height * params.pow_target_spacing,
+                bits: 0x1d00ffff,
+            });
+        }
+
+        let bits = lwma_next_work_required(&chain, &params).expect("lwma bits");
+        assert_eq!(bits, 0x1d00fffe);
+    }
+}

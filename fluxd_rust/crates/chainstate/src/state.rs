@@ -2946,6 +2946,377 @@ mod tests {
         }
     }
 
+    fn test_hash(height: u8) -> Hash256 {
+        [height; 32]
+    }
+
+    fn make_header_entry(prev_hash: Hash256, height: i32, time: u32, bits: u32) -> HeaderEntry {
+        HeaderEntry {
+            prev_hash,
+            height,
+            time,
+            bits,
+            chainwork: [0u8; 32],
+            status: status_with_header(0),
+        }
+    }
+
+    #[test]
+    fn pon_expected_bits_uses_start_limit_until_window_complete() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let mut params = chain_params(Network::Mainnet).consensus;
+        let activation_height = 100;
+        params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = activation_height;
+
+        let start_bits = fluxd_pow::difficulty::target_to_compact(&params.pon_start_limit);
+        let prev_hash = test_hash((activation_height - 1) as u8);
+        let prev_entry = make_header_entry([0u8; 32], activation_height - 1, 1_000_000, 0x1e7fffff);
+        let pending = HashMap::from([(prev_hash, prev_entry)]);
+
+        let bits = expected_pon_bits(
+            &chainstate,
+            &prev_hash,
+            activation_height,
+            &params,
+            Some(&pending),
+        )
+        .expect("expected bits");
+        assert_eq!(bits, start_bits);
+
+        let bits = expected_pon_bits(
+            &chainstate,
+            &prev_hash,
+            activation_height + params.pon_difficulty_window as i32 - 1,
+            &params,
+            Some(&pending),
+        )
+        .expect("expected bits");
+        assert_eq!(bits, start_bits);
+    }
+
+    #[test]
+    fn pon_expected_bits_adjusts_harder_for_fast_blocks() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let mut params = chain_params(Network::Mainnet).consensus;
+        let activation_height = 100;
+        params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = activation_height;
+
+        let window = params.pon_difficulty_window as i32;
+        let start_bits = fluxd_pow::difficulty::target_to_compact(&params.pon_start_limit);
+        let target_timespan = (window as i64 - 1) * params.pon_target_spacing;
+
+        let mut pending: HashMap<Hash256, HeaderEntry> = HashMap::new();
+        let base_time = 1_000_000u32;
+
+        for height in (activation_height - 1)..=(activation_height + window - 1) {
+            let hash = test_hash(height as u8);
+            let prev_hash = if height == activation_height - 1 {
+                [0u8; 32]
+            } else {
+                test_hash((height - 1) as u8)
+            };
+            let time = if height < activation_height {
+                base_time
+            } else {
+                let offset = height - activation_height;
+                base_time + (offset as u32) * (params.pon_target_spacing as u32 / 2)
+            };
+            let bits = if height < activation_height {
+                0x1e7fffff
+            } else {
+                start_bits
+            };
+            pending.insert(hash, make_header_entry(prev_hash, height, time, bits));
+        }
+
+        let prev_hash = test_hash((activation_height + window - 1) as u8);
+        let adjusted_bits = expected_pon_bits(
+            &chainstate,
+            &prev_hash,
+            activation_height + window,
+            &params,
+            Some(&pending),
+        )
+        .expect("expected bits");
+
+        let start_target = fluxd_pow::difficulty::compact_to_u256(start_bits).expect("start");
+        let adjusted_target = fluxd_pow::difficulty::compact_to_u256(adjusted_bits).expect("adj");
+        assert!(target_timespan > 0);
+        assert!(adjusted_target < start_target);
+    }
+
+    #[test]
+    fn pon_expected_bits_adjusts_easier_for_slow_blocks() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let mut params = chain_params(Network::Mainnet).consensus;
+        let activation_height = 100;
+        params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = activation_height;
+
+        let window = params.pon_difficulty_window as i32;
+        let start_bits = fluxd_pow::difficulty::target_to_compact(&params.pon_start_limit);
+        let max_target = primitive_types::U256::from_little_endian(&params.pon_limit);
+
+        let mut pending: HashMap<Hash256, HeaderEntry> = HashMap::new();
+        let base_time = 1_000_000u32;
+
+        for height in (activation_height - 1)..=(activation_height + window - 1) {
+            let hash = test_hash(height as u8);
+            let prev_hash = if height == activation_height - 1 {
+                [0u8; 32]
+            } else {
+                test_hash((height - 1) as u8)
+            };
+            let time = if height < activation_height {
+                base_time
+            } else {
+                let offset = height - activation_height;
+                base_time + (offset as u32) * (params.pon_target_spacing as u32 * 2)
+            };
+            let bits = if height < activation_height {
+                0x1e7fffff
+            } else {
+                start_bits
+            };
+            pending.insert(hash, make_header_entry(prev_hash, height, time, bits));
+        }
+
+        let prev_hash = test_hash((activation_height + window - 1) as u8);
+        let adjusted_bits = expected_pon_bits(
+            &chainstate,
+            &prev_hash,
+            activation_height + window,
+            &params,
+            Some(&pending),
+        )
+        .expect("expected bits");
+
+        let start_target = fluxd_pow::difficulty::compact_to_u256(start_bits).expect("start");
+        let adjusted_target = fluxd_pow::difficulty::compact_to_u256(adjusted_bits).expect("adj");
+        assert!(adjusted_target > start_target);
+        assert!(adjusted_target <= max_target);
+    }
+
+    #[test]
+    fn pon_expected_bits_stabilizes_under_perfect_timing() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let mut params = chain_params(Network::Mainnet).consensus;
+        let activation_height = 100;
+        params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = activation_height;
+
+        let last_height = activation_height + 120;
+        let base_time = 1_000_000i64;
+        let mut pending: HashMap<Hash256, HeaderEntry> = HashMap::new();
+
+        for height in 0..activation_height {
+            let hash = test_hash(height as u8);
+            let prev_hash = if height == 0 {
+                [0u8; 32]
+            } else {
+                test_hash((height - 1) as u8)
+            };
+            let time = base_time + (height as i64) * params.pow_target_spacing;
+            pending.insert(
+                hash,
+                make_header_entry(prev_hash, height, time as u32, 0x1e7fffff),
+            );
+        }
+
+        let pon_limit_bits = fluxd_pow::difficulty::target_to_compact(&params.pon_limit);
+        for height in activation_height..=last_height {
+            let hash = test_hash(height as u8);
+            let prev_hash = test_hash((height - 1) as u8);
+            let time = base_time
+                + (activation_height as i64 - 1) * params.pow_target_spacing
+                + (height as i64 - activation_height as i64 + 1) * params.pon_target_spacing;
+
+            let bits = if height == activation_height {
+                pon_limit_bits
+            } else {
+                expected_pon_bits(&chainstate, &prev_hash, height, &params, Some(&pending))
+                    .expect("expected bits")
+            };
+
+            pending.insert(
+                hash,
+                make_header_entry(prev_hash, height, time as u32, bits),
+            );
+        }
+
+        let stable_bits = pending
+            .get(&test_hash(last_height as u8))
+            .expect("stable entry")
+            .bits;
+        let previous_bits = pending
+            .get(&test_hash((last_height - 10) as u8))
+            .expect("previous entry")
+            .bits;
+
+        let stable_target = fluxd_pow::difficulty::compact_to_u256(stable_bits).expect("stable");
+        let previous_target =
+            fluxd_pow::difficulty::compact_to_u256(previous_bits).expect("previous");
+
+        let diff = if stable_target > previous_target {
+            stable_target - previous_target
+        } else {
+            previous_target - stable_target
+        };
+        let max_diff = previous_target / primitive_types::U256::from(100u64);
+        assert!(diff <= max_diff);
+    }
+
+    #[test]
+    fn pow_chainwork_accumulates_block_proof() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let mut consensus = chain_params(Network::Regtest).consensus;
+        let pow_bits = fluxd_pow::difficulty::target_to_compact(&consensus.pow_limit);
+
+        let header0 = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: [0u8; 32],
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: 1_000_000,
+            bits: pow_bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let hash0 = header0.hash();
+        consensus.hash_genesis_block = hash0;
+        consensus.checkpoints = vec![fluxd_consensus::params::Checkpoint {
+            height: 0,
+            hash: hash0,
+        }];
+
+        let header1 = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: hash0,
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: 1_000_120,
+            bits: pow_bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let hash1 = header1.hash();
+
+        let mut batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(&[header0, header1], &consensus, &mut batch, false)
+            .expect("insert headers");
+        chainstate.commit_batch(batch).expect("commit headers");
+
+        let entry0 = chainstate
+            .header_entry(&hash0)
+            .expect("entry0")
+            .expect("entry0");
+        let entry1 = chainstate
+            .header_entry(&hash1)
+            .expect("entry1")
+            .expect("entry1");
+
+        let work = fluxd_pow::difficulty::block_proof(pow_bits).expect("block proof");
+        let expected_0 = work;
+        let expected_1 = work + work;
+
+        assert_eq!(entry0.chainwork_value(), expected_0);
+        assert_eq!(entry1.chainwork_value(), expected_1);
+    }
+
+    #[test]
+    fn pon_chainwork_uses_fixed_work() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let mut consensus = chain_params(Network::Regtest).consensus;
+        consensus.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = 1;
+
+        let pow_bits = fluxd_pow::difficulty::target_to_compact(&consensus.pow_limit);
+        let pon_bits = fluxd_pow::difficulty::target_to_compact(&consensus.pon_start_limit);
+
+        let header0 = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: [0u8; 32],
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: 1_000_000,
+            bits: pow_bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let hash0 = header0.hash();
+        consensus.hash_genesis_block = hash0;
+        consensus.checkpoints = vec![fluxd_consensus::params::Checkpoint {
+            height: 0,
+            hash: hash0,
+        }];
+
+        let header1 = BlockHeader {
+            version: fluxd_primitives::block::PON_VERSION,
+            prev_block: hash0,
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: 1_000_001,
+            bits: pon_bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint {
+                hash: [0x11; 32],
+                index: 1,
+            },
+            block_sig: vec![0x01],
+        };
+        let hash1 = header1.hash();
+
+        let mut batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(&[header0, header1], &consensus, &mut batch, false)
+            .expect("insert headers");
+        chainstate.commit_batch(batch).expect("commit headers");
+
+        let entry0 = chainstate
+            .header_entry(&hash0)
+            .expect("entry0")
+            .expect("entry0");
+        let entry1 = chainstate
+            .header_entry(&hash1)
+            .expect("entry1")
+            .expect("entry1");
+
+        let pow_work = fluxd_pow::difficulty::block_proof(pow_bits).expect("block proof");
+        let pon_work = primitive_types::U256::from(1u64 << 40);
+
+        assert_eq!(entry0.chainwork_value(), pow_work);
+        assert_eq!(entry1.chainwork_value(), pow_work + pon_work);
+    }
+
     #[test]
     fn disconnect_restores_utxo_set_for_intrablock_spends() {
         let store = Arc::new(MemoryStore::new());

@@ -54,11 +54,17 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P0] PoN rules parity (header validation, signature rules, economics) (owner: TBD)
 - [ ] [P0] Block reward schedule parity (including canceled halving at 1,968,550) (owner: TBD)
   - [x] Regression tests for 1,968,550 canceled halving and PoN activation subsidy/dev-fund
+  - [x] Regression tests for PoN annual subsidy reductions and cap
+  - [x] Regression tests for PoN tier distribution + dev-fund remainder
 - [ ] [P0] Coinbase rules parity (funding outputs + maturity) (owner: TBD)
   - [x] Regression tests for exchange/foundation/swap-pool coinbase enforcement (mainnet)
   - [x] Regression test for coinbase maturity (premature spend rejection)
 - [ ] [P0] Chainwork parity for PoN/PoW edge cases and existing headers (owner: TBD)
+  - [x] Regression tests for PoW chainwork accumulation and PoN fixed-work increment (2^40)
 - [ ] [P0] Difficulty/target parity across LWMA/legacy windows and transitions (owner: TBD)
+  - [x] Digishield vector tests (Flux mainnet params)
+  - [x] LWMA vector test (Flux mainnet params)
+  - [x] PoN difficulty adjustment regression tests (start-limit, fast/slow, stability)
 - [ ] [P0] Checkpoint handling parity and tests (owner: TBD)
   - [x] Mainnet checkpoint list regression test (values + ordering)
 - [ ] [P0] Expanded block index fields (status/validity/tx counts/undo offsets) (owner: TBD)

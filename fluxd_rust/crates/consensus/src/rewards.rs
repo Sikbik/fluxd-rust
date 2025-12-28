@@ -175,4 +175,94 @@ mod tests {
         assert_eq!(min_dev_fund_amount(activation_height - 1, &params), 0);
         assert_eq!(min_dev_fund_amount(activation_height, &params), COIN / 2);
     }
+
+    #[test]
+    fn mainnet_pon_subsidy_reduces_on_schedule_and_caps() {
+        let params = consensus_params(Network::Mainnet);
+        let activation_height = params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+
+        assert_eq!(block_subsidy(activation_height, &params), 14 * COIN);
+        assert_eq!(
+            block_subsidy(
+                activation_height + params.pon_subsidy_reduction_interval - 1,
+                &params
+            ),
+            14 * COIN
+        );
+
+        assert_eq!(
+            block_subsidy(
+                activation_height + params.pon_subsidy_reduction_interval,
+                &params
+            ),
+            12_600_000_000 / 10
+        );
+        assert_eq!(
+            block_subsidy(
+                activation_height + 2 * params.pon_subsidy_reduction_interval,
+                &params
+            ),
+            11_340_000_000 / 10
+        );
+        assert_eq!(
+            block_subsidy(
+                activation_height + 5 * params.pon_subsidy_reduction_interval,
+                &params
+            ),
+            8_266_860_000 / 10
+        );
+
+        let year_20 = block_subsidy(
+            activation_height + 20 * params.pon_subsidy_reduction_interval,
+            &params,
+        );
+        assert_eq!(year_20, 170_207_313);
+        assert_eq!(
+            block_subsidy(
+                activation_height + 21 * params.pon_subsidy_reduction_interval,
+                &params
+            ),
+            year_20
+        );
+        assert_eq!(
+            block_subsidy(
+                activation_height + 30 * params.pon_subsidy_reduction_interval,
+                &params
+            ),
+            year_20
+        );
+    }
+
+    #[test]
+    fn mainnet_pon_reward_distribution_matches_cpp() {
+        let params = consensus_params(Network::Mainnet);
+        let activation_height = params.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+
+        let total = block_subsidy(activation_height, &params);
+        assert_eq!(total, 14 * COIN);
+
+        let cumulus = fluxnode_subsidy(activation_height, total, 1, &params);
+        let nimbus = fluxnode_subsidy(activation_height, total, 2, &params);
+        let stratus = fluxnode_subsidy(activation_height, total, 3, &params);
+        assert_eq!(cumulus, COIN);
+        assert_eq!(nimbus, 35 * COIN / 10);
+        assert_eq!(stratus, 9 * COIN);
+
+        let dev_fund = min_dev_fund_amount(activation_height, &params);
+        assert_eq!(dev_fund, total / 28);
+        assert_eq!(cumulus + nimbus + stratus + dev_fund, total);
+
+        let year_1 = block_subsidy(
+            activation_height + params.pon_subsidy_reduction_interval,
+            &params,
+        );
+        assert_eq!(year_1, 12_600_000_000 / 10);
+        assert_eq!(
+            min_dev_fund_amount(
+                activation_height + params.pon_subsidy_reduction_interval,
+                &params
+            ),
+            year_1 / 28
+        );
+    }
 }
