@@ -76,7 +76,7 @@ and dashboard requests during high-throughput sync.
 
 Worker counts and queue depths are controlled via:
 - `--verify-workers` / `--verify-queue`
-- `--shielded-workers` / `--shielded-queue`
+- `--shielded-workers`
 
 ## Reorg handling
 
@@ -120,6 +120,10 @@ Key consensus behaviors:
 - Memory: in-memory store for tests and short-lived runs.
 
 The storage backend is selected via `--backend` and affects all indexes.
+
+Fjall performs background flush and compaction work. If compaction falls behind during initial sync,
+writes can be throttled (appearing as "stalls" in block indexing). Use `--db-write-buffer-mb`,
+`--db-memtable-mb`, and `--db-compaction-workers` to tune throughput on high-core hosts.
 
 For performance, the storage layer commits blocks using batched writes, and stores common small
 keys inline to avoid per-op heap allocations during high-throughput indexing.

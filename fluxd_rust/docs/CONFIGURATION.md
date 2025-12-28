@@ -23,6 +23,15 @@ These flags control Fjall memory usage. Use them when running on VPS or constrai
 - `--db-write-buffer-mb N` - max write buffer size.
 - `--db-journal-mb N` - max journaling size.
 - `--db-memtable-mb N` - per-partition memtable size.
+- `--db-flush-workers N` - flush worker threads.
+- `--db-compaction-workers N` - compaction worker threads.
+- `--db-fsync-ms N` - async fsync interval (0 disables).
+
+If you see long pauses where blocks stop connecting while the process remains alive, this is often
+Fjall write throttling due to L0 segment buildup. Practical mitigations:
+
+- Ensure `--db-write-buffer-mb` is comfortably above `--db-memtable-mb × 19` (current partition count).
+- Increase `--db-compaction-workers` (and optionally `--db-flush-workers`) on hosts with spare CPU.
 
 ## Chainstate caching
 
@@ -67,7 +76,6 @@ Practical notes:
 - `--verify-workers N` - pre-validation worker threads (0 = auto).
 - `--verify-queue N` - pre-validation queue depth (0 = auto).
 - `--shielded-workers N` - shielded verification threads (0 = auto).
-- `--shielded-queue N` - shielded verification queue depth (0 = auto).
 
 ## RPC
 

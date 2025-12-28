@@ -44,6 +44,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Reduce per-input allocation overhead (outpoint key handling + per-block UTXO cache)
   - [x] Inline small keys in `WriteBatch` (UTXO/address keys stored without heap allocs)
   - [x] LRU UTXO read cache for sequential block spends (`--utxo-cache-entries`)
+  - [x] Reuse txids across validation/connect/mempool purge (avoid redundant txid hashing)
+  - [x] Fix shielded pipeline ordering bug (prevents rare sync stalls)
+  - [x] Expose Fjall flush/compaction worker knobs (`--db-flush-workers`, `--db-compaction-workers`)
+  - [x] Warn when `--db-write-buffer-mb` is below `--db-memtable-mb × partitions` (prevents hidden L0 stalls)
+  - [ ] Surface Fjall health stats in `/stats` (L0 segments, flush backlog, compaction backlog)
   - [ ] Review index write amplification (txindex/address index) and batching opportunities
   - [x] Capture initial throughput stats (~150–180 b/s on 8-core mainnet sync with `--shielded-workers 6` and `--inflight-per-peer 2`)
 - [ ] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)

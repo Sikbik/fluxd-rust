@@ -47,6 +47,28 @@ pub enum Column {
 }
 
 impl Column {
+    pub const ALL: [Column; 19] = [
+        Column::BlockIndex,
+        Column::HeaderIndex,
+        Column::HeightIndex,
+        Column::BlockHeader,
+        Column::TxIndex,
+        Column::SpentIndex,
+        Column::Utxo,
+        Column::AnchorSprout,
+        Column::AnchorSapling,
+        Column::NullifierSprout,
+        Column::NullifierSapling,
+        Column::Fluxnode,
+        Column::FluxnodeKey,
+        Column::AddressOutpoint,
+        Column::AddressDelta,
+        Column::TimestampIndex,
+        Column::BlockTimestamp,
+        Column::BlockUndo,
+        Column::Meta,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Column::BlockIndex => "block_index",

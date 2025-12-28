@@ -156,6 +156,15 @@ pub fn validate_block(
     params: &ConsensusParams,
     flags: &ValidationFlags,
 ) -> Result<(), ValidationError> {
+    validate_block_with_txids(block, height, params, flags).map(|_| ())
+}
+
+pub fn validate_block_with_txids(
+    block: &Block,
+    height: i32,
+    params: &ConsensusParams,
+    flags: &ValidationFlags,
+) -> Result<Vec<Hash256>, ValidationError> {
     if block.transactions.is_empty() {
         return Err(ValidationError::InvalidBlock(
             "block must contain at least one transaction",
@@ -173,13 +182,18 @@ pub fn validate_block(
 
     let validate_start = Instant::now();
     validate_header(block, height, params, flags)?;
-    validate_merkle_root(block)?;
+    let txids: Vec<Hash256> = block
+        .transactions
+        .iter()
+        .map(|tx| tx.txid())
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_merkle_root(block, &txids)?;
     if height > 20 && !coinbase_height_matches(&block.transactions[0], height) {
         return Err(ValidationError::InvalidBlock("coinbase height mismatch"));
     }
 
     let branch_id = current_epoch_branch_id(height, &params.upgrades);
-    let mut txids = HashSet::new();
+    let mut seen_txids = HashSet::with_capacity(txids.len());
     let mut fluxnode_outpoints = HashSet::new();
     let mut shielded_txs: Vec<&Transaction> = Vec::new();
     let mut tx_flags = flags.clone();
@@ -194,8 +208,13 @@ pub fn validate_block(
             ));
         }
         validate_transaction(tx, index == 0, height, params, branch_id, &tx_flags)?;
-        let txid = tx.txid()?;
-        if !txids.insert(txid) {
+        let txid = txids
+            .get(index)
+            .copied()
+            .ok_or(ValidationError::InvalidBlock(
+                "transaction id cache mismatch",
+            ))?;
+        if !seen_txids.insert(txid) {
             return Err(ValidationError::DuplicateTransaction);
         }
         if index > 0 {
@@ -243,7 +262,7 @@ pub fn validate_block(
     if let Some(metrics) = flags.metrics.as_ref() {
         metrics.record_validate(validate_start.elapsed());
     }
-    Ok(())
+    Ok(txids)
 }
 
 pub fn validate_mempool_transaction(
@@ -310,9 +329,8 @@ fn validate_header(
     Ok(())
 }
 
-fn validate_merkle_root(block: &Block) -> Result<(), ValidationError> {
-    let txids: Result<Vec<Hash256>, _> = block.transactions.iter().map(|tx| tx.txid()).collect();
-    let (root, mutated) = merkle_root(&txids?);
+fn validate_merkle_root(block: &Block, txids: &[Hash256]) -> Result<(), ValidationError> {
+    let (root, mutated) = merkle_root(txids);
     if mutated {
         return Err(ValidationError::DuplicateTransaction);
     }

@@ -50,7 +50,7 @@ use crate::spentindex::{SpentIndex, SpentIndexValue};
 use crate::txindex::{TxIndex, TxLocation};
 use crate::undo::{BlockUndo, FluxnodeUndo, SpentOutput};
 use crate::utxo::{outpoint_key_bytes, OutPointKey, UtxoEntry, UtxoSet};
-use crate::validation::{validate_block, ValidationError, ValidationFlags};
+use crate::validation::{validate_block_with_txids, ValidationError, ValidationFlags};
 use fluxd_pon::validation as pon_validation;
 use fluxd_pow::difficulty::{block_proof, HeaderInfo};
 use fluxd_pow::validation as pow_validation;
@@ -1358,6 +1358,7 @@ impl<S: KeyValueStore> ChainState<S> {
         params: &ChainParams,
         flags: &ValidationFlags,
         prevalidated: bool,
+        txids: Option<&[Hash256]>,
         connect_metrics: Option<&ConnectMetrics>,
     ) -> Result<WriteBatch, ChainStateError> {
         let consensus = &params.consensus;
@@ -1381,9 +1382,41 @@ impl<S: KeyValueStore> ChainState<S> {
             ));
         }
 
-        if !prevalidated {
-            validate_block(block, height, consensus, flags)?;
-        }
+        let txids_owned = if !prevalidated {
+            Some(validate_block_with_txids(block, height, consensus, flags)?)
+        } else if txids.is_some() {
+            None
+        } else {
+            Some(
+                block
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.txid())
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        let txids: &[Hash256] = if !prevalidated {
+            txids_owned
+                .as_ref()
+                .ok_or(ChainStateError::CorruptIndex(
+                    "transaction id cache missing",
+                ))?
+                .as_slice()
+        } else if let Some(txids) = txids {
+            if txids.len() != block.transactions.len() {
+                return Err(ChainStateError::CorruptIndex(
+                    "transaction id cache mismatch",
+                ));
+            }
+            txids
+        } else {
+            txids_owned
+                .as_ref()
+                .ok_or(ChainStateError::CorruptIndex(
+                    "transaction id cache missing",
+                ))?
+                .as_slice()
+        };
         if block.header.is_pon()
             && network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Pon)
         {
@@ -1420,7 +1453,6 @@ impl<S: KeyValueStore> ChainState<S> {
         };
         let mut seen_sprout_nullifiers = HashSet::new();
         let mut seen_sapling_nullifiers = HashSet::new();
-        let mut txids = Vec::with_capacity(block.transactions.len());
         let estimated_inputs = block
             .transactions
             .iter()
@@ -1443,7 +1475,12 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut fluxnode_operator_pubkeys: HashMap<OutPoint, Vec<u8>> = HashMap::new();
         for (index, tx) in block.transactions.iter().enumerate() {
             let is_coinbase = index == 0;
-            let txid = tx.txid()?;
+            let txid = txids
+                .get(index)
+                .copied()
+                .ok_or(ChainStateError::CorruptIndex(
+                    "transaction id cache mismatch",
+                ))?;
             self.validate_fluxnode_tx(
                 tx,
                 &txid,
@@ -1452,7 +1489,6 @@ impl<S: KeyValueStore> ChainState<S> {
                 &created_utxos,
                 &fluxnode_operator_pubkeys,
             )?;
-            txids.push(txid);
             let tx_value_out = tx_value_out(tx)?;
             let mut tx_value_in = tx_shielded_value_in(tx)?;
             let mut sprout_intermediates: HashMap<Hash256, SproutTree> = HashMap::new();
@@ -3894,7 +3930,7 @@ mod tests {
         };
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block0, 0, &params, &flags, true, None)
+            .connect_block(&block0, 0, &params, &flags, true, None, None)
             .expect("connect block 0");
         chainstate.commit_batch(batch).expect("commit block 0");
 
@@ -3930,7 +3966,7 @@ mod tests {
         };
 
         let err = chainstate
-            .connect_block(&block1, 1, &params, &flags, true, None)
+            .connect_block(&block1, 1, &params, &flags, true, None, None)
             .expect_err("premature spend rejected");
         match err {
             ChainStateError::Validation(ValidationError::InvalidTransaction(message)) => {
@@ -4445,7 +4481,7 @@ mod tests {
 
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block, 0, &params, &flags, true, None)
+            .connect_block(&block, 0, &params, &flags, true, None, None)
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit connect");
         let connected_stats = chainstate.utxo_stats().expect("utxo stats").expect("stats");
@@ -4673,7 +4709,7 @@ mod tests {
 
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block, 0, &params, &flags, true, None)
+            .connect_block(&block, 0, &params, &flags, true, None, None)
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit connect");
 

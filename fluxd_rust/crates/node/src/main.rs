@@ -22,7 +22,7 @@ use fluxd_chainstate::flatfiles::FlatFileStore;
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::metrics::ConnectMetrics;
 use fluxd_chainstate::state::{ChainState, HeaderValidationCache};
-use fluxd_chainstate::validation::{validate_block, ValidationFlags, ValidationMetrics};
+use fluxd_chainstate::validation::{validate_block_with_txids, ValidationFlags, ValidationMetrics};
 use fluxd_consensus::money::{money_range, COIN, MAX_MONEY};
 use fluxd_consensus::params::{chain_params, hash256_from_hex, ChainParams, Network};
 use fluxd_consensus::upgrades::current_epoch_branch_id;
@@ -151,12 +151,14 @@ struct Config {
     db_write_buffer_bytes: Option<u64>,
     db_journal_bytes: Option<u64>,
     db_memtable_bytes: Option<u32>,
+    db_flush_workers: Option<usize>,
+    db_compaction_workers: Option<usize>,
+    db_fsync_ms: Option<u16>,
     utxo_cache_entries: usize,
     header_verify_workers: usize,
     verify_workers: usize,
     verify_queue: usize,
     shielded_workers: usize,
-    shielded_queue: usize,
 }
 
 #[derive(Clone)]
@@ -171,7 +173,6 @@ struct VerifySettings {
     verify_workers: usize,
     verify_queue: usize,
     shielded_workers: usize,
-    shielded_queue: usize,
 }
 
 struct HeaderDownloadState {
@@ -301,6 +302,7 @@ struct VerifyResult {
     hash: fluxd_consensus::Hash256,
     height: i32,
     block: Arc<Block>,
+    txids: Vec<fluxd_consensus::Hash256>,
     needs_shielded: bool,
     error: Option<String>,
 }
@@ -319,6 +321,7 @@ struct ShieldedResult {
 struct VerifiedBlock {
     height: i32,
     block: Arc<Block>,
+    txids: Vec<fluxd_consensus::Hash256>,
 }
 
 enum PipelineEvent {
@@ -1034,7 +1037,24 @@ fn open_store(backend: Backend, db_path: &PathBuf, config: &Config) -> Result<St
                 write_buffer_bytes: config.db_write_buffer_bytes,
                 journal_bytes: config.db_journal_bytes,
                 memtable_bytes: config.db_memtable_bytes,
+                flush_workers: config.db_flush_workers,
+                compaction_workers: config.db_compaction_workers,
+                fsync_ms: config.db_fsync_ms,
             };
+            if let (Some(write_buffer), Some(memtable)) =
+                (options.write_buffer_bytes, options.memtable_bytes)
+            {
+                let partition_count = fluxd_storage::Column::ALL.len() as u64;
+                let max_memtables = u64::from(memtable).saturating_mul(partition_count);
+                if write_buffer < max_memtables {
+                    eprintln!(
+                        "Warning: --db-write-buffer-mb ({}) is below partitions ({}) × --db-memtable-mb ({}); expect frequent flushes / L0 stalls",
+                        write_buffer / (1024 * 1024),
+                        partition_count,
+                        u64::from(memtable) / (1024 * 1024),
+                    );
+                }
+            }
             Ok(Store::Fjall(
                 FjallStore::open_with_options(db_path, options).map_err(|err| err.to_string())?,
             ))
@@ -1541,7 +1561,7 @@ fn ensure_genesis<S: KeyValueStore>(
 
     let genesis = build_genesis_block(params)?;
     let batch = chainstate
-        .connect_block(&genesis, 0, params, flags, false, connect_metrics)
+        .connect_block(&genesis, 0, params, flags, false, None, connect_metrics)
         .map_err(|err| err.to_string())?;
     let _guard = write_lock
         .lock()
@@ -3706,9 +3726,8 @@ fn connect_pending<S: KeyValueStore>(
     }
 
     let verify_queue = verify_settings.verify_queue.max(1);
-    let shielded_queue = verify_settings.shielded_queue.max(1);
     let (verify_tx, verify_rx) = bounded::<VerifyJob>(verify_queue);
-    let (shielded_tx, shielded_rx) = bounded::<ShieldedJob>(shielded_queue);
+    let (shielded_tx, shielded_rx) = unbounded::<ShieldedJob>();
     let (event_tx, event_rx) = unbounded::<PipelineEvent>();
 
     let mut pre_flags = flags.clone();
@@ -3731,11 +3750,15 @@ fn connect_pending<S: KeyValueStore>(
         let consensus = Arc::clone(&consensus);
         verify_handles.push(thread::spawn(move || {
             while let Ok(job) = verify_rx.recv() {
-                let error =
-                    match validate_block(job.block.as_ref(), job.height, &consensus, &pre_flags) {
-                        Ok(()) => None,
-                        Err(err) => Some(err.to_string()),
-                    };
+                let (txids, error) = match validate_block_with_txids(
+                    job.block.as_ref(),
+                    job.height,
+                    &consensus,
+                    &pre_flags,
+                ) {
+                    Ok(txids) => (txids, None),
+                    Err(err) => (Vec::new(), Some(err.to_string())),
+                };
                 let mut needs_shielded = false;
                 if error.is_none() && shielded_enabled && block_needs_shielded(job.block.as_ref()) {
                     needs_shielded = true;
@@ -3749,6 +3772,7 @@ fn connect_pending<S: KeyValueStore>(
                             hash: job.hash,
                             height: job.height,
                             block: job.block,
+                            txids,
                             needs_shielded,
                             error: Some("shielded queue closed".to_string()),
                         }));
@@ -3759,6 +3783,7 @@ fn connect_pending<S: KeyValueStore>(
                     hash: job.hash,
                     height: job.height,
                     block: job.block,
+                    txids,
                     needs_shielded,
                     error,
                 }));
@@ -3828,6 +3853,7 @@ fn connect_pending<S: KeyValueStore>(
     let mut pending_shielded = 0usize;
     let mut verified: HashMap<fluxd_consensus::Hash256, VerifiedBlock> = HashMap::new();
     let mut waiting_shielded: HashMap<fluxd_consensus::Hash256, VerifiedBlock> = HashMap::new();
+    let mut shielded_ready: HashSet<fluxd_consensus::Hash256> = HashSet::new();
     let mut connect_flags = flags.clone();
     if shielded_enabled {
         connect_flags.check_shielded = false;
@@ -3842,6 +3868,7 @@ fn connect_pending<S: KeyValueStore>(
                 params,
                 &connect_flags,
                 true,
+                Some(verified_block.txids.as_slice()),
                 Some(connect_metrics),
             ) {
                 Ok(batch) => batch,
@@ -3871,7 +3898,11 @@ fn connect_pending<S: KeyValueStore>(
                 .commit_batch(batch)
                 .map_err(|err| err.to_string())?;
             metrics.record_commit(1, commit_start.elapsed());
-            purge_mempool_for_connected_block(mempool, verified_block.block.as_ref())?;
+            purge_mempool_for_connected_block(
+                mempool,
+                verified_block.block.as_ref(),
+                verified_block.txids.as_slice(),
+            )?;
 
             pending.pop_front();
             continue;
@@ -3903,16 +3934,20 @@ fn connect_pending<S: KeyValueStore>(
                 let entry = VerifiedBlock {
                     height: result.height,
                     block: result.block,
+                    txids: result.txids,
                 };
                 if result.needs_shielded {
-                    pending_shielded = pending_shielded.saturating_add(1);
-                    waiting_shielded.insert(result.hash, entry);
+                    if shielded_ready.remove(&result.hash) {
+                        verified.insert(result.hash, entry);
+                    } else {
+                        pending_shielded = pending_shielded.saturating_add(1);
+                        waiting_shielded.insert(result.hash, entry);
+                    }
                 } else {
                     verified.insert(result.hash, entry);
                 }
             }
             PipelineEvent::Shielded(result) => {
-                pending_shielded = pending_shielded.saturating_sub(1);
                 if let Some(error) = result.error {
                     return Err(format!(
                         "shielded verification failed for {}: {}",
@@ -3921,7 +3956,10 @@ fn connect_pending<S: KeyValueStore>(
                     ));
                 }
                 if let Some(entry) = waiting_shielded.remove(&result.hash) {
+                    pending_shielded = pending_shielded.saturating_sub(1);
                     verified.insert(result.hash, entry);
+                } else {
+                    shielded_ready.insert(result.hash);
                 }
             }
         }
@@ -3940,17 +3978,25 @@ fn connect_pending<S: KeyValueStore>(
 fn purge_mempool_for_connected_block(
     mempool: &Mutex<mempool::Mempool>,
     block: &Block,
+    txids: &[Hash256],
 ) -> Result<(), String> {
     if block.transactions.len() <= 1 {
         return Ok(());
+    }
+    if txids.len() != block.transactions.len() {
+        return Err("transaction id cache mismatch".to_string());
     }
 
     let mut guard = mempool
         .lock()
         .map_err(|_| "mempool lock poisoned".to_string())?;
     let mut to_remove: HashSet<Hash256> = HashSet::new();
-    for tx in block.transactions.iter().skip(1) {
-        let txid = tx.txid().map_err(|err| err.to_string())?;
+    for (txid, tx) in txids
+        .iter()
+        .copied()
+        .skip(1)
+        .zip(block.transactions.iter().skip(1))
+    {
         to_remove.insert(txid);
         for input in &tx.vin {
             if let Some(conflict) = guard.spender(&input.prevout) {
@@ -4026,12 +4072,14 @@ fn parse_args() -> Result<Config, String> {
     let mut db_write_buffer_bytes: Option<u64> = None;
     let mut db_journal_bytes: Option<u64> = None;
     let mut db_memtable_bytes: Option<u32> = None;
+    let mut db_flush_workers: Option<usize> = None;
+    let mut db_compaction_workers: Option<usize> = None;
+    let mut db_fsync_ms: Option<u16> = None;
     let mut utxo_cache_entries: usize = DEFAULT_UTXO_CACHE_ENTRIES;
     let mut header_verify_workers: usize = 0;
     let mut verify_workers: usize = 0;
     let mut verify_queue: usize = 0;
     let mut shielded_workers: usize = 0;
-    let mut shielded_queue: usize = 0;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -4213,6 +4261,43 @@ fn parse_args() -> Result<Config, String> {
                 }
                 db_memtable_bytes = Some(bytes as u32);
             }
+            "--db-flush-workers" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --db-flush-workers\n{}", usage()))?;
+                let workers = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid db flush workers '{value}'\n{}", usage()))?;
+                if workers == 0 {
+                    return Err(format!("db flush workers must be > 0\n{}", usage()));
+                }
+                db_flush_workers = Some(workers);
+            }
+            "--db-compaction-workers" => {
+                let value = args.next().ok_or_else(|| {
+                    format!("missing value for --db-compaction-workers\n{}", usage())
+                })?;
+                let workers = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid db compaction workers '{value}'\n{}", usage()))?;
+                if workers == 0 {
+                    return Err(format!("db compaction workers must be > 0\n{}", usage()));
+                }
+                db_compaction_workers = Some(workers);
+            }
+            "--db-fsync-ms" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --db-fsync-ms\n{}", usage()))?;
+                let ms = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid db fsync ms '{value}'\n{}", usage()))?;
+                if ms > u64::from(u16::MAX) {
+                    return Err(format!("db fsync ms too large '{value}'\n{}", usage()));
+                }
+                let ms = ms as u16;
+                db_fsync_ms = if ms == 0 { None } else { Some(ms) };
+            }
             "--utxo-cache-entries" => {
                 let value = args.next().ok_or_else(|| {
                     format!("missing value for --utxo-cache-entries\n{}", usage())
@@ -4252,14 +4337,6 @@ fn parse_args() -> Result<Config, String> {
                 shielded_workers = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid shielded workers '{value}'\n{}", usage()))?;
-            }
-            "--shielded-queue" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("missing value for --shielded-queue\n{}", usage()))?;
-                shielded_queue = value
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid shielded queue '{value}'\n{}", usage()))?;
             }
             "--dashboard-addr" => {
                 let value = args
@@ -4305,12 +4382,14 @@ fn parse_args() -> Result<Config, String> {
         db_write_buffer_bytes,
         db_journal_bytes,
         db_memtable_bytes,
+        db_flush_workers,
+        db_compaction_workers,
+        db_fsync_ms,
         utxo_cache_entries,
         header_verify_workers,
         verify_workers,
         verify_queue,
         shielded_workers,
-        shielded_queue,
     })
 }
 
@@ -4353,17 +4432,11 @@ fn resolve_verify_settings(
     } else {
         inflight.max(64)
     };
-    let shielded_queue = if config.shielded_queue > 0 {
-        config.shielded_queue
-    } else {
-        (verify_queue / 4).max(16)
-    };
 
     VerifySettings {
         verify_workers,
         verify_queue,
         shielded_workers,
-        shielded_queue,
     }
 }
 
@@ -4378,7 +4451,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--shielded-queue N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -4404,12 +4477,14 @@ fn usage() -> String {
         "  --db-write-buffer-mb  Fjall max write buffer in MiB (optional)",
         "  --db-journal-mb  Fjall max journaling size in MiB (optional)",
         "  --db-memtable-mb  Fjall partition memtable size in MiB (optional)",
+        "  --db-flush-workers  Fjall flush worker threads (optional)",
+        "  --db-compaction-workers  Fjall compaction worker threads (optional)",
+        "  --db-fsync-ms  Fjall async fsync interval in ms (0 disables, optional)",
         "  --utxo-cache-entries  In-memory UTXO entry cache size (0 disables, default: 200000)",
         "  --header-verify-workers  POW header verification threads (0 = auto)",
         "  --verify-workers  Pre-validation worker threads (0 = auto)",
         "  --verify-queue  Pre-validation queue depth (0 = auto)",
         "  --shielded-workers  Shielded verification threads (0 = auto)",
-        "  --shielded-queue  Shielded verification queue depth (0 = auto)",
         "  --dashboard-addr  Bind dashboard HTTP server (disabled by default)",
     ]
     .join("\n")

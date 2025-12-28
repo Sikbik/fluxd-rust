@@ -5,28 +5,6 @@ use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 
 use crate::{Column, KeyValueStore, PrefixVisitor, StoreError, WriteBatch, WriteOp};
 
-const ALL_COLUMNS: [Column; 19] = [
-    Column::BlockIndex,
-    Column::HeaderIndex,
-    Column::HeightIndex,
-    Column::BlockHeader,
-    Column::TxIndex,
-    Column::SpentIndex,
-    Column::Utxo,
-    Column::AnchorSprout,
-    Column::AnchorSapling,
-    Column::NullifierSprout,
-    Column::NullifierSapling,
-    Column::Fluxnode,
-    Column::FluxnodeKey,
-    Column::AddressOutpoint,
-    Column::AddressDelta,
-    Column::TimestampIndex,
-    Column::BlockTimestamp,
-    Column::BlockUndo,
-    Column::Meta,
-];
-
 pub struct FjallStore {
     keyspace: Keyspace,
     partitions: HashMap<Column, PartitionHandle>,
@@ -38,6 +16,9 @@ pub struct FjallOptions {
     pub write_buffer_bytes: Option<u64>,
     pub journal_bytes: Option<u64>,
     pub memtable_bytes: Option<u32>,
+    pub flush_workers: Option<usize>,
+    pub compaction_workers: Option<usize>,
+    pub fsync_ms: Option<u16>,
 }
 
 impl FjallOptions {
@@ -50,6 +31,15 @@ impl FjallOptions {
         }
         if let Some(bytes) = self.journal_bytes {
             config = config.max_journaling_size(bytes);
+        }
+        if let Some(workers) = self.flush_workers {
+            config = config.flush_workers(workers);
+        }
+        if let Some(workers) = self.compaction_workers {
+            config = config.compaction_workers(workers);
+        }
+        if let Some(ms) = self.fsync_ms {
+            config = config.fsync_ms(Some(ms));
         }
         config
     }
@@ -87,7 +77,7 @@ impl FjallStore {
     ) -> Result<Self, StoreError> {
         let keyspace = config.open().map_err(map_err)?;
         let mut partitions = HashMap::new();
-        for column in ALL_COLUMNS {
+        for column in Column::ALL {
             let handle = keyspace
                 .open_partition(column.as_str(), partition_options.clone())
                 .map_err(map_err)?;
