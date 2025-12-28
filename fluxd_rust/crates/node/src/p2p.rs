@@ -14,12 +14,16 @@ use tokio::net::TcpStream;
 const MAX_PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const MAX_HEADERS_RESULTS: usize = 160;
 const MAX_ADDR_RESULTS: usize = 1000;
+const MAX_INV_RESULTS: usize = 50_000;
 const NODE_NETWORK: u64 = 1;
+pub const MSG_TX: u32 = 1;
+pub const MSG_BLOCK: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerKind {
     Block,
     Header,
+    Relay,
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +199,7 @@ pub struct Peer {
     remote_height: i32,
     remote_version: i32,
     remote_user_agent: String,
+    kind: PeerKind,
     addr: SocketAddr,
     registry: Arc<PeerRegistry>,
     net_totals: Arc<NetTotals>,
@@ -219,6 +224,7 @@ impl Peer {
             remote_height: -1,
             remote_version: 0,
             remote_user_agent: String::new(),
+            kind,
             addr,
             registry,
             net_totals,
@@ -284,7 +290,8 @@ impl Peer {
     }
 
     pub async fn handshake(&mut self, start_height: i32) -> Result<(), String> {
-        let payload = build_version_payload(start_height);
+        let relay = matches!(self.kind, PeerKind::Relay);
+        let payload = build_version_payload(start_height, relay);
         self.send_message("version", &payload).await?;
 
         let mut got_verack = false;
@@ -347,16 +354,33 @@ impl Peer {
         self.send_message("getheaders", &payload).await
     }
 
-    pub async fn send_getdata(
+    pub async fn send_getdata_blocks(
         &mut self,
         hashes: &[fluxd_consensus::Hash256],
     ) -> Result<(), String> {
-        let payload = build_getdata_payload(hashes);
+        let payload = build_getdata_payload(hashes, MSG_BLOCK);
+        self.send_message("getdata", &payload).await
+    }
+
+    pub async fn send_getdata_txs(
+        &mut self,
+        hashes: &[fluxd_consensus::Hash256],
+    ) -> Result<(), String> {
+        let payload = build_getdata_payload(hashes, MSG_TX);
         self.send_message("getdata", &payload).await
     }
 
     pub async fn send_getaddr(&mut self) -> Result<(), String> {
         self.send_message("getaddr", &[]).await
+    }
+
+    pub async fn send_mempool(&mut self) -> Result<(), String> {
+        self.send_message("mempool", &[]).await
+    }
+
+    pub async fn send_inv_tx(&mut self, hashes: &[fluxd_consensus::Hash256]) -> Result<(), String> {
+        let payload = build_inv_payload(hashes, MSG_TX);
+        self.send_message("inv", &payload).await
     }
 }
 
@@ -415,7 +439,42 @@ pub fn parse_addr(payload: &[u8]) -> Result<Vec<SocketAddr>, String> {
     Ok(addrs)
 }
 
-fn build_version_payload(start_height: i32) -> Vec<u8> {
+#[derive(Clone, Copy, Debug)]
+pub struct InventoryVector {
+    pub inv_type: u32,
+    pub hash: fluxd_consensus::Hash256,
+}
+
+pub fn parse_inv(payload: &[u8]) -> Result<Vec<InventoryVector>, String> {
+    let mut decoder = Decoder::new(payload);
+    let count = decoder.read_varint().map_err(|err| err.to_string())?;
+    let count = usize::try_from(count).map_err(|_| "inv count too large".to_string())?;
+    if count > MAX_INV_RESULTS {
+        return Err("inv count too large".to_string());
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let inv_type = decoder.read_u32_le().map_err(|err| err.to_string())?;
+        let hash = decoder.read_hash_le().map_err(|err| err.to_string())?;
+        out.push(InventoryVector { inv_type, hash });
+    }
+    if !decoder.is_empty() {
+        return Err("trailing bytes in inv payload".to_string());
+    }
+    Ok(out)
+}
+
+pub fn build_inv_payload(hashes: &[fluxd_consensus::Hash256], inv_type: u32) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.write_varint(hashes.len() as u64);
+    for hash in hashes {
+        encoder.write_u32_le(inv_type);
+        encoder.write_hash_le(hash);
+    }
+    encoder.into_inner()
+}
+
+fn build_version_payload(start_height: i32, relay: bool) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.write_i32_le(PROTOCOL_VERSION);
     encoder.write_u64_le(NODE_NETWORK);
@@ -429,7 +488,7 @@ fn build_version_payload(start_height: i32) -> Vec<u8> {
     encoder.write_u64_le(rand::random());
     encoder.write_var_str("/fluxd-rust:0.1.0/");
     encoder.write_i32_le(start_height);
-    encoder.write_u8(0);
+    encoder.write_u8(relay as u8);
     encoder.into_inner()
 }
 
@@ -444,11 +503,11 @@ fn build_getheaders_payload(locator: &[fluxd_consensus::Hash256]) -> Vec<u8> {
     encoder.into_inner()
 }
 
-fn build_getdata_payload(hashes: &[fluxd_consensus::Hash256]) -> Vec<u8> {
+fn build_getdata_payload(hashes: &[fluxd_consensus::Hash256], inv_type: u32) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.write_varint(hashes.len() as u64);
     for hash in hashes {
-        encoder.write_u32_le(2); // MSG_BLOCK
+        encoder.write_u32_le(inv_type);
         encoder.write_hash_le(hash);
     }
     encoder.into_inner()

@@ -100,6 +100,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P1] Peer scoring and eviction parity (owner: TBD)
 - [ ] [P1] Address manager parity (stochastic buckets, last-seen timestamps) (owner: TBD)
 - [ ] [P2] P2P message coverage parity (addr/getaddr/feefilter/mempool, etc.) (owner: TBD)
+  - [x] Address discovery: `getaddr` + `addr` ingest (owner: TBD)
+  - [x] Tx relay: `inv`/`getdata`/`tx` + `mempool` (owner: TBD)
+  - [ ] `feefilter` and fee-based relay policies (owner: TBD)
+  - [ ] `reject`/`notfound` handling parity (owner: TBD)
 - [ ] [P2] Service flags and user agent compatibility (owner: TBD)
 
 ## Mempool and mining
@@ -108,6 +112,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P1] Fee estimator persistence (owner: TBD)
 - [ ] [P1] Standardness policy parity (mempool accept rules) (owner: TBD)
 - [x] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
+- [x] [P1] Basic P2P tx relay (inv/getdata/tx + `mempool`) (owner: TBD)
 - [ ] [P1] `getblocktemplate`, `getmininginfo`, `submitblock` (owner: TBD)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
 
@@ -157,7 +162,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `gettxout`<br>`getrawtransaction` | `sendrawtransaction` (local-only; relay TBD) | `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`createmultisig`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`estimatefee`<br>`estimatepriority`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`prioritisetransaction` |
+| `gettxout`<br>`getrawtransaction` | `sendrawtransaction` (relays; confirmed inputs only) | `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`createmultisig`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`estimatefee`<br>`estimatepriority`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`prioritisetransaction` |
 
 ### Mempool and relay
 

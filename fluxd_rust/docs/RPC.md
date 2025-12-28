@@ -269,7 +269,8 @@ Notes:
 - Result: transaction id hex string.
 
 Notes:
-- Inserts into the local in-memory mempool; P2P relay is not implemented yet.
+- Inserts into the local in-memory mempool.
+- If `--tx-peers > 0`, announces the txid to relay peers via P2P (`inv` + `getdata`/`tx`).
 - Only accepts transactions spending confirmed UTXOs (no unconfirmed parent/ancestor tracking yet).
 
 ### gettxout

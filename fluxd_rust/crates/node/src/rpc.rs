@@ -11,6 +11,7 @@ use rand::RngCore;
 use serde_json::{json, Number, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::state::ChainState;
@@ -31,10 +32,10 @@ use fluxd_primitives::{address_to_script_pubkey, script_pubkey_to_address, Addre
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
 
+use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind};
 use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::peer_book::HeaderPeerBook;
 use crate::stats::hash256_to_hex;
-use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const RPC_REALM: &str = "fluxd";
@@ -145,6 +146,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     net_totals: Arc<NetTotals>,
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
+    tx_announce: broadcast::Sender<Hash256>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
         .await
@@ -166,6 +168,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
+        let tx_announce = tx_announce.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 stream,
@@ -178,6 +181,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 net_totals,
                 peer_registry,
                 header_peer_book,
+                tx_announce,
             )
             .await
             {
@@ -199,6 +203,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     net_totals: Arc<NetTotals>,
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
+    tx_announce: broadcast::Sender<Hash256>,
 ) -> Result<(), String> {
     let request = read_http_request(&mut stream).await?;
     let is_daemon = request.path.starts_with("/daemon/");
@@ -249,6 +254,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
             &net_totals,
             &peer_registry,
             &header_peer_book,
+            &tx_announce,
         ) {
             Ok(value) => rpc_ok(Value::Null, value),
             Err(err) => rpc_error(Value::Null, err.code, err.message),
@@ -272,6 +278,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         &net_totals,
         &peer_registry,
         &header_peer_book,
+        &tx_announce,
     ) {
         Ok(value) => value,
         Err(err) => err,
@@ -297,6 +304,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
+    tx_announce: &broadcast::Sender<Hash256>,
 ) -> Result<Value, RpcError> {
     let params = if request.method == "GET" {
         parse_query_params(request.query.as_deref().unwrap_or(""))?
@@ -316,6 +324,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
         net_totals,
         peer_registry,
         header_peer_book,
+        tx_announce,
     )
 }
 
@@ -329,6 +338,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
+    tx_announce: &broadcast::Sender<Hash256>,
 ) -> Result<Value, Value> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| rpc_error(Value::Null, RPC_PARSE_ERROR, format!("parse error: {err}")))?;
@@ -373,6 +383,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         net_totals,
         peer_registry,
         header_peer_book,
+        tx_announce,
     );
 
     match result {
@@ -515,6 +526,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
+    tx_announce: &broadcast::Sender<Hash256>,
 ) -> Result<Value, RpcError> {
     match method {
         "help" => rpc_help(params),
@@ -537,9 +549,14 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getblocksubsidy" => rpc_getblocksubsidy(chainstate, params, chain_params),
         "getblockhashes" => rpc_getblockhashes(chainstate, params),
         "getrawtransaction" => rpc_getrawtransaction(chainstate, mempool, params, chain_params),
-        "sendrawtransaction" => {
-            rpc_sendrawtransaction(chainstate, mempool, mempool_flags, params, chain_params)
-        }
+        "sendrawtransaction" => rpc_sendrawtransaction(
+            chainstate,
+            mempool,
+            mempool_flags,
+            params,
+            chain_params,
+            tx_announce,
+        ),
         "getmempoolinfo" => rpc_getmempoolinfo(params, mempool),
         "getrawmempool" => rpc_getrawmempool(params, mempool),
         "gettxout" => rpc_gettxout(chainstate, mempool, params, chain_params),
@@ -1112,6 +1129,7 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
     mempool_flags: &ValidationFlags,
     params: Vec<Value>,
     chain_params: &ChainParams,
+    tx_announce: &broadcast::Sender<Hash256>,
 ) -> Result<Value, RpcError> {
     if params.is_empty() || params.len() > 2 {
         return Err(RpcError::new(
@@ -1129,8 +1147,8 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
     };
     let raw = bytes_from_hex(hex)
         .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
-    let tx =
-        Transaction::consensus_decode(&raw).map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    let tx = Transaction::consensus_decode(&raw)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
     let txid = tx
         .txid()
         .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
@@ -1151,6 +1169,7 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
         if guard.contains(&txid) {
+            let _ = tx_announce.send(txid);
             return Ok(Value::String(hash256_to_hex(&txid)));
         }
         for input in &tx.vin {
@@ -1163,23 +1182,26 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    let entry = build_mempool_entry(chainstate, chain_params, mempool_flags, tx, raw).map_err(
-        |err| match err.kind {
-            MempoolErrorKind::MissingInput => RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs"),
-            MempoolErrorKind::ConflictingInput => {
-                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
+    let entry =
+        build_mempool_entry(chainstate, chain_params, mempool_flags, tx, raw).map_err(|err| {
+            match err.kind {
+                MempoolErrorKind::MissingInput => {
+                    RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs")
+                }
+                MempoolErrorKind::ConflictingInput => {
+                    RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
+                }
+                MempoolErrorKind::InvalidTransaction
+                | MempoolErrorKind::InvalidScript
+                | MempoolErrorKind::InvalidShielded => {
+                    RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
+                }
+                MempoolErrorKind::AlreadyInMempool => {
+                    RpcError::new(RPC_INTERNAL_ERROR, "unexpected mempool duplicate")
+                }
+                MempoolErrorKind::Internal => RpcError::new(RPC_INTERNAL_ERROR, err.message),
             }
-            MempoolErrorKind::InvalidTransaction
-            | MempoolErrorKind::InvalidScript
-            | MempoolErrorKind::InvalidShielded => {
-                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
-            }
-            MempoolErrorKind::AlreadyInMempool => {
-                RpcError::new(RPC_INTERNAL_ERROR, "unexpected mempool duplicate")
-            }
-            MempoolErrorKind::Internal => RpcError::new(RPC_INTERNAL_ERROR, err.message),
-        },
-    )?;
+        })?;
 
     let txid = entry.txid;
     let mut guard = mempool
@@ -1190,12 +1212,15 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
             return Err(RpcError::new(RPC_TRANSACTION_REJECTED, err.message));
         }
     }
+    let _ = tx_announce.send(txid);
     Ok(Value::String(hash256_to_hex(&txid)))
 }
 
 fn rpc_getmempoolinfo(params: Vec<Value>, mempool: &Mutex<Mempool>) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
-    let guard = mempool.lock().map_err(|_| map_internal("mempool lock poisoned"))?;
+    let guard = mempool
+        .lock()
+        .map_err(|_| map_internal("mempool lock poisoned"))?;
     Ok(json!({
         "size": guard.size(),
         "bytes": guard.bytes(),
@@ -1215,7 +1240,9 @@ fn rpc_getrawmempool(params: Vec<Value>, mempool: &Mutex<Mempool>) -> Result<Val
     } else {
         parse_verbose_flag(&params[0])?
     };
-    let guard = mempool.lock().map_err(|_| map_internal("mempool lock poisoned"))?;
+    let guard = mempool
+        .lock()
+        .map_err(|_| map_internal("mempool lock poisoned"))?;
     if !verbose {
         return Ok(Value::Array(
             guard
@@ -1725,7 +1752,9 @@ fn rpc_getaddressmempool<S: fluxd_storage::KeyValueStore>(
             }
         }
         for (index, input) in entry.tx.vin.iter().enumerate() {
-            let prevout_entry = match chainstate.utxo_entry(&input.prevout).map_err(map_internal)?
+            let prevout_entry = match chainstate
+                .utxo_entry(&input.prevout)
+                .map_err(map_internal)?
             {
                 Some(entry) => entry,
                 None => continue,
@@ -2362,6 +2391,7 @@ fn peer_kind_name(kind: PeerKind) -> &'static str {
     match kind {
         PeerKind::Block => "block",
         PeerKind::Header => "header",
+        PeerKind::Relay => "relay",
     }
 }
 

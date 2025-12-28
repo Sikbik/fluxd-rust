@@ -219,9 +219,9 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
                 ));
             }
         }
-        transparent_in = transparent_in
-            .checked_add(entry.value)
-            .ok_or_else(|| MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range"))?;
+        transparent_in = transparent_in.checked_add(entry.value).ok_or_else(|| {
+            MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
+        })?;
         if flags.check_script {
             verify_script(
                 &input.script_sig,
@@ -239,9 +239,11 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
 
     let value_out = tx_value_out(&tx)?;
     let shielded_value_in = tx_shielded_value_in(&tx)?;
-    let value_in = shielded_value_in.checked_add(transparent_in).ok_or_else(|| {
-        MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
-    })?;
+    let value_in = shielded_value_in
+        .checked_add(transparent_in)
+        .ok_or_else(|| {
+            MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
+        })?;
     if value_in < value_out {
         return Err(MempoolError::new(
             MempoolErrorKind::InvalidTransaction,
@@ -329,9 +331,9 @@ fn tx_needs_shielded(tx: &Transaction) -> bool {
 fn tx_value_out(tx: &Transaction) -> Result<i64, MempoolError> {
     let mut total = 0i64;
     for output in &tx.vout {
-        total = total
-            .checked_add(output.value)
-            .ok_or_else(|| MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range"))?;
+        total = total.checked_add(output.value).ok_or_else(|| {
+            MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
+        })?;
         if !money_range(total) || output.value < 0 || output.value > MAX_MONEY {
             return Err(MempoolError::new(
                 MempoolErrorKind::InvalidTransaction,
@@ -342,9 +344,9 @@ fn tx_value_out(tx: &Transaction) -> Result<i64, MempoolError> {
 
     if tx.value_balance <= 0 {
         let balance = -tx.value_balance;
-        total = total
-            .checked_add(balance)
-            .ok_or_else(|| MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range"))?;
+        total = total.checked_add(balance).ok_or_else(|| {
+            MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
+        })?;
         if !money_range(balance) || !money_range(total) {
             return Err(MempoolError::new(
                 MempoolErrorKind::InvalidTransaction,
@@ -354,9 +356,9 @@ fn tx_value_out(tx: &Transaction) -> Result<i64, MempoolError> {
     }
 
     for joinsplit in &tx.join_splits {
-        total = total
-            .checked_add(joinsplit.vpub_old)
-            .ok_or_else(|| MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range"))?;
+        total = total.checked_add(joinsplit.vpub_old).ok_or_else(|| {
+            MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
+        })?;
         if !money_range(joinsplit.vpub_old) || !money_range(total) {
             return Err(MempoolError::new(
                 MempoolErrorKind::InvalidTransaction,
@@ -371,9 +373,9 @@ fn tx_value_out(tx: &Transaction) -> Result<i64, MempoolError> {
 fn tx_shielded_value_in(tx: &Transaction) -> Result<i64, MempoolError> {
     let mut total = 0i64;
     if tx.value_balance >= 0 {
-        total = total
-            .checked_add(tx.value_balance)
-            .ok_or_else(|| MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range"))?;
+        total = total.checked_add(tx.value_balance).ok_or_else(|| {
+            MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
+        })?;
         if !money_range(tx.value_balance) || !money_range(total) {
             return Err(MempoolError::new(
                 MempoolErrorKind::InvalidTransaction,
@@ -383,9 +385,9 @@ fn tx_shielded_value_in(tx: &Transaction) -> Result<i64, MempoolError> {
     }
 
     for joinsplit in &tx.join_splits {
-        total = total
-            .checked_add(joinsplit.vpub_new)
-            .ok_or_else(|| MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range"))?;
+        total = total.checked_add(joinsplit.vpub_new).ok_or_else(|| {
+            MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
+        })?;
         if !money_range(joinsplit.vpub_new) || !money_range(total) {
             return Err(MempoolError::new(
                 MempoolErrorKind::InvalidTransaction,

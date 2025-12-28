@@ -51,6 +51,7 @@ RPC defaults:
 - `--header-peers N` - peers to probe for header sync (default: 4).
 - `--header-peer IP:PORT` - pin a specific header peer (repeatable).
 - `--header-lead N` - target header lead over blocks (default: 20000, 0 disables cap).
+- `--tx-peers N` - relay peers for transaction inventory/tx relay (default: 2, 0 disables).
 - `--inflight-per-peer N` - concurrent getdata requests per peer (default: 2).
 - `--status-interval SECS` - status log interval (default: 15, 0 disables).
 

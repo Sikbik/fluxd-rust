@@ -4,6 +4,7 @@ mod p2p;
 mod peer_book;
 mod rpc;
 mod stats;
+mod tx_relay;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -41,7 +42,7 @@ use fluxd_storage::memory::MemoryStore;
 use fluxd_storage::{KeyValueStore, StoreError, WriteBatch};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 
 use crate::p2p::{parse_addr, parse_headers, NetTotals, Peer, PeerKind, PeerRegistry};
@@ -57,6 +58,7 @@ const DEFAULT_BLOCK_PEERS: usize = 4;
 const DEFAULT_HEADER_PEERS: usize = 4;
 const DEFAULT_HEADER_LEAD: i32 = 20000;
 const DEFAULT_INFLIGHT_PER_PEER: usize = 2;
+const DEFAULT_TX_PEERS: usize = 2;
 const DEFAULT_UTXO_CACHE_ENTRIES: usize = 200_000;
 const READ_TIMEOUT_SECS: u64 = 120;
 const READ_TIMEOUT_RETRIES: usize = 3;
@@ -78,6 +80,7 @@ const HEADER_LOCATOR_MAX_WALK: usize = 1024;
 const HEADER_BAD_CHAIN_BAN_SECS: u64 = 900;
 const HEADER_BEHIND_BAN_SECS: u64 = 300;
 const HEADER_BEHIND_BAN_THRESHOLD: i32 = 1000;
+const TX_ANNOUNCE_QUEUE: usize = 4096;
 const ADDR_BOOK_MAX: usize = 5000;
 const ADDR_BOOK_SAMPLE: usize = 128;
 const ADDR_DISCOVERY_SAMPLE: usize = 64;
@@ -140,6 +143,7 @@ struct Config {
     header_peers: usize,
     header_lead: i32,
     header_peer_addrs: Vec<String>,
+    tx_peers: usize,
     inflight_per_peer: usize,
     status_interval_secs: u64,
     dashboard_addr: Option<SocketAddr>,
@@ -499,6 +503,7 @@ async fn run() -> Result<(), String> {
         Some(Arc::clone(&validation_metrics)),
     );
     let mempool = Arc::new(Mutex::new(mempool::Mempool::default()));
+    let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
     {
         let chainstate = Arc::clone(&chainstate);
         let mempool = Arc::clone(&mempool);
@@ -508,6 +513,7 @@ async fn run() -> Result<(), String> {
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
+        let tx_announce = tx_announce.clone();
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -525,6 +531,7 @@ async fn run() -> Result<(), String> {
                     net_totals,
                     peer_registry,
                     header_peer_book,
+                    tx_announce,
                 )
                 .await
                 {
@@ -769,11 +776,43 @@ async fn run() -> Result<(), String> {
         }
     });
 
+    if config.tx_peers > 0 {
+        let relay_peer_ctx = PeerContext {
+            net_totals: Arc::clone(&net_totals),
+            registry: Arc::clone(&peer_registry),
+            kind: PeerKind::Relay,
+        };
+        let relay_chainstate = Arc::clone(&chainstate);
+        let relay_params = Arc::clone(&params);
+        let relay_addr_book = Arc::clone(&addr_book);
+        let relay_mempool = Arc::clone(&mempool);
+        let relay_flags = flags.clone();
+        let relay_tx_announce = tx_announce.clone();
+        let relay_target = config.tx_peers;
+        tokio::spawn(async move {
+            if let Err(err) = tx_relay::tx_relay_loop(
+                relay_chainstate,
+                relay_params,
+                relay_addr_book,
+                relay_peer_ctx,
+                relay_mempool,
+                relay_flags,
+                relay_tx_announce,
+                relay_target,
+            )
+            .await
+            {
+                eprintln!("tx relay stopped: {err}");
+            }
+        });
+    }
+
     sync_chain(
         &mut block_peer,
         &mut block_peers,
         block_peers_target,
         Arc::clone(&chainstate),
+        Arc::clone(&mempool),
         Arc::clone(&sync_metrics),
         Arc::clone(&params),
         addr_book.as_ref(),
@@ -2636,6 +2675,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
     block_peers: &mut Vec<Peer>,
     block_peers_target: usize,
     chainstate: Arc<ChainState<S>>,
+    mempool: Arc<Mutex<mempool::Mempool>>,
     metrics: Arc<SyncMetrics>,
     params: Arc<ChainParams>,
     addr_book: &AddrBook,
@@ -2729,6 +2769,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                 block_peer,
                 block_peers,
                 Arc::clone(&chainstate),
+                Arc::clone(&mempool),
                 Arc::clone(&metrics),
                 Arc::clone(&params),
                 &missing,
@@ -3369,6 +3410,7 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
     peer: &mut Peer,
     block_peers: &mut Vec<Peer>,
     chainstate: Arc<ChainState<S>>,
+    mempool: Arc<Mutex<mempool::Mempool>>,
     metrics: Arc<SyncMetrics>,
     params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
@@ -3388,6 +3430,7 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
         return fetch_blocks_single(
             peer,
             chainstate,
+            mempool,
             Arc::clone(&metrics),
             params,
             hashes,
@@ -3405,6 +3448,7 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
     fetch_blocks_multi(
         block_peers,
         chainstate,
+        mempool,
         metrics,
         params,
         hashes,
@@ -3423,6 +3467,7 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
 async fn fetch_blocks_single<S: KeyValueStore + 'static>(
     peer: &mut Peer,
     chainstate: Arc<ChainState<S>>,
+    mempool: Arc<Mutex<mempool::Mempool>>,
     metrics: Arc<SyncMetrics>,
     params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
@@ -3445,6 +3490,7 @@ async fn fetch_blocks_single<S: KeyValueStore + 'static>(
 
     let chainstate = Arc::clone(&chainstate);
     let params = Arc::clone(&params);
+    let mempool = Arc::clone(&mempool);
     let metrics = Arc::clone(&metrics);
     let flags = flags.clone();
     let verify_settings = *verify_settings;
@@ -3454,6 +3500,7 @@ async fn fetch_blocks_single<S: KeyValueStore + 'static>(
     let join = tokio::task::spawn_blocking(move || {
         connect_pending(
             chainstate.as_ref(),
+            mempool.as_ref(),
             params.as_ref(),
             &flags,
             metrics.as_ref(),
@@ -3477,6 +3524,7 @@ async fn fetch_blocks_single<S: KeyValueStore + 'static>(
 async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     block_peers: &mut Vec<Peer>,
     chainstate: Arc<ChainState<S>>,
+    mempool: Arc<Mutex<mempool::Mempool>>,
     metrics: Arc<SyncMetrics>,
     params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
@@ -3533,6 +3581,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     *block_peers = returned_peers;
     let chainstate = Arc::clone(&chainstate);
     let params = Arc::clone(&params);
+    let mempool = Arc::clone(&mempool);
     let metrics = Arc::clone(&metrics);
     let flags = flags.clone();
     let verify_settings = *verify_settings;
@@ -3542,6 +3591,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     let join = tokio::task::spawn_blocking(move || {
         connect_pending(
             chainstate.as_ref(),
+            mempool.as_ref(),
             params.as_ref(),
             &flags,
             metrics.as_ref(),
@@ -3590,7 +3640,7 @@ async fn fetch_blocks_on_peer_inner(
     while next_index < chunks.len() && inflight.len() < inflight_target {
         let chunk = &chunks[next_index];
         println!("Requesting {} block(s)", chunk.len());
-        peer.send_getdata(chunk).await?;
+        peer.send_getdata_blocks(chunk).await?;
         inflight.push(chunk.iter().copied().collect());
         next_index += 1;
     }
@@ -3618,7 +3668,7 @@ async fn fetch_blocks_on_peer_inner(
                         if next_index < chunks.len() {
                             let chunk = &chunks[next_index];
                             println!("Requesting {} block(s)", chunk.len());
-                            peer.send_getdata(chunk).await?;
+                            peer.send_getdata_blocks(chunk).await?;
                             inflight.push(chunk.iter().copied().collect());
                             next_index += 1;
                         }
@@ -3640,6 +3690,7 @@ async fn fetch_blocks_on_peer_inner(
 #[allow(clippy::too_many_arguments)]
 fn connect_pending<S: KeyValueStore>(
     chainstate: &ChainState<S>,
+    mempool: &Mutex<mempool::Mempool>,
     params: &ChainParams,
     flags: &ValidationFlags,
     metrics: &SyncMetrics,
@@ -3820,6 +3871,7 @@ fn connect_pending<S: KeyValueStore>(
                 .commit_batch(batch)
                 .map_err(|err| err.to_string())?;
             metrics.record_commit(1, commit_start.elapsed());
+            purge_mempool_for_connected_block(mempool, verified_block.block.as_ref())?;
 
             pending.pop_front();
             continue;
@@ -3885,6 +3937,34 @@ fn connect_pending<S: KeyValueStore>(
     Ok(())
 }
 
+fn purge_mempool_for_connected_block(
+    mempool: &Mutex<mempool::Mempool>,
+    block: &Block,
+) -> Result<(), String> {
+    if block.transactions.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut guard = mempool
+        .lock()
+        .map_err(|_| "mempool lock poisoned".to_string())?;
+    let mut to_remove: HashSet<Hash256> = HashSet::new();
+    for tx in block.transactions.iter().skip(1) {
+        let txid = tx.txid().map_err(|err| err.to_string())?;
+        to_remove.insert(txid);
+        for input in &tx.vin {
+            if let Some(conflict) = guard.spender(&input.prevout) {
+                to_remove.insert(conflict);
+            }
+        }
+    }
+
+    for txid in to_remove {
+        guard.remove(&txid);
+    }
+    Ok(())
+}
+
 async fn read_message_with_timeout(peer: &mut Peer) -> Result<(String, Vec<u8>), String> {
     read_message_with_timeout_opts(peer, READ_TIMEOUT_SECS, READ_TIMEOUT_RETRIES).await
 }
@@ -3938,6 +4018,7 @@ fn parse_args() -> Result<Config, String> {
     let mut header_peers: usize = DEFAULT_HEADER_PEERS;
     let mut header_lead: i32 = DEFAULT_HEADER_LEAD;
     let mut header_peer_addrs: Vec<String> = Vec::new();
+    let mut tx_peers: usize = DEFAULT_TX_PEERS;
     let mut inflight_per_peer: usize = DEFAULT_INFLIGHT_PER_PEER;
     let mut status_interval_secs: u64 = 15;
     let mut dashboard_addr: Option<SocketAddr> = None;
@@ -4064,6 +4145,14 @@ fn parse_args() -> Result<Config, String> {
                 if header_lead < 0 {
                     return Err(format!("header lead must be >= 0\n{}", usage()));
                 }
+            }
+            "--tx-peers" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --tx-peers\n{}", usage()))?;
+                tx_peers = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid tx peers '{value}'\n{}", usage()))?;
             }
             "--inflight-per-peer" => {
                 let value = args
@@ -4208,6 +4297,7 @@ fn parse_args() -> Result<Config, String> {
         header_peers,
         header_lead,
         header_peer_addrs,
+        tx_peers,
         inflight_per_peer,
         status_interval_secs,
         dashboard_addr,
@@ -4288,7 +4378,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-lead N] [--inflight-per-peer N] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--shielded-queue N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--shielded-queue N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -4307,6 +4397,7 @@ fn usage() -> String {
         "  --header-peers  Number of peers to probe for header sync (default: 4)",
         "  --header-peer  Header peer IP:PORT to pin for header sync (repeatable)",
         "  --header-lead  Target header lead over blocks (default: 20000, 0 disables cap)",
+        "  --tx-peers  Number of relay peers for tx inventory/tx relay (0 disables, default: 2)",
         "  --inflight-per-peer  Concurrent getdata requests per peer (default: 2)",
         "  --status-interval  Status log interval in seconds (default: 15, 0 disables)",
         "  --db-cache-mb  Fjall block cache size in MiB (optional)",
