@@ -22,7 +22,9 @@ use fluxd_chainstate::flatfiles::FlatFileStore;
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::metrics::ConnectMetrics;
 use fluxd_chainstate::state::{ChainState, HeaderValidationCache};
-use fluxd_chainstate::validation::{validate_block_with_txids, ValidationFlags, ValidationMetrics};
+use fluxd_chainstate::validation::{
+    validate_block_with_txids_and_size, ValidationFlags, ValidationMetrics,
+};
 use fluxd_consensus::money::{money_range, COIN, MAX_MONEY};
 use fluxd_consensus::params::{chain_params, hash256_from_hex, ChainParams, Network};
 use fluxd_consensus::upgrades::current_epoch_branch_id;
@@ -296,12 +298,19 @@ struct VerifyJob {
     hash: fluxd_consensus::Hash256,
     height: i32,
     block: Arc<Block>,
+    bytes: Arc<Vec<u8>>,
+}
+
+struct ReceivedBlock {
+    block: Block,
+    bytes: Vec<u8>,
 }
 
 struct VerifyResult {
     hash: fluxd_consensus::Hash256,
     height: i32,
     block: Arc<Block>,
+    bytes: Arc<Vec<u8>>,
     txids: Vec<fluxd_consensus::Hash256>,
     needs_shielded: bool,
     error: Option<String>,
@@ -321,6 +330,7 @@ struct ShieldedResult {
 struct VerifiedBlock {
     height: i32,
     block: Arc<Block>,
+    bytes: Arc<Vec<u8>>,
     txids: Vec<fluxd_consensus::Hash256>,
 }
 
@@ -1573,7 +1583,16 @@ fn ensure_genesis<S: KeyValueStore>(
 
     let genesis = build_genesis_block(params)?;
     let batch = chainstate
-        .connect_block(&genesis, 0, params, flags, false, None, connect_metrics)
+        .connect_block(
+            &genesis,
+            0,
+            params,
+            flags,
+            false,
+            None,
+            connect_metrics,
+            None,
+        )
         .map_err(|err| err.to_string())?;
     let _guard = write_lock
         .lock()
@@ -3575,7 +3594,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     }
 
     let mut pending: VecDeque<fluxd_consensus::Hash256> = hashes.iter().copied().collect();
-    let mut received: HashMap<fluxd_consensus::Hash256, Block> = HashMap::new();
+    let mut received: HashMap<fluxd_consensus::Hash256, ReceivedBlock> = HashMap::new();
 
     let peers = std::mem::take(block_peers);
     let mut assignments: Vec<Vec<Vec<fluxd_consensus::Hash256>>> = vec![Vec::new(); peers.len()];
@@ -3650,7 +3669,7 @@ async fn fetch_blocks_on_peer(
     chunks: Vec<Vec<fluxd_consensus::Hash256>>,
     inflight_per_peer: usize,
     metrics: Arc<SyncMetrics>,
-) -> Result<(Peer, HashMap<fluxd_consensus::Hash256, Block>), String> {
+) -> Result<(Peer, HashMap<fluxd_consensus::Hash256, ReceivedBlock>), String> {
     let download_start = Instant::now();
     let received = fetch_blocks_on_peer_inner(&mut peer, chunks, inflight_per_peer).await?;
     metrics.record_download(received.len() as u64, download_start.elapsed());
@@ -3661,8 +3680,8 @@ async fn fetch_blocks_on_peer_inner(
     peer: &mut Peer,
     chunks: Vec<Vec<fluxd_consensus::Hash256>>,
     inflight_per_peer: usize,
-) -> Result<HashMap<fluxd_consensus::Hash256, Block>, String> {
-    let mut received: HashMap<fluxd_consensus::Hash256, Block> = HashMap::new();
+) -> Result<HashMap<fluxd_consensus::Hash256, ReceivedBlock>, String> {
+    let mut received: HashMap<fluxd_consensus::Hash256, ReceivedBlock> = HashMap::new();
     if chunks.is_empty() {
         return Ok(received);
     }
@@ -3692,7 +3711,8 @@ async fn fetch_blocks_on_peer_inner(
         .await?;
         match command.as_str() {
             "block" => {
-                let block = Block::consensus_decode(&payload).map_err(|err| err.to_string())?;
+                let bytes = payload;
+                let block = Block::consensus_decode(&bytes).map_err(|err| err.to_string())?;
                 let hash = block.header.hash();
                 if let Some(pos) = inflight.iter_mut().position(|set| set.contains(&hash)) {
                     let set = &mut inflight[pos];
@@ -3708,7 +3728,7 @@ async fn fetch_blocks_on_peer_inner(
                         }
                     }
                 }
-                received.insert(hash, block);
+                received.insert(hash, ReceivedBlock { block, bytes });
                 last_block_at = Instant::now();
             }
             "notfound" => {
@@ -3733,7 +3753,7 @@ fn connect_pending<S: KeyValueStore>(
     write_lock: &Mutex<()>,
     _header_cursor: &Arc<Mutex<HeaderCursor>>,
     pending: &mut VecDeque<fluxd_consensus::Hash256>,
-    received: &mut HashMap<fluxd_consensus::Hash256, Block>,
+    received: &mut HashMap<fluxd_consensus::Hash256, ReceivedBlock>,
 ) -> Result<(), String> {
     if received.is_empty() {
         return Ok(());
@@ -3764,11 +3784,13 @@ fn connect_pending<S: KeyValueStore>(
         let consensus = Arc::clone(&consensus);
         verify_handles.push(thread::spawn(move || {
             while let Ok(job) = verify_rx.recv() {
-                let (txids, error) = match validate_block_with_txids(
+                let block_size = u32::try_from(job.bytes.len()).unwrap_or(u32::MAX);
+                let (txids, error) = match validate_block_with_txids_and_size(
                     job.block.as_ref(),
                     job.height,
                     &consensus,
                     &pre_flags,
+                    Some(block_size),
                 ) {
                     Ok(txids) => (txids, None),
                     Err(err) => (Vec::new(), Some(err.to_string())),
@@ -3786,6 +3808,7 @@ fn connect_pending<S: KeyValueStore>(
                             hash: job.hash,
                             height: job.height,
                             block: job.block,
+                            bytes: job.bytes,
                             txids,
                             needs_shielded,
                             error: Some("shielded queue closed".to_string()),
@@ -3797,6 +3820,7 @@ fn connect_pending<S: KeyValueStore>(
                     hash: job.hash,
                     height: job.height,
                     block: job.block,
+                    bytes: job.bytes,
                     txids,
                     needs_shielded,
                     error,
@@ -3834,7 +3858,7 @@ fn connect_pending<S: KeyValueStore>(
     }
 
     let mut received_heights = HashMap::new();
-    for (hash, block) in received.drain() {
+    for (hash, received_block) in received.drain() {
         let height = match chainstate
             .header_entry(&hash)
             .map_err(|err| err.to_string())?
@@ -3848,10 +3872,12 @@ fn connect_pending<S: KeyValueStore>(
                 }
             }
         };
+        let bytes = Arc::new(received_block.bytes);
         let job = VerifyJob {
             hash,
             height,
-            block: Arc::new(block),
+            block: Arc::new(received_block.block),
+            bytes,
         };
         verify_tx
             .send(job)
@@ -3884,6 +3910,7 @@ fn connect_pending<S: KeyValueStore>(
                 true,
                 Some(verified_block.txids.as_slice()),
                 Some(connect_metrics),
+                Some(verified_block.bytes.as_slice()),
             ) {
                 Ok(batch) => batch,
                 Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(
@@ -3948,6 +3975,7 @@ fn connect_pending<S: KeyValueStore>(
                 let entry = VerifiedBlock {
                     height: result.height,
                     block: result.block,
+                    bytes: result.bytes,
                     txids: result.txids,
                 };
                 if result.needs_shielded {

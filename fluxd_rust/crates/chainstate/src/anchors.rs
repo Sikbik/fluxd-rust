@@ -24,11 +24,11 @@ impl<S: KeyValueStore> AnchorSet<S> {
     }
 
     pub fn insert(&self, batch: &mut WriteBatch, anchor: &Hash256, tree: Vec<u8>) {
-        batch.put(self.column, anchor.to_vec(), tree);
+        batch.put(self.column, anchor, tree);
     }
 
     pub fn remove(&self, batch: &mut WriteBatch, anchor: &Hash256) {
-        batch.delete(self.column, anchor.to_vec());
+        batch.delete(self.column, anchor);
     }
 }
 
@@ -49,10 +49,10 @@ impl<S: KeyValueStore> NullifierSet<S> {
     }
 
     pub fn insert(&self, batch: &mut WriteBatch, nullifier: &Hash256) {
-        batch.put(self.column, nullifier.to_vec(), []);
+        batch.put(self.column, nullifier, []);
     }
 
     pub fn remove(&self, batch: &mut WriteBatch, nullifier: &Hash256) {
-        batch.delete(self.column, nullifier.to_vec());
+        batch.delete(self.column, nullifier);
     }
 }

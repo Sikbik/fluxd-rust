@@ -43,11 +43,11 @@ impl<S> TxIndex<S> {
 
 impl<S: KeyValueStore> TxIndex<S> {
     pub fn insert(&self, batch: &mut WriteBatch, txid: &Hash256, location: TxLocation) {
-        batch.put(Column::TxIndex, txid.to_vec(), location.encode());
+        batch.put(Column::TxIndex, txid, location.encode());
     }
 
     pub fn delete(&self, batch: &mut WriteBatch, txid: &Hash256) {
-        batch.delete(Column::TxIndex, txid.to_vec());
+        batch.delete(Column::TxIndex, txid);
     }
 
     pub fn get(&self, txid: &Hash256) -> Result<Option<TxLocation>, StoreError> {

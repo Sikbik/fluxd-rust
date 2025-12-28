@@ -61,11 +61,7 @@ impl<S: KeyValueStore> ChainIndex<S> {
     }
 
     pub fn put_header(&self, batch: &mut WriteBatch, hash: &Hash256, entry: &HeaderEntry) {
-        batch.put(
-            Column::HeaderIndex,
-            hash.to_vec(),
-            encode_header_entry(entry),
-        );
+        batch.put(Column::HeaderIndex, hash, encode_header_entry(entry));
     }
 
     pub fn set_best_header(&self, batch: &mut WriteBatch, hash: &Hash256) {
@@ -130,12 +126,12 @@ impl<S: KeyValueStore> ChainIndex<S> {
 
     pub fn set_height_hash(&self, batch: &mut WriteBatch, height: i32, hash: &Hash256) {
         let key = height_key(height);
-        batch.put(Column::HeightIndex, key.to_vec(), hash.to_vec());
+        batch.put(Column::HeightIndex, key, hash.to_vec());
     }
 
     pub fn clear_height_hash(&self, batch: &mut WriteBatch, height: i32) {
         let key = height_key(height);
-        batch.delete(Column::HeightIndex, key.to_vec());
+        batch.delete(Column::HeightIndex, key);
     }
 }
 

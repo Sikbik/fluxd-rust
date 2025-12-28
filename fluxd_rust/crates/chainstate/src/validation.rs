@@ -156,7 +156,7 @@ pub fn validate_block(
     params: &ConsensusParams,
     flags: &ValidationFlags,
 ) -> Result<(), ValidationError> {
-    validate_block_with_txids(block, height, params, flags).map(|_| ())
+    validate_block_with_txids_and_size(block, height, params, flags, None).map(|_| ())
 }
 
 pub fn validate_block_with_txids(
@@ -164,6 +164,16 @@ pub fn validate_block_with_txids(
     height: i32,
     params: &ConsensusParams,
     flags: &ValidationFlags,
+) -> Result<Vec<Hash256>, ValidationError> {
+    validate_block_with_txids_and_size(block, height, params, flags, None)
+}
+
+pub fn validate_block_with_txids_and_size(
+    block: &Block,
+    height: i32,
+    params: &ConsensusParams,
+    flags: &ValidationFlags,
+    block_size: Option<u32>,
 ) -> Result<Vec<Hash256>, ValidationError> {
     if block.transactions.is_empty() {
         return Err(ValidationError::InvalidBlock(
@@ -175,7 +185,11 @@ pub fn validate_block_with_txids(
             "block transaction count too large",
         ));
     }
-    let block_size = block.consensus_encode()?.len() as u32;
+    let block_size = if let Some(size) = block_size {
+        size
+    } else {
+        block.consensus_encode()?.len() as u32
+    };
     if block_size > MAX_BLOCK_SIZE {
         return Err(ValidationError::InvalidBlock("block size too large"));
     }

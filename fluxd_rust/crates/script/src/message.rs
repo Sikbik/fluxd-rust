@@ -3,9 +3,11 @@
 use fluxd_consensus::constants::SIGNED_MESSAGE_MAGIC;
 use fluxd_consensus::Hash256;
 use fluxd_primitives::encoding::Encoder;
-use fluxd_primitives::hash::{hash160, sha256d};
+use fluxd_primitives::hash::sha256d;
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-use secp256k1::{Message, Secp256k1};
+use secp256k1::Message;
+
+use crate::secp::secp256k1_verify;
 
 #[derive(Debug)]
 pub enum SignedMessageError {
@@ -47,23 +49,20 @@ pub fn verify_signed_message(
     if expected_pubkey.is_empty() {
         return Err(SignedMessageError::InvalidPubkey);
     }
-    let expected_id = hash160(expected_pubkey);
     let (recoverable, compressed) = decode_compact_signature(signature)?;
+    let expected_compressed = expected_pubkey.len() == 33;
+    if compressed != expected_compressed {
+        return Err(SignedMessageError::PubkeyMismatch);
+    }
     let digest = signed_message_hash(message);
     let msg =
         Message::from_digest_slice(&digest).map_err(|_| SignedMessageError::InvalidMessage)?;
-    let secp = Secp256k1::verification_only();
-    let pubkey = secp
-        .recover_ecdsa(&msg, &recoverable)
-        .map_err(|_| SignedMessageError::RecoverFailed)?;
-    let recovered = if compressed {
-        pubkey.serialize().to_vec()
-    } else {
-        pubkey.serialize_uncompressed().to_vec()
-    };
-    if hash160(&recovered) != expected_id {
-        return Err(SignedMessageError::PubkeyMismatch);
-    }
+    let pubkey = secp256k1::PublicKey::from_slice(expected_pubkey)
+        .map_err(|_| SignedMessageError::InvalidPubkey)?;
+    let sig = recoverable.to_standard();
+    secp256k1_verify()
+        .verify_ecdsa(&msg, &sig, &pubkey)
+        .map_err(|_| SignedMessageError::InvalidSignature)?;
     Ok(())
 }
 
@@ -90,6 +89,7 @@ fn decode_compact_signature(
 mod tests {
     use super::*;
     use secp256k1::ecdsa::RecoverableSignature;
+    use secp256k1::Secp256k1;
     use secp256k1::SecretKey;
 
     fn encode_compact(sig: &RecoverableSignature, compressed: bool) -> [u8; 65] {

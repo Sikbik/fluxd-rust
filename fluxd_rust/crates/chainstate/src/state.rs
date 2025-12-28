@@ -60,9 +60,40 @@ use fluxd_script::message::verify_signed_message;
 struct ScriptCheck {
     tx_index: usize,
     input_index: usize,
-    script_sig: Vec<u8>,
-    script_pubkey: Vec<u8>,
+    spent_index: usize,
     value: i64,
+}
+
+enum FluxnodeSigPubkeys {
+    Single(Vec<u8>),
+    Any(Vec<Vec<u8>>),
+}
+
+struct FluxnodeSigCheck {
+    pubkeys: FluxnodeSigPubkeys,
+    signature: Vec<u8>,
+    message: Vec<u8>,
+    error: &'static str,
+}
+
+impl FluxnodeSigCheck {
+    fn verify(&self) -> Result<(), &'static str> {
+        match &self.pubkeys {
+            FluxnodeSigPubkeys::Single(pubkey) => {
+                verify_signed_message(pubkey, &self.signature, &self.message)
+                    .map_err(|_| self.error)
+            }
+            FluxnodeSigPubkeys::Any(pubkeys) => {
+                if pubkeys.iter().any(|pubkey| {
+                    verify_signed_message(pubkey, &self.signature, &self.message).is_ok()
+                }) {
+                    Ok(())
+                } else {
+                    Err(self.error)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1031,13 +1062,11 @@ impl<S: KeyValueStore> ChainState<S> {
         params: &ChainParams,
         created_utxos: &HashMap<OutPointKey, UtxoEntry>,
         operator_pubkeys: &HashMap<OutPoint, Vec<u8>>,
+        signature_checks: Option<&mut Vec<FluxnodeSigCheck>>,
     ) -> Result<(), ChainStateError> {
         let Some(fluxnode) = tx.fluxnode.as_ref() else {
             return Ok(());
         };
-
-        let message_hex = hash256_to_hex(txid);
-        let message = message_hex.as_bytes();
 
         match fluxnode {
             FluxnodeTx::V5(FluxnodeTxV5::Start(start)) => {
@@ -1076,13 +1105,23 @@ impl<S: KeyValueStore> ChainState<S> {
                     None,
                 )?;
 
-                verify_signed_message(&start.collateral_pubkey, &start.sig, message).map_err(
-                    |_| {
-                        ChainStateError::Validation(ValidationError::Fluxnode(
-                            "fluxnode start signature invalid",
-                        ))
-                    },
-                )?;
+                let message = hash256_to_hex(txid).into_bytes();
+                if let Some(signature_checks) = signature_checks {
+                    signature_checks.push(FluxnodeSigCheck {
+                        pubkeys: FluxnodeSigPubkeys::Single(start.collateral_pubkey.clone()),
+                        signature: start.sig.clone(),
+                        message,
+                        error: "fluxnode start signature invalid",
+                    });
+                } else {
+                    verify_signed_message(&start.collateral_pubkey, &start.sig, &message).map_err(
+                        |_| {
+                            ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode start signature invalid",
+                            ))
+                        },
+                    )?;
+                }
             }
             FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => match &start.variant {
                 FluxnodeStartVariantV6::Normal {
@@ -1133,11 +1172,21 @@ impl<S: KeyValueStore> ChainState<S> {
                         )));
                     }
 
-                    verify_signed_message(collateral_pubkey, sig, message).map_err(|_| {
-                        ChainStateError::Validation(ValidationError::Fluxnode(
-                            "fluxnode start signature invalid",
-                        ))
-                    })?;
+                    let message = hash256_to_hex(txid).into_bytes();
+                    if let Some(signature_checks) = signature_checks {
+                        signature_checks.push(FluxnodeSigCheck {
+                            pubkeys: FluxnodeSigPubkeys::Single(collateral_pubkey.clone()),
+                            signature: sig.clone(),
+                            message,
+                            error: "fluxnode start signature invalid",
+                        });
+                    } else {
+                        verify_signed_message(collateral_pubkey, sig, &message).map_err(|_| {
+                            ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode start signature invalid",
+                            ))
+                        })?;
+                    }
                 }
                 FluxnodeStartVariantV6::P2sh {
                     collateral,
@@ -1198,17 +1247,27 @@ impl<S: KeyValueStore> ChainState<S> {
                         )));
                     }
 
-                    let mut ok = false;
-                    for pubkey in pubkeys {
-                        if verify_signed_message(&pubkey, sig, message).is_ok() {
-                            ok = true;
-                            break;
+                    let message = hash256_to_hex(txid).into_bytes();
+                    if let Some(signature_checks) = signature_checks {
+                        signature_checks.push(FluxnodeSigCheck {
+                            pubkeys: FluxnodeSigPubkeys::Any(pubkeys),
+                            signature: sig.clone(),
+                            message,
+                            error: "fluxnode start signature invalid",
+                        });
+                    } else {
+                        let mut ok = false;
+                        for pubkey in pubkeys {
+                            if verify_signed_message(&pubkey, sig, &message).is_ok() {
+                                ok = true;
+                                break;
+                            }
                         }
-                    }
-                    if !ok {
-                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
-                            "fluxnode start signature invalid",
-                        )));
+                        if !ok {
+                            return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode start signature invalid",
+                            )));
+                        }
                     }
                 }
             },
@@ -1259,11 +1318,6 @@ impl<S: KeyValueStore> ChainState<S> {
                 };
 
                 let msg = fluxnode_confirm_message(confirm);
-                verify_signed_message(&operator_pubkey, &confirm.sig, &msg).map_err(|_| {
-                    ChainStateError::Validation(ValidationError::Fluxnode(
-                        "fluxnode confirm signature invalid",
-                    ))
-                })?;
 
                 let benchmark_key = select_timed_pubkey(
                     params.fluxnode.benchmarking_public_keys,
@@ -1281,12 +1335,37 @@ impl<S: KeyValueStore> ChainState<S> {
                 })?;
 
                 let benchmark_msg = fluxnode_benchmark_message(confirm);
-                verify_signed_message(&benchmark_pubkey, &confirm.benchmark_sig, &benchmark_msg)
+
+                if let Some(signature_checks) = signature_checks {
+                    signature_checks.push(FluxnodeSigCheck {
+                        pubkeys: FluxnodeSigPubkeys::Single(operator_pubkey),
+                        signature: confirm.sig.clone(),
+                        message: msg,
+                        error: "fluxnode confirm signature invalid",
+                    });
+                    signature_checks.push(FluxnodeSigCheck {
+                        pubkeys: FluxnodeSigPubkeys::Single(benchmark_pubkey),
+                        signature: confirm.benchmark_sig.clone(),
+                        message: benchmark_msg,
+                        error: "fluxnode benchmark signature invalid",
+                    });
+                } else {
+                    verify_signed_message(&operator_pubkey, &confirm.sig, &msg).map_err(|_| {
+                        ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode confirm signature invalid",
+                        ))
+                    })?;
+                    verify_signed_message(
+                        &benchmark_pubkey,
+                        &confirm.benchmark_sig,
+                        &benchmark_msg,
+                    )
                     .map_err(|_| {
                         ChainStateError::Validation(ValidationError::Fluxnode(
                             "fluxnode benchmark signature invalid",
                         ))
                     })?;
+                }
             }
         }
 
@@ -1366,6 +1445,7 @@ impl<S: KeyValueStore> ChainState<S> {
         prevalidated: bool,
         txids: Option<&[Hash256]>,
         connect_metrics: Option<&ConnectMetrics>,
+        block_bytes: Option<&[u8]>,
     ) -> Result<WriteBatch, ChainStateError> {
         let consensus = &params.consensus;
         let mut batch = WriteBatch::new();
@@ -1496,6 +1576,7 @@ impl<S: KeyValueStore> ChainState<S> {
             network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Flux);
         let mut total_fees = 0i64;
         let mut fluxnode_operator_pubkeys: HashMap<OutPoint, Vec<u8>> = HashMap::new();
+        let mut fluxnode_sig_checks: Vec<FluxnodeSigCheck> = Vec::new();
         for (index, tx) in block.transactions.iter().enumerate() {
             let is_coinbase = index == 0;
             let txid = txids
@@ -1511,6 +1592,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 params,
                 &created_utxos,
                 &fluxnode_operator_pubkeys,
+                Some(&mut fluxnode_sig_checks),
             )?;
             let tx_value_out = tx_value_out(tx)?;
             let mut tx_value_in = tx_shielded_value_in(tx)?;
@@ -1663,11 +1745,11 @@ impl<S: KeyValueStore> ChainState<S> {
                         }
                     }
                     if flags.check_script {
+                        let spent_index = undo.spent.len();
                         block_script_checks.push(ScriptCheck {
                             tx_index: index,
                             input_index,
-                            script_sig: input.script_sig.clone(),
-                            script_pubkey: entry.script_pubkey.clone(),
+                            spent_index,
                             value: entry.value,
                         });
                     }
@@ -1824,13 +1906,26 @@ impl<S: KeyValueStore> ChainState<S> {
             }
         }
 
+        if !fluxnode_sig_checks.is_empty() {
+            let result = fluxnode_sig_checks
+                .par_iter()
+                .try_for_each(|check| check.verify());
+            if let Err(message) = result {
+                return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                    message,
+                )));
+            }
+        }
+
         if flags.check_script && !block_script_checks.is_empty() {
             let script_start = Instant::now();
             let result = block_script_checks.par_iter().try_for_each(|check| {
                 let tx = &block.transactions[check.tx_index];
+                let script_sig = &tx.vin[check.input_index].script_sig;
+                let script_pubkey = &undo.spent[check.spent_index].entry.script_pubkey;
                 verify_script(
-                    &check.script_sig,
-                    &check.script_pubkey,
+                    script_sig,
+                    script_pubkey,
                     tx,
                     check.input_index,
                     check.value,
@@ -1907,9 +2002,16 @@ impl<S: KeyValueStore> ChainState<S> {
         }
         anchor_time += anchor_finalize_start.elapsed();
 
-        let block_bytes = block.consensus_encode()?;
+        let encoded_block_bytes = if block_bytes.is_none() {
+            Some(block.consensus_encode()?)
+        } else {
+            None
+        };
+        let block_bytes = block_bytes
+            .or_else(|| encoded_block_bytes.as_deref())
+            .ok_or(ChainStateError::CorruptIndex("block bytes missing"))?;
         let flatfile_start = Instant::now();
-        let location = self.blocks.append(&block_bytes)?;
+        let location = self.blocks.append(block_bytes)?;
         flatfile_time += flatfile_start.elapsed();
         let block_file_len = location
             .offset
@@ -2244,7 +2346,7 @@ impl<S: KeyValueStore> ChainState<S> {
             ts_key.extend_from_slice(&ts.to_be_bytes());
             ts_key.extend_from_slice(hash);
             batch.delete(Column::TimestampIndex, ts_key);
-            batch.delete(Column::BlockTimestamp, hash.to_vec());
+            batch.delete(Column::BlockTimestamp, hash);
         }
 
         let (
@@ -2280,7 +2382,7 @@ impl<S: KeyValueStore> ChainState<S> {
 
         self.index.clear_height_hash(&mut batch, entry.height);
         self.index.set_best_block(&mut batch, &entry.prev_hash);
-        batch.delete(Column::BlockUndo, hash.to_vec());
+        batch.delete(Column::BlockUndo, hash);
         self.clear_block_index_undo(hash, &mut batch)?;
 
         utxo_stats.txouts = utxo_stats
@@ -2437,7 +2539,7 @@ impl<S: KeyValueStore> ChainState<S> {
         }
         entry.undo = None;
         entry.status &= !STATUS_HAVE_UNDO;
-        batch.put(Column::BlockIndex, hash.to_vec(), entry.encode());
+        batch.put(Column::BlockIndex, hash, entry.encode());
         Ok(())
     }
 
@@ -2588,7 +2690,7 @@ impl<S: KeyValueStore> ChainState<S> {
             return Ok(());
         }
         if let Some(hash) = self.index.height_hash(prune_height)? {
-            batch.delete(Column::BlockUndo, hash.to_vec());
+            batch.delete(Column::BlockUndo, hash);
             self.clear_block_index_undo(&hash, batch)?;
         }
         Ok(())
@@ -2850,7 +2952,15 @@ impl<S: KeyValueStore> ChainState<S> {
     ) -> Result<(), ChainStateError> {
         let created_utxos = HashMap::new();
         let operator_pubkeys = HashMap::new();
-        self.validate_fluxnode_tx(tx, txid, height, params, &created_utxos, &operator_pubkeys)
+        self.validate_fluxnode_tx(
+            tx,
+            txid,
+            height,
+            params,
+            &created_utxos,
+            &operator_pubkeys,
+            None,
+        )
     }
 
     fn sprout_anchor_tree(
@@ -4024,7 +4134,7 @@ mod tests {
         };
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block0, 0, &params, &flags, true, None, None)
+            .connect_block(&block0, 0, &params, &flags, true, None, None, None)
             .expect("connect block 0");
         chainstate.commit_batch(batch).expect("commit block 0");
 
@@ -4060,7 +4170,7 @@ mod tests {
         };
 
         let err = chainstate
-            .connect_block(&block1, 1, &params, &flags, true, None, None)
+            .connect_block(&block1, 1, &params, &flags, true, None, None, None)
             .expect_err("premature spend rejected");
         match err {
             ChainStateError::Validation(ValidationError::InvalidTransaction(message)) => {
@@ -4575,7 +4685,7 @@ mod tests {
 
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block, 0, &params, &flags, true, None, None)
+            .connect_block(&block, 0, &params, &flags, true, None, None, None)
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit connect");
         let connected_stats = chainstate.utxo_stats().expect("utxo stats").expect("stats");
@@ -4803,7 +4913,7 @@ mod tests {
 
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block, 0, &params, &flags, true, None, None)
+            .connect_block(&block, 0, &params, &flags, true, None, None, None)
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit connect");
 
@@ -4929,6 +5039,7 @@ mod tests {
                 &params,
                 &HashMap::new(),
                 &HashMap::new(),
+                None,
             )
             .expect("start tx valid");
     }
@@ -5027,6 +5138,7 @@ mod tests {
                 &params,
                 &HashMap::new(),
                 &HashMap::new(),
+                None,
             )
             .expect("start tx valid after expiration");
     }
@@ -5125,6 +5237,7 @@ mod tests {
                 &params,
                 &HashMap::new(),
                 &HashMap::new(),
+                None,
             )
             .expect_err("start tx rejected while confirmed");
         match err {
@@ -5209,7 +5322,15 @@ mod tests {
         let mut operator_pubkeys = HashMap::new();
         operator_pubkeys.insert(collateral_outpoint, operator_pubkey.serialize().to_vec());
         chainstate
-            .validate_fluxnode_tx(&tx, &txid, 100, &params, &HashMap::new(), &operator_pubkeys)
+            .validate_fluxnode_tx(
+                &tx,
+                &txid,
+                100,
+                &params,
+                &HashMap::new(),
+                &operator_pubkeys,
+                None,
+            )
             .expect("confirm valid");
     }
 }

@@ -43,15 +43,18 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Run block connect on blocking threads to keep RPC/dashboard responsive under high throughput
   - [x] Reduce per-input allocation overhead (outpoint key handling + per-block UTXO cache)
   - [x] Inline small keys in `WriteBatch` (UTXO/address keys stored without heap allocs)
+  - [x] Avoid heap allocs for common index keys (txindex/header/block index keys)
   - [x] LRU UTXO read cache for sequential block spends (`--utxo-cache-entries`)
   - [x] Reuse txids across validation/connect/mempool purge (avoid redundant txid hashing)
+  - [x] Optimize fluxnode signed-message verification (verify vs recover)
+  - [x] Parallelize fluxnode signature checks during connect (multi-core)
   - [x] Fix shielded pipeline ordering bug (prevents rare sync stalls)
   - [x] Expose Fjall flush/compaction worker knobs (`--db-flush-workers`, `--db-compaction-workers`)
   - [x] Warn when `--db-write-buffer-mb` is below `--db-memtable-mb × partitions` (prevents hidden L0 stalls)
   - [x] Surface Fjall health stats in `/stats` (write buffer, compactions, per-partition segments/flushes)
   - [x] Add detailed connect-stage telemetry in `/stats` (UTXO get/put/delete, undo encode/append, index op counts)
   - [ ] Review index write amplification (txindex/address index) and batching opportunities
-  - [x] Capture initial throughput stats (~150–180 b/s on 8-core mainnet sync with `--shielded-workers 6` and `--inflight-per-peer 2`)
+  - [x] Capture throughput stats (8-core mainnet: `ver_ms` ~5–6ms, ~110–120 b/s typical; block download becomes limiter)
 - [ ] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)
 
 ## Consensus and chainstate parity

@@ -3,9 +3,10 @@
 use fluxd_primitives::hash::{sha256, sha256d};
 use fluxd_primitives::transaction::Transaction;
 use ripemd::{Digest as RipemdDigest, Ripemd160};
-use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
+use secp256k1::{ecdsa::Signature, Message, PublicKey};
 use sha1::Sha1;
 
+use crate::secp::secp256k1_verify;
 use crate::sighash::{signature_hash, SighashType, SIGHASH_NONE, SIGHASH_SINGLE};
 
 pub type ScriptFlags = u32;
@@ -224,8 +225,9 @@ impl<'a> SignatureChecker<'a> {
         };
 
         let msg = Message::from_digest_slice(&sighash).map_err(|_| ScriptError::SigCheck)?;
-        let secp = Secp256k1::verification_only();
-        Ok(secp.verify_ecdsa(&msg, &sig_for_verify, &pubkey).is_ok())
+        Ok(secp256k1_verify()
+            .verify_ecdsa(&msg, &sig_for_verify, &pubkey)
+            .is_ok())
     }
 
     fn check_lock_time(&self, lock_time: i64) -> Result<(), ScriptError> {

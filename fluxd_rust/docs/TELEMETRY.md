@@ -46,6 +46,18 @@ Tuning hint:
 - If `utxo_cache_hits / (utxo_cache_hits + utxo_cache_misses)` is low and `utxo_get_us` dominates,
   increasing `--utxo-cache-entries` can help (memory permitting).
 
+## When UTXO/index look cheap but `verify_us` is high
+
+If `verify_ms_per_block` is high while `utxo_ms_per_block`, `index_ms_per_block`, and `undo_*`
+remain low, the remaining time is typically **signature-heavy CPU work**, e.g.:
+
+- Script signature checks (ECDSA/secp256k1 via `verify_script`).
+- Fluxnode signed-message checks (start/confirm/benchmark).
+
+In this case, CPU profiling is the fastest way to confirm the hotspot:
+
+- `perf top` / `perf record` should show `rustsecp256k1_*` symbols near the top.
+
 ## Fjall (DB) health
 
 When using the `fjall` backend, `/stats` includes `db_*` fields:

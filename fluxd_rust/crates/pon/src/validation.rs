@@ -1,6 +1,7 @@
 //! PON header validation.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use fluxd_consensus::params::{hash256_from_hex, ConsensusParams, Network};
 use fluxd_consensus::upgrades::UpgradeIndex;
@@ -8,9 +9,15 @@ use fluxd_primitives::block::BlockHeader;
 use fluxd_primitives::encoding::Decoder;
 use fluxd_primitives::outpoint::OutPoint;
 use primitive_types::U256;
-use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
+use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, VerifyOnly};
 
 use crate::slot::{get_slot_number, pon_hash};
+
+static SECP256K1_VERIFY: OnceLock<Secp256k1<VerifyOnly>> = OnceLock::new();
+
+fn secp256k1_verify() -> &'static Secp256k1<VerifyOnly> {
+    SECP256K1_VERIFY.get_or_init(Secp256k1::verification_only)
+}
 
 #[derive(Debug)]
 pub enum PonError {
@@ -71,8 +78,8 @@ pub fn validate_pon_signature(
         .map_err(|_| PonError::InvalidHeader("invalid pon signature"))?;
     let msg = Message::from_digest_slice(&header.hash())
         .map_err(|_| PonError::InvalidHeader("invalid pon hash"))?;
-    let secp = Secp256k1::verification_only();
-    secp.verify_ecdsa(&msg, &sig, &pubkey)
+    secp256k1_verify()
+        .verify_ecdsa(&msg, &sig, &pubkey)
         .map_err(|_| PonError::InvalidHeader("pon signature verification failed"))
 }
 
@@ -169,7 +176,7 @@ fn validate_emergency_signatures(
 
     let msg = Message::from_digest_slice(&header.hash())
         .map_err(|_| PonError::InvalidHeader("invalid emergency block hash"))?;
-    let secp = Secp256k1::verification_only();
+    let secp = secp256k1_verify();
     let mut used_keys: HashSet<usize> = HashSet::new();
     let mut valid = 0usize;
 
