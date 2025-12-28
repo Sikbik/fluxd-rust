@@ -43,7 +43,7 @@ fn fjall_smoke_roundtrip() {
     let mut batch = WriteBatch::new();
     batch.put(Column::Meta, b"batch", b"ok");
     batch.delete(Column::Meta, b"key");
-    store.write_batch(batch).expect("batch commit");
+    store.write_batch(&batch).expect("batch commit");
 
     assert!(store.get(Column::Meta, b"key").expect("get").is_none());
     assert_eq!(

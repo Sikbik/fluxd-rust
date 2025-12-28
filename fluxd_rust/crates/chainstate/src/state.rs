@@ -117,6 +117,7 @@ impl From<pon_validation::PonError> for ChainStateError {
 }
 
 const HEADER_CACHE_CAPACITY: usize = 200_000;
+const UTXO_CACHE_CAPACITY: usize = 200_000;
 const MTP_WINDOW_SIZE: usize = 11;
 
 struct HeaderCache {
@@ -149,6 +150,74 @@ impl HeaderCache {
                     break;
                 }
             }
+        }
+    }
+}
+
+struct UtxoCacheEntry {
+    bytes: Vec<u8>,
+    stamp: u64,
+}
+
+struct UtxoCache {
+    entries: HashMap<OutPointKey, UtxoCacheEntry>,
+    order: VecDeque<(OutPointKey, u64)>,
+    capacity: usize,
+    clock: u64,
+}
+
+impl UtxoCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, key: &OutPointKey) -> Option<&[u8]> {
+        if self.capacity == 0 {
+            return None;
+        }
+        let stamp = self.bump_stamp();
+        let entry = self.entries.get_mut(key)?;
+        entry.stamp = stamp;
+        self.order.push_back((*key, stamp));
+        Some(entry.bytes.as_slice())
+    }
+
+    fn insert(&mut self, key: OutPointKey, bytes: Vec<u8>) {
+        if self.capacity == 0 {
+            return;
+        }
+        let stamp = self.bump_stamp();
+        self.entries.insert(key, UtxoCacheEntry { bytes, stamp });
+        self.order.push_back((key, stamp));
+        self.evict();
+    }
+
+    fn remove(&mut self, key: &OutPointKey) {
+        self.entries.remove(key);
+    }
+
+    fn bump_stamp(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > self.capacity {
+            let Some((key, stamp)) = self.order.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            if entry.stamp != stamp {
+                continue;
+            }
+            self.entries.remove(&key);
         }
     }
 }
@@ -263,11 +332,20 @@ pub struct ChainState<S> {
     index: ChainIndex<S>,
     blocks: FlatFileStore,
     header_cache: Mutex<HeaderCache>,
+    utxo_cache: Mutex<UtxoCache>,
     shielded_cache: Mutex<Option<ShieldedTreesCache>>,
 }
 
 impl<S: KeyValueStore> ChainState<S> {
     pub fn new(store: Arc<S>, blocks: FlatFileStore) -> Self {
+        Self::new_with_utxo_cache_capacity(store, blocks, UTXO_CACHE_CAPACITY)
+    }
+
+    pub fn new_with_utxo_cache_capacity(
+        store: Arc<S>,
+        blocks: FlatFileStore,
+        utxo_cache_capacity: usize,
+    ) -> Self {
         Self {
             utxos: UtxoSet::new(Arc::clone(&store)),
             anchors_sprout: AnchorSet::new(Arc::clone(&store), Column::AnchorSprout),
@@ -280,6 +358,7 @@ impl<S: KeyValueStore> ChainState<S> {
             store,
             blocks,
             header_cache: Mutex::new(HeaderCache::new(HEADER_CACHE_CAPACITY)),
+            utxo_cache: Mutex::new(UtxoCache::new(utxo_cache_capacity)),
             shielded_cache: Mutex::new(None),
         }
     }
@@ -1080,7 +1159,7 @@ impl<S: KeyValueStore> ChainState<S> {
                         Some(entry) => entry,
                         None => {
                             let utxo_start = Instant::now();
-                            let entry = self.utxos.get(&input.prevout)?;
+                            let entry = self.utxo_entry_cached(outpoint_key)?;
                             utxo_time += utxo_start.elapsed();
                             match entry {
                                 Some(entry) => entry,
@@ -1650,7 +1729,7 @@ impl<S: KeyValueStore> ChainState<S> {
         }
         let mut batch = WriteBatch::new();
         self.index.set_best_header(&mut batch, hash);
-        self.store.write_batch(batch)?;
+        self.store.write_batch(&batch)?;
         Ok(())
     }
 
@@ -1669,9 +1748,34 @@ impl<S: KeyValueStore> ChainState<S> {
                 }
             }
         }
-        self.store.write_batch(batch)?;
+        self.store.write_batch(&batch)?;
         if sprout_bytes.is_some() || sapling_bytes.is_some() {
             self.update_shielded_cache(sprout_bytes, sapling_bytes)?;
+        }
+        let ops = batch.into_ops();
+        if let Ok(mut cache) = self.utxo_cache.lock() {
+            for op in ops {
+                match op {
+                    WriteOp::Put { column, key, value } => {
+                        if column != Column::Utxo {
+                            continue;
+                        }
+                        let Some(outpoint_key) = OutPointKey::from_slice(key.as_slice()) else {
+                            continue;
+                        };
+                        cache.insert(outpoint_key, value);
+                    }
+                    WriteOp::Delete { column, key } => {
+                        if column != Column::Utxo {
+                            continue;
+                        }
+                        let Some(outpoint_key) = OutPointKey::from_slice(key.as_slice()) else {
+                            continue;
+                        };
+                        cache.remove(&outpoint_key);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1776,7 +1880,29 @@ impl<S: KeyValueStore> ChainState<S> {
     }
 
     pub fn utxo_entry(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, ChainStateError> {
-        Ok(self.utxos.get(outpoint)?)
+        let key = outpoint_key_bytes(outpoint);
+        self.utxo_entry_cached(key)
+    }
+
+    fn utxo_entry_cached(&self, key: OutPointKey) -> Result<Option<UtxoEntry>, ChainStateError> {
+        if let Ok(mut cache) = self.utxo_cache.lock() {
+            if let Some(bytes) = cache.get(&key) {
+                let entry =
+                    UtxoEntry::decode(bytes).map_err(|err| StoreError::Backend(err.to_string()))?;
+                return Ok(Some(entry));
+            }
+        }
+
+        let bytes = match self.store.get(Column::Utxo, key.as_bytes())? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let entry =
+            UtxoEntry::decode(&bytes).map_err(|err| StoreError::Backend(err.to_string()))?;
+        if let Ok(mut cache) = self.utxo_cache.lock() {
+            cache.insert(key, bytes);
+        }
+        Ok(Some(entry))
     }
 
     pub fn utxo_stats(&self) -> Result<Option<UtxoStats>, ChainStateError> {

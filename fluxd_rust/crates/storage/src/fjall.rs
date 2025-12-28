@@ -151,7 +151,7 @@ impl KeyValueStore for FjallStore {
         Ok(())
     }
 
-    fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {
+    fn write_batch(&self, batch: &WriteBatch) -> Result<(), StoreError> {
         let mut fjall_batch = self.keyspace.batch();
         for op in batch.iter() {
             match op {

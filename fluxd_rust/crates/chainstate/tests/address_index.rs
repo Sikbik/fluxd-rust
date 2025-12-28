@@ -17,14 +17,14 @@ fn address_index_roundtrip() {
 
     let mut batch = WriteBatch::new();
     index.insert(&mut batch, &script, &outpoint);
-    store.write_batch(batch).expect("commit");
+    store.write_batch(&batch).expect("commit");
 
     let outpoints = index.scan(&script).expect("scan");
     assert_eq!(outpoints, vec![outpoint.clone()]);
 
     let mut batch = WriteBatch::new();
     index.delete(&mut batch, &script, &outpoint);
-    store.write_batch(batch).expect("commit");
+    store.write_batch(&batch).expect("commit");
 
     let outpoints = index.scan(&script).expect("scan");
     assert!(outpoints.is_empty());

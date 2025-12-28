@@ -35,7 +35,7 @@ fn tx_index_roundtrip() {
 
     let mut batch = WriteBatch::new();
     index.insert(&mut batch, &txid, location);
-    store.write_batch(batch).expect("commit");
+    store.write_batch(&batch).expect("commit");
 
     let fetched = index.get(&txid).expect("get").expect("missing");
     assert_eq!(fetched, location);

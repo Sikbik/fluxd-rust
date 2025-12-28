@@ -24,6 +24,13 @@ These flags control Fjall memory usage. Use them when running on VPS or constrai
 - `--db-journal-mb N` - max journaling size.
 - `--db-memtable-mb N` - per-partition memtable size.
 
+## Chainstate caching
+
+- `--utxo-cache-entries N`
+  - In-memory cache for recently accessed UTXO entries (default: `200000`).
+  - Set to `0` to disable.
+  - This is a performance knob only; it does not affect consensus rules.
+
 ## Shielded parameters
 
 - `--params-dir PATH` - directory for shielded params (default: `~/.zcash-params`).

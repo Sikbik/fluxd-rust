@@ -148,6 +148,10 @@ impl WriteBatch {
     pub fn iter(&self) -> impl Iterator<Item = &WriteOp> {
         self.ops.iter()
     }
+
+    pub fn into_ops(self) -> Vec<WriteOp> {
+        self.ops
+    }
 }
 
 pub type ScanResult = Vec<(Vec<u8>, Vec<u8>)>;
@@ -164,7 +168,7 @@ pub trait KeyValueStore: Send + Sync {
         prefix: &[u8],
         visitor: &mut PrefixVisitor<'a>,
     ) -> Result<(), StoreError>;
-    fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError>;
+    fn write_batch(&self, batch: &WriteBatch) -> Result<(), StoreError>;
 }
 
 impl<T: KeyValueStore + ?Sized> KeyValueStore for Arc<T> {
@@ -193,7 +197,7 @@ impl<T: KeyValueStore + ?Sized> KeyValueStore for Arc<T> {
         self.as_ref().for_each_prefix(column, prefix, visitor)
     }
 
-    fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {
+    fn write_batch(&self, batch: &WriteBatch) -> Result<(), StoreError> {
         self.as_ref().write_batch(batch)
     }
 }

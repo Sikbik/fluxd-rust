@@ -64,7 +64,7 @@ impl KeyValueStore for MemoryStore {
         Ok(())
     }
 
-    fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {
+    fn write_batch(&self, batch: &WriteBatch) -> Result<(), StoreError> {
         let mut guard = self.inner.write().expect("memory store lock");
         for op in batch.iter() {
             match op {

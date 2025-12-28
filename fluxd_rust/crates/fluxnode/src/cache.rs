@@ -199,7 +199,7 @@ mod tests {
 
         let mut batch = WriteBatch::new();
         apply_fluxnode_tx(&store, &mut batch, &tx, 100).expect("apply tx");
-        store.write_batch(batch).expect("write batch");
+        store.write_batch(&batch).expect("write batch");
 
         let loaded = lookup_operator_pubkey(&store, &outpoint)
             .expect("lookup")

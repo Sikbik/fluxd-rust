@@ -55,6 +55,7 @@ const DEFAULT_BLOCK_PEERS: usize = 4;
 const DEFAULT_HEADER_PEERS: usize = 4;
 const DEFAULT_HEADER_LEAD: i32 = 20000;
 const DEFAULT_INFLIGHT_PER_PEER: usize = 2;
+const DEFAULT_UTXO_CACHE_ENTRIES: usize = 200_000;
 const READ_TIMEOUT_SECS: u64 = 120;
 const READ_TIMEOUT_RETRIES: usize = 3;
 const BLOCK_READ_TIMEOUT_SECS: u64 = 30;
@@ -139,6 +140,7 @@ struct Config {
     db_write_buffer_bytes: Option<u64>,
     db_journal_bytes: Option<u64>,
     db_memtable_bytes: Option<u32>,
+    utxo_cache_entries: usize,
     header_verify_workers: usize,
     verify_workers: usize,
     verify_queue: usize,
@@ -351,7 +353,7 @@ impl KeyValueStore for Store {
         }
     }
 
-    fn write_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {
+    fn write_batch(&self, batch: &WriteBatch) -> Result<(), StoreError> {
         match self {
             Store::Memory(store) => store.write_batch(batch),
             Store::Fjall(store) => store.write_batch(batch),
@@ -390,7 +392,11 @@ async fn run() -> Result<(), String> {
 
     let blocks = FlatFileStore::new(&blocks_path, DEFAULT_MAX_FLATFILE_SIZE)
         .map_err(|err| err.to_string())?;
-    let chainstate = Arc::new(ChainState::new(Arc::clone(&store), blocks));
+    let chainstate = Arc::new(ChainState::new_with_utxo_cache_capacity(
+        Arc::clone(&store),
+        blocks,
+        config.utxo_cache_entries,
+    ));
     let net_totals = Arc::new(NetTotals::default());
     let peer_registry = Arc::new(PeerRegistry::default());
     let header_peer_book = Arc::new(HeaderPeerBook::default());
@@ -3773,6 +3779,7 @@ fn parse_args() -> Result<Config, String> {
     let mut db_write_buffer_bytes: Option<u64> = None;
     let mut db_journal_bytes: Option<u64> = None;
     let mut db_memtable_bytes: Option<u32> = None;
+    let mut utxo_cache_entries: usize = DEFAULT_UTXO_CACHE_ENTRIES;
     let mut header_verify_workers: usize = 0;
     let mut verify_workers: usize = 0;
     let mut verify_queue: usize = 0;
@@ -3951,6 +3958,14 @@ fn parse_args() -> Result<Config, String> {
                 }
                 db_memtable_bytes = Some(bytes as u32);
             }
+            "--utxo-cache-entries" => {
+                let value = args.next().ok_or_else(|| {
+                    format!("missing value for --utxo-cache-entries\n{}", usage())
+                })?;
+                utxo_cache_entries = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid utxo cache entries '{value}'\n{}", usage()))?;
+            }
             "--header-verify-workers" => {
                 let value = args.next().ok_or_else(|| {
                     format!("missing value for --header-verify-workers\n{}", usage())
@@ -4034,6 +4049,7 @@ fn parse_args() -> Result<Config, String> {
         db_write_buffer_bytes,
         db_journal_bytes,
         db_memtable_bytes,
+        utxo_cache_entries,
         header_verify_workers,
         verify_workers,
         verify_queue,
@@ -4106,7 +4122,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-lead N] [--inflight-per-peer N] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--shielded-queue N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-lead N] [--inflight-per-peer N] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--shielded-queue N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -4131,6 +4147,7 @@ fn usage() -> String {
         "  --db-write-buffer-mb  Fjall max write buffer in MiB (optional)",
         "  --db-journal-mb  Fjall max journaling size in MiB (optional)",
         "  --db-memtable-mb  Fjall partition memtable size in MiB (optional)",
+        "  --utxo-cache-entries  In-memory UTXO entry cache size (0 disables, default: 200000)",
         "  --header-verify-workers  POW header verification threads (0 = auto)",
         "  --verify-workers  Pre-validation worker threads (0 = auto)",
         "  --verify-queue  Pre-validation queue depth (0 = auto)",

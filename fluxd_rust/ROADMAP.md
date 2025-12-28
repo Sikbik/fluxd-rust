@@ -42,7 +42,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Run block connect on blocking threads to keep RPC/dashboard responsive under high throughput
   - [x] Reduce per-input allocation overhead (outpoint key handling + per-block UTXO cache)
   - [x] Inline small keys in `WriteBatch` (UTXO/address keys stored without heap allocs)
-  - [ ] Evaluate an LRU UTXO read cache for sequential block spends
+  - [x] LRU UTXO read cache for sequential block spends (`--utxo-cache-entries`)
   - [ ] Review index write amplification (txindex/address index) and batching opportunities
   - [x] Capture initial throughput stats (~150–180 b/s on 8-core mainnet sync with `--shielded-workers 6` and `--inflight-per-peer 2`)
 - [ ] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)

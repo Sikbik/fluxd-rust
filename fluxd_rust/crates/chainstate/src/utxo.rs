@@ -53,6 +53,15 @@ impl OutPointKey {
         Self(bytes)
     }
 
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != OUTPOINT_KEY_LEN {
+            return None;
+        }
+        let mut out = [0u8; OUTPOINT_KEY_LEN];
+        out.copy_from_slice(bytes);
+        Some(Self(out))
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_slice()
     }
