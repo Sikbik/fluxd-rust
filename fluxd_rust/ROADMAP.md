@@ -49,13 +49,18 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Consensus and chainstate parity
 
-- [ ] [P0] Upgrade activation heights and block hashes cross-checked against C++ (owner: TBD)
+- [x] [P0] Upgrade activation heights and block hashes cross-checked against C++ (owner: TBD)
+  - [x] Mainnet upgrade schedule regression tests (protocol version, height, activation hash)
 - [ ] [P0] PoN rules parity (header validation, signature rules, economics) (owner: TBD)
 - [ ] [P0] Block reward schedule parity (including canceled halving at 1,968,550) (owner: TBD)
   - [x] Regression tests for 1,968,550 canceled halving and PoN activation subsidy/dev-fund
+- [ ] [P0] Coinbase rules parity (funding outputs + maturity) (owner: TBD)
+  - [x] Regression tests for exchange/foundation/swap-pool coinbase enforcement (mainnet)
+  - [x] Regression test for coinbase maturity (premature spend rejection)
 - [ ] [P0] Chainwork parity for PoN/PoW edge cases and existing headers (owner: TBD)
 - [ ] [P0] Difficulty/target parity across LWMA/legacy windows and transitions (owner: TBD)
 - [ ] [P0] Checkpoint handling parity and tests (owner: TBD)
+  - [x] Mainnet checkpoint list regression test (values + ordering)
 - [ ] [P0] Expanded block index fields (status/validity/tx counts/undo offsets) (owner: TBD)
 - [ ] [P0] Block file metadata (per-file stats, last file tracking, prune flags) (owner: TBD)
 

@@ -2707,6 +2707,246 @@ mod tests {
     }
 
     #[test]
+    fn coinbase_funding_requires_exchange_payment_at_exchange_height() {
+        let params = chain_params(Network::Mainnet);
+        let height = params.funding.exchange_height as i32;
+
+        let tx = make_tx(
+            vec![],
+            vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51],
+            }],
+        );
+        let err = check_coinbase_funding(&tx, height, &params).expect_err("missing exchange fund");
+        match err {
+            ChainStateError::Validation(ValidationError::InvalidTransaction(message)) => {
+                assert_eq!(message, "coinbase missing exchange funding");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let exchange_script = fluxd_primitives::address_to_script_pubkey(
+            params.funding.exchange_address,
+            params.network,
+        )
+        .expect("exchange script");
+        let tx = make_tx(
+            vec![],
+            vec![
+                TxOut {
+                    value: params.funding.exchange_amount,
+                    script_pubkey: exchange_script,
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: vec![0x51],
+                },
+            ],
+        );
+        check_coinbase_funding(&tx, height, &params).expect("exchange funding ok");
+    }
+
+    #[test]
+    fn coinbase_funding_requires_foundation_payment_at_foundation_height() {
+        let params = chain_params(Network::Mainnet);
+        let height = params.funding.foundation_height as i32;
+
+        let tx = make_tx(
+            vec![],
+            vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51],
+            }],
+        );
+        let err =
+            check_coinbase_funding(&tx, height, &params).expect_err("missing foundation fund");
+        match err {
+            ChainStateError::Validation(ValidationError::InvalidTransaction(message)) => {
+                assert_eq!(message, "coinbase missing foundation funding");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let foundation_script = fluxd_primitives::address_to_script_pubkey(
+            params.funding.foundation_address,
+            params.network,
+        )
+        .expect("foundation script");
+        let tx = make_tx(
+            vec![],
+            vec![
+                TxOut {
+                    value: params.funding.foundation_amount,
+                    script_pubkey: foundation_script,
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: vec![0x51],
+                },
+            ],
+        );
+        check_coinbase_funding(&tx, height, &params).expect("foundation funding ok");
+    }
+
+    #[test]
+    fn coinbase_funding_requires_swap_pool_payment_at_swap_pool_start_height() {
+        let params = chain_params(Network::Mainnet);
+        let height = params.swap_pool.start_height as i32;
+
+        let tx = make_tx(
+            vec![],
+            vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51],
+            }],
+        );
+        let err = check_coinbase_funding(&tx, height, &params).expect_err("missing swap pool");
+        match err {
+            ChainStateError::Validation(ValidationError::InvalidTransaction(message)) => {
+                assert_eq!(message, "coinbase missing swap pool funding");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let swap_script =
+            fluxd_primitives::address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool script");
+        let tx = make_tx(
+            vec![],
+            vec![
+                TxOut {
+                    value: params.swap_pool.amount,
+                    script_pubkey: swap_script,
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: vec![0x51],
+                },
+            ],
+        );
+        check_coinbase_funding(&tx, height, &params).expect("swap pool funding ok");
+    }
+
+    #[test]
+    fn coinbase_maturity_rejects_premature_spend() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+
+        let mut params = chain_params(Network::Regtest);
+        let now = current_time_secs() as u32;
+
+        let header0 = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: [0u8; 32],
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: now,
+            bits: block_bits_from_params(&params.consensus),
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let hash0 = header0.hash();
+        params.consensus.hash_genesis_block = hash0;
+        params.consensus.checkpoints = vec![fluxd_consensus::params::Checkpoint {
+            height: 0,
+            hash: hash0,
+        }];
+
+        let header1 = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: hash0,
+            merkle_root: [0u8; 32],
+            final_sapling_root: [0u8; 32],
+            time: now + 1,
+            bits: header0.bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header0.clone(), header1.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert headers");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit headers");
+
+        let coinbase0 = make_tx(
+            vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vec![TxOut {
+                value: 50,
+                script_pubkey: vec![0x51],
+            }],
+        );
+        let block0 = Block {
+            header: header0,
+            transactions: vec![coinbase0.clone()],
+        };
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(&block0, 0, &params, &flags, true, None)
+            .expect("connect block 0");
+        chainstate.commit_batch(batch).expect("commit block 0");
+
+        let coinbase0_txid = coinbase0.txid().expect("coinbase txid");
+        let spend_tx = make_tx(
+            vec![TxIn {
+                prevout: OutPoint {
+                    hash: coinbase0_txid,
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vec![TxOut {
+                value: 50,
+                script_pubkey: vec![0x52],
+            }],
+        );
+        let coinbase1 = make_tx(
+            vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vec![TxOut {
+                value: 0,
+                script_pubkey: vec![0x51],
+            }],
+        );
+        let block1 = Block {
+            header: header1,
+            transactions: vec![coinbase1, spend_tx],
+        };
+
+        let err = chainstate
+            .connect_block(&block1, 1, &params, &flags, true, None)
+            .expect_err("premature spend rejected");
+        match err {
+            ChainStateError::Validation(ValidationError::InvalidTransaction(message)) => {
+                assert_eq!(message, "premature spend of coinbase");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn disconnect_restores_utxo_set_for_intrablock_spends() {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");

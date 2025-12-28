@@ -982,3 +982,283 @@ fn regtest_chain_params() -> ChainParams {
         fixed_seeds: &REGTEST_FIXED_SEEDS,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::upgrades::UpgradeIndex;
+
+    fn hash256_to_hex(hash: &Hash256) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::with_capacity(64);
+        for byte in hash.iter().rev() {
+            let _ = write!(out, "{:02x}", byte);
+        }
+        out
+    }
+
+    #[test]
+    fn mainnet_consensus_params_match_cpp() {
+        let params = consensus_params(Network::Mainnet);
+
+        assert_eq!(
+            hash256_to_hex(&params.hash_genesis_block),
+            "00052461a5006c2e3b74ce48992a08695607912d5604c3eb8da25749b0900444"
+        );
+        assert_eq!(params.genesis_time, 1_516_980_000);
+        assert!(params.coinbase_must_be_protected);
+
+        assert_eq!(params.subsidy_slow_start_interval, 5_000);
+        assert_eq!(params.subsidy_halving_interval, 655_350);
+        assert_eq!(params.majority_enforce_block_upgrade, 750);
+        assert_eq!(params.majority_reject_block_outdated, 950);
+        assert_eq!(params.majority_window, 4_000);
+
+        assert_eq!(
+            hash256_to_hex(&params.pow_limit),
+            "0007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(
+            hash256_to_hex(&params.pon_limit),
+            "0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(
+            hash256_to_hex(&params.pon_start_limit),
+            "000bffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(params.pow_allow_min_difficulty_after_height, None);
+
+        assert_eq!(params.digishield_averaging_window, 17);
+        assert_eq!(params.digishield_max_adjust_down, 32);
+        assert_eq!(params.digishield_max_adjust_up, 16);
+        assert_eq!(params.pow_target_spacing, 120);
+
+        assert_eq!(params.pon_target_spacing, 30);
+        assert_eq!(params.pon_difficulty_window, 30);
+        assert_eq!(params.pon_subsidy_reduction_interval, 1_051_200);
+        assert_eq!(params.pon_max_reductions, 20);
+        assert_eq!(params.pon_initial_subsidy, 14);
+
+        assert_eq!(
+            hash256_to_hex(&params.minimum_chain_work),
+            "000000000000000000000000000000000000000000000000000021f5d5da5d73"
+        );
+        assert_eq!(params.zawy_lwma_averaging_window, 60);
+        assert_eq!(params.eh_epoch_fade_length, 11);
+
+        assert_eq!(params.eh_epoch_1.n, 200);
+        assert_eq!(params.eh_epoch_1.k, 9);
+        assert_eq!(params.eh_epoch_1.solution_size, 1344);
+
+        assert_eq!(params.eh_epoch_2.n, 144);
+        assert_eq!(params.eh_epoch_2.k, 5);
+        assert_eq!(params.eh_epoch_2.solution_size, 100);
+
+        assert_eq!(params.eh_epoch_3.n, 125);
+        assert_eq!(params.eh_epoch_3.k, 4);
+        assert_eq!(params.eh_epoch_3.solution_size, 52);
+    }
+
+    #[test]
+    fn mainnet_upgrades_match_cpp() {
+        let params = consensus_params(Network::Mainnet);
+        let upgrades = &params.upgrades;
+
+        assert_eq!(
+            upgrades[UpgradeIndex::BaseSprout.as_usize()].protocol_version,
+            170_002
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::BaseSprout.as_usize()].activation_height,
+            NetworkUpgrade::ALWAYS_ACTIVE
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::BaseSprout.as_usize()].hash_activation_block,
+            None
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::TestDummy.as_usize()].protocol_version,
+            170_002
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::TestDummy.as_usize()].activation_height,
+            NetworkUpgrade::NO_ACTIVATION_HEIGHT
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::TestDummy.as_usize()].hash_activation_block,
+            None
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::Lwma.as_usize()].protocol_version,
+            170_002
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Lwma.as_usize()].activation_height,
+            125_000
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Lwma.as_usize()].hash_activation_block,
+            None
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::Equi144_5.as_usize()].protocol_version,
+            170_002
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Equi144_5.as_usize()].activation_height,
+            125_100
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Equi144_5.as_usize()].hash_activation_block,
+            None
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::Acadia.as_usize()].protocol_version,
+            170_007
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Acadia.as_usize()].activation_height,
+            250_000
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Acadia.as_usize()].hash_activation_block,
+            Some(
+                hash256_from_hex(
+                    "0000001d65fa78f2f6c172a51b5aca59ee1927e51f728647fca21b180becfe59"
+                )
+                .expect("acadia activation hash")
+            )
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::Kamiooka.as_usize()].protocol_version,
+            170_012
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Kamiooka.as_usize()].activation_height,
+            372_500
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Kamiooka.as_usize()].hash_activation_block,
+            Some(
+                hash256_from_hex(
+                    "00000052e2ac144c2872ff641c646e41dac166ac577bc9b0837f501aba19de4a"
+                )
+                .expect("kamiooka activation hash")
+            )
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::Kamata.as_usize()].protocol_version,
+            170_016
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Kamata.as_usize()].activation_height,
+            558_000
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Kamata.as_usize()].hash_activation_block,
+            Some(
+                hash256_from_hex(
+                    "000000a33d38f37f586b843a9c8cf6d1ff1269e6114b34604cabcd14c44268d4"
+                )
+                .expect("kamata activation hash")
+            )
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::Flux.as_usize()].protocol_version,
+            170_017
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Flux.as_usize()].activation_height,
+            835_554
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Flux.as_usize()].hash_activation_block,
+            Some(
+                hash256_from_hex(
+                    "000000ce99aa6765bdaae673cdf41f661ff20a116eb6f2fe0843488d8061f193"
+                )
+                .expect("flux activation hash")
+            )
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::Halving.as_usize()].protocol_version,
+            170_018
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Halving.as_usize()].activation_height,
+            1_076_532
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Halving.as_usize()].hash_activation_block,
+            Some(
+                hash256_from_hex(
+                    "000000111f8643ce24d9753dbc324220877299075a8a6102da61ef4460296325"
+                )
+                .expect("halving activation hash")
+            )
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::P2ShNodes.as_usize()].protocol_version,
+            170_019
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::P2ShNodes.as_usize()].activation_height,
+            1_549_500
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::P2ShNodes.as_usize()].hash_activation_block,
+            Some(
+                hash256_from_hex(
+                    "00000009f9178347f3dea495a089400050c3388e07f9c871fb1ebddcab1f8044"
+                )
+                .expect("p2shnodes activation hash")
+            )
+        );
+
+        assert_eq!(
+            upgrades[UpgradeIndex::Pon.as_usize()].protocol_version,
+            170_020
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Pon.as_usize()].activation_height,
+            2_020_000
+        );
+        assert_eq!(
+            upgrades[UpgradeIndex::Pon.as_usize()].hash_activation_block,
+            None
+        );
+    }
+
+    #[test]
+    fn mainnet_checkpoints_match_cpp() {
+        let params = consensus_params(Network::Mainnet);
+
+        assert_eq!(params.checkpoints.len(), 25);
+        assert_eq!(params.checkpoints[0].height, 0);
+        assert_eq!(
+            hash256_to_hex(&params.checkpoints[0].hash),
+            "00052461a5006c2e3b74ce48992a08695607912d5604c3eb8da25749b0900444"
+        );
+
+        let last = params.checkpoints.last().expect("checkpoint");
+        assert_eq!(last.height, 2_029_000);
+        assert_eq!(
+            hash256_to_hex(&last.hash),
+            "4856dc788a973db4cc537465c9ef80288e1eb065898993d72371b1ee48c248b4"
+        );
+
+        for window in params.checkpoints.windows(2) {
+            assert!(window[0].height < window[1].height);
+        }
+    }
+}
