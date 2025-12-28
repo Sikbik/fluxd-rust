@@ -118,7 +118,7 @@ Type notes:
 ### Indexer endpoints (placeholders)
 
 - `getblockdeltas` (not implemented)
-- `getspentinfo` (not implemented)
+- `getspentinfo`
 - `gettxoutproof` (not implemented)
 - `verifytxoutproof` (not implemented)
 
@@ -283,6 +283,11 @@ Notes:
 - UTXO stats are maintained incrementally in the chainstate `Meta` column under `utxo_stats_v1`.
 - Shielded value pools are maintained incrementally in the chainstate `Meta` column under `value_pools_v1`.
 - `*_zat` fields are provided for exact integer values.
+
+### getspentinfo
+
+- Params: either `{"txid":"...","index":n}` or positional `<txid> <index>`.
+- Result: `{ "txid": "<spending_txid>", "index": <vin>, "height": <spending_height> }`.
 
 ### getnetworkhashps / getnetworksolps / getlocalsolps
 

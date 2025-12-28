@@ -39,7 +39,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - gettxoutproof - Stub
 - gettxoutsetinfo - Partial
 - verifytxoutproof - Stub
-- getspentinfo - Stub
+- getspentinfo - Implemented
 
 ## Mining
 

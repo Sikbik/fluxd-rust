@@ -59,6 +59,16 @@ Allows `getrawtransaction` lookups without scanning blocks.
 
 This is the authoritative UTXO set.
 
+## SpentIndex
+
+- Key: `OutPoint` (txid + vout)
+- Value: `SpentIndexValue`
+  - spending `txid` (32 bytes)
+  - spending `vin` index (u32 LE)
+  - spending `block_height` (u32 LE)
+
+This enables `getspentinfo` without scanning blocks.
+
 ## AddressOutpoint
 
 - Key: `sha256(script_pubkey)` (32 bytes) + `OutPoint` (36 bytes)
@@ -128,7 +138,7 @@ Undo entries are pruned as the chain advances to retain only the most recent
 ## Index lifecycle
 
 Indexes are maintained during block connect. There are no runtime flags to
-disable txindex, address index, or timestamp index in the Rust daemon yet.
+disable txindex, spent index, address index, or timestamp index in the Rust daemon yet.
 For a full rebuild of indexes, perform a fresh sync by clearing the data dir.
 
 Note: `BlockUndo` is also generated during block connect. If undo/reorg support

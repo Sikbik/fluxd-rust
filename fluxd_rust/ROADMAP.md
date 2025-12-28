@@ -11,7 +11,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Current sprint (next 3-5)
 
-- [ ] [P1] Spent index + `getspentinfo` (owner: TBD)
+- [x] [P1] Spent index + `getspentinfo` (owner: TBD)
 - [ ] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
 - [ ] [P1] Header throughput parity with C++ (owner: TBD)
 
@@ -82,7 +82,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Indexes and data services
 
-- [ ] [P1] Spent index (`getspentinfo`) (owner: TBD)
+- [x] [P1] Spent index (`getspentinfo`) (owner: TBD)
 - [ ] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
 - [ ] [P1] Address unspent index (owner: TBD)
 - [x] [P1] UTXO set stats (`gettxoutsetinfo`) (owner: TBD)
@@ -180,7 +180,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | - | `getaddressbalance`<br>`getaddressdeltas`<br>`getaddressutxos`<br>`getaddressmempool`<br>`getaddresstxids`<br>`getspentinfo` |
+| `getspentinfo` | - | `getaddressbalance`<br>`getaddressdeltas`<br>`getaddressutxos`<br>`getaddressmempool`<br>`getaddresstxids` |
 
 ### Network admin
 

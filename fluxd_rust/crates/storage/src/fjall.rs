@@ -5,12 +5,13 @@ use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 
 use crate::{Column, KeyValueStore, PrefixVisitor, StoreError, WriteBatch, WriteOp};
 
-const ALL_COLUMNS: [Column; 17] = [
+const ALL_COLUMNS: [Column; 18] = [
     Column::BlockIndex,
     Column::HeaderIndex,
     Column::HeightIndex,
     Column::BlockHeader,
     Column::TxIndex,
+    Column::SpentIndex,
     Column::Utxo,
     Column::AnchorSprout,
     Column::AnchorSapling,

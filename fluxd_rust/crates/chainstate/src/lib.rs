@@ -8,6 +8,7 @@ pub mod flatfiles;
 pub mod index;
 pub mod metrics;
 mod shielded;
+pub mod spentindex;
 pub mod state;
 pub mod txindex;
 pub mod undo;

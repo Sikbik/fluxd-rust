@@ -45,6 +45,7 @@ use crate::shielded::{
     sapling_root_hash, sapling_tree_from_bytes, sapling_tree_to_bytes, sprout_empty_root_hash,
     sprout_root_hash, sprout_tree_from_bytes, sprout_tree_to_bytes, SaplingTree, SproutTree,
 };
+use crate::spentindex::{SpentIndex, SpentIndexValue};
 use crate::txindex::{TxIndex, TxLocation};
 use crate::undo::{BlockUndo, FluxnodeUndo, SpentOutput};
 use crate::utxo::{outpoint_key_bytes, OutPointKey, UtxoEntry, UtxoSet};
@@ -359,6 +360,7 @@ pub struct ChainState<S> {
     nullifiers_sapling: NullifierSet<Arc<S>>,
     address_index: AddressIndex<Arc<S>>,
     tx_index: TxIndex<Arc<S>>,
+    spent_index: SpentIndex<Arc<S>>,
     index: ChainIndex<S>,
     blocks: FlatFileStore,
     undo: FlatFileStore,
@@ -387,6 +389,7 @@ impl<S: KeyValueStore> ChainState<S> {
             nullifiers_sapling: NullifierSet::new(Arc::clone(&store), Column::NullifierSapling),
             address_index: AddressIndex::new(Arc::clone(&store)),
             tx_index: TxIndex::new(Arc::clone(&store)),
+            spent_index: SpentIndex::new(Arc::clone(&store)),
             index: ChainIndex::new(Arc::clone(&store)),
             store,
             blocks,
@@ -1555,6 +1558,15 @@ impl<S: KeyValueStore> ChainState<S> {
                             }
                         }
                     };
+                    self.spent_index.insert(
+                        &mut batch,
+                        &input.prevout,
+                        SpentIndexValue {
+                            txid,
+                            input_index: input_index as u32,
+                            block_height: height as u32,
+                        },
+                    );
                     utxos_spent = utxos_spent
                         .checked_add(1)
                         .ok_or(ChainStateError::ValueOutOfRange)?;
@@ -2025,6 +2037,7 @@ impl<S: KeyValueStore> ChainState<S> {
                             "block undo outpoint mismatch",
                         ));
                     }
+                    self.spent_index.delete(&mut batch, &spent.outpoint);
                     self.utxos.put(&mut batch, &spent.outpoint, &spent.entry);
                     self.address_index.insert(
                         &mut batch,
@@ -2446,6 +2459,15 @@ impl<S: KeyValueStore> ChainState<S> {
 
     pub fn tx_location(&self, txid: &[u8; 32]) -> Result<Option<TxLocation>, ChainStateError> {
         self.tx_index.get(txid).map_err(ChainStateError::from)
+    }
+
+    pub fn spent_info(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<SpentIndexValue>, ChainStateError> {
+        self.spent_index
+            .get(outpoint)
+            .map_err(ChainStateError::from)
     }
 
     pub fn address_outpoints(
@@ -4341,6 +4363,28 @@ mod tests {
             .expect("seed utxo exists"));
         assert!(!chainstate.utxo_exists(&outpoint1).expect("tx1 utxo exists"));
         assert!(chainstate.utxo_exists(&outpoint2).expect("tx2 utxo exists"));
+        assert_eq!(
+            chainstate
+                .spent_info(&seed_outpoint)
+                .expect("spent index query")
+                .expect("missing spent entry"),
+            SpentIndexValue {
+                txid: tx1id,
+                input_index: 0,
+                block_height: 0
+            }
+        );
+        assert_eq!(
+            chainstate
+                .spent_info(&outpoint1)
+                .expect("spent index query")
+                .expect("missing spent entry"),
+            SpentIndexValue {
+                txid: tx2id,
+                input_index: 0,
+                block_height: 0
+            }
+        );
 
         let batch = chainstate
             .disconnect_block(&block_hash)
@@ -4364,6 +4408,14 @@ mod tests {
         assert!(!chainstate
             .utxo_exists(&outpoint2)
             .expect("tx2 output removed"));
+        assert!(chainstate
+            .spent_info(&seed_outpoint)
+            .expect("spent index query")
+            .is_none());
+        assert!(chainstate
+            .spent_info(&outpoint1)
+            .expect("spent index query")
+            .is_none());
 
         assert!(chainstate
             .tx_location(&tx1id)

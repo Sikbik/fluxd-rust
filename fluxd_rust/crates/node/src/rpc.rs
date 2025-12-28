@@ -510,7 +510,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "verifytxoutproof" => rpc_verifytxoutproof(params),
         "gettxoutsetinfo" => rpc_gettxoutsetinfo(chainstate, params, data_dir),
         "getblockdeltas" => rpc_getblockdeltas(params),
-        "getspentinfo" => rpc_getspentinfo(params),
+        "getspentinfo" => rpc_getspentinfo(chainstate, params),
         "getblocktemplate" => rpc_getblocktemplate(params),
         "getnetworkhashps" => rpc_getnetworkhashps(params),
         "getnetworksolps" => rpc_getnetworksolps(params),
@@ -1180,12 +1180,40 @@ fn rpc_getblockdeltas(params: Vec<Value>) -> Result<Value, RpcError> {
     ))
 }
 
-fn rpc_getspentinfo(params: Vec<Value>) -> Result<Value, RpcError> {
-    let _ = params;
-    Err(RpcError::new(
-        RPC_INTERNAL_ERROR,
-        "getspentinfo is not implemented",
-    ))
+fn rpc_getspentinfo<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
+    let (txid, index) = match params.as_slice() {
+        [Value::Object(map)] => {
+            let txid_value = map
+                .get("txid")
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "getspentinfo missing txid"))?;
+            let index_value = map.get("index").ok_or_else(|| {
+                RpcError::new(RPC_INVALID_PARAMETER, "getspentinfo missing index")
+            })?;
+            (parse_hash(txid_value)?, parse_u32(index_value, "index")?)
+        }
+        [txid_value, index_value] => (parse_hash(txid_value)?, parse_u32(index_value, "index")?),
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "getspentinfo expects {\"txid\": \"...\", \"index\": n}",
+            ))
+        }
+    };
+
+    let outpoint = fluxd_primitives::outpoint::OutPoint { hash: txid, index };
+    let spent = chainstate
+        .spent_info(&outpoint)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Unable to get spent info"))?;
+
+    Ok(json!({
+        "txid": hash256_to_hex(&spent.txid),
+        "index": spent.input_index,
+        "height": spent.block_height,
+    }))
 }
 
 fn rpc_getblocktemplate(params: Vec<Value>) -> Result<Value, RpcError> {
