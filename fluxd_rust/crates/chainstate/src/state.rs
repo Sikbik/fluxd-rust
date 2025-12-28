@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fluxd_consensus::constants::{
-    max_reorg_depth, COINBASE_MATURITY, MIN_BLOCK_VERSION, MIN_PON_BLOCK_VERSION,
+    max_reorg_depth, COINBASE_MATURITY, FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC, MAX_SCRIPT_SIZE,
+    MIN_BLOCK_VERSION, MIN_PON_BLOCK_VERSION,
 };
 use fluxd_consensus::money::MAX_MONEY;
 use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
@@ -16,9 +17,10 @@ use fluxd_fluxnode::storage::{FluxnodeRecord, KeyId};
 use fluxd_primitives::address_to_script_pubkey;
 use fluxd_primitives::block::Block;
 use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
+use fluxd_primitives::hash::hash160;
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
-    FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
+    FluxnodeConfirmTx, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
     TransactionEncodeError,
 };
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
@@ -26,6 +28,12 @@ use rayon::prelude::*;
 
 use crate::address_index::AddressIndex;
 use crate::anchors::{AnchorSet, NullifierSet};
+use crate::blockindex::{BlockIndexEntry, STATUS_HAVE_DATA, STATUS_HAVE_UNDO};
+use crate::filemeta::{
+    block_file_info_key, parse_block_file_info_key, parse_undo_file_info_key, undo_file_info_key,
+    FlatFileInfo, META_BLOCK_FILES_LAST_FILE_KEY, META_BLOCK_FILES_LAST_LEN_KEY,
+    META_UNDO_FILES_LAST_FILE_KEY, META_UNDO_FILES_LAST_LEN_KEY,
+};
 use crate::flatfiles::{FileLocation, FlatFileError, FlatFileStore};
 use crate::index::{status_with_block, status_with_header, ChainIndex, ChainTip, HeaderEntry};
 use crate::metrics::ConnectMetrics;
@@ -42,6 +50,7 @@ use fluxd_pon::validation as pon_validation;
 use fluxd_pow::difficulty::{block_proof, HeaderInfo};
 use fluxd_pow::validation as pow_validation;
 use fluxd_script::interpreter::{verify_script, BLOCK_SCRIPT_VERIFY_FLAGS};
+use fluxd_script::message::verify_signed_message;
 
 struct ScriptCheck {
     tx_index: usize,
@@ -222,6 +231,24 @@ impl UtxoCache {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FlatFileKind {
+    Blocks,
+    Undo,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrackedFlatFile {
+    file_id: u32,
+    info: FlatFileInfo,
+}
+
+#[derive(Default)]
+struct FlatFileMetaCache {
+    blocks: Option<TrackedFlatFile>,
+    undo: Option<TrackedFlatFile>,
+}
+
 struct DifficultyWindow {
     tip_hash: Hash256,
     window: VecDeque<HeaderInfo>,
@@ -331,19 +358,22 @@ pub struct ChainState<S> {
     tx_index: TxIndex<Arc<S>>,
     index: ChainIndex<S>,
     blocks: FlatFileStore,
+    undo: FlatFileStore,
     header_cache: Mutex<HeaderCache>,
     utxo_cache: Mutex<UtxoCache>,
     shielded_cache: Mutex<Option<ShieldedTreesCache>>,
+    file_meta: Mutex<FlatFileMetaCache>,
 }
 
 impl<S: KeyValueStore> ChainState<S> {
-    pub fn new(store: Arc<S>, blocks: FlatFileStore) -> Self {
-        Self::new_with_utxo_cache_capacity(store, blocks, UTXO_CACHE_CAPACITY)
+    pub fn new(store: Arc<S>, blocks: FlatFileStore, undo: FlatFileStore) -> Self {
+        Self::new_with_utxo_cache_capacity(store, blocks, undo, UTXO_CACHE_CAPACITY)
     }
 
     pub fn new_with_utxo_cache_capacity(
         store: Arc<S>,
         blocks: FlatFileStore,
+        undo: FlatFileStore,
         utxo_cache_capacity: usize,
     ) -> Self {
         Self {
@@ -357,9 +387,11 @@ impl<S: KeyValueStore> ChainState<S> {
             index: ChainIndex::new(Arc::clone(&store)),
             store,
             blocks,
+            undo,
             header_cache: Mutex::new(HeaderCache::new(HEADER_CACHE_CAPACITY)),
             utxo_cache: Mutex::new(UtxoCache::new(utxo_cache_capacity)),
             shielded_cache: Mutex::new(None),
+            file_meta: Mutex::new(FlatFileMetaCache::default()),
         }
     }
 
@@ -976,6 +1008,265 @@ impl<S: KeyValueStore> ChainState<S> {
             .map_err(|_| ChainStateError::InvalidHeader("difficulty calculation failed"))
     }
 
+    fn validate_fluxnode_tx(
+        &self,
+        tx: &Transaction,
+        txid: &Hash256,
+        height: i32,
+        params: &ChainParams,
+        created_utxos: &HashMap<OutPointKey, UtxoEntry>,
+        operator_pubkeys: &HashMap<OutPoint, Vec<u8>>,
+    ) -> Result<(), ChainStateError> {
+        let Some(fluxnode) = tx.fluxnode.as_ref() else {
+            return Ok(());
+        };
+
+        let message_hex = hash256_to_hex(txid);
+        let message = message_hex.as_bytes();
+
+        match fluxnode {
+            FluxnodeTx::V5(FluxnodeTxV5::Start(start)) => {
+                if start.collateral == OutPoint::null() {
+                    return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode start has null collateral",
+                    )));
+                }
+                if operator_pubkeys.contains_key(&start.collateral)
+                    || self.fluxnode_exists(&start.collateral)?
+                {
+                    return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode start collateral already registered",
+                    )));
+                }
+
+                let collateral =
+                    self.lookup_fluxnode_collateral(&start.collateral, created_utxos)?;
+                ensure_fluxnode_collateral_mature(collateral.height, height)?;
+                validate_fluxnode_collateral_script(
+                    &collateral.script_pubkey,
+                    height,
+                    &start.collateral_pubkey,
+                    start.sig_time,
+                    params,
+                    None,
+                )?;
+
+                verify_signed_message(&start.collateral_pubkey, &start.sig, message).map_err(
+                    |_| {
+                        ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode start signature invalid",
+                        ))
+                    },
+                )?;
+            }
+            FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => match &start.variant {
+                FluxnodeStartVariantV6::Normal {
+                    collateral,
+                    collateral_pubkey,
+                    sig_time,
+                    sig,
+                    ..
+                } => {
+                    if *collateral == OutPoint::null() {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode start has null collateral",
+                        )));
+                    }
+                    if operator_pubkeys.contains_key(collateral)
+                        || self.fluxnode_exists(collateral)?
+                    {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode start collateral already registered",
+                        )));
+                    }
+
+                    let collateral_entry =
+                        self.lookup_fluxnode_collateral(collateral, created_utxos)?;
+                    ensure_fluxnode_collateral_mature(collateral_entry.height, height)?;
+                    validate_fluxnode_collateral_script(
+                        &collateral_entry.script_pubkey,
+                        height,
+                        collateral_pubkey,
+                        *sig_time,
+                        params,
+                        None,
+                    )?;
+
+                    if script_p2pkh_hash(&collateral_entry.script_pubkey).is_none() {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode normal collateral not p2pkh",
+                        )));
+                    }
+
+                    verify_signed_message(collateral_pubkey, sig, message).map_err(|_| {
+                        ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode start signature invalid",
+                        ))
+                    })?;
+                }
+                FluxnodeStartVariantV6::P2sh {
+                    collateral,
+                    redeem_script,
+                    sig_time,
+                    sig,
+                    ..
+                } => {
+                    if *collateral == OutPoint::null() {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode start has null collateral",
+                        )));
+                    }
+                    if redeem_script.len() > MAX_SCRIPT_SIZE {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode redeem script too large",
+                        )));
+                    }
+                    if operator_pubkeys.contains_key(collateral)
+                        || self.fluxnode_exists(collateral)?
+                    {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode start collateral already registered",
+                        )));
+                    }
+
+                    let pubkeys = parse_multisig_redeem_script(redeem_script).ok_or_else(|| {
+                        ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode redeem script not multisig",
+                        ))
+                    })?;
+
+                    let collateral_entry =
+                        self.lookup_fluxnode_collateral(collateral, created_utxos)?;
+                    ensure_fluxnode_collateral_mature(collateral_entry.height, height)?;
+                    validate_fluxnode_collateral_script(
+                        &collateral_entry.script_pubkey,
+                        height,
+                        &[],
+                        *sig_time,
+                        params,
+                        Some(redeem_script),
+                    )?;
+
+                    if script_p2sh_hash(&collateral_entry.script_pubkey).is_none() {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode p2sh collateral not p2sh",
+                        )));
+                    }
+
+                    let mut ok = false;
+                    for pubkey in pubkeys {
+                        if verify_signed_message(&pubkey, sig, message).is_ok() {
+                            ok = true;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode start signature invalid",
+                        )));
+                    }
+                }
+            },
+            FluxnodeTx::V5(FluxnodeTxV5::Confirm(confirm))
+            | FluxnodeTx::V6(FluxnodeTxV6::Confirm(confirm)) => {
+                if confirm.collateral == OutPoint::null() {
+                    return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode confirm has null collateral",
+                    )));
+                }
+                if confirm.sig.is_empty() || confirm.benchmark_sig.is_empty() {
+                    return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode confirm missing signatures",
+                    )));
+                }
+                if !(1..=3).contains(&confirm.benchmark_tier) {
+                    return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode confirm has invalid benchmarking tier",
+                    )));
+                }
+                if confirm.update_type > 1 {
+                    return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode confirm has invalid update type",
+                    )));
+                }
+
+                let max_ip_len = if confirm.benchmark_sig_time >= 1_647_262_800 {
+                    60
+                } else {
+                    40
+                };
+                if confirm.ip.len() > max_ip_len {
+                    return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode confirm ip too large",
+                    )));
+                }
+
+                let operator_pubkey = if let Some(pubkey) =
+                    operator_pubkeys.get(&confirm.collateral)
+                {
+                    pubkey.clone()
+                } else {
+                    lookup_operator_pubkey(&self.store, &confirm.collateral)?.ok_or_else(|| {
+                        ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode confirm missing start record",
+                        ))
+                    })?
+                };
+
+                let msg = fluxnode_confirm_message(confirm);
+                verify_signed_message(&operator_pubkey, &confirm.sig, &msg).map_err(|_| {
+                    ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode confirm signature invalid",
+                    ))
+                })?;
+
+                let benchmark_key = select_timed_pubkey(
+                    params.fluxnode.benchmarking_public_keys,
+                    confirm.benchmark_sig_time,
+                )
+                .ok_or_else(|| {
+                    ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode benchmark key missing",
+                    ))
+                })?;
+                let benchmark_pubkey = hex_to_bytes(benchmark_key.key).ok_or_else(|| {
+                    ChainStateError::Validation(ValidationError::Fluxnode(
+                        "invalid benchmark pubkey",
+                    ))
+                })?;
+
+                let benchmark_msg = fluxnode_benchmark_message(confirm);
+                verify_signed_message(&benchmark_pubkey, &confirm.benchmark_sig, &benchmark_msg)
+                    .map_err(|_| {
+                        ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode benchmark signature invalid",
+                        ))
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn lookup_fluxnode_collateral(
+        &self,
+        outpoint: &OutPoint,
+        created_utxos: &HashMap<OutPointKey, UtxoEntry>,
+    ) -> Result<UtxoEntry, ChainStateError> {
+        let key = outpoint_key_bytes(outpoint);
+        if let Some(entry) = created_utxos.get(&key) {
+            return Ok(entry.clone());
+        }
+        self.utxo_entry_cached(key)?.ok_or_else(|| {
+            ChainStateError::Validation(ValidationError::Fluxnode("fluxnode collateral not found"))
+        })
+    }
+
+    fn fluxnode_exists(&self, outpoint: &OutPoint) -> Result<bool, ChainStateError> {
+        let key = outpoint_key_bytes(outpoint);
+        Ok(self.store.get(Column::Fluxnode, key.as_bytes())?.is_some())
+    }
+
     pub fn connect_block(
         &self,
         block: &Block,
@@ -1065,9 +1356,18 @@ impl<S: KeyValueStore> ChainState<S> {
         let flux_rebrand_active =
             network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Flux);
         let mut total_fees = 0i64;
+        let mut fluxnode_operator_pubkeys: HashMap<OutPoint, Vec<u8>> = HashMap::new();
         for (index, tx) in block.transactions.iter().enumerate() {
             let is_coinbase = index == 0;
             let txid = tx.txid()?;
+            self.validate_fluxnode_tx(
+                tx,
+                &txid,
+                height,
+                params,
+                &created_utxos,
+                &fluxnode_operator_pubkeys,
+            )?;
             txids.push(txid);
             let tx_value_out = tx_value_out(tx)?;
             let mut tx_value_in = tx_shielded_value_in(tx)?;
@@ -1242,6 +1542,9 @@ impl<S: KeyValueStore> ChainState<S> {
                 undo.fluxnode.push(entry);
             }
             apply_fluxnode_tx(&self.store, &mut batch, tx, height as u32)?;
+            if let Some((collateral, operator_pubkey)) = fluxnode_start_operator_pubkey(tx) {
+                fluxnode_operator_pubkeys.insert(collateral, operator_pubkey);
+            }
 
             if !(tx.join_splits.is_empty() && tx.shielded_spends.is_empty()) {
                 let anchor_start = Instant::now();
@@ -1417,6 +1720,19 @@ impl<S: KeyValueStore> ChainState<S> {
         let flatfile_start = Instant::now();
         let location = self.blocks.append(&block_bytes)?;
         flatfile_time += flatfile_start.elapsed();
+        let block_file_len = location
+            .offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(location.len as u64))
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        self.update_flatfile_meta(
+            &mut batch,
+            FlatFileKind::Blocks,
+            location.file_id,
+            block_file_len,
+            height,
+            block.header.time,
+        )?;
         let block_hash = block.header.hash();
         let mut logical_ts = block.header.time;
         if block.header.prev_block != [0u8; 32] {
@@ -1441,7 +1757,6 @@ impl<S: KeyValueStore> ChainState<S> {
             block_hash.to_vec(),
             logical_ts.to_be_bytes().to_vec(),
         );
-        batch.put(Column::BlockIndex, block_hash.to_vec(), location.encode());
         batch.put(
             Column::BlockHeader,
             block_hash.to_vec(),
@@ -1510,7 +1825,40 @@ impl<S: KeyValueStore> ChainState<S> {
         }
         batch.put(Column::Meta, VALUE_POOLS_KEY, value_pools.encode());
 
-        batch.put(Column::BlockUndo, block_hash.to_vec(), undo.encode());
+        let undo_bytes = undo.encode();
+        let undo_flatfile_start = Instant::now();
+        let undo_location = self.undo.append(&undo_bytes)?;
+        flatfile_time += undo_flatfile_start.elapsed();
+        let undo_file_len = undo_location
+            .offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(undo_location.len as u64))
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        self.update_flatfile_meta(
+            &mut batch,
+            FlatFileKind::Undo,
+            undo_location.file_id,
+            undo_file_len,
+            height,
+            block.header.time,
+        )?;
+
+        batch.put(
+            Column::BlockIndex,
+            block_hash.to_vec(),
+            BlockIndexEntry {
+                block: location,
+                undo: Some(undo_location),
+                tx_count: block.transactions.len() as u32,
+                status: STATUS_HAVE_DATA | STATUS_HAVE_UNDO,
+            }
+            .encode(),
+        );
+        batch.put(
+            Column::BlockUndo,
+            block_hash.to_vec(),
+            undo_location.encode(),
+        );
         self.prune_block_undo(height, &mut batch)?;
 
         if let Some(metrics) = connect_metrics {
@@ -1688,6 +2036,7 @@ impl<S: KeyValueStore> ChainState<S> {
         self.index.clear_height_hash(&mut batch, entry.height);
         self.index.set_best_block(&mut batch, &entry.prev_hash);
         batch.delete(Column::BlockUndo, hash.to_vec());
+        self.clear_block_index_undo(hash, &mut batch)?;
 
         utxo_stats.txouts = utxo_stats
             .txouts
@@ -1753,6 +2102,35 @@ impl<S: KeyValueStore> ChainState<S> {
             self.update_shielded_cache(sprout_bytes, sapling_bytes)?;
         }
         let ops = batch.into_ops();
+        if let Ok(mut meta_cache) = self.file_meta.lock() {
+            for op in &ops {
+                match op {
+                    WriteOp::Put { column, key, value } if *column == Column::Meta => {
+                        if let Some(file_id) = parse_block_file_info_key(key.as_slice()) {
+                            if let Some(info) = FlatFileInfo::decode(value) {
+                                meta_cache.blocks = Some(TrackedFlatFile { file_id, info });
+                            }
+                        } else if let Some(file_id) = parse_undo_file_info_key(key.as_slice()) {
+                            if let Some(info) = FlatFileInfo::decode(value) {
+                                meta_cache.undo = Some(TrackedFlatFile { file_id, info });
+                            }
+                        }
+                    }
+                    WriteOp::Delete { column, key } if *column == Column::Meta => {
+                        if let Some(file_id) = parse_block_file_info_key(key.as_slice()) {
+                            if meta_cache.blocks.map(|tracked| tracked.file_id) == Some(file_id) {
+                                meta_cache.blocks = None;
+                            }
+                        } else if let Some(file_id) = parse_undo_file_info_key(key.as_slice()) {
+                            if meta_cache.undo.map(|tracked| tracked.file_id) == Some(file_id) {
+                                meta_cache.undo = None;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Ok(mut cache) = self.utxo_cache.lock() {
             for op in ops {
                 match op {
@@ -1785,13 +2163,129 @@ impl<S: KeyValueStore> ChainState<S> {
     }
 
     pub fn block_location(&self, hash: &[u8; 32]) -> Result<Option<FileLocation>, ChainStateError> {
+        Ok(self.block_index_entry(hash)?.map(|entry| entry.block))
+    }
+
+    fn block_index_entry(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Option<BlockIndexEntry>, ChainStateError> {
         let bytes = match self.store.get(Column::BlockIndex, hash)? {
             Some(bytes) => bytes,
             None => return Ok(None),
         };
-        FileLocation::decode(&bytes)
+        BlockIndexEntry::decode(&bytes)
             .ok_or(ChainStateError::CorruptIndex("invalid block index entry"))
             .map(Some)
+    }
+
+    fn clear_block_index_undo(
+        &self,
+        hash: &Hash256,
+        batch: &mut WriteBatch,
+    ) -> Result<(), ChainStateError> {
+        let Some(mut entry) = self.block_index_entry(hash)? else {
+            return Ok(());
+        };
+        if entry.undo.is_none() && (entry.status & STATUS_HAVE_UNDO) == 0 {
+            return Ok(());
+        }
+        entry.undo = None;
+        entry.status &= !STATUS_HAVE_UNDO;
+        batch.put(Column::BlockIndex, hash.to_vec(), entry.encode());
+        Ok(())
+    }
+
+    fn flatfile_info_cached(
+        &self,
+        kind: FlatFileKind,
+        file_id: u32,
+    ) -> Result<FlatFileInfo, ChainStateError> {
+        if let Ok(cache) = self.file_meta.lock() {
+            let tracked = match kind {
+                FlatFileKind::Blocks => cache.blocks,
+                FlatFileKind::Undo => cache.undo,
+            };
+            if let Some(tracked) = tracked {
+                if tracked.file_id == file_id {
+                    return Ok(tracked.info);
+                }
+            }
+        }
+
+        let key = match kind {
+            FlatFileKind::Blocks => block_file_info_key(file_id).to_vec(),
+            FlatFileKind::Undo => undo_file_info_key(file_id).to_vec(),
+        };
+        let info = match self.store.get(Column::Meta, &key)? {
+            Some(bytes) => FlatFileInfo::decode(&bytes)
+                .ok_or(ChainStateError::CorruptIndex("invalid flatfile info entry"))?,
+            None => FlatFileInfo::default(),
+        };
+        if let Ok(mut cache) = self.file_meta.lock() {
+            let tracked = TrackedFlatFile { file_id, info };
+            match kind {
+                FlatFileKind::Blocks => cache.blocks = Some(tracked),
+                FlatFileKind::Undo => cache.undo = Some(tracked),
+            }
+        }
+        Ok(info)
+    }
+
+    fn update_flatfile_meta(
+        &self,
+        batch: &mut WriteBatch,
+        kind: FlatFileKind,
+        file_id: u32,
+        file_len: u64,
+        height: i32,
+        time: u32,
+    ) -> Result<(), ChainStateError> {
+        let mut info = self.flatfile_info_cached(kind, file_id)?;
+        if info.blocks == 0 {
+            info.height_first = height;
+            info.time_first = time;
+        }
+        info.blocks = info
+            .blocks
+            .checked_add(1)
+            .ok_or(ChainStateError::ValueOutOfRange)?;
+        info.size = file_len;
+        info.height_last = height;
+        info.time_last = time;
+
+        match kind {
+            FlatFileKind::Blocks => {
+                let info_key = block_file_info_key(file_id);
+                batch.put(Column::Meta, info_key, info.encode());
+                batch.put(
+                    Column::Meta,
+                    META_BLOCK_FILES_LAST_FILE_KEY,
+                    file_id.to_le_bytes().to_vec(),
+                );
+                batch.put(
+                    Column::Meta,
+                    META_BLOCK_FILES_LAST_LEN_KEY,
+                    file_len.to_le_bytes().to_vec(),
+                );
+            }
+            FlatFileKind::Undo => {
+                let info_key = undo_file_info_key(file_id);
+                batch.put(Column::Meta, info_key, info.encode());
+                batch.put(
+                    Column::Meta,
+                    META_UNDO_FILES_LAST_FILE_KEY,
+                    file_id.to_le_bytes().to_vec(),
+                );
+                batch.put(
+                    Column::Meta,
+                    META_UNDO_FILES_LAST_LEN_KEY,
+                    file_len.to_le_bytes().to_vec(),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub fn height_hash(&self, height: i32) -> Result<Option<Hash256>, ChainStateError> {
@@ -1826,6 +2320,14 @@ impl<S: KeyValueStore> ChainState<S> {
             Some(bytes) => bytes,
             None => return Ok(None),
         };
+        if bytes.len() == 16 {
+            let location = FileLocation::decode(&bytes)
+                .ok_or(ChainStateError::CorruptIndex("invalid block undo entry"))?;
+            let undo_bytes = self.undo.read(location)?;
+            return BlockUndo::decode(&undo_bytes)
+                .map(Some)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid block undo entry"));
+        }
         BlockUndo::decode(&bytes)
             .map(Some)
             .map_err(|_| ChainStateError::CorruptIndex("invalid block undo entry"))
@@ -1842,6 +2344,7 @@ impl<S: KeyValueStore> ChainState<S> {
         }
         if let Some(hash) = self.index.height_hash(prune_height)? {
             batch.delete(Column::BlockUndo, hash.to_vec());
+            self.clear_block_index_undo(&hash, batch)?;
         }
         Ok(())
     }
@@ -2616,17 +3119,265 @@ fn check_coinbase_funding(
     Ok(())
 }
 
+fn ensure_fluxnode_collateral_mature(
+    collateral_height: u32,
+    height: i32,
+) -> Result<(), ChainStateError> {
+    if height < 0 {
+        return Ok(());
+    }
+    let age = height
+        .checked_sub(collateral_height as i32)
+        .unwrap_or_default();
+    if age < FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC {
+        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+            "fluxnode collateral too new",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_fluxnode_collateral_script(
+    script_pubkey: &[u8],
+    _height: i32,
+    collateral_pubkey: &[u8],
+    sig_time: u32,
+    params: &ChainParams,
+    redeem_script: Option<&[u8]>,
+) -> Result<(), ChainStateError> {
+    if let Some(script_hash) = script_p2sh_hash(script_pubkey) {
+        if let Some(redeem_script) = redeem_script {
+            if hash160(redeem_script) != script_hash {
+                return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                    "fluxnode p2sh redeem script hash mismatch",
+                )));
+            }
+            return Ok(());
+        }
+
+        let key =
+            select_timed_pubkey(params.fluxnode.p2sh_public_keys, sig_time).ok_or_else(|| {
+                ChainStateError::Validation(ValidationError::Fluxnode(
+                    "fluxnode p2sh signing key missing",
+                ))
+            })?;
+        let expected = hex_to_bytes(key.key).ok_or_else(|| {
+            ChainStateError::Validation(ValidationError::Fluxnode(
+                "invalid fluxnode p2sh signing pubkey",
+            ))
+        })?;
+        if collateral_pubkey != expected.as_slice() {
+            return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                "fluxnode p2sh collateral pubkey mismatch",
+            )));
+        }
+        return Ok(());
+    }
+
+    let Some(pubkey_hash) = script_p2pkh_hash(script_pubkey) else {
+        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+            "fluxnode collateral script unsupported",
+        )));
+    };
+    if collateral_pubkey.is_empty() {
+        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+            "fluxnode collateral pubkey missing",
+        )));
+    }
+    if hash160(collateral_pubkey) != pubkey_hash {
+        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+            "fluxnode collateral pubkey does not match script",
+        )));
+    }
+    Ok(())
+}
+
+fn script_p2pkh_hash(script: &[u8]) -> Option<[u8; 20]> {
+    if script.len() != 25 {
+        return None;
+    }
+    if script[0] != 0x76
+        || script[1] != 0xa9
+        || script[2] != 0x14
+        || script[23] != 0x88
+        || script[24] != 0xac
+    {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&script[3..23]);
+    Some(out)
+}
+
+fn script_p2sh_hash(script: &[u8]) -> Option<[u8; 20]> {
+    if script.len() != 23 {
+        return None;
+    }
+    if script[0] != 0xa9 || script[1] != 0x14 || script[22] != 0x87 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&script[2..22]);
+    Some(out)
+}
+
+fn select_timed_pubkey(
+    keys: &[fluxd_consensus::TimedPublicKey],
+    time: u32,
+) -> Option<fluxd_consensus::TimedPublicKey> {
+    let mut current = *keys.first()?;
+    for key in keys {
+        if key.valid_from <= time && key.valid_from >= current.valid_from {
+            current = *key;
+        }
+    }
+    Some(current)
+}
+
+fn hex_to_bytes(input: &str) -> Option<Vec<u8>> {
+    let mut hex = input.trim();
+    if let Some(stripped) = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")) {
+        hex = stripped;
+    }
+    if hex.len() % 2 == 1 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut iter = hex.as_bytes().iter().copied();
+    while let (Some(high), Some(low)) = (iter.next(), iter.next()) {
+        let high = (high as char).to_digit(16)? as u8;
+        let low = (low as char).to_digit(16)? as u8;
+        bytes.push(high << 4 | low);
+    }
+    Some(bytes)
+}
+
+fn parse_multisig_redeem_script(script: &[u8]) -> Option<Vec<Vec<u8>>> {
+    const OP_1: u8 = 0x51;
+    const OP_16: u8 = 0x60;
+    const OP_CHECKMULTISIG: u8 = 0xae;
+    const OP_PUSHDATA1: u8 = 0x4c;
+    const OP_PUSHDATA2: u8 = 0x4d;
+
+    if script.len() < 1 + 1 + 1 {
+        return None;
+    }
+    let mut cursor = 0usize;
+    let opcode = *script.get(cursor)?;
+    cursor += 1;
+    if !(OP_1..=OP_16).contains(&opcode) {
+        return None;
+    }
+    let required = opcode - OP_1 + 1;
+
+    let mut pubkeys: Vec<Vec<u8>> = Vec::new();
+    while cursor < script.len() {
+        let op = *script.get(cursor)?;
+        if (OP_1..=OP_16).contains(&op) {
+            break;
+        }
+        cursor += 1;
+        let len = if op <= 75 {
+            op as usize
+        } else if op == OP_PUSHDATA1 {
+            let len = *script.get(cursor)? as usize;
+            cursor += 1;
+            len
+        } else if op == OP_PUSHDATA2 {
+            let lo = *script.get(cursor)? as u16;
+            let hi = *script.get(cursor + 1)? as u16;
+            cursor += 2;
+            u16::from_le_bytes([lo as u8, hi as u8]) as usize
+        } else {
+            return None;
+        };
+        if cursor + len > script.len() {
+            return None;
+        }
+        let data = &script[cursor..cursor + len];
+        cursor += len;
+        if matches!(data.len(), 33 | 65) {
+            pubkeys.push(data.to_vec());
+        }
+    }
+
+    let total_opcode = *script.get(cursor)?;
+    cursor += 1;
+    if !(OP_1..=OP_16).contains(&total_opcode) {
+        return None;
+    }
+    let total = total_opcode - OP_1 + 1;
+
+    if cursor >= script.len() || script[cursor] != OP_CHECKMULTISIG {
+        return None;
+    }
+    cursor += 1;
+    if cursor != script.len() {
+        return None;
+    }
+    if total as usize != pubkeys.len() || required > total {
+        return None;
+    }
+    Some(pubkeys)
+}
+
+fn fluxnode_start_operator_pubkey(tx: &Transaction) -> Option<(OutPoint, Vec<u8>)> {
+    let fluxnode = tx.fluxnode.as_ref()?;
+    match fluxnode {
+        FluxnodeTx::V5(FluxnodeTxV5::Start(start)) => {
+            Some((start.collateral.clone(), start.pubkey.clone()))
+        }
+        FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => match &start.variant {
+            FluxnodeStartVariantV6::Normal {
+                collateral, pubkey, ..
+            } => Some((collateral.clone(), pubkey.clone())),
+            FluxnodeStartVariantV6::P2sh {
+                collateral, pubkey, ..
+            } => Some((collateral.clone(), pubkey.clone())),
+        },
+        _ => None,
+    }
+}
+
+fn fluxnode_confirm_message(confirm: &FluxnodeConfirmTx) -> Vec<u8> {
+    let hash_hex = hash256_to_hex(&confirm.collateral.hash);
+    let prefix = &hash_hex[..10];
+    let outpoint = format!("COutPoint({prefix}, {})", confirm.collateral.index);
+    let mut msg = String::new();
+    msg.push_str(&outpoint);
+    msg.push_str(&confirm.collateral.index.to_string());
+    msg.push_str(&confirm.update_type.to_string());
+    msg.push_str(&confirm.sig_time.to_string());
+    msg.into_bytes()
+}
+
+fn fluxnode_benchmark_message(confirm: &FluxnodeConfirmTx) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(confirm.sig.len() + 32 + confirm.ip.len());
+    msg.extend_from_slice(&confirm.sig);
+    msg.extend_from_slice(confirm.benchmark_tier.to_string().as_bytes());
+    msg.extend_from_slice(confirm.benchmark_sig_time.to_string().as_bytes());
+    msg.extend_from_slice(confirm.ip.as_bytes());
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fluxd_consensus::params::{chain_params, Network};
     use fluxd_consensus::rewards::min_dev_fund_amount;
     use fluxd_consensus::upgrades::UpgradeIndex;
+    use fluxd_consensus::TimedPublicKey;
     use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
     use fluxd_primitives::outpoint::OutPoint;
-    use fluxd_primitives::transaction::{Transaction, TxIn, TxOut, SAPLING_VERSION_GROUP_ID};
+    use fluxd_primitives::transaction::{
+        FluxnodeConfirmTx, FluxnodeStartV5, FluxnodeTx, FluxnodeTxV5, Transaction, TxIn, TxOut,
+        FLUXNODE_TX_VERSION, SAPLING_VERSION_GROUP_ID,
+    };
+    use fluxd_script::message::signed_message_hash;
     use fluxd_storage::memory::MemoryStore;
     use fluxd_storage::WriteBatch;
+    use secp256k1::ecdsa::RecoverableSignature;
+    use secp256k1::{Message, Secp256k1, SecretKey};
     use std::sync::Arc;
 
     fn make_tx(vin: Vec<TxIn>, vout: Vec<TxOut>) -> Transaction {
@@ -2647,6 +3398,30 @@ mod tests {
             binding_sig: [0u8; 64],
             fluxnode: None,
         }
+    }
+
+    fn make_test_secret_key(last_byte: u8) -> SecretKey {
+        let mut bytes = [0u8; 32];
+        bytes[31] = last_byte;
+        SecretKey::from_slice(&bytes).expect("secret key")
+    }
+
+    fn encode_compact(sig: &RecoverableSignature, compressed: bool) -> [u8; 65] {
+        let (rec_id, bytes) = sig.serialize_compact();
+        let mut out = [0u8; 65];
+        let header = 27u8 + (rec_id.to_i32() as u8) + if compressed { 4 } else { 0 };
+        out[0] = header;
+        out[1..].copy_from_slice(&bytes);
+        out
+    }
+
+    fn p2pkh_script_for_pubkey(pubkey: &[u8]) -> Vec<u8> {
+        let hash = hash160(pubkey);
+        let mut script = Vec::with_capacity(25);
+        script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        script.extend_from_slice(&hash);
+        script.extend_from_slice(&[0x88, 0xac]);
+        script
     }
 
     #[test]
@@ -2833,7 +3608,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let mut params = chain_params(Network::Regtest);
         let now = current_time_secs() as u32;
@@ -2966,7 +3743,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let mut params = chain_params(Network::Mainnet).consensus;
         let activation_height = 100;
@@ -3003,7 +3782,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let mut params = chain_params(Network::Mainnet).consensus;
         let activation_height = 100;
@@ -3058,7 +3839,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let mut params = chain_params(Network::Mainnet).consensus;
         let activation_height = 100;
@@ -3113,7 +3896,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let mut params = chain_params(Network::Mainnet).consensus;
         let activation_height = 100;
@@ -3185,7 +3970,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let mut consensus = chain_params(Network::Regtest).consensus;
         let pow_bits = fluxd_pow::difficulty::target_to_compact(&consensus.pow_limit);
@@ -3251,7 +4038,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let mut consensus = chain_params(Network::Regtest).consensus;
         consensus.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = 1;
@@ -3322,7 +4111,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let seed_script = vec![0x51];
         let seed_outpoint = OutPoint {
@@ -3489,7 +4280,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let mut params = chain_params(Network::Regtest);
         let header = BlockHeader {
@@ -3532,7 +4325,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
-        let chainstate = ChainState::new(Arc::clone(&store), blocks);
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
 
         let seed_script = vec![0x51];
         let seed_outpoint = OutPoint {
@@ -3679,5 +4474,163 @@ mod tests {
                 sapling: 0
             }
         );
+    }
+
+    #[test]
+    fn fluxnode_start_validates_signature_and_collateral_script() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let collateral_secret = make_test_secret_key(1);
+        let operator_secret = make_test_secret_key(2);
+        let secp = Secp256k1::signing_only();
+        let collateral_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &collateral_secret);
+        let operator_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &operator_secret);
+
+        let collateral_outpoint = OutPoint {
+            hash: [0x11; 32],
+            index: 0,
+        };
+        let entry = UtxoEntry {
+            value: 1000,
+            script_pubkey: p2pkh_script_for_pubkey(&collateral_pubkey.serialize()),
+            height: 0,
+            is_coinbase: false,
+        };
+        store
+            .put(
+                Column::Utxo,
+                outpoint_key_bytes(&collateral_outpoint).as_bytes(),
+                &entry.encode(),
+            )
+            .expect("store utxo");
+
+        let mut tx = Transaction {
+            f_overwintered: false,
+            version: FLUXNODE_TX_VERSION,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: Some(FluxnodeTx::V5(FluxnodeTxV5::Start(FluxnodeStartV5 {
+                collateral: collateral_outpoint.clone(),
+                collateral_pubkey: collateral_pubkey.serialize().to_vec(),
+                pubkey: operator_pubkey.serialize().to_vec(),
+                sig_time: 0,
+                sig: Vec::new(),
+            }))),
+        };
+
+        let txid = tx.txid().expect("txid");
+        let message = hash256_to_hex(&txid);
+        let digest = signed_message_hash(message.as_bytes());
+        let msg = Message::from_digest_slice(&digest).expect("msg");
+        let sig = secp.sign_ecdsa_recoverable(&msg, &collateral_secret);
+        let sig_bytes = encode_compact(&sig, true);
+        if let Some(FluxnodeTx::V5(FluxnodeTxV5::Start(start))) = tx.fluxnode.as_mut() {
+            start.sig = sig_bytes.to_vec();
+        }
+
+        let params = chain_params(Network::Regtest);
+        chainstate
+            .validate_fluxnode_tx(
+                &tx,
+                &txid,
+                FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC,
+                &params,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .expect("start tx valid");
+    }
+
+    #[test]
+    fn fluxnode_confirm_validates_operator_and_benchmark_signatures() {
+        const BENCH_KEYS: [TimedPublicKey; 1] = [TimedPublicKey {
+            key: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            valid_from: 0,
+        }];
+
+        let store = Arc::new(MemoryStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocks = FlatFileStore::new(dir.path(), 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(dir.path(), "undo", 10_000_000).expect("flatfiles");
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let operator_secret = make_test_secret_key(2);
+        let benchmark_secret = make_test_secret_key(1);
+        let secp = Secp256k1::signing_only();
+        let operator_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &operator_secret);
+
+        let collateral_outpoint = OutPoint {
+            hash: [0x22; 32],
+            index: 5,
+        };
+
+        let mut params = chain_params(Network::Regtest);
+        params.fluxnode.benchmarking_public_keys = &BENCH_KEYS;
+
+        let mut tx = Transaction {
+            f_overwintered: false,
+            version: FLUXNODE_TX_VERSION,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: Some(FluxnodeTx::V5(FluxnodeTxV5::Confirm(FluxnodeConfirmTx {
+                collateral: collateral_outpoint.clone(),
+                sig_time: 1,
+                benchmark_tier: 1,
+                benchmark_sig_time: 1,
+                update_type: 0,
+                ip: "127.0.0.1".to_string(),
+                sig: Vec::new(),
+                benchmark_sig: Vec::new(),
+            }))),
+        };
+
+        let confirm = match tx.fluxnode.as_mut() {
+            Some(FluxnodeTx::V5(FluxnodeTxV5::Confirm(confirm))) => confirm,
+            _ => panic!("missing confirm"),
+        };
+        let operator_msg = fluxnode_confirm_message(confirm);
+        let operator_digest = signed_message_hash(&operator_msg);
+        let operator_msg = Message::from_digest_slice(&operator_digest).expect("msg");
+        let sig = secp.sign_ecdsa_recoverable(&operator_msg, &operator_secret);
+        confirm.sig = encode_compact(&sig, true).to_vec();
+
+        let benchmark_msg = fluxnode_benchmark_message(confirm);
+        let benchmark_digest = signed_message_hash(&benchmark_msg);
+        let benchmark_msg = Message::from_digest_slice(&benchmark_digest).expect("msg");
+        let sig = secp.sign_ecdsa_recoverable(&benchmark_msg, &benchmark_secret);
+        confirm.benchmark_sig = encode_compact(&sig, true).to_vec();
+
+        let txid = tx.txid().expect("txid");
+        let mut operator_pubkeys = HashMap::new();
+        operator_pubkeys.insert(collateral_outpoint, operator_pubkey.serialize().to_vec());
+        chainstate
+            .validate_fluxnode_tx(&tx, &txid, 100, &params, &HashMap::new(), &operator_pubkeys)
+            .expect("confirm valid");
     }
 }

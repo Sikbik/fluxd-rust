@@ -61,6 +61,7 @@ impl From<std::io::Error> for FlatFileError {
 
 pub struct FlatFileStore {
     dir: PathBuf,
+    prefix: String,
     max_file_size: u64,
     state: Mutex<FlatFileState>,
 }
@@ -73,11 +74,21 @@ struct FlatFileState {
 
 impl FlatFileStore {
     pub fn new(dir: impl Into<PathBuf>, max_file_size: u64) -> Result<Self, FlatFileError> {
+        Self::new_with_prefix(dir, "data", max_file_size)
+    }
+
+    pub fn new_with_prefix(
+        dir: impl Into<PathBuf>,
+        prefix: impl Into<String>,
+        max_file_size: u64,
+    ) -> Result<Self, FlatFileError> {
         let dir = dir.into();
+        let prefix = prefix.into();
         std::fs::create_dir_all(&dir)?;
-        let (current_file, current_len) = Self::locate_active_file(&dir, max_file_size)?;
+        let (current_file, current_len) = Self::locate_active_file(&dir, &prefix, max_file_size)?;
         Ok(Self {
             dir,
+            prefix,
             max_file_size,
             state: Mutex::new(FlatFileState {
                 current_file,
@@ -127,14 +138,18 @@ impl FlatFileStore {
     }
 
     fn file_path(&self, file_id: u32) -> PathBuf {
-        self.dir.join(format!("data{file_id:05}.dat"))
+        self.dir.join(format!("{}{file_id:05}.dat", self.prefix))
     }
 
-    fn locate_active_file(dir: &Path, max_file_size: u64) -> Result<(u32, u64), FlatFileError> {
+    fn locate_active_file(
+        dir: &Path,
+        prefix: &str,
+        max_file_size: u64,
+    ) -> Result<(u32, u64), FlatFileError> {
         let mut file_id = 0u32;
         let mut last_existing: Option<(u32, u64)> = None;
         loop {
-            let path = dir.join(format!("data{file_id:05}.dat"));
+            let path = dir.join(format!("{prefix}{file_id:05}.dat"));
             if !path.exists() {
                 break;
             }

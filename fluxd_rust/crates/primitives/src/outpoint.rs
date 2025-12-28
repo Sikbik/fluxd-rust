@@ -4,7 +4,7 @@ use fluxd_consensus::Hash256;
 
 use crate::encoding::{Decodable, DecodeError, Decoder, Encodable, Encoder};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct OutPoint {
     pub hash: Hash256,
     pub index: u32,

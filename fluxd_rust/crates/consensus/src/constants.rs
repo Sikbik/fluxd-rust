@@ -38,6 +38,8 @@ pub const MAX_TX_SIZE_BEFORE_SAPLING: u32 = 100_000;
 pub const MAX_TX_SIZE_AFTER_SAPLING: u32 = MAX_BLOCK_SIZE;
 /// Coinbase transaction outputs can only be spent after this number of new blocks.
 pub const COINBASE_MATURITY: i32 = 100;
+/// Minimum confirmations required for fluxnode collateral UTXOs.
+pub const FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC: i32 = 100;
 /// The minimum value which is invalid for expiry height.
 pub const TX_EXPIRY_HEIGHT_THRESHOLD: u32 = 500_000_000;
 
@@ -48,3 +50,11 @@ pub const STANDARD_LOCKTIME_VERIFY_FLAGS: u32 = LOCKTIME_MEDIAN_TIME_PAST;
 
 /// Current network protocol version for P2P messages.
 pub const PROTOCOL_VERSION: i32 = 170_020;
+
+/// Message magic used for `SignMessage`/`VerifyMessage` style signatures.
+///
+/// This matches the legacy constant in the C++ daemon (`strMessageMagic`).
+pub const SIGNED_MESSAGE_MAGIC: &str = "Zelcash Signed Message:\n";
+
+/// Maximum script size (consensus).
+pub const MAX_SCRIPT_SIZE: usize = 10_000;

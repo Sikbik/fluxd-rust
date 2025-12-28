@@ -9,6 +9,9 @@ publish = false
 fluxd-consensus = { path = "../consensus" }
 fluxd-primitives = { path = "../primitives" }
 blake2b_simd = "1"
-secp256k1 = "0.29"
+secp256k1 = { version = "0.29", features = ["recovery"] }
 ripemd = "0.1"
 sha1 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

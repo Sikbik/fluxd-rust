@@ -421,9 +421,12 @@ async fn run() -> Result<(), String> {
 
     let blocks = FlatFileStore::new(&blocks_path, DEFAULT_MAX_FLATFILE_SIZE)
         .map_err(|err| err.to_string())?;
+    let undo = FlatFileStore::new_with_prefix(&blocks_path, "undo", DEFAULT_MAX_FLATFILE_SIZE)
+        .map_err(|err| err.to_string())?;
     let chainstate = Arc::new(ChainState::new_with_utxo_cache_capacity(
         Arc::clone(&store),
         blocks,
+        undo,
         config.utxo_cache_entries,
     ));
     let net_totals = Arc::new(NetTotals::default());
