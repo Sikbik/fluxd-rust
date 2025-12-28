@@ -246,6 +246,23 @@ pub fn validate_block(
     Ok(())
 }
 
+pub fn validate_mempool_transaction(
+    tx: &Transaction,
+    height: i32,
+    block_time: i64,
+    params: &ConsensusParams,
+    flags: &ValidationFlags,
+) -> Result<(), ValidationError> {
+    if !is_final_tx(tx, height, block_time) {
+        return Err(ValidationError::InvalidTransaction(
+            "transaction is not final",
+        ));
+    }
+    let branch_id = current_epoch_branch_id(height, &params.upgrades);
+    validate_transaction(tx, false, height, params, branch_id, flags)?;
+    Ok(())
+}
+
 fn validate_header(
     block: &Block,
     height: i32,

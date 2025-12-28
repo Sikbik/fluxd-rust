@@ -1,4 +1,5 @@
 mod dashboard;
+mod mempool;
 mod p2p;
 mod peer_book;
 mod rpc;
@@ -483,8 +484,25 @@ async fn run() -> Result<(), String> {
     let rpc_addr = config.rpc_addr.unwrap_or_else(|| default_rpc_addr(network));
     let rpc_auth =
         rpc::load_or_create_auth(config.rpc_user.clone(), config.rpc_pass.clone(), data_dir)?;
+
+    if config.fetch_params {
+        fetch_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
+    }
+    let shielded_params =
+        load_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
+    let validation_metrics = Arc::new(ValidationMetrics::default());
+    let connect_metrics = Arc::new(ConnectMetrics::default());
+    let write_lock = Arc::new(Mutex::new(()));
+    let flags = validation_flags(
+        Arc::new(shielded_params),
+        config.check_script,
+        Some(Arc::clone(&validation_metrics)),
+    );
+    let mempool = Arc::new(Mutex::new(mempool::Mempool::default()));
     {
         let chainstate = Arc::clone(&chainstate);
+        let mempool = Arc::clone(&mempool);
+        let mempool_flags = flags.clone();
         let params = params.as_ref().clone();
         let data_dir = data_dir.clone();
         let net_totals = Arc::clone(&net_totals);
@@ -500,6 +518,8 @@ async fn run() -> Result<(), String> {
                     rpc_addr,
                     rpc_auth,
                     chainstate,
+                    mempool,
+                    mempool_flags,
                     params,
                     data_dir,
                     net_totals,
@@ -513,20 +533,6 @@ async fn run() -> Result<(), String> {
             });
         });
     }
-
-    if config.fetch_params {
-        fetch_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
-    }
-    let shielded_params =
-        load_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
-    let validation_metrics = Arc::new(ValidationMetrics::default());
-    let connect_metrics = Arc::new(ConnectMetrics::default());
-    let write_lock = Arc::new(Mutex::new(()));
-    let flags = validation_flags(
-        Arc::new(shielded_params),
-        config.check_script,
-        Some(Arc::clone(&validation_metrics)),
-    );
     let verify_settings = resolve_verify_settings(
         &config,
         getdata_batch,

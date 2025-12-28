@@ -13,7 +13,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 - [x] [P1] Spent index + `getspentinfo` (owner: TBD)
 - [x] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
-- [ ] [P1] Address mempool deltas + `getaddressmempool` (owner: TBD)
+- [x] [P1] Address mempool deltas + `getaddressmempool` (owner: TBD)
 - [ ] [P1] Header throughput parity with C++ (owner: TBD)
 
 ## Completed (core)
@@ -107,7 +107,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P1] Mempool persistence + eviction policy parity (owner: TBD)
 - [ ] [P1] Fee estimator persistence (owner: TBD)
 - [ ] [P1] Standardness policy parity (mempool accept rules) (owner: TBD)
-- [ ] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
+- [x] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
 - [ ] [P1] `getblocktemplate`, `getmininginfo`, `submitblock` (owner: TBD)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
 
@@ -157,13 +157,13 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `gettxout` | `getrawtransaction` (chain only) | `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`sendrawtransaction`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`createmultisig`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`estimatefee`<br>`estimatepriority`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`prioritisetransaction` |
+| `gettxout`<br>`getrawtransaction` | `sendrawtransaction` (local-only; relay TBD) | `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`createmultisig`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`estimatefee`<br>`estimatepriority`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`prioritisetransaction` |
 
 ### Mempool and relay
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | - | `getmempoolinfo`<br>`getrawmempool` |
+| `getmempoolinfo`<br>`getrawmempool` | - | - |
 
 ### Mining
 
@@ -181,7 +181,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getspentinfo` | - | `getaddressbalance`<br>`getaddressdeltas`<br>`getaddressutxos`<br>`getaddressmempool`<br>`getaddresstxids` |
+| `getspentinfo`<br>`getaddressbalance`<br>`getaddressdeltas`<br>`getaddressutxos`<br>`getaddressmempool`<br>`getaddresstxids` | - | - |
 
 ### Network admin
 

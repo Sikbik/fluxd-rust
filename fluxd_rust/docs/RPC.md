@@ -94,13 +94,14 @@ Type notes:
 ### Transactions and UTXO
 
 - `getrawtransaction <txid> [verbose]`
+- `sendrawtransaction <hexstring> [allowhighfees]`
 - `gettxout <txid> <vout> [include_mempool]`
 - `gettxoutsetinfo`
 
-### Mining and mempool (placeholders)
+### Mining and mempool
 
-- `getmempoolinfo` (not implemented)
-- `getrawmempool` (not implemented)
+- `getmempoolinfo`
+- `getrawmempool [verbose]`
 - `getblocktemplate` (not implemented)
 - `getnetworkhashps` (returns 0.0)
 - `getnetworksolps` (returns 0.0)
@@ -123,7 +124,7 @@ Type notes:
 - `getaddressbalance`
 - `getaddressdeltas`
 - `getaddresstxids`
-- `getaddressmempool` (not implemented)
+- `getaddressmempool`
 - `gettxoutproof` (not implemented)
 - `verifytxoutproof` (not implemented)
 
@@ -258,17 +259,31 @@ Notes:
     - `blockhash`, `confirmations`, `time`, `blocktime`, `height` if known
 
 Notes:
-- Mempool lookup is not implemented; only confirmed txs are returned.
+- Mempool lookup is supported; confirmed transactions include `blockhash`/`confirmations` fields.
+
+### sendrawtransaction
+
+- Params:
+  - `hexstring` (string)
+  - `allowhighfees` (boolean, optional; currently ignored)
+- Result: transaction id hex string.
+
+Notes:
+- Inserts into the local in-memory mempool; P2P relay is not implemented yet.
+- Only accepts transactions spending confirmed UTXOs (no unconfirmed parent/ancestor tracking yet).
 
 ### gettxout
 
 - Params:
   - `txid` (hex string)
   - `vout` (number)
-  - `include_mempool` (boolean or numeric, default true; currently ignored)
+  - `include_mempool` (boolean or numeric, default true)
 - Result:
   - `null` if the output is spent.
   - Otherwise: `bestblock`, `confirmations`, `value`, `scriptPubKey`, `coinbase`.
+
+Notes:
+- If `include_mempool=true`, returns `null` when the output is spent by a mempool transaction.
 
 ### gettxoutsetinfo
 

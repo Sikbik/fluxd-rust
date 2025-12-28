@@ -2711,6 +2711,18 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(self.store.get(Column::FluxnodeKey, &key.0)?)
     }
 
+    pub fn validate_fluxnode_tx_for_mempool(
+        &self,
+        tx: &Transaction,
+        txid: &Hash256,
+        height: i32,
+        params: &ChainParams,
+    ) -> Result<(), ChainStateError> {
+        let created_utxos = HashMap::new();
+        let operator_pubkeys = HashMap::new();
+        self.validate_fluxnode_tx(tx, txid, height, params, &created_utxos, &operator_pubkeys)
+    }
+
     fn sprout_anchor_tree(
         &self,
         anchor: &fluxd_consensus::Hash256,
@@ -2727,7 +2739,17 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(Some(tree))
     }
 
-    fn sapling_anchor_exists(
+    pub fn sprout_anchor_exists(
+        &self,
+        anchor: &fluxd_consensus::Hash256,
+    ) -> Result<bool, ChainStateError> {
+        if *anchor == sprout_empty_root_hash() {
+            return Ok(true);
+        }
+        Ok(self.anchors_sprout.contains(anchor)?)
+    }
+
+    pub fn sapling_anchor_exists(
         &self,
         anchor: &fluxd_consensus::Hash256,
     ) -> Result<bool, ChainStateError> {
@@ -2735,6 +2757,20 @@ impl<S: KeyValueStore> ChainState<S> {
             return Ok(true);
         }
         Ok(self.anchors_sapling.contains(anchor)?)
+    }
+
+    pub fn sprout_nullifier_spent(
+        &self,
+        nullifier: &fluxd_consensus::Hash256,
+    ) -> Result<bool, ChainStateError> {
+        Ok(self.nullifiers_sprout.contains(nullifier)?)
+    }
+
+    pub fn sapling_nullifier_spent(
+        &self,
+        nullifier: &fluxd_consensus::Hash256,
+    ) -> Result<bool, ChainStateError> {
+        Ok(self.nullifiers_sapling.contains(nullifier)?)
     }
 }
 

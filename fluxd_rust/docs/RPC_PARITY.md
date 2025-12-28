@@ -33,8 +33,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Mempool and UTXO
 
-- getmempoolinfo - Stub
-- getrawmempool - Stub
+- getmempoolinfo - Implemented
+- getrawmempool - Implemented
 - gettxout - Implemented
 - gettxoutproof - Stub
 - gettxoutsetinfo - Partial
@@ -64,9 +64,9 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - createrawtransaction - Missing
 - decoderawtransaction - Missing
 - decodescript - Missing
-- getrawtransaction - Implemented (chain only)
+- getrawtransaction - Implemented (chain + mempool)
 - fundrawtransaction - Missing
-- sendrawtransaction - Missing
+- sendrawtransaction - Partial (local-only; relay TBD)
 - createmultisig - Missing
 - estimatefee - Missing
 - estimatepriority - Missing
@@ -87,7 +87,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getaddressbalance - Implemented
 - getaddressdeltas - Implemented
 - getaddressutxos - Implemented
-- getaddressmempool - Stub
+- getaddressmempool - Implemented
 
 ## Node control
 
