@@ -132,7 +132,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Standardness policy parity (mempool accept rules) (owner: TBD)
 - [x] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
 - [x] [P1] Basic P2P tx relay (inv/getdata/tx + `mempool`) (owner: TBD)
-- [ ] [P1] `getblocktemplate`, `getmininginfo`, `submitblock` (owner: TBD)
+- [x] [P1] `getmininginfo`, `submitblock` (owner: TBD)
+- [ ] [P1] `getblocktemplate` (block assembly + deterministic payouts) (owner: TBD)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
 
 ## Wallet
@@ -193,7 +194,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | `getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps` | `getblocktemplate`<br>`getmininginfo`<br>`submitblock` |
+| - | `getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps`<br>`getmininginfo`<br>`submitblock` | `getblocktemplate` |
 
 ### Fluxnode
 

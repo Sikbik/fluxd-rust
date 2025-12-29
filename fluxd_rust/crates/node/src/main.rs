@@ -833,6 +833,7 @@ async fn run() -> Result<(), String> {
     let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
     {
         let chainstate = Arc::clone(&chainstate);
+        let write_lock = Arc::clone(&write_lock);
         let mempool = Arc::clone(&mempool);
         let mempool_policy = Arc::clone(&mempool_policy);
         let mempool_metrics = Arc::clone(&mempool_metrics);
@@ -855,6 +856,7 @@ async fn run() -> Result<(), String> {
                     rpc_addr,
                     rpc_auth,
                     chainstate,
+                    write_lock,
                     mempool,
                     mempool_policy,
                     mempool_metrics,
@@ -5056,12 +5058,35 @@ fn connect_pending<S: KeyValueStore>(
             metrics.record_verify(1, verify_start.elapsed());
 
             let commit_start = Instant::now();
-            let _guard = write_lock
-                .lock()
-                .map_err(|_| "write lock poisoned".to_string())?;
-            chainstate
-                .commit_batch(batch)
-                .map_err(|err| err.to_string())?;
+            let should_reorg = {
+                let _guard = write_lock
+                    .lock()
+                    .map_err(|_| "write lock poisoned".to_string())?;
+                let tip = chainstate.best_block().map_err(|err| err.to_string())?;
+                if let Some(tip) = tip {
+                    if tip.hash == hash {
+                        false
+                    } else if tip.hash != verified_block.block.header.prev_block {
+                        true
+                    } else {
+                        chainstate
+                            .commit_batch(batch)
+                            .map_err(|err| err.to_string())?;
+                        false
+                    }
+                } else {
+                    true
+                }
+            };
+            if should_reorg {
+                eprintln!(
+                    "block commit tip moved at height {} ({}); attempting reorg",
+                    verified_block.height,
+                    hash256_to_hex(&hash)
+                );
+                reorg_to_best_header(chainstate, write_lock)?;
+                return Ok(());
+            }
             metrics.record_commit(1, commit_start.elapsed());
             purge_mempool_for_connected_block(
                 mempool,

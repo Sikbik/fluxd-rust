@@ -107,7 +107,9 @@ Type notes:
 
 - `getmempoolinfo`
 - `getrawmempool [verbose]`
+- `getmininginfo` (partial; rate fields return 0.0)
 - `getblocktemplate` (not implemented)
+- `submitblock <hexdata>` (partial)
 - `getnetworkhashps` (returns 0.0)
 - `getnetworksolps` (returns 0.0)
 - `getlocalsolps` (returns 0.0)

@@ -27,6 +27,7 @@ use fluxd_consensus::upgrades::{
 use fluxd_consensus::Hash256;
 use fluxd_fluxnode::storage::FluxnodeRecord;
 use fluxd_pow::difficulty::compact_to_u256;
+use fluxd_primitives::block::Block;
 use fluxd_primitives::transaction::Transaction;
 use fluxd_primitives::{address_to_script_pubkey, script_pubkey_to_address, AddressError};
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
@@ -84,7 +85,9 @@ const RPC_METHODS: &[&str] = &[
     "getaddressdeltas",
     "getaddresstxids",
     "getaddressmempool",
+    "getmininginfo",
     "getblocktemplate",
+    "submitblock",
     "getnetworkhashps",
     "getnetworksolps",
     "getlocalsolps",
@@ -145,6 +148,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     addr: SocketAddr,
     auth: RpcAuth,
     chainstate: Arc<ChainState<S>>,
+    write_lock: Arc<Mutex<()>>,
     mempool: Arc<Mutex<Mempool>>,
     mempool_policy: Arc<MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
@@ -171,6 +175,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
             .map_err(|err| format!("rpc accept failed: {err}"))?;
         let auth = Arc::clone(&auth);
         let chainstate = Arc::clone(&chainstate);
+        let write_lock = Arc::clone(&write_lock);
         let mempool = Arc::clone(&mempool);
         let mempool_policy = Arc::clone(&mempool_policy);
         let mempool_metrics = Arc::clone(&mempool_metrics);
@@ -188,6 +193,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 stream,
                 auth,
                 chainstate,
+                write_lock,
                 mempool,
                 mempool_policy,
                 mempool_metrics,
@@ -214,6 +220,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     mut stream: tokio::net::TcpStream,
     auth: Arc<RpcAuth>,
     chainstate: Arc<ChainState<S>>,
+    write_lock: Arc<Mutex<()>>,
     mempool: Arc<Mutex<Mempool>>,
     mempool_policy: Arc<MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
@@ -269,6 +276,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
             method,
             &request,
             chainstate.as_ref(),
+            write_lock.as_ref(),
             mempool.as_ref(),
             mempool_policy.as_ref(),
             mempool_metrics.as_ref(),
@@ -297,6 +305,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     let rpc_response = match handle_rpc_request(
         &request.body,
         chainstate.as_ref(),
+        write_lock.as_ref(),
         mempool.as_ref(),
         mempool_policy.as_ref(),
         mempool_metrics.as_ref(),
@@ -327,6 +336,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     method: &str,
     request: &HttpRequest,
     chainstate: &ChainState<S>,
+    write_lock: &Mutex<()>,
     mempool: &Mutex<Mempool>,
     mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
@@ -351,6 +361,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
         method,
         params,
         chainstate,
+        write_lock,
         mempool,
         mempool_policy,
         mempool_metrics,
@@ -369,6 +380,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
 fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     body: &[u8],
     chainstate: &ChainState<S>,
+    write_lock: &Mutex<()>,
     mempool: &Mutex<Mempool>,
     mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
@@ -418,6 +430,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         method,
         params,
         chainstate,
+        write_lock,
         mempool,
         mempool_policy,
         mempool_metrics,
@@ -565,6 +578,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     method: &str,
     params: Vec<Value>,
     chainstate: &ChainState<S>,
+    write_lock: &Mutex<()>,
     mempool: &Mutex<Mempool>,
     mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
@@ -627,7 +641,11 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getaddressdeltas" => rpc_getaddressdeltas(chainstate, params, chain_params),
         "getaddresstxids" => rpc_getaddresstxids(chainstate, params, chain_params),
         "getaddressmempool" => rpc_getaddressmempool(chainstate, mempool, params, chain_params),
+        "getmininginfo" => rpc_getmininginfo(chainstate, mempool, params, chain_params),
         "getblocktemplate" => rpc_getblocktemplate(params),
+        "submitblock" => {
+            rpc_submitblock(chainstate, write_lock, params, chain_params, mempool_flags)
+        }
         "getnetworkhashps" => rpc_getnetworkhashps(params),
         "getnetworksolps" => rpc_getnetworksolps(params),
         "getlocalsolps" => rpc_getlocalsolps(params),
@@ -2079,8 +2097,148 @@ fn rpc_getblocktemplate(params: Vec<Value>) -> Result<Value, RpcError> {
     let _ = params;
     Err(RpcError::new(
         RPC_INTERNAL_ERROR,
-        "getblocktemplate is not implemented",
+        "getblocktemplate is not implemented (block assembly + deterministic payouts pending)",
     ))
+}
+
+fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+
+    let best_block = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+
+    let best_header = chainstate
+        .best_header()
+        .map_err(map_internal)?
+        .map(|tip| tip.hash);
+    let difficulty = match best_header {
+        Some(hash) => {
+            let entry = chainstate
+                .header_entry(&hash)
+                .map_err(map_internal)?
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing header entry"))?;
+            difficulty_from_bits(entry.bits, chain_params).unwrap_or(0.0)
+        }
+        None => 0.0,
+    };
+
+    let pooledtx = mempool
+        .lock()
+        .map_err(|_| map_internal("mempool lock poisoned"))?
+        .size();
+
+    Ok(json!({
+        "blocks": best_block,
+        "currentblocksize": 0,
+        "currentblocktx": 0,
+        "difficulty": difficulty,
+        "errors": "",
+        "generate": false,
+        "genproclimit": -1,
+        "localsolps": 0.0,
+        "networksolps": 0.0,
+        "networkhashps": 0.0,
+        "pooledtx": pooledtx,
+        "testnet": chain_params.network != Network::Mainnet,
+        "chain": network_name(chain_params.network),
+        "ponminter": false,
+    }))
+}
+
+fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    write_lock: &Mutex<()>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    flags: &ValidationFlags,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "submitblock expects 1 or 2 parameters",
+        ));
+    }
+    let hex = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "block hex must be a string"))?;
+    let bytes = bytes_from_hex(hex)
+        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "Block decode failed"))?;
+    let block = Block::consensus_decode(&bytes)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "Block decode failed"))?;
+    let hash = block.header.hash();
+
+    if let Some(entry) = chainstate.header_entry(&hash).map_err(map_internal)? {
+        if entry.has_block() {
+            return Ok(Value::String("duplicate".to_string()));
+        }
+    }
+
+    let prev_hash = block.header.prev_block;
+    let best = chainstate.best_block().map_err(map_internal)?;
+    if let Some(tip) = best.as_ref() {
+        if tip.hash == hash {
+            return Ok(Value::String("duplicate".to_string()));
+        }
+        if tip.hash != prev_hash {
+            return Ok(Value::String("inconclusive".to_string()));
+        }
+    } else if !(prev_hash == [0u8; 32] && hash == chain_params.consensus.hash_genesis_block) {
+        return Ok(Value::String("inconclusive".to_string()));
+    }
+
+    let height = if prev_hash == [0u8; 32] && hash == chain_params.consensus.hash_genesis_block {
+        0
+    } else {
+        best.as_ref()
+            .map(|tip| tip.height + 1)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing best block"))?
+    };
+
+    let batch = match chainstate.connect_block(
+        &block,
+        height,
+        chain_params,
+        flags,
+        false,
+        None,
+        None,
+        Some(bytes.as_slice()),
+    ) {
+        Ok(batch) => batch,
+        Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(
+            "block does not extend best block tip",
+        ))
+        | Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(
+            "block height does not match header index",
+        )) => return Ok(Value::String("inconclusive".to_string())),
+        Err(fluxd_chainstate::state::ChainStateError::Validation(err)) => {
+            return Ok(Value::String(err.to_string()))
+        }
+        Err(err) => return Err(map_internal(err.to_string())),
+    };
+
+    let _guard = write_lock
+        .lock()
+        .map_err(|_| map_internal("write lock poisoned"))?;
+    let current_tip = chainstate.best_block().map_err(map_internal)?;
+    if let Some(tip) = current_tip {
+        if tip.hash == hash {
+            return Ok(Value::String("duplicate".to_string()));
+        }
+        if tip.hash != prev_hash {
+            return Ok(Value::String("inconclusive".to_string()));
+        }
+    }
+    chainstate.commit_batch(batch).map_err(map_internal)?;
+    Ok(Value::Null)
 }
 
 fn rpc_getfluxnodecount<S: fluxd_storage::KeyValueStore>(

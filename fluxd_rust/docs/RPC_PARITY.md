@@ -46,7 +46,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getblocksubsidy - Implemented
 - getblocktemplate - Stub
 - getlocalsolps - Stub (returns 0.0)
-- getmininginfo - Missing
+- getmininginfo - Partial (rates and mining fields are placeholders)
 - getnetworkhashps - Stub (returns 0.0)
 - getnetworksolps - Stub (returns 0.0)
 
@@ -92,7 +92,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Node control
 
 - sendfrom - Missing
-- submitblock - Missing
+- submitblock - Partial (accepts blocks; return codes are simplified)
 - zcrawjoinsplit - Missing
 - zcrawreceive - Missing
 - prioritisetransaction - Missing
