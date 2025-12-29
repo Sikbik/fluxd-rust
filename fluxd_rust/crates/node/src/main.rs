@@ -60,14 +60,20 @@ const DEFAULT_MAX_FLATFILE_SIZE: u64 = 128 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 8;
 const DEFAULT_GETDATA_BATCH: usize = 128;
-const DEFAULT_BLOCK_PEERS: usize = 4;
+const DEFAULT_BLOCK_PEERS: usize = 3;
 const DEFAULT_HEADER_PEERS: usize = 4;
 const DEFAULT_HEADER_LEAD: i32 = 20000;
-const DEFAULT_INFLIGHT_PER_PEER: usize = 2;
+const DEFAULT_INFLIGHT_PER_PEER: usize = 1;
 const DEFAULT_TX_PEERS: usize = 2;
 const DEFAULT_MEMPOOL_MAX_MB: u64 = 300;
 const DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS: u64 = 60;
 const DEFAULT_UTXO_CACHE_ENTRIES: usize = 200_000;
+const DEFAULT_DB_CACHE_MB: u64 = 256;
+const DEFAULT_DB_WRITE_BUFFER_MB: u64 = 2048;
+const DEFAULT_DB_JOURNAL_MB: u64 = 2048;
+const DEFAULT_DB_MEMTABLE_MB: u64 = 64;
+const DEFAULT_DB_FLUSH_WORKERS: usize = 2;
+const DEFAULT_DB_COMPACTION_WORKERS: usize = 4;
 const READ_TIMEOUT_SECS: u64 = 120;
 const READ_TIMEOUT_RETRIES: usize = 3;
 const BLOCK_READ_TIMEOUT_SECS: u64 = 30;
@@ -163,6 +169,7 @@ struct Config {
     fetch_params: bool,
     scan_flatfiles: bool,
     scan_supply: bool,
+    scan_fluxnodes: bool,
     check_script: bool,
     rpc_addr: Option<SocketAddr>,
     rpc_user: Option<String>,
@@ -791,6 +798,11 @@ async fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    if config.scan_fluxnodes {
+        scan_fluxnodes(chainstate.as_ref())?;
+        return Ok(());
+    }
+
     let rpc_addr = config.rpc_addr.unwrap_or_else(|| default_rpc_addr(network));
     let rpc_auth =
         rpc::load_or_create_auth(config.rpc_user.clone(), config.rpc_pass.clone(), data_dir)?;
@@ -882,6 +894,13 @@ async fn run() -> Result<(), String> {
         getdata_batch,
         inflight_per_peer,
         block_peers_target,
+    );
+    println!(
+        "Worker settings: header_verify_workers={} verify_workers={} shielded_workers={} verify_queue={}",
+        header_verify_workers,
+        verify_settings.verify_workers,
+        verify_settings.shielded_workers,
+        verify_settings.verify_queue
     );
 
     ensure_genesis(
@@ -1394,6 +1413,97 @@ fn scan_supply<S: KeyValueStore>(
     Ok(())
 }
 
+fn scan_fluxnodes<S: KeyValueStore>(chainstate: &ChainState<S>) -> Result<(), String> {
+    let records = chainstate
+        .fluxnode_records()
+        .map_err(|err| err.to_string())?;
+    if records.is_empty() {
+        println!("No fluxnode records found in the local database.");
+        return Ok(());
+    }
+
+    let mut total = 0usize;
+    let mut confirmed_total = 0usize;
+    let mut tier_total = [0usize; 3];
+    let mut tier_confirmed = [0usize; 3];
+    let mut collateral_value_zero = 0usize;
+
+    let mut min_start: Option<u32> = None;
+    let mut max_start: Option<u32> = None;
+    let mut min_confirmed: Option<u32> = None;
+    let mut max_confirmed: Option<u32> = None;
+    let mut min_last_confirmed: Option<u32> = None;
+    let mut max_last_confirmed: Option<u32> = None;
+    let mut min_last_paid: Option<u32> = None;
+    let mut max_last_paid: Option<u32> = None;
+
+    for record in &records {
+        total += 1;
+        if record.collateral_value == 0 {
+            collateral_value_zero += 1;
+        }
+        if (1..=3).contains(&record.tier) {
+            tier_total[(record.tier - 1) as usize] += 1;
+        }
+
+        min_start = Some(min_start.map_or(record.start_height, |v| v.min(record.start_height)));
+        max_start = Some(max_start.map_or(record.start_height, |v| v.max(record.start_height)));
+        min_last_confirmed = Some(
+            min_last_confirmed.map_or(record.last_confirmed_height, |v| {
+                v.min(record.last_confirmed_height)
+            }),
+        );
+        max_last_confirmed = Some(
+            max_last_confirmed.map_or(record.last_confirmed_height, |v| {
+                v.max(record.last_confirmed_height)
+            }),
+        );
+        min_last_paid =
+            Some(min_last_paid.map_or(record.last_paid_height, |v| v.min(record.last_paid_height)));
+        max_last_paid =
+            Some(max_last_paid.map_or(record.last_paid_height, |v| v.max(record.last_paid_height)));
+
+        if record.confirmed_height > 0 {
+            confirmed_total += 1;
+            if (1..=3).contains(&record.tier) {
+                tier_confirmed[(record.tier - 1) as usize] += 1;
+            }
+            min_confirmed = Some(
+                min_confirmed.map_or(record.confirmed_height, |v| v.min(record.confirmed_height)),
+            );
+            max_confirmed = Some(
+                max_confirmed.map_or(record.confirmed_height, |v| v.max(record.confirmed_height)),
+            );
+        }
+    }
+
+    println!("Fluxnode DB scan complete");
+    println!("Total records: {total}");
+    println!("Confirmed records: {confirmed_total}");
+    println!(
+        "Tier totals: cumulus={} nimbus={} stratus={}",
+        tier_total[0], tier_total[1], tier_total[2]
+    );
+    println!(
+        "Tier confirmed: cumulus={} nimbus={} stratus={}",
+        tier_confirmed[0], tier_confirmed[1], tier_confirmed[2]
+    );
+    println!("Records with collateral_value=0: {collateral_value_zero}");
+    if let (Some(min), Some(max)) = (min_start, max_start) {
+        println!("start_height range: {min}..{max}");
+    }
+    if let (Some(min), Some(max)) = (min_confirmed, max_confirmed) {
+        println!("confirmed_height range: {min}..{max}");
+    }
+    if let (Some(min), Some(max)) = (min_last_confirmed, max_last_confirmed) {
+        println!("last_confirmed_height range: {min}..{max}");
+    }
+    if let (Some(min), Some(max)) = (min_last_paid, max_last_paid) {
+        println!("last_paid_height range: {min}..{max}");
+    }
+    Ok(())
+}
+
 fn scan_flatfiles<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     blocks_path: &std::path::Path,
@@ -1527,15 +1637,29 @@ fn open_store(backend: Backend, db_path: &PathBuf, config: &Config) -> Result<St
                 compaction_workers: config.db_compaction_workers,
                 fsync_ms: config.db_fsync_ms,
             };
+            let partition_count = fluxd_storage::Column::ALL.len() as u64;
             if let (Some(write_buffer), Some(memtable)) =
                 (options.write_buffer_bytes, options.memtable_bytes)
             {
-                let partition_count = fluxd_storage::Column::ALL.len() as u64;
                 let max_memtables = u64::from(memtable).saturating_mul(partition_count);
                 if write_buffer < max_memtables {
                     eprintln!(
                         "Warning: --db-write-buffer-mb ({}) is below partitions ({}) × --db-memtable-mb ({}); expect frequent flushes / L0 stalls",
                         write_buffer / (1024 * 1024),
+                        partition_count,
+                        u64::from(memtable) / (1024 * 1024),
+                    );
+                }
+            }
+            if let (Some(journal), Some(memtable)) = (options.journal_bytes, options.memtable_bytes)
+            {
+                let min_journal = u64::from(memtable)
+                    .saturating_mul(partition_count)
+                    .saturating_mul(2);
+                if journal < min_journal {
+                    eprintln!(
+                        "Warning: --db-journal-mb ({}) is below 2 × partitions ({}) × --db-memtable-mb ({}); Fjall may halt writes when journals fill",
+                        journal / (1024 * 1024),
                         partition_count,
                         u64::from(memtable) / (1024 * 1024),
                     );
@@ -4696,7 +4820,9 @@ async fn fetch_blocks_on_peer_queue_inner(
                     }
                 };
                 let hash = block.header.hash();
+                let mut matched = false;
                 if let Some(pos) = inflight.iter_mut().position(|set| set.contains(&hash)) {
+                    matched = true;
                     let set = &mut inflight[pos];
                     set.remove(&hash);
                     if set.is_empty() {
@@ -4719,8 +4845,10 @@ async fn fetch_blocks_on_peer_queue_inner(
                         }
                     }
                 }
-                received.insert(hash, ReceivedBlock { block, bytes });
-                last_block_at = Instant::now();
+                if matched {
+                    received.insert(hash, ReceivedBlock { block, bytes });
+                    last_block_at = Instant::now();
+                }
             }
             "notfound" => {
                 let message = match parse_inv(&payload) {
@@ -4813,7 +4941,9 @@ async fn fetch_blocks_on_peer_inner(
                 let bytes = payload;
                 let block = Block::consensus_decode(&bytes).map_err(|err| err.to_string())?;
                 let hash = block.header.hash();
+                let mut matched = false;
                 if let Some(pos) = inflight.iter_mut().position(|set| set.contains(&hash)) {
+                    matched = true;
                     let set = &mut inflight[pos];
                     set.remove(&hash);
                     if set.is_empty() {
@@ -4827,8 +4957,10 @@ async fn fetch_blocks_on_peer_inner(
                         }
                     }
                 }
-                received.insert(hash, ReceivedBlock { block, bytes });
-                last_block_at = Instant::now();
+                if matched {
+                    received.insert(hash, ReceivedBlock { block, bytes });
+                    last_block_at = Instant::now();
+                }
             }
             "notfound" => {
                 let message = match parse_inv(&payload) {
@@ -5245,6 +5377,7 @@ fn parse_args() -> Result<Config, String> {
     let mut fetch_params = false;
     let mut scan_flatfiles = false;
     let mut scan_supply = false;
+    let mut scan_fluxnodes = false;
     let mut check_script = true;
     let mut rpc_addr: Option<SocketAddr> = None;
     let mut rpc_user: Option<String> = None;
@@ -5264,12 +5397,15 @@ fn parse_args() -> Result<Config, String> {
     let mut fee_estimates_persist_interval_secs: u64 = DEFAULT_FEE_ESTIMATES_PERSIST_INTERVAL_SECS;
     let mut status_interval_secs: u64 = 15;
     let mut dashboard_addr: Option<SocketAddr> = None;
-    let mut db_cache_bytes: Option<u64> = None;
-    let mut db_write_buffer_bytes: Option<u64> = None;
-    let mut db_journal_bytes: Option<u64> = None;
-    let mut db_memtable_bytes: Option<u32> = None;
-    let mut db_flush_workers: Option<usize> = None;
-    let mut db_compaction_workers: Option<usize> = None;
+    let mut db_cache_mb: u64 = DEFAULT_DB_CACHE_MB;
+    let mut db_write_buffer_mb: u64 = DEFAULT_DB_WRITE_BUFFER_MB;
+    let mut db_journal_mb: u64 = DEFAULT_DB_JOURNAL_MB;
+    let mut db_memtable_mb: u64 = DEFAULT_DB_MEMTABLE_MB;
+    let mut db_flush_workers: usize = DEFAULT_DB_FLUSH_WORKERS;
+    let mut db_compaction_workers: usize = DEFAULT_DB_COMPACTION_WORKERS;
+    let mut db_write_buffer_set = false;
+    let mut db_journal_set = false;
+    let mut db_memtable_set = false;
     let mut db_fsync_ms: Option<u16> = None;
     let mut utxo_cache_entries: usize = DEFAULT_UTXO_CACHE_ENTRIES;
     let mut header_verify_workers: usize = 0;
@@ -5306,6 +5442,9 @@ fn parse_args() -> Result<Config, String> {
             }
             "--scan-supply" => {
                 scan_supply = true;
+            }
+            "--scan-fluxnodes" => {
+                scan_fluxnodes = true;
             }
             "--skip-script" => {
                 check_script = false;
@@ -5467,7 +5606,7 @@ fn parse_args() -> Result<Config, String> {
                 let mb = value
                     .parse::<u64>()
                     .map_err(|_| format!("invalid db cache '{value}'\n{}", usage()))?;
-                db_cache_bytes = Some(mb_to_bytes(mb));
+                db_cache_mb = mb;
             }
             "--db-write-buffer-mb" => {
                 let value = args.next().ok_or_else(|| {
@@ -5476,7 +5615,8 @@ fn parse_args() -> Result<Config, String> {
                 let mb = value
                     .parse::<u64>()
                     .map_err(|_| format!("invalid db write buffer '{value}'\n{}", usage()))?;
-                db_write_buffer_bytes = Some(mb_to_bytes(mb));
+                db_write_buffer_mb = mb;
+                db_write_buffer_set = true;
             }
             "--db-journal-mb" => {
                 let value = args
@@ -5485,7 +5625,8 @@ fn parse_args() -> Result<Config, String> {
                 let mb = value
                     .parse::<u64>()
                     .map_err(|_| format!("invalid db journal '{value}'\n{}", usage()))?;
-                db_journal_bytes = Some(mb_to_bytes(mb));
+                db_journal_mb = mb;
+                db_journal_set = true;
             }
             "--db-memtable-mb" => {
                 let value = args
@@ -5498,7 +5639,8 @@ fn parse_args() -> Result<Config, String> {
                 if bytes > u64::from(u32::MAX) {
                     return Err(format!("db memtable too large '{value}'\n{}", usage()));
                 }
-                db_memtable_bytes = Some(bytes as u32);
+                db_memtable_mb = mb;
+                db_memtable_set = true;
             }
             "--db-flush-workers" => {
                 let value = args
@@ -5510,7 +5652,7 @@ fn parse_args() -> Result<Config, String> {
                 if workers == 0 {
                     return Err(format!("db flush workers must be > 0\n{}", usage()));
                 }
-                db_flush_workers = Some(workers);
+                db_flush_workers = workers;
             }
             "--db-compaction-workers" => {
                 let value = args.next().ok_or_else(|| {
@@ -5522,7 +5664,7 @@ fn parse_args() -> Result<Config, String> {
                 if workers == 0 {
                     return Err(format!("db compaction workers must be > 0\n{}", usage()));
                 }
-                db_compaction_workers = Some(workers);
+                db_compaction_workers = workers;
             }
             "--db-fsync-ms" => {
                 let value = args
@@ -5597,6 +5739,56 @@ fn parse_args() -> Result<Config, String> {
     }
 
     let require_standard = require_standard.unwrap_or(network != Network::Regtest);
+    let partition_count = fluxd_storage::Column::ALL.len() as u64;
+    if !db_memtable_set && db_memtable_mb == 0 {
+        db_memtable_mb = DEFAULT_DB_MEMTABLE_MB;
+    }
+    let memtable_bytes = mb_to_bytes(db_memtable_mb);
+    if memtable_bytes > u64::from(u32::MAX) {
+        return Err(format!(
+            "db memtable too large '{db_memtable_mb}'\n{}",
+            usage()
+        ));
+    }
+    let memtable_bytes = memtable_bytes as u32;
+
+    let min_write_buffer_mb = partition_count.saturating_mul(db_memtable_mb).max(1);
+    let min_journal_mb = min_write_buffer_mb.saturating_mul(2);
+    if db_write_buffer_mb < min_write_buffer_mb {
+        if db_write_buffer_set {
+            eprintln!(
+                "Warning: --db-write-buffer-mb ({}) is below partitions ({}) × --db-memtable-mb ({}); clamping to {}",
+                db_write_buffer_mb,
+                partition_count,
+                db_memtable_mb,
+                min_write_buffer_mb
+            );
+        }
+        db_write_buffer_mb = min_write_buffer_mb;
+    } else if !db_write_buffer_set {
+        db_write_buffer_mb = db_write_buffer_mb.max(min_write_buffer_mb);
+    }
+    if db_journal_mb < min_journal_mb {
+        if db_journal_set {
+            eprintln!(
+                "Warning: --db-journal-mb ({}) is below 2 × partitions ({}) × --db-memtable-mb ({}); clamping to {}",
+                db_journal_mb,
+                partition_count,
+                db_memtable_mb,
+                min_journal_mb
+            );
+        }
+        db_journal_mb = min_journal_mb;
+    } else if !db_journal_set {
+        db_journal_mb = db_journal_mb.max(min_journal_mb);
+    }
+
+    let db_cache_bytes = Some(mb_to_bytes(db_cache_mb));
+    let db_write_buffer_bytes = Some(mb_to_bytes(db_write_buffer_mb));
+    let db_journal_bytes = Some(mb_to_bytes(db_journal_mb));
+    let db_memtable_bytes = Some(memtable_bytes);
+    let db_flush_workers = Some(db_flush_workers);
+    let db_compaction_workers = Some(db_compaction_workers);
 
     Ok(Config {
         backend,
@@ -5606,6 +5798,7 @@ fn parse_args() -> Result<Config, String> {
         fetch_params,
         scan_flatfiles,
         scan_supply,
+        scan_fluxnodes,
         check_script,
         rpc_addr,
         rpc_user,
@@ -5726,15 +5919,19 @@ fn resolve_verify_settings(
     let cores = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(4);
+    let reserved = if cores >= 3 { 1 } else { 0 };
+    let available = cores.saturating_sub(reserved).max(1);
     let shielded_workers = if config.shielded_workers > 0 {
         config.shielded_workers
     } else {
-        (cores / 4).max(1)
+        // Shielded proof verification becomes the dominant cost on mainnet, so default to roughly
+        // half of available cores, leaving the remainder for block validation/connect + async IO.
+        ((available + 1) / 2).max(1)
     };
     let verify_workers = if config.verify_workers > 0 {
         config.verify_workers
     } else {
-        cores.saturating_sub(shielded_workers + 1).max(1)
+        available.saturating_sub(shielded_workers).max(1)
     };
     let inflight = getdata_batch
         .saturating_mul(inflight_per_peer.max(1))
@@ -5756,14 +5953,18 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
     if config.header_verify_workers > 0 {
         return config.header_verify_workers;
     }
+    // Header POW verification can saturate CPU if allowed to use all cores; reserve a little headroom
+    // for block connect/verification.
     std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1)
+        .saturating_sub(2)
+        .max(1)
 }
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -5772,18 +5973,19 @@ fn usage() -> String {
         "  --fetch-params  Download shielded params into --params-dir",
         "  --scan-flatfiles  Scan flatfiles for block index mismatches, then exit",
         "  --scan-supply  Scan blocks in the local DB and print coinbase totals, then exit",
+        "  --scan-fluxnodes  Scan fluxnode records in the local DB and print summary stats, then exit",
         "  --skip-script  Disable script validation (testing only)",
         "  --network   Network selection (default: mainnet)",
         "  --rpc-addr  Bind JSON-RPC server (default: 127.0.0.1:16124 mainnet, 26124 testnet)",
         "  --rpc-user  JSON-RPC basic auth username (required unless cookie exists)",
         "  --rpc-pass  JSON-RPC basic auth password (required unless cookie exists)",
         "  --getdata-batch  Max blocks per getdata request (default: 128)",
-        "  --block-peers  Number of parallel peers for block download (default: 4)",
+        "  --block-peers  Number of parallel peers for block download (default: 3)",
         "  --header-peers  Number of peers to probe for header sync (default: 4)",
         "  --header-peer  Header peer IP:PORT to pin for header sync (repeatable)",
         "  --header-lead  Target header lead over blocks (default: 20000, 0 disables cap)",
         "  --tx-peers  Number of relay peers for tx inventory/tx relay (0 disables, default: 2)",
-        "  --inflight-per-peer  Concurrent getdata requests per peer (default: 2)",
+        "  --inflight-per-peer  Concurrent getdata requests per peer (default: 1)",
         "  --minrelaytxfee  Minimum relay fee-rate in zatoshis/kB (default: 100)",
         "  --accept-non-standard  Disable standardness checks (default: off on mainnet/testnet)",
         "  --require-standard  Force standardness checks on regtest (default: off)",
@@ -5791,12 +5993,12 @@ fn usage() -> String {
         "  --mempool-persist-interval  Persist mempool to disk every N seconds (0 disables, default: 60)",
         "  --fee-estimates-persist-interval  Persist fee estimates every N seconds (0 disables, default: 300)",
         "  --status-interval  Status log interval in seconds (default: 15, 0 disables)",
-        "  --db-cache-mb  Fjall block cache size in MiB (optional)",
-        "  --db-write-buffer-mb  Fjall max write buffer in MiB (optional)",
-        "  --db-journal-mb  Fjall max journaling size in MiB (optional)",
-        "  --db-memtable-mb  Fjall partition memtable size in MiB (optional)",
-        "  --db-flush-workers  Fjall flush worker threads (optional)",
-        "  --db-compaction-workers  Fjall compaction worker threads (optional)",
+        "  --db-cache-mb  Fjall block cache size in MiB (default: 256)",
+        "  --db-write-buffer-mb  Fjall max write buffer in MiB (default: 2048)",
+        "  --db-journal-mb  Fjall max journaling size in MiB (default: 2048)",
+        "  --db-memtable-mb  Fjall partition memtable size in MiB (default: 64)",
+        "  --db-flush-workers  Fjall flush worker threads (default: 2)",
+        "  --db-compaction-workers  Fjall compaction worker threads (default: 4)",
         "  --db-fsync-ms  Fjall async fsync interval in ms (0 disables, optional)",
         "  --utxo-cache-entries  In-memory UTXO entry cache size (0 disables, default: 200000)",
         "  --header-verify-workers  POW header verification threads (0 = auto)",

@@ -62,6 +62,36 @@ Fix:
 - Stop the daemon, remove the data directory, and resync from scratch so undo entries
   are generated during block connect.
 
+## Coinbase / fluxnode payout validation failures
+
+Symptoms:
+- `coinbase missing deterministic fluxnode payout`
+- `coinbase missing dev fund remainder` (post-PoN)
+
+Newer builds also print a one-line diagnostic with the failing height plus expected payouts and
+coinbase outputs.
+
+Likely causes:
+- You are running an older `fluxd-rust` build with a deterministic fluxnode payee ordering mismatch
+  (older builds could disagree on which fluxnode should be paid when heights tie).
+- You are reusing a database created by an older `fluxd-rust` build that did not yet track
+  fluxnode tier metadata and/or deterministic `last_paid_height` state.
+
+Quick diagnosis:
+
+```bash
+./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --scan-fluxnodes
+```
+
+If you see `Tier totals: cumulus=0 nimbus=0 stratus=0` or `last_paid_height range: 0..0` at high
+chain heights, the DB is missing required fluxnode payout state.
+
+Fix:
+- If you're on an older build, upgrade and restart first (no resync needed if the DB was created by a
+  recent build).
+- If the DB is missing payout state, stop the daemon, remove the data directory, and resync from scratch
+  so fluxnode tier/paid state is populated deterministically during block connect.
+
 ## RPC auth failures
 
 Symptoms:
@@ -83,6 +113,33 @@ Reason:
 Fix:
 - Wait for blocks to index, or resync from scratch if the index was
   introduced after the existing DB was created.
+
+## Sync stalls / Fjall write throttling
+
+Symptoms:
+- Heights stop moving for long periods while the process stays alive.
+- Log may include: `Warning: Fjall write_batch commit took ...ms ...`
+
+Cause:
+- Fjall is throttling writes due to flush/compaction backpressure (similar to an L0 stall).
+  This is most common when running with too-small `--db-*` settings for the current indexing load.
+  A second common cause is hitting the Fjall journal / write-buffer limits, which can halt writes until
+  background flushes catch up.
+
+Fix:
+- Prefer running with no explicit `--db-*` flags first (the daemon auto-tunes/clamps the most dangerous
+  combinations), then only override if needed.
+- If you do override:
+  - `--db-write-buffer-mb` should be at least `partitions × --db-memtable-mb`.
+  - `--db-journal-mb` should be at least `2 × partitions × --db-memtable-mb`.
+
+A known-good mainnet sync configuration is:
+
+```bash
+./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --fetch-params \
+  --db-cache-mb 256 --db-write-buffer-mb 4096 --db-journal-mb 16384 --db-memtable-mb 128 \
+  --db-flush-workers 4 --db-compaction-workers 6
+```
 
 ## Memory pressure or OOM
 

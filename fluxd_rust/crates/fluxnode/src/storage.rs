@@ -15,8 +15,10 @@ pub struct FluxnodeRecord {
     pub collateral: OutPoint,
     pub tier: u8,
     pub start_height: u32,
+    pub confirmed_height: u32,
     pub last_confirmed_height: u32,
     pub last_paid_height: u32,
+    pub collateral_value: i64,
     pub operator_pubkey: KeyId,
     pub collateral_pubkey: Option<KeyId>,
     pub p2sh_script: Option<KeyId>,
@@ -33,6 +35,8 @@ impl FluxnodeRecord {
         encoder.write_bytes(&self.operator_pubkey.0);
         write_optional_key(&mut encoder, self.collateral_pubkey);
         write_optional_key(&mut encoder, self.p2sh_script);
+        encoder.write_u32_le(self.confirmed_height);
+        encoder.write_i64_le(self.collateral_value);
         encoder.into_inner()
     }
 
@@ -46,6 +50,20 @@ impl FluxnodeRecord {
         let operator_pubkey = KeyId(decoder.read_fixed::<32>()?);
         let collateral_pubkey = read_optional_key(&mut decoder)?;
         let p2sh_script = read_optional_key(&mut decoder)?;
+        let (confirmed_height, collateral_value) = if decoder.is_empty() {
+            (
+                if last_confirmed_height != start_height {
+                    last_confirmed_height
+                } else {
+                    0
+                },
+                0,
+            )
+        } else {
+            let confirmed_height = decoder.read_u32_le()?;
+            let collateral_value = decoder.read_i64_le()?;
+            (confirmed_height, collateral_value)
+        };
         if !decoder.is_empty() {
             return Err(DecodeError::TrailingBytes);
         }
@@ -53,8 +71,10 @@ impl FluxnodeRecord {
             collateral,
             tier,
             start_height,
+            confirmed_height,
             last_confirmed_height,
             last_paid_height,
+            collateral_value,
             operator_pubkey,
             collateral_pubkey,
             p2sh_script,

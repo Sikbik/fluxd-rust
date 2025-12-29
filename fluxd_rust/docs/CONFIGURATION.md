@@ -19,9 +19,17 @@ and how they affect behavior.
     - `fee_estimates.dat` - persisted fee estimator samples (when enabled).
     - `rpc.cookie` - RPC auth cookie when not using `--rpc-user`/`--rpc-pass`.
 
-### Fjall tuning (optional)
+### Fjall tuning
 
-These flags control Fjall memory usage. Use them when running on VPS or constrained hosts.
+These flags control Fjall memory usage.
+
+Defaults (mainnet sync-focused; some values are auto-tuned to safe minima):
+- `--db-cache-mb 256`
+- `--db-write-buffer-mb 2048`
+- `--db-journal-mb 2048`
+- `--db-memtable-mb 64`
+- `--db-flush-workers 2`
+- `--db-compaction-workers 4`
 
 - `--db-cache-mb N` - block cache size.
 - `--db-write-buffer-mb N` - max write buffer size.
@@ -35,7 +43,11 @@ If you see long pauses where blocks stop connecting while the process remains al
 Fjall write throttling due to L0 segment buildup. Practical mitigations:
 
 - Ensure `--db-write-buffer-mb` is comfortably above `--db-memtable-mb × 19` (current partition count).
+- Ensure `--db-journal-mb` is at least `2 × --db-memtable-mb × 19` (journal GC requires all partitions to flush).
 - Increase `--db-compaction-workers` (and optionally `--db-flush-workers`) on hosts with spare CPU.
+
+When `--db-write-buffer-mb` or `--db-journal-mb` is set below these minima, `fluxd` clamps the values
+upward at startup (and prints a warning) to avoid long write halts.
 
 ## Chainstate caching
 
@@ -60,12 +72,12 @@ RPC defaults:
 ## Sync and peer behavior
 
 - `--getdata-batch N` - max blocks per getdata request (default: 128).
-- `--block-peers N` - parallel peers for block download (default: 4).
+- `--block-peers N` - parallel peers for block download (default: 3).
 - `--header-peers N` - peers to probe for header sync (default: 4).
 - `--header-peer IP:PORT` - pin a specific header peer (repeatable).
 - `--header-lead N` - target header lead over blocks (default: 20000, 0 disables cap).
 - `--tx-peers N` - relay peers for transaction inventory/tx relay (default: 2, 0 disables).
-- `--inflight-per-peer N` - concurrent getdata requests per peer (default: 2).
+- `--inflight-per-peer N` - concurrent getdata requests per peer (default: 1).
 - `--status-interval SECS` - status log interval (default: 15, 0 disables).
 
 ## Mempool
@@ -106,6 +118,9 @@ Practical notes:
 - `--verify-queue N` - pre-validation queue depth (0 = auto).
 - `--shielded-workers N` - shielded verification threads (0 = auto).
 
+Auto worker defaults aim to keep shielded proof verification saturated while leaving CPU for
+block connect/DB work.
+
 ## RPC
 
 - `--rpc-addr IP:PORT` - bind address (defaults per network).
@@ -126,3 +141,4 @@ Endpoints:
 
 - `--scan-flatfiles` - scan flatfiles for index mismatches, then exit.
 - `--scan-supply` - scan blocks in the local DB and print coinbase totals, then exit.
+- `--scan-fluxnodes` - scan fluxnode records in the local DB and print summary stats, then exit.

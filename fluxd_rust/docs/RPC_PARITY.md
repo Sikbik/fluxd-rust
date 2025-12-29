@@ -44,7 +44,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Mining
 
 - getblocksubsidy - Implemented
-- getblocktemplate - Stub
+- getblocktemplate - Partial (coinbase + deterministic payouts; tx selection/assembly WIP)
 - getlocalsolps - Stub (returns 0.0)
 - getmininginfo - Partial (rates and mining fields are placeholders)
 - getnetworkhashps - Stub (returns 0.0)

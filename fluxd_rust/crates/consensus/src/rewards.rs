@@ -1,8 +1,16 @@
 //! Subsidy and funding schedule helpers.
 
 use crate::money::{Amount, COIN};
-use crate::params::{ConsensusParams, FundingParams, SwapPoolParams};
+use crate::params::{ConsensusParams, FluxnodeParams, FundingParams, SwapPoolParams};
 use crate::upgrades::{network_upgrade_active, UpgradeIndex};
+
+const V1_FLUXNODE_COLLAT_CUMULUS: Amount = 10_000 * COIN;
+const V1_FLUXNODE_COLLAT_NIMBUS: Amount = 25_000 * COIN;
+const V1_FLUXNODE_COLLAT_STRATUS: Amount = 100_000 * COIN;
+
+const V2_FLUXNODE_COLLAT_CUMULUS: Amount = 1_000 * COIN;
+const V2_FLUXNODE_COLLAT_NIMBUS: Amount = 12_500 * COIN;
+const V2_FLUXNODE_COLLAT_STRATUS: Amount = 40_000 * COIN;
 
 pub fn block_subsidy(height: i32, params: &ConsensusParams) -> Amount {
     if network_upgrade_active(height, &params.upgrades, UpgradeIndex::Pon) {
@@ -79,6 +87,57 @@ pub fn fluxnode_subsidy(
     ((block_value as f64) * (percentage * multiple)) as Amount
 }
 
+pub fn fluxnode_tier_from_collateral(
+    height: i32,
+    amount: Amount,
+    params: &FluxnodeParams,
+) -> Option<u8> {
+    for tier in 1u8..=3u8 {
+        if fluxnode_collateral_matches_tier(height, amount, tier, params) {
+            return Some(tier);
+        }
+    }
+    None
+}
+
+pub fn fluxnode_collateral_matches_tier(
+    height: i32,
+    amount: Amount,
+    tier: u8,
+    params: &FluxnodeParams,
+) -> bool {
+    match tier {
+        1 => {
+            if (height as i64) < params.cumulus_transition_start {
+                amount == V1_FLUXNODE_COLLAT_CUMULUS
+            } else if (height as i64) < params.cumulus_transition_end {
+                amount == V1_FLUXNODE_COLLAT_CUMULUS || amount == V2_FLUXNODE_COLLAT_CUMULUS
+            } else {
+                amount == V2_FLUXNODE_COLLAT_CUMULUS
+            }
+        }
+        2 => {
+            if (height as i64) < params.nimbus_transition_start {
+                amount == V1_FLUXNODE_COLLAT_NIMBUS
+            } else if (height as i64) < params.nimbus_transition_end {
+                amount == V1_FLUXNODE_COLLAT_NIMBUS || amount == V2_FLUXNODE_COLLAT_NIMBUS
+            } else {
+                amount == V2_FLUXNODE_COLLAT_NIMBUS
+            }
+        }
+        3 => {
+            if (height as i64) < params.stratus_transition_start {
+                amount == V1_FLUXNODE_COLLAT_STRATUS
+            } else if (height as i64) < params.stratus_transition_end {
+                amount == V1_FLUXNODE_COLLAT_STRATUS || amount == V2_FLUXNODE_COLLAT_STRATUS
+            } else {
+                amount == V2_FLUXNODE_COLLAT_STRATUS
+            }
+        }
+        _ => false,
+    }
+}
+
 pub fn min_dev_fund_amount(height: i32, params: &ConsensusParams) -> Amount {
     if !network_upgrade_active(height, &params.upgrades, UpgradeIndex::Pon) {
         return 0;
@@ -132,6 +191,7 @@ pub fn swap_pool_amount(height: i64, swap_pool: &SwapPoolParams) -> Amount {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::params::chain_params;
     use crate::params::{consensus_params, Network};
     use crate::upgrades::UpgradeIndex;
 
@@ -263,6 +323,42 @@ mod tests {
                 &params
             ),
             year_1 / 28
+        );
+    }
+
+    #[test]
+    fn fluxnode_tier_from_collateral_respects_transition_windows() {
+        let params = chain_params(Network::Mainnet);
+        let flux = &params.fluxnode;
+
+        let before = flux.cumulus_transition_start as i32 - 1;
+        assert_eq!(
+            fluxnode_tier_from_collateral(before, V1_FLUXNODE_COLLAT_CUMULUS, flux),
+            Some(1)
+        );
+        assert_eq!(
+            fluxnode_tier_from_collateral(before, V2_FLUXNODE_COLLAT_CUMULUS, flux),
+            None
+        );
+
+        let during = flux.cumulus_transition_start as i32;
+        assert_eq!(
+            fluxnode_tier_from_collateral(during, V1_FLUXNODE_COLLAT_CUMULUS, flux),
+            Some(1)
+        );
+        assert_eq!(
+            fluxnode_tier_from_collateral(during, V2_FLUXNODE_COLLAT_CUMULUS, flux),
+            Some(1)
+        );
+
+        let after = flux.cumulus_transition_end as i32;
+        assert_eq!(
+            fluxnode_tier_from_collateral(after, V1_FLUXNODE_COLLAT_CUMULUS, flux),
+            None
+        );
+        assert_eq!(
+            fluxnode_tier_from_collateral(after, V2_FLUXNODE_COLLAT_CUMULUS, flux),
+            Some(1)
         );
     }
 }

@@ -9,11 +9,18 @@ use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch};
 
 use crate::storage::{dedupe_key, FluxnodeRecord, KeyId};
 
+#[derive(Clone, Copy, Debug)]
+pub struct FluxnodeStartMeta {
+    pub tier: u8,
+    pub collateral_value: i64,
+}
+
 pub fn apply_fluxnode_tx<S: KeyValueStore>(
     store: &S,
     batch: &mut WriteBatch,
     tx: &Transaction,
     height: u32,
+    start_meta: Option<FluxnodeStartMeta>,
 ) -> Result<(), StoreError> {
     let Some(fluxnode) = tx.fluxnode.as_ref() else {
         return Ok(());
@@ -21,6 +28,9 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
 
     match fluxnode {
         FluxnodeTx::V5(FluxnodeTxV5::Start(start)) => {
+            let meta = start_meta.ok_or_else(|| {
+                StoreError::Backend("missing fluxnode start metadata".to_string())
+            })?;
             let operator_pubkey = start.pubkey.as_slice();
             let collateral_pubkey = Some(start.collateral_pubkey.as_slice());
             store_fluxnode_start(
@@ -30,6 +40,7 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                 collateral_pubkey,
                 None,
                 height,
+                meta,
             )?;
         }
         FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => match &start.variant {
@@ -39,6 +50,9 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                 pubkey,
                 ..
             } => {
+                let meta = start_meta.ok_or_else(|| {
+                    StoreError::Backend("missing fluxnode start metadata".to_string())
+                })?;
                 store_fluxnode_start(
                     batch,
                     collateral,
@@ -46,6 +60,7 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                     Some(collateral_pubkey.as_slice()),
                     None,
                     height,
+                    meta,
                 )?;
             }
             FluxnodeStartVariantV6::P2sh {
@@ -54,6 +69,9 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                 redeem_script,
                 ..
             } => {
+                let meta = start_meta.ok_or_else(|| {
+                    StoreError::Backend("missing fluxnode start metadata".to_string())
+                })?;
                 store_fluxnode_start(
                     batch,
                     collateral,
@@ -61,12 +79,19 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                     None,
                     Some(redeem_script.as_slice()),
                     height,
+                    meta,
                 )?;
             }
         },
         FluxnodeTx::V5(FluxnodeTxV5::Confirm(confirm))
         | FluxnodeTx::V6(FluxnodeTxV6::Confirm(confirm)) => {
-            update_fluxnode_confirm(store, batch, &confirm.collateral, height)?;
+            update_fluxnode_confirm(
+                store,
+                batch,
+                &confirm.collateral,
+                height,
+                confirm.update_type,
+            )?;
         }
     }
 
@@ -90,6 +115,7 @@ fn store_fluxnode_start(
     collateral_pubkey: Option<&[u8]>,
     redeem_script: Option<&[u8]>,
     height: u32,
+    meta: FluxnodeStartMeta,
 ) -> Result<(), StoreError> {
     let operator_key = store_key(batch, operator_pubkey);
     let collateral_key = collateral_pubkey.map(|key| store_key(batch, key));
@@ -97,10 +123,12 @@ fn store_fluxnode_start(
 
     let record = FluxnodeRecord {
         collateral: collateral.clone(),
-        tier: 0,
+        tier: meta.tier,
         start_height: height,
+        confirmed_height: 0,
         last_confirmed_height: height,
         last_paid_height: 0,
+        collateral_value: meta.collateral_value,
         operator_pubkey: operator_key,
         collateral_pubkey: collateral_key,
         p2sh_script: p2sh_key,
@@ -115,11 +143,32 @@ fn update_fluxnode_confirm<S: KeyValueStore>(
     batch: &mut WriteBatch,
     collateral: &OutPoint,
     height: u32,
+    update_type: u8,
 ) -> Result<(), StoreError> {
     let Some(mut record) = load_fluxnode_record(store, collateral)? else {
         return Ok(());
     };
-    record.last_confirmed_height = height;
+    match update_type {
+        0 => {
+            if record.confirmed_height == 0 {
+                record.confirmed_height = height;
+            }
+            record.last_confirmed_height = height;
+        }
+        1 => {
+            if record.confirmed_height == 0 {
+                return Err(StoreError::Backend(
+                    "fluxnode update confirm before initial confirm".to_string(),
+                ));
+            }
+            record.last_confirmed_height = height;
+        }
+        _ => {
+            return Err(StoreError::Backend(
+                "fluxnode confirm has invalid update type".to_string(),
+            ));
+        }
+    }
     batch.put(Column::Fluxnode, outpoint_key(collateral), record.encode());
     Ok(())
 }
@@ -198,7 +247,17 @@ mod tests {
         let tx = make_start_tx(outpoint.clone(), pubkey.clone());
 
         let mut batch = WriteBatch::new();
-        apply_fluxnode_tx(&store, &mut batch, &tx, 100).expect("apply tx");
+        apply_fluxnode_tx(
+            &store,
+            &mut batch,
+            &tx,
+            100,
+            Some(super::FluxnodeStartMeta {
+                tier: 1,
+                collateral_value: 0,
+            }),
+        )
+        .expect("apply tx");
         store.write_batch(&batch).expect("write batch");
 
         let loaded = lookup_operator_pubkey(&store, &outpoint)

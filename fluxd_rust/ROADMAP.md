@@ -32,7 +32,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] Reorg handling (disconnect to common ancestor)
 - [x] RPC framework (JSON-RPC + `/daemon` endpoints)
 - [x] Dashboard + status metrics
-- [x] CLI supply scan (`--scan-supply`) and flatfile scan (`--scan-flatfiles`)
+- [x] CLI scan tools (`--scan-supply`, `--scan-flatfiles`, `--scan-fluxnodes`)
 - [x] Documentation set (README + docs/)
 - [x] Binary name `fluxd`
 
@@ -52,13 +52,15 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Fix shielded pipeline ordering bug (prevents rare sync stalls)
   - [x] Expose Fjall flush/compaction worker knobs (`--db-flush-workers`, `--db-compaction-workers`)
   - [x] Warn when `--db-write-buffer-mb` is below `--db-memtable-mb × partitions` (prevents hidden L0 stalls)
+  - [x] Raise default Fjall buffers/workers (avoid write stalls during heavy indexing)
+  - [x] Log slow Fjall commits (helps diagnose stalls in the field)
   - [x] Surface Fjall health stats in `/stats` (write buffer, compactions, per-partition segments/flushes)
   - [x] Add detailed connect-stage telemetry in `/stats` (UTXO get/put/delete, undo encode/append, index op counts)
   - [x] Review index write amplification (txindex/address index) and batching opportunities
     - [x] Reuse address script hash across indexes (avoid double hashing per I/O)
-    - [x] Defer UTXO + address-outpoint writes to end-of-block (eliminate intrablock put+delete pairs)
-    - [x] Reserve `WriteBatch` capacity per block (reduce allocator churn)
-  - [x] Capture throughput stats (8-core mainnet: `ver_ms` ~5–6ms, ~110–120 b/s typical; block download becomes limiter)
+  - [x] Defer UTXO + address-outpoint writes to end-of-block (eliminate intrablock put+delete pairs)
+  - [x] Reserve `WriteBatch` capacity per block (reduce allocator churn)
+  - [x] Capture throughput stats (8-core mainnet: default worker auto-split yields ~120–150 b/s typical; shielded proof verification is the primary limiter)
 - [ ] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)
 
 ## Consensus and chainstate parity
@@ -78,6 +80,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Regression tests for PoN tier distribution + dev-fund remainder
 - [x] [P0] Coinbase rules parity (funding outputs + maturity) (owner: TBD)
   - [x] Regression tests for exchange/foundation/swap-pool coinbase enforcement (mainnet)
+  - [x] Deterministic fluxnode payout ordering parity (never-paid tie-break on equal height)
   - [x] Regression test for coinbase maturity (premature spend rejection)
 - [x] [P0] Chainwork parity for PoN/PoW edge cases and existing headers (owner: TBD)
   - [x] Regression tests for PoW chainwork accumulation and PoN fixed-work increment (2^40)
@@ -121,6 +124,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Tx relay: `inv`/`getdata`/`tx` + `mempool` (owner: TBD)
   - [x] `feefilter` and fee-based relay policies (owner: TBD)
   - [x] `reject`/`notfound` handling parity (owner: TBD)
+  - [x] Ignore unsolicited `block` messages during getdata download (prevents sync stalls) (owner: TBD)
 - [ ] [P2] Service flags and user agent compatibility (owner: TBD)
 
 ## Mempool and mining
@@ -133,7 +137,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
 - [x] [P1] Basic P2P tx relay (inv/getdata/tx + `mempool`) (owner: TBD)
 - [x] [P1] `getmininginfo`, `submitblock` (owner: TBD)
-- [ ] [P1] `getblocktemplate` (block assembly + deterministic payouts) (owner: TBD)
+- [ ] [P1] `getblocktemplate` (coinbase + deterministic payouts; tx selection/assembly WIP) (owner: TBD)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
 
 ## Wallet
@@ -146,6 +150,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## UX, ops, and tooling
 
+- [ ] [P2] Sync/run profiles (`--profile low|default|high`) for worker + DB presets (owner: TBD)
 - [ ] [P2] Config file support (`flux.conf` parity) (owner: TBD)
 - [ ] [P2] Structured CLI help output and subcommands (owner: TBD)
 - [ ] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
@@ -194,7 +199,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | `getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps`<br>`getmininginfo`<br>`submitblock` | `getblocktemplate` |
+| `getmininginfo`<br>`submitblock` | `getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps` | - |
 
 ### Fluxnode
 

@@ -11,7 +11,8 @@ pub use params::{
     Network, TimedPublicKey,
 };
 pub use rewards::{
-    block_subsidy, exchange_fund_amount, fluxnode_subsidy, foundation_fund_amount,
-    is_swap_pool_interval, min_dev_fund_amount, swap_pool_amount,
+    block_subsidy, exchange_fund_amount, fluxnode_collateral_matches_tier, fluxnode_subsidy,
+    fluxnode_tier_from_collateral, foundation_fund_amount, is_swap_pool_interval,
+    min_dev_fund_amount, swap_pool_amount,
 };
 pub use upgrades::Hash256;

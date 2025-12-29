@@ -16,19 +16,22 @@ use tokio::sync::{broadcast, watch};
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::ValidationFlags;
-use fluxd_consensus::block_subsidy;
 use fluxd_consensus::constants::PROTOCOL_VERSION;
 use fluxd_consensus::money::COIN;
 use fluxd_consensus::params::{hash256_from_hex, ChainParams, Network};
 use fluxd_consensus::upgrades::{
-    current_epoch_branch_id, network_upgrade_state, UpgradeState, ALL_UPGRADES,
-    NETWORK_UPGRADE_INFO,
+    current_epoch_branch_id, network_upgrade_active, network_upgrade_state, UpgradeIndex,
+    UpgradeState, ALL_UPGRADES, NETWORK_UPGRADE_INFO,
 };
 use fluxd_consensus::Hash256;
+use fluxd_consensus::{
+    block_subsidy, exchange_fund_amount, foundation_fund_amount, swap_pool_amount,
+};
 use fluxd_fluxnode::storage::FluxnodeRecord;
 use fluxd_pow::difficulty::compact_to_u256;
-use fluxd_primitives::block::Block;
-use fluxd_primitives::transaction::Transaction;
+use fluxd_primitives::block::{Block, CURRENT_VERSION, PON_VERSION};
+use fluxd_primitives::outpoint::OutPoint;
+use fluxd_primitives::transaction::{Transaction, TxIn, TxOut, SAPLING_VERSION_GROUP_ID};
 use fluxd_primitives::{address_to_script_pubkey, script_pubkey_to_address, AddressError};
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
@@ -642,7 +645,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getaddresstxids" => rpc_getaddresstxids(chainstate, params, chain_params),
         "getaddressmempool" => rpc_getaddressmempool(chainstate, mempool, params, chain_params),
         "getmininginfo" => rpc_getmininginfo(chainstate, mempool, params, chain_params),
-        "getblocktemplate" => rpc_getblocktemplate(params),
+        "getblocktemplate" => rpc_getblocktemplate(chainstate, mempool, params, chain_params),
         "submitblock" => {
             rpc_submitblock(chainstate, write_lock, params, chain_params, mempool_flags)
         }
@@ -2093,12 +2096,235 @@ fn rpc_getaddressmempool<S: fluxd_storage::KeyValueStore>(
     ))
 }
 
-fn rpc_getblocktemplate(params: Vec<Value>) -> Result<Value, RpcError> {
-    let _ = params;
-    Err(RpcError::new(
-        RPC_INTERNAL_ERROR,
-        "getblocktemplate is not implemented (block assembly + deterministic payouts pending)",
-    ))
+fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    _mempool: &Mutex<Mempool>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getblocktemplate expects 0 or 1 parameter",
+        ));
+    }
+
+    let miner_address = if params.is_empty() {
+        None
+    } else {
+        let obj = params[0].as_object().ok_or_else(|| {
+            RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "getblocktemplate param must be an object",
+            )
+        })?;
+        obj.get("mineraddress")
+            .or_else(|| obj.get("address"))
+            .and_then(|val| val.as_str())
+            .map(|val| val.to_string())
+    };
+
+    let miner_script_pubkey = match miner_address.as_deref() {
+        Some(addr) => {
+            address_to_script_pubkey(addr, chain_params.network).map_err(|err| match err {
+                AddressError::UnknownPrefix => RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "miner address has invalid prefix",
+                ),
+                _ => RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "invalid miner address"),
+            })?
+        }
+        None => vec![0x51],
+    };
+
+    let best = chainstate.best_block().map_err(map_internal)?;
+    let (prev_hash, height) = match best {
+        Some(tip) => (tip.hash, tip.height + 1),
+        None => ([0u8; 32], 0),
+    };
+
+    let curtime = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(u32::MAX as u64) as u32;
+
+    let bits = chainstate
+        .next_work_required_bits(&prev_hash, height, curtime as i64, &chain_params.consensus)
+        .map_err(map_internal)?;
+
+    let pon_active =
+        network_upgrade_active(height, &chain_params.consensus.upgrades, UpgradeIndex::Pon);
+    let sapling_active = network_upgrade_active(
+        height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Acadia,
+    );
+
+    let sapling_root = chainstate.sapling_root().map_err(map_internal)?;
+
+    let payouts = chainstate
+        .deterministic_fluxnode_payouts(height, chain_params)
+        .map_err(map_internal)?;
+
+    let subsidy = block_subsidy(height, &chain_params.consensus);
+    let payout_sum = payouts
+        .iter()
+        .try_fold(0i64, |acc, (_, _, amount)| acc.checked_add(*amount))
+        .ok_or_else(|| map_internal("fluxnode payout sum out of range"))?;
+    let remainder = subsidy
+        .checked_sub(payout_sum)
+        .ok_or_else(|| map_internal("fluxnode payout remainder out of range"))?;
+
+    let exchange_fund = exchange_fund_amount(height, &chain_params.funding);
+    let foundation_fund = foundation_fund_amount(height, &chain_params.funding);
+    let swap_pool = swap_pool_amount(height as i64, &chain_params.swap_pool);
+
+    let fees = 0i64;
+    let miner_value = if pon_active { fees } else { remainder + fees };
+
+    let mut outputs = Vec::new();
+    outputs.push(TxOut {
+        value: miner_value,
+        script_pubkey: miner_script_pubkey,
+    });
+    for (_, script_pubkey, amount) in &payouts {
+        outputs.push(TxOut {
+            value: *amount,
+            script_pubkey: script_pubkey.clone(),
+        });
+    }
+
+    if pon_active {
+        let dev_script =
+            address_to_script_pubkey(chain_params.funding.dev_fund_address, chain_params.network)
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid dev fund address"))?;
+        outputs.push(TxOut {
+            value: remainder,
+            script_pubkey: dev_script,
+        });
+    }
+
+    if exchange_fund > 0 {
+        let exchange_script =
+            address_to_script_pubkey(chain_params.funding.exchange_address, chain_params.network)
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid exchange fund address"))?;
+        outputs.push(TxOut {
+            value: exchange_fund,
+            script_pubkey: exchange_script,
+        });
+    }
+    if foundation_fund > 0 {
+        let foundation_script = address_to_script_pubkey(
+            chain_params.funding.foundation_address,
+            chain_params.network,
+        )
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid foundation fund address"))?;
+        outputs.push(TxOut {
+            value: foundation_fund,
+            script_pubkey: foundation_script,
+        });
+    }
+    if swap_pool > 0 {
+        let swap_script =
+            address_to_script_pubkey(chain_params.swap_pool.address, chain_params.network)
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid swap pool address"))?;
+        outputs.push(TxOut {
+            value: swap_pool,
+            script_pubkey: swap_script,
+        });
+    }
+
+    let mut script_sig = script_push_int(height as i64);
+    crate::push_data(&mut script_sig, b"fluxd-rust");
+
+    let coinbase = Transaction {
+        f_overwintered: sapling_active,
+        version: if sapling_active { 4 } else { 1 },
+        version_group_id: if sapling_active {
+            SAPLING_VERSION_GROUP_ID
+        } else {
+            0
+        },
+        vin: vec![TxIn {
+            prevout: OutPoint::null(),
+            script_sig,
+            sequence: u32::MAX,
+        }],
+        vout: outputs,
+        lock_time: 0,
+        expiry_height: 0,
+        value_balance: 0,
+        shielded_spends: Vec::new(),
+        shielded_outputs: Vec::new(),
+        join_splits: Vec::new(),
+        join_split_pub_key: [0u8; 32],
+        join_split_sig: [0u8; 64],
+        binding_sig: [0u8; 64],
+        fluxnode: None,
+    };
+
+    let coinbase_bytes = coinbase.consensus_encode().map_err(map_internal)?;
+    let coinbase_txid = coinbase.txid().map_err(map_internal)?;
+
+    let coinbase_value = coinbase
+        .vout
+        .iter()
+        .try_fold(0i64, |acc, out| acc.checked_add(out.value))
+        .ok_or_else(|| map_internal("coinbase output value out of range"))?;
+
+    let target = compact_to_u256(bits).map_err(|err| map_internal(err.to_string()))?;
+    let target_hex = hex_bytes(&target.to_big_endian());
+
+    let payouts_json = payouts
+        .iter()
+        .map(|(outpoint, script_pubkey, amount)| {
+            json!({
+                "outpoint": format_outpoint(outpoint),
+                "scriptPubKey": hex_bytes(script_pubkey),
+                "amount": Number::from(*amount),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "capabilities": ["proposal"],
+        "version": if pon_active { PON_VERSION } else { CURRENT_VERSION },
+        "previousblockhash": hash256_to_hex(&prev_hash),
+        "height": height,
+        "curtime": curtime,
+        "bits": format!("{:08x}", bits),
+        "target": target_hex,
+        "defaultsaplingroot": hash256_to_hex(&sapling_root),
+        "transactions": [],
+        "coinbasetxn": {
+            "data": hex_bytes(&coinbase_bytes),
+            "hash": hash256_to_hex(&coinbase_txid),
+        },
+        "coinbasevalue": coinbase_value,
+        "fluxnodepayouts": payouts_json,
+    }))
+}
+
+fn script_push_int(value: i64) -> Vec<u8> {
+    const OP_0: u8 = 0x00;
+    const OP_1NEGATE: u8 = 0x4f;
+    const OP_1: u8 = 0x51;
+
+    if value == 0 {
+        return vec![OP_0];
+    }
+    if value == -1 {
+        return vec![OP_1NEGATE];
+    }
+    if (1..=16).contains(&value) {
+        return vec![OP_1 + (value as u8 - 1)];
+    }
+
+    let data = crate::script_num_to_vec(value);
+    let mut script = Vec::new();
+    crate::push_data(&mut script, &data);
+    script
 }
 
 fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(

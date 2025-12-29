@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,10 +12,11 @@ use fluxd_consensus::constants::{
 use fluxd_consensus::money::MAX_MONEY;
 use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
 use fluxd_consensus::{
-    block_subsidy, exchange_fund_amount, foundation_fund_amount, is_swap_pool_interval,
+    block_subsidy, exchange_fund_amount, fluxnode_collateral_matches_tier, fluxnode_subsidy,
+    fluxnode_tier_from_collateral, foundation_fund_amount, is_swap_pool_interval,
     min_dev_fund_amount, swap_pool_amount, ChainParams, ConsensusParams, Hash256,
 };
-use fluxd_fluxnode::cache::{apply_fluxnode_tx, lookup_operator_pubkey};
+use fluxd_fluxnode::cache::{apply_fluxnode_tx, lookup_operator_pubkey, FluxnodeStartMeta};
 use fluxd_fluxnode::storage::{FluxnodeRecord, KeyId};
 use fluxd_primitives::address_to_script_pubkey;
 use fluxd_primitives::block::Block;
@@ -294,6 +295,141 @@ impl UtxoCache {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FluxnodePaymentMeta {
+    tier: u8,
+    confirmed_height: u32,
+    last_confirmed_height: u32,
+    last_paid_height: u32,
+    collateral_value: i64,
+    operator_pubkey: KeyId,
+    collateral_pubkey: Option<KeyId>,
+    p2sh_script: Option<KeyId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FluxnodePayeeKey {
+    comparator_height: u32,
+    has_last_paid: bool,
+    hash_le: [u8; 32],
+    index: u32,
+    outpoint: OutPointKey,
+}
+
+impl FluxnodePayeeKey {
+    fn from_record(record: &FluxnodeRecord) -> Option<Self> {
+        if !(1..=3).contains(&record.tier) {
+            return None;
+        }
+        if record.confirmed_height == 0 {
+            return None;
+        }
+        let has_last_paid = record.last_paid_height > 0;
+        let comparator_height = if record.last_paid_height > 0 {
+            record.last_paid_height
+        } else {
+            record.confirmed_height
+        };
+        let hash_le = record.collateral.hash;
+        Some(Self {
+            comparator_height,
+            has_last_paid,
+            hash_le,
+            index: record.collateral.index,
+            outpoint: outpoint_key_bytes(&record.collateral),
+        })
+    }
+}
+
+impl Ord for FluxnodePayeeKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.comparator_height
+            .cmp(&other.comparator_height)
+            .then_with(|| self.has_last_paid.cmp(&other.has_last_paid))
+            .then_with(|| self.hash_le.cmp(&other.hash_le))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for FluxnodePayeeKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct FluxnodePaymentsCache {
+    initialized: bool,
+    by_tier: [BTreeSet<FluxnodePayeeKey>; 3],
+    key_by_outpoint: HashMap<OutPointKey, FluxnodePayeeKey>,
+    meta_by_outpoint: HashMap<OutPointKey, FluxnodePaymentMeta>,
+}
+
+impl FluxnodePaymentsCache {
+    fn new() -> Self {
+        Self {
+            initialized: false,
+            by_tier: [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()],
+            key_by_outpoint: HashMap::new(),
+            meta_by_outpoint: HashMap::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.by_tier = [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()];
+        self.key_by_outpoint.clear();
+        self.meta_by_outpoint.clear();
+        self.initialized = true;
+    }
+
+    fn remove_outpoint(&mut self, outpoint: &OutPointKey) {
+        let old_meta = self.meta_by_outpoint.remove(outpoint);
+        let old_key = self.key_by_outpoint.remove(outpoint);
+        let Some(old_meta) = old_meta else {
+            return;
+        };
+        let Some(old_key) = old_key else {
+            return;
+        };
+        if !(1..=3).contains(&old_meta.tier) {
+            return;
+        }
+        self.by_tier[(old_meta.tier - 1) as usize].remove(&old_key);
+    }
+
+    fn upsert_record(&mut self, record: &FluxnodeRecord) {
+        let outpoint = outpoint_key_bytes(&record.collateral);
+        if self.meta_by_outpoint.contains_key(&outpoint) {
+            self.remove_outpoint(&outpoint);
+        }
+
+        let Some(key) = FluxnodePayeeKey::from_record(record) else {
+            return;
+        };
+        let tier = record.tier;
+        let meta = FluxnodePaymentMeta {
+            tier,
+            confirmed_height: record.confirmed_height,
+            last_confirmed_height: record.last_confirmed_height,
+            last_paid_height: record.last_paid_height,
+            collateral_value: record.collateral_value,
+            operator_pubkey: record.operator_pubkey,
+            collateral_pubkey: record.collateral_pubkey,
+            p2sh_script: record.p2sh_script,
+        };
+        self.by_tier[(tier - 1) as usize].insert(key);
+        self.key_by_outpoint.insert(outpoint, key);
+        self.meta_by_outpoint.insert(outpoint, meta);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FluxnodePayout {
+    tier: u8,
+    outpoint: OutPoint,
+    script_pubkey: Vec<u8>,
+    amount: i64,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum FlatFileKind {
     Blocks,
@@ -428,6 +564,7 @@ pub struct ChainState<S> {
     utxo_cache: Mutex<UtxoCache>,
     shielded_cache: Mutex<Option<ShieldedTreesCache>>,
     file_meta: Mutex<FlatFileMetaCache>,
+    fluxnode_payments: Mutex<FluxnodePaymentsCache>,
 }
 
 impl<S: KeyValueStore> ChainState<S> {
@@ -459,6 +596,7 @@ impl<S: KeyValueStore> ChainState<S> {
             utxo_cache: Mutex::new(UtxoCache::new(utxo_cache_capacity)),
             shielded_cache: Mutex::new(None),
             file_meta: Mutex::new(FlatFileMetaCache::default()),
+            fluxnode_payments: Mutex::new(FluxnodePaymentsCache::new()),
         }
     }
 
@@ -1119,6 +1257,16 @@ impl<S: KeyValueStore> ChainState<S> {
             .map_err(|_| ChainStateError::InvalidHeader("difficulty calculation failed"))
     }
 
+    pub fn next_work_required_bits(
+        &self,
+        prev_hash: &fluxd_consensus::Hash256,
+        height: i32,
+        next_time: i64,
+        params: &ConsensusParams,
+    ) -> Result<u32, ChainStateError> {
+        self.expected_bits(prev_hash, height, next_time, params, None)
+    }
+
     fn validate_fluxnode_tx(
         &self,
         tx: &Transaction,
@@ -1128,6 +1276,7 @@ impl<S: KeyValueStore> ChainState<S> {
         created_utxos: &HashMap<OutPointKey, CreatedUtxo>,
         operator_pubkeys: &HashMap<OutPoint, Vec<u8>>,
         signature_checks: Option<&mut Vec<FluxnodeSigCheck>>,
+        start_meta: &mut HashMap<OutPoint, FluxnodeStartMeta>,
     ) -> Result<(), ChainStateError> {
         let Some(fluxnode) = tx.fluxnode.as_ref() else {
             return Ok(());
@@ -1169,6 +1318,20 @@ impl<S: KeyValueStore> ChainState<S> {
                     params,
                     None,
                 )?;
+                let tier =
+                    fluxnode_tier_from_collateral(height, collateral.value, &params.fluxnode)
+                        .ok_or_else(|| {
+                            ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode collateral amount invalid",
+                            ))
+                        })?;
+                start_meta.insert(
+                    start.collateral.clone(),
+                    FluxnodeStartMeta {
+                        tier,
+                        collateral_value: collateral.value,
+                    },
+                );
 
                 let message = hash256_to_hex(txid).into_bytes();
                 if let Some(signature_checks) = signature_checks {
@@ -1230,6 +1393,23 @@ impl<S: KeyValueStore> ChainState<S> {
                         params,
                         None,
                     )?;
+                    let tier = fluxnode_tier_from_collateral(
+                        height,
+                        collateral_entry.value,
+                        &params.fluxnode,
+                    )
+                    .ok_or_else(|| {
+                        ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode collateral amount invalid",
+                        ))
+                    })?;
+                    start_meta.insert(
+                        collateral.clone(),
+                        FluxnodeStartMeta {
+                            tier,
+                            collateral_value: collateral_entry.value,
+                        },
+                    );
 
                     if script_p2pkh_hash(&collateral_entry.script_pubkey).is_none() {
                         return Err(ChainStateError::Validation(ValidationError::Fluxnode(
@@ -1305,6 +1485,23 @@ impl<S: KeyValueStore> ChainState<S> {
                         params,
                         Some(redeem_script),
                     )?;
+                    let tier = fluxnode_tier_from_collateral(
+                        height,
+                        collateral_entry.value,
+                        &params.fluxnode,
+                    )
+                    .ok_or_else(|| {
+                        ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode collateral amount invalid",
+                        ))
+                    })?;
+                    start_meta.insert(
+                        collateral.clone(),
+                        FluxnodeStartMeta {
+                            tier,
+                            collateral_value: collateral_entry.value,
+                        },
+                    );
 
                     if script_p2sh_hash(&collateral_entry.script_pubkey).is_none() {
                         return Err(ChainStateError::Validation(ValidationError::Fluxnode(
@@ -1343,6 +1540,32 @@ impl<S: KeyValueStore> ChainState<S> {
                         "fluxnode confirm has null collateral",
                     )));
                 }
+                let record = self.fluxnode_record(&confirm.collateral)?.ok_or_else(|| {
+                    ChainStateError::Validation(ValidationError::Fluxnode(
+                        "fluxnode confirm missing start record",
+                    ))
+                })?;
+                match confirm.update_type {
+                    0 => {
+                        if record.confirmed_height != 0 {
+                            return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode confirm already confirmed",
+                            )));
+                        }
+                    }
+                    1 => {
+                        if record.confirmed_height == 0 {
+                            return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode update confirm before initial confirm",
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                            "fluxnode confirm has invalid update type",
+                        )));
+                    }
+                }
                 if confirm.sig.is_empty() || confirm.benchmark_sig.is_empty() {
                     return Err(ChainStateError::Validation(ValidationError::Fluxnode(
                         "fluxnode confirm missing signatures",
@@ -1377,7 +1600,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 } else {
                     lookup_operator_pubkey(&self.store, &confirm.collateral)?.ok_or_else(|| {
                         ChainStateError::Validation(ValidationError::Fluxnode(
-                            "fluxnode confirm missing start record",
+                            "fluxnode operator pubkey missing",
                         ))
                     })?
                 };
@@ -1522,6 +1745,349 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(height_u32 > expire_height)
     }
 
+    fn ensure_fluxnode_payments_cache_loaded(&self) -> Result<(), ChainStateError> {
+        let mut cache = self
+            .fluxnode_payments
+            .lock()
+            .map_err(|_| ChainStateError::CorruptIndex("fluxnode payments cache lock poisoned"))?;
+        if cache.initialized {
+            return Ok(());
+        }
+        cache.reset();
+
+        self.store
+            .for_each_prefix(Column::Fluxnode, &[], &mut |_, value| {
+                let record = FluxnodeRecord::decode(value)
+                    .map_err(|err| StoreError::Backend(err.to_string()))?;
+                cache.upsert_record(&record);
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    fn fluxnode_payee_script(
+        &self,
+        utxo: &UtxoEntry,
+        meta: FluxnodePaymentMeta,
+        params: &ChainParams,
+    ) -> Result<Vec<u8>, ChainStateError> {
+        let p2sh_script = |hash: &[u8; 20]| {
+            let mut script = Vec::with_capacity(23);
+            script.extend_from_slice(&[0xa9, 0x14]);
+            script.extend_from_slice(hash);
+            script.push(0x87);
+            script
+        };
+        let p2pkh_script = |hash: &[u8; 20]| {
+            let mut script = Vec::with_capacity(25);
+            script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            script.extend_from_slice(hash);
+            script.extend_from_slice(&[0x88, 0xac]);
+            script
+        };
+
+        if let Some(redeem_key) = meta.p2sh_script {
+            let redeem_script = self.store.get(Column::FluxnodeKey, &redeem_key.0)?.ok_or(
+                ChainStateError::CorruptIndex("missing fluxnode redeem script"),
+            )?;
+            let script_hash = hash160(&redeem_script);
+            return Ok(p2sh_script(&script_hash));
+        }
+
+        let collateral_key = meta.collateral_pubkey.ok_or(ChainStateError::CorruptIndex(
+            "missing fluxnode collateral pubkey key",
+        ))?;
+        let pubkey_bytes = self
+            .store
+            .get(Column::FluxnodeKey, &collateral_key.0)?
+            .ok_or(ChainStateError::CorruptIndex(
+                "missing fluxnode collateral pubkey bytes",
+            ))?;
+
+        let is_p2sh_signing_key = params.fluxnode.p2sh_public_keys.iter().any(|key| {
+            hex_to_bytes(key.key)
+                .as_ref()
+                .is_some_and(|expected| expected.as_slice() == pubkey_bytes.as_slice())
+        });
+        if is_p2sh_signing_key {
+            return Ok(utxo.script_pubkey.clone());
+        }
+
+        Ok(p2pkh_script(&hash160(&pubkey_bytes)))
+    }
+
+    fn next_fluxnode_payee(
+        &self,
+        tier: u8,
+        pay_height: i32,
+        params: &ChainParams,
+    ) -> Result<Option<(OutPoint, Vec<u8>)>, ChainStateError> {
+        if !(1..=3).contains(&tier) {
+            return Ok(None);
+        }
+        if pay_height < 0 {
+            return Ok(None);
+        }
+        self.ensure_fluxnode_payments_cache_loaded()?;
+
+        let tier_index = (tier - 1) as usize;
+        let pay_height_u32 =
+            u32::try_from(pay_height).map_err(|_| ChainStateError::ValueOutOfRange)?;
+        let expiration = fluxnode_confirm_expiration_count(pay_height, &params.consensus);
+        let mut removed = 0usize;
+        let mut last_reason = "none";
+
+        loop {
+            let (key, meta) = {
+                let mut cache = self.fluxnode_payments.lock().map_err(|_| {
+                    ChainStateError::CorruptIndex("fluxnode payments cache lock poisoned")
+                })?;
+                let Some(key) = cache.by_tier[tier_index].iter().next().copied() else {
+                    if removed > 0 {
+                        eprintln!(
+                            "no eligible fluxnodes for tier {} at pay height {} after removing {} entries (last={})",
+                            tier, pay_height, removed, last_reason
+                        );
+                    }
+                    return Ok(None);
+                };
+                let Some(meta) = cache.meta_by_outpoint.get(&key.outpoint).copied() else {
+                    cache.by_tier[tier_index].remove(&key);
+                    cache.key_by_outpoint.remove(&key.outpoint);
+                    removed = removed.saturating_add(1);
+                    last_reason = "missing_meta";
+                    continue;
+                };
+                (key, meta)
+            };
+
+            if meta.tier != tier {
+                let mut cache = self.fluxnode_payments.lock().map_err(|_| {
+                    ChainStateError::CorruptIndex("fluxnode payments cache lock poisoned")
+                })?;
+                cache.remove_outpoint(&key.outpoint);
+                removed = removed.saturating_add(1);
+                last_reason = "tier_mismatch";
+                continue;
+            }
+
+            let expired = if pay_height_u32 <= meta.last_confirmed_height {
+                false
+            } else {
+                (pay_height_u32 - meta.last_confirmed_height) > expiration
+            };
+            if expired {
+                let mut cache = self.fluxnode_payments.lock().map_err(|_| {
+                    ChainStateError::CorruptIndex("fluxnode payments cache lock poisoned")
+                })?;
+                cache.remove_outpoint(&key.outpoint);
+                removed = removed.saturating_add(1);
+                last_reason = "expired";
+                continue;
+            }
+
+            let bytes = key.outpoint.as_bytes();
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&bytes[..32]);
+            let mut index_bytes = [0u8; 4];
+            index_bytes.copy_from_slice(&bytes[32..36]);
+            let outpoint = OutPoint {
+                hash,
+                index: u32::from_le_bytes(index_bytes),
+            };
+
+            let Some(utxo) = self.utxo_entry(&outpoint)? else {
+                let mut cache = self.fluxnode_payments.lock().map_err(|_| {
+                    ChainStateError::CorruptIndex("fluxnode payments cache lock poisoned")
+                })?;
+                cache.remove_outpoint(&key.outpoint);
+                removed = removed.saturating_add(1);
+                last_reason = "missing_utxo";
+                continue;
+            };
+            if !fluxnode_collateral_matches_tier(pay_height, utxo.value, tier, &params.fluxnode) {
+                let mut cache = self.fluxnode_payments.lock().map_err(|_| {
+                    ChainStateError::CorruptIndex("fluxnode payments cache lock poisoned")
+                })?;
+                cache.remove_outpoint(&key.outpoint);
+                removed = removed.saturating_add(1);
+                last_reason = "collateral_mismatch";
+                continue;
+            }
+            let script_pubkey = self.fluxnode_payee_script(&utxo, meta, params)?;
+            return Ok(Some((outpoint, script_pubkey)));
+        }
+    }
+
+    fn expected_fluxnode_payouts(
+        &self,
+        height: i32,
+        params: &ChainParams,
+    ) -> Result<Vec<FluxnodePayout>, ChainStateError> {
+        if (height as i64) < params.fluxnode.start_payments_height {
+            return Ok(Vec::new());
+        }
+        let pay_height = height.saturating_sub(1);
+        let block_value = block_subsidy(height, &params.consensus);
+        let mut payouts = Vec::new();
+        for tier in 1u8..=3u8 {
+            if let Some((outpoint, script_pubkey)) =
+                self.next_fluxnode_payee(tier, pay_height, params)?
+            {
+                let amount = fluxnode_subsidy(height, block_value, tier as i32, &params.consensus);
+                payouts.push(FluxnodePayout {
+                    tier,
+                    outpoint,
+                    script_pubkey,
+                    amount,
+                });
+            }
+        }
+        Ok(payouts)
+    }
+
+    pub fn deterministic_fluxnode_payouts(
+        &self,
+        height: i32,
+        params: &ChainParams,
+    ) -> Result<Vec<(OutPoint, Vec<u8>, i64)>, ChainStateError> {
+        Ok(self
+            .expected_fluxnode_payouts(height, params)?
+            .into_iter()
+            .map(|payout| (payout.outpoint, payout.script_pubkey, payout.amount))
+            .collect())
+    }
+
+    fn check_deterministic_fluxnode_payouts(
+        &self,
+        coinbase: &Transaction,
+        height: i32,
+        params: &ChainParams,
+    ) -> Result<Vec<OutPoint>, ChainStateError> {
+        let payouts = self.expected_fluxnode_payouts(height, params)?;
+        let mut tiers_present = [false; 3];
+        for payout in &payouts {
+            if (1..=3).contains(&payout.tier) {
+                tiers_present[(payout.tier - 1) as usize] = true;
+            }
+        }
+        let check_dev_fund =
+            network_upgrade_active(height, &params.consensus.upgrades, UpgradeIndex::Pon);
+        if payouts.is_empty() && !check_dev_fund {
+            return Ok(Vec::new());
+        }
+
+        let mut remainder = block_subsidy(height, &params.consensus);
+        for payout in &payouts {
+            remainder = remainder
+                .checked_sub(payout.amount)
+                .ok_or(ChainStateError::ValueOutOfRange)?;
+        }
+
+        let dev_fund_script = if check_dev_fund {
+            Some(
+                address_to_script_pubkey(params.funding.dev_fund_address, params.network).map_err(
+                    |_| {
+                        ChainStateError::Validation(ValidationError::InvalidTransaction(
+                            "invalid dev fund address",
+                        ))
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+
+        let mut approved = vec![false; payouts.len()];
+        let mut used_outputs = vec![false; coinbase.vout.len()];
+        let mut dev_fund_paid = false;
+
+        for (idx, out) in coinbase.vout.iter().enumerate() {
+            for (payout_idx, payout) in payouts.iter().enumerate() {
+                if approved[payout_idx] {
+                    continue;
+                }
+                if out.value == payout.amount && out.script_pubkey == payout.script_pubkey {
+                    approved[payout_idx] = true;
+                    used_outputs[idx] = true;
+                    break;
+                }
+            }
+
+            if check_dev_fund && !dev_fund_paid && !used_outputs[idx] {
+                if let Some(script) = dev_fund_script.as_ref() {
+                    if &out.script_pubkey == script && out.value >= remainder {
+                        dev_fund_paid = true;
+                    }
+                }
+            }
+        }
+
+        if check_dev_fund && !dev_fund_paid {
+            let min_dev = min_dev_fund_amount(height, &params.consensus);
+            let dev_outputs = dev_fund_script
+                .as_ref()
+                .map(|script| {
+                    coinbase
+                        .vout
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, out)| &out.script_pubkey == script)
+                        .map(|(idx, out)| {
+                            let used = used_outputs.get(idx).copied().unwrap_or(false);
+                            (idx, out.value, used)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "dev fund remainder check failed at height {}: remainder={} min_dev={} tiers_present={:?} payouts={} dev_outputs={:?}",
+                height,
+                remainder,
+                min_dev,
+                tiers_present,
+                payouts.len(),
+                dev_outputs
+            );
+            return Err(ChainStateError::Validation(
+                ValidationError::InvalidTransaction("coinbase missing dev fund remainder"),
+            ));
+        }
+
+        if approved.iter().any(|ok| !ok) {
+            let missing = payouts
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !approved.get(*idx).copied().unwrap_or(false))
+                .map(|(_, payout)| {
+                    (
+                        payout.tier,
+                        payout.amount,
+                        outpoint_to_string(&payout.outpoint),
+                        bytes_to_hex(&payout.script_pubkey),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let coinbase_outputs = coinbase
+                .vout
+                .iter()
+                .enumerate()
+                .map(|(idx, out)| (idx, out.value, bytes_to_hex(&out.script_pubkey)))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "deterministic fluxnode payout mismatch at height {}: missing={:?} coinbase_vout={:?}",
+                height, missing, coinbase_outputs
+            );
+            return Err(ChainStateError::Validation(
+                ValidationError::InvalidTransaction(
+                    "coinbase missing deterministic fluxnode payout",
+                ),
+            ));
+        }
+
+        Ok(payouts.into_iter().map(|p| p.outpoint).collect())
+    }
+
     pub fn connect_block(
         &self,
         block: &Block,
@@ -1599,6 +2165,8 @@ impl<S: KeyValueStore> ChainState<S> {
             pon_validation::validate_pon_signature(&block.header, consensus, &operator_pubkey)?;
         }
         check_coinbase_funding(&block.transactions[0], height, params)?;
+        let paid_fluxnodes =
+            self.check_deterministic_fluxnode_payouts(&block.transactions[0], height, params)?;
 
         let mut utxo_stats = self.utxo_stats_or_compute()?;
         let mut value_pools = self.value_pools_or_compute()?;
@@ -1639,6 +2207,7 @@ impl<S: KeyValueStore> ChainState<S> {
             prev_sapling_tree,
             spent: Vec::new(),
             fluxnode: Vec::new(),
+            fluxnode_extra: Vec::new(),
         };
         let mut seen_sprout_nullifiers = HashSet::new();
         let mut seen_sapling_nullifiers = HashSet::new();
@@ -1670,6 +2239,7 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut total_fees = 0i64;
         let mut fluxnode_operator_pubkeys: HashMap<OutPoint, Vec<u8>> = HashMap::new();
         let mut fluxnode_sig_checks: Vec<FluxnodeSigCheck> = Vec::new();
+        let mut fluxnode_start_meta: HashMap<OutPoint, FluxnodeStartMeta> = HashMap::new();
         for (index, tx) in block.transactions.iter().enumerate() {
             let is_coinbase = index == 0;
             let txid = txids
@@ -1686,6 +2256,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 &created_utxos,
                 &fluxnode_operator_pubkeys,
                 Some(&mut fluxnode_sig_checks),
+                &mut fluxnode_start_meta,
             )?;
             let tx_value_out = tx_value_out(tx)?;
             let mut tx_value_in = tx_shielded_value_in(tx)?;
@@ -1910,8 +2481,12 @@ impl<S: KeyValueStore> ChainState<S> {
             if let Some(entry) = fluxnode_undo_entry(&self.store, tx)? {
                 undo.fluxnode.push(entry);
             }
-            apply_fluxnode_tx(&self.store, &mut batch, tx, height as u32)?;
-            if let Some((collateral, operator_pubkey)) = fluxnode_start_operator_pubkey(tx) {
+            let start_operator = fluxnode_start_operator_pubkey(tx);
+            let start_meta_entry = start_operator
+                .as_ref()
+                .and_then(|(collateral, _)| fluxnode_start_meta.get(collateral).copied());
+            apply_fluxnode_tx(&self.store, &mut batch, tx, height as u32, start_meta_entry)?;
+            if let Some((collateral, operator_pubkey)) = start_operator {
                 fluxnode_operator_pubkeys.insert(collateral, operator_pubkey);
             }
 
@@ -2085,6 +2660,50 @@ impl<S: KeyValueStore> ChainState<S> {
                 return Err(ChainStateError::Validation(
                     ValidationError::InvalidTransaction("script validation failed"),
                 ));
+            }
+        }
+
+        if !paid_fluxnodes.is_empty() {
+            for collateral in &paid_fluxnodes {
+                let key = outpoint_key_bytes(collateral);
+                let mut record_in_batch = None;
+                for op in batch.iter() {
+                    match op {
+                        WriteOp::Put {
+                            column,
+                            key: op_key,
+                            value,
+                        } if *column == Column::Fluxnode && op_key.as_slice() == key.as_bytes() => {
+                            record_in_batch = Some(Some(value.as_slice()));
+                        }
+                        WriteOp::Delete {
+                            column,
+                            key: op_key,
+                        } if *column == Column::Fluxnode && op_key.as_slice() == key.as_bytes() => {
+                            record_in_batch = Some(None);
+                        }
+                        _ => {}
+                    }
+                }
+
+                let Some(mut record) = (match record_in_batch {
+                    Some(Some(bytes)) => FluxnodeRecord::decode(bytes).map(Some).map_err(|_| {
+                        ChainStateError::CorruptIndex("invalid fluxnode record bytes in batch")
+                    })?,
+                    Some(None) => None,
+                    None => self.fluxnode_record(collateral)?,
+                }) else {
+                    return Err(ChainStateError::CorruptIndex(
+                        "missing fluxnode record for deterministic payout",
+                    ));
+                };
+
+                undo.fluxnode_extra.push(FluxnodeUndo {
+                    collateral: collateral.clone(),
+                    prev: Some(record.clone()),
+                });
+                record.last_paid_height = height as u32;
+                batch.put(Column::Fluxnode, key.as_bytes(), record.encode());
             }
         }
 
@@ -2376,6 +2995,19 @@ impl<S: KeyValueStore> ChainState<S> {
             }
         }
 
+        for entry in undo.fluxnode_extra.iter().rev() {
+            let key = outpoint_key_bytes(&entry.collateral);
+            match &entry.prev {
+                Some(record) => {
+                    batch.put(Column::Fluxnode, key.as_bytes(), record.encode());
+                }
+                None => {
+                    batch.delete(Column::Fluxnode, key.as_bytes());
+                }
+            }
+        }
+        undo.fluxnode_extra.clear();
+
         for (tx_index, tx) in block.transactions.iter().enumerate().rev() {
             let txid = tx.txid()?;
             for (output_index, output) in tx.vout.iter().enumerate() {
@@ -2469,6 +3101,11 @@ impl<S: KeyValueStore> ChainState<S> {
         if !undo.fluxnode.is_empty() {
             return Err(ChainStateError::CorruptIndex(
                 "block undo has extra fluxnode entries",
+            ));
+        }
+        if !undo.fluxnode_extra.is_empty() {
+            return Err(ChainStateError::CorruptIndex(
+                "block undo has extra fluxnode extra entries",
             ));
         }
 
@@ -2609,10 +3246,15 @@ impl<S: KeyValueStore> ChainState<S> {
                 }
             }
         }
+        let mut fluxnode_updates: Vec<WriteOp> = Vec::new();
         if let Ok(mut cache) = self.utxo_cache.lock() {
             for op in ops {
                 match op {
                     WriteOp::Put { column, key, value } => {
+                        if column == Column::Fluxnode {
+                            fluxnode_updates.push(WriteOp::Put { column, key, value });
+                            continue;
+                        }
                         if column != Column::Utxo {
                             continue;
                         }
@@ -2622,6 +3264,10 @@ impl<S: KeyValueStore> ChainState<S> {
                         cache.insert(outpoint_key, value);
                     }
                     WriteOp::Delete { column, key } => {
+                        if column == Column::Fluxnode {
+                            fluxnode_updates.push(WriteOp::Delete { column, key });
+                            continue;
+                        }
                         if column != Column::Utxo {
                             continue;
                         }
@@ -2629,6 +3275,28 @@ impl<S: KeyValueStore> ChainState<S> {
                             continue;
                         };
                         cache.remove(&outpoint_key);
+                    }
+                }
+            }
+        }
+        if let Ok(mut cache) = self.fluxnode_payments.lock() {
+            if cache.initialized {
+                for update in fluxnode_updates {
+                    match update {
+                        WriteOp::Put { key: _, value, .. } => {
+                            let Ok(record) = FluxnodeRecord::decode(&value) else {
+                                return Err(ChainStateError::CorruptIndex(
+                                    "invalid fluxnode record bytes in batch",
+                                ));
+                            };
+                            cache.upsert_record(&record);
+                        }
+                        WriteOp::Delete { key, .. } => {
+                            let Some(outpoint_key) = OutPointKey::from_slice(key.as_slice()) else {
+                                continue;
+                            };
+                            cache.remove_outpoint(&outpoint_key);
+                        }
                     }
                 }
             }
@@ -3083,6 +3751,7 @@ impl<S: KeyValueStore> ChainState<S> {
     ) -> Result<(), ChainStateError> {
         let created_utxos = HashMap::new();
         let operator_pubkeys = HashMap::new();
+        let mut start_meta = HashMap::new();
         self.validate_fluxnode_tx(
             tx,
             txid,
@@ -3091,6 +3760,7 @@ impl<S: KeyValueStore> ChainState<S> {
             &created_utxos,
             &operator_pubkeys,
             None,
+            &mut start_meta,
         )
     }
 
@@ -3253,6 +3923,20 @@ impl ShieldedTreesCache {
 }
 
 impl<S: KeyValueStore> ChainState<S> {
+    pub fn sapling_root(&self) -> Result<Hash256, ChainStateError> {
+        let mut cache = self
+            .shielded_cache
+            .lock()
+            .map_err(|_| ChainStateError::CorruptIndex("shielded cache poisoned"))?;
+        if cache.is_none() {
+            *cache = Some(ShieldedTreesCache::load(&self.store)?);
+        }
+        Ok(cache
+            .as_ref()
+            .ok_or(ChainStateError::CorruptIndex("missing shielded cache"))?
+            .sapling_root)
+    }
+
     fn shielded_cache_snapshot(
         &self,
     ) -> Result<(Hash256, Vec<u8>, Hash256, Vec<u8>), ChainStateError> {
@@ -3624,6 +4308,16 @@ fn hash256_to_hex(hash: &Hash256) -> String {
     out
 }
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
 fn outpoint_to_string(outpoint: &OutPoint) -> String {
     format!("{}:{}", hash256_to_hex(&outpoint.hash), outpoint.index)
 }
@@ -3975,6 +4669,7 @@ fn fluxnode_benchmark_message(confirm: &FluxnodeConfirmTx) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxd_consensus::money::COIN;
     use fluxd_consensus::params::{chain_params, Network};
     use fluxd_consensus::rewards::min_dev_fund_amount;
     use fluxd_consensus::upgrades::UpgradeIndex;
@@ -4034,6 +4729,44 @@ mod tests {
         script.extend_from_slice(&hash);
         script.extend_from_slice(&[0x88, 0xac]);
         script
+    }
+
+    #[test]
+    fn fluxnode_payee_ordering_matches_cpp_unpaid_first_on_equal_height() {
+        fn record(
+            hash_byte: u8,
+            index: u32,
+            confirmed_height: u32,
+            last_paid_height: u32,
+        ) -> FluxnodeRecord {
+            FluxnodeRecord {
+                collateral: OutPoint {
+                    hash: [hash_byte; 32],
+                    index,
+                },
+                tier: 1,
+                start_height: 1,
+                confirmed_height,
+                last_confirmed_height: confirmed_height,
+                last_paid_height,
+                collateral_value: 0,
+                operator_pubkey: KeyId([0u8; 32]),
+                collateral_pubkey: None,
+                p2sh_script: None,
+            }
+        }
+
+        let unpaid = record(0xff, 1, 100, 0);
+        let paid = record(0x00, 1, 50, 100);
+        let unpaid_key = FluxnodePayeeKey::from_record(&unpaid).expect("unpaid key");
+        let paid_key = FluxnodePayeeKey::from_record(&paid).expect("paid key");
+        assert!(unpaid_key < paid_key);
+
+        let unpaid_a = record(0x01, 1, 100, 0);
+        let unpaid_b = record(0x02, 1, 100, 0);
+        let unpaid_a_key = FluxnodePayeeKey::from_record(&unpaid_a).expect("unpaid a key");
+        let unpaid_b_key = FluxnodePayeeKey::from_record(&unpaid_b).expect("unpaid b key");
+        assert!(unpaid_a_key < unpaid_b_key);
     }
 
     #[test]
@@ -5149,7 +5882,7 @@ mod tests {
             index: 0,
         };
         let entry = UtxoEntry {
-            value: 1000,
+            value: 1_000 * COIN,
             script_pubkey: p2pkh_script_for_pubkey(&collateral_pubkey.serialize()),
             height: 0,
             is_coinbase: false,
@@ -5197,6 +5930,7 @@ mod tests {
         }
 
         let params = chain_params(Network::Regtest);
+        let mut start_meta = HashMap::new();
         chainstate
             .validate_fluxnode_tx(
                 &tx,
@@ -5206,6 +5940,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 None,
+                &mut start_meta,
             )
             .expect("start tx valid");
     }
@@ -5230,7 +5965,7 @@ mod tests {
             index: 0,
         };
         let entry = UtxoEntry {
-            value: 1000,
+            value: 1_000 * COIN,
             script_pubkey: p2pkh_script_for_pubkey(&collateral_pubkey.serialize()),
             height: 0,
             is_coinbase: false,
@@ -5245,10 +5980,12 @@ mod tests {
 
         let record = FluxnodeRecord {
             collateral: collateral_outpoint.clone(),
-            tier: 0,
+            tier: 1,
             start_height: 0,
+            confirmed_height: 1,
             last_confirmed_height: 1,
             last_paid_height: 0,
+            collateral_value: 1_000 * COIN,
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
@@ -5296,6 +6033,7 @@ mod tests {
         }
 
         let params = chain_params(Network::Regtest);
+        let mut start_meta = HashMap::new();
         chainstate
             .validate_fluxnode_tx(
                 &tx,
@@ -5305,6 +6043,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 None,
+                &mut start_meta,
             )
             .expect("start tx valid after expiration");
     }
@@ -5329,7 +6068,7 @@ mod tests {
             index: 0,
         };
         let entry = UtxoEntry {
-            value: 1000,
+            value: 1_000 * COIN,
             script_pubkey: p2pkh_script_for_pubkey(&collateral_pubkey.serialize()),
             height: 0,
             is_coinbase: false,
@@ -5344,10 +6083,12 @@ mod tests {
 
         let record = FluxnodeRecord {
             collateral: collateral_outpoint.clone(),
-            tier: 0,
+            tier: 1,
             start_height: 0,
+            confirmed_height: 80,
             last_confirmed_height: 80,
             last_paid_height: 0,
+            collateral_value: 1_000 * COIN,
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
@@ -5395,6 +6136,7 @@ mod tests {
         }
 
         let params = chain_params(Network::Regtest);
+        let mut start_meta = HashMap::new();
         let err = chainstate
             .validate_fluxnode_tx(
                 &tx,
@@ -5404,6 +6146,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 None,
+                &mut start_meta,
             )
             .expect_err("start tx rejected while confirmed");
         match err {
@@ -5434,7 +6177,7 @@ mod tests {
             index: 0,
         };
         let entry = UtxoEntry {
-            value: 1000,
+            value: 1_000 * COIN,
             script_pubkey: p2pkh_script_for_pubkey(&collateral_pubkey.serialize()),
             height: 2_019_000,
             is_coinbase: false,
@@ -5450,10 +6193,12 @@ mod tests {
         let start_height = 2_019_752u32;
         let record = FluxnodeRecord {
             collateral: collateral_outpoint.clone(),
-            tier: 0,
+            tier: 1,
             start_height,
+            confirmed_height: 0,
             last_confirmed_height: start_height,
             last_paid_height: 0,
+            collateral_value: 1_000 * COIN,
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
@@ -5501,6 +6246,7 @@ mod tests {
         }
 
         let params = chain_params(Network::Mainnet);
+        let mut start_meta = HashMap::new();
         chainstate
             .validate_fluxnode_tx(
                 &tx,
@@ -5510,6 +6256,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 None,
+                &mut start_meta,
             )
             .expect("start tx valid after pre-PON DoS removal");
     }
@@ -5537,6 +6284,26 @@ mod tests {
             hash: [0x22; 32],
             index: 5,
         };
+
+        let record = FluxnodeRecord {
+            collateral: collateral_outpoint.clone(),
+            tier: 1,
+            start_height: 0,
+            confirmed_height: 0,
+            last_confirmed_height: 0,
+            last_paid_height: 0,
+            collateral_value: 1_000 * COIN,
+            operator_pubkey: KeyId([0x11; 32]),
+            collateral_pubkey: None,
+            p2sh_script: None,
+        };
+        store
+            .put(
+                Column::Fluxnode,
+                outpoint_key_bytes(&collateral_outpoint).as_bytes(),
+                &record.encode(),
+            )
+            .expect("store record");
 
         let mut params = chain_params(Network::Regtest);
         params.fluxnode.benchmarking_public_keys = &BENCH_KEYS;
@@ -5587,6 +6354,7 @@ mod tests {
         let txid = tx.txid().expect("txid");
         let mut operator_pubkeys = HashMap::new();
         operator_pubkeys.insert(collateral_outpoint, operator_pubkey.serialize().to_vec());
+        let mut start_meta = HashMap::new();
         chainstate
             .validate_fluxnode_tx(
                 &tx,
@@ -5596,6 +6364,7 @@ mod tests {
                 &HashMap::new(),
                 &operator_pubkeys,
                 None,
+                &mut start_meta,
             )
             .expect("confirm valid");
     }

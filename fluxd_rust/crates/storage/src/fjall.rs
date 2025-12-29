@@ -1,9 +1,16 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 
 use crate::{Column, KeyValueStore, PrefixVisitor, StoreError, WriteBatch, WriteOp};
+
+const SLOW_COMMIT_THRESHOLD: Duration = Duration::from_millis(500);
+const SLOW_COMMIT_LOG_INTERVAL_SECS: u64 = 30;
+
+static LAST_SLOW_COMMIT_LOG_SECS: AtomicU64 = AtomicU64::new(0);
 
 pub struct FjallStore {
     keyspace: Keyspace,
@@ -224,7 +231,30 @@ impl KeyValueStore for FjallStore {
                 }
             }
         }
+        let commit_start = Instant::now();
         fjall_batch.commit().map_err(map_err)?;
+        let elapsed = commit_start.elapsed();
+        if elapsed >= SLOW_COMMIT_THRESHOLD {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last = LAST_SLOW_COMMIT_LOG_SECS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= SLOW_COMMIT_LOG_INTERVAL_SECS
+                && LAST_SLOW_COMMIT_LOG_SECS
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                eprintln!(
+                    "Warning: Fjall write_batch commit took {}ms (ops {}, write_buffer {}B, journals {}, active_compactions {})",
+                    elapsed.as_millis(),
+                    batch.len(),
+                    self.keyspace.write_buffer_size(),
+                    self.keyspace.journal_count(),
+                    self.keyspace.active_compactions(),
+                );
+            }
+        }
         Ok(())
     }
 }
