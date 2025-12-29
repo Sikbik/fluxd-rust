@@ -1,4 +1,5 @@
 mod dashboard;
+mod fee_estimator;
 mod mempool;
 mod p2p;
 mod peer_book;
@@ -99,11 +100,14 @@ const ADDR_DISCOVERY_TIMEOUT_SECS: u64 = 6;
 const PEERS_FILE_NAME: &str = "peers.dat";
 const BANLIST_FILE_NAME: &str = "banlist.dat";
 const MEMPOOL_FILE_NAME: &str = "mempool.dat";
+const FEE_ESTIMATES_FILE_NAME: &str = "fee_estimates.dat";
 const PEERS_FILE_VERSION: u32 = 2;
 const PEERS_FILE_VERSION_V1: u32 = 1;
 const MEMPOOL_FILE_VERSION: u32 = 1;
 const PEERS_PERSIST_INTERVAL_SECS: u64 = 60;
 const BANLIST_PERSIST_INTERVAL_SECS: u64 = 60;
+const DEFAULT_FEE_ESTIMATOR_MAX_SAMPLES: usize = 10_000;
+const DEFAULT_FEE_ESTIMATES_PERSIST_INTERVAL_SECS: u64 = 300;
 const GENESIS_TIMESTAMP: &str =
     "Zelcash06f40b01ab1f135bd96c5d72f8e37c7906dc216dcaaa36fcd00ebf9b8e109567";
 const GENESIS_PUBKEY_HEX: &str =
@@ -168,8 +172,11 @@ struct Config {
     header_peer_addrs: Vec<String>,
     tx_peers: usize,
     inflight_per_peer: usize,
+    require_standard: bool,
+    min_relay_fee_per_kb: i64,
     mempool_max_bytes: usize,
     mempool_persist_interval_secs: u64,
+    fee_estimates_persist_interval_secs: u64,
     status_interval_secs: u64,
     dashboard_addr: Option<SocketAddr>,
     db_cache_bytes: Option<u64>,
@@ -800,12 +807,33 @@ async fn run() -> Result<(), String> {
         Some(Arc::clone(&validation_metrics)),
     );
     let mempool = Arc::new(Mutex::new(mempool::Mempool::new(config.mempool_max_bytes)));
+    let mempool_policy = Arc::new(mempool::MempoolPolicy::standard(
+        config.min_relay_fee_per_kb,
+        config.require_standard,
+    ));
     let mempool_metrics = Arc::new(stats::MempoolMetrics::default());
+    let fee_estimates_path = data_dir.join(FEE_ESTIMATES_FILE_NAME);
+    let fee_estimator = match fee_estimator::FeeEstimator::load(
+        &fee_estimates_path,
+        DEFAULT_FEE_ESTIMATOR_MAX_SAMPLES,
+    ) {
+        Ok(estimator) => estimator,
+        Err(err) => {
+            eprintln!(
+                "failed to load fee estimates from {}: {err}",
+                fee_estimates_path.display()
+            );
+            fee_estimator::FeeEstimator::new(DEFAULT_FEE_ESTIMATOR_MAX_SAMPLES)
+        }
+    };
+    let fee_estimator = Arc::new(Mutex::new(fee_estimator));
     let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
     {
         let chainstate = Arc::clone(&chainstate);
         let mempool = Arc::clone(&mempool);
+        let mempool_policy = Arc::clone(&mempool_policy);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let fee_estimator = Arc::clone(&fee_estimator);
         let mempool_flags = flags.clone();
         let params = params.as_ref().clone();
         let data_dir = data_dir.clone();
@@ -824,7 +852,9 @@ async fn run() -> Result<(), String> {
                     rpc_auth,
                     chainstate,
                     mempool,
+                    mempool_policy,
                     mempool_metrics,
+                    fee_estimator,
                     mempool_flags,
                     params,
                     data_dir,
@@ -911,6 +941,7 @@ async fn run() -> Result<(), String> {
                         chainstate.as_ref(),
                         params.as_ref(),
                         &flags,
+                        mempool_policy.as_ref(),
                         tx,
                         raw,
                     ) {
@@ -920,14 +951,21 @@ async fn run() -> Result<(), String> {
                             continue;
                         }
                     };
-                    let inserted = match mempool.lock() {
+                    let should_observe_fee = entry.tx.fluxnode.is_none();
+                    let entry_fee = entry.fee;
+                    let entry_size = entry.size();
+
+                    let (inserted, observe_fee) = match mempool.lock() {
                         Ok(mut guard) => match guard.insert(entry) {
                             Ok(outcome) => {
                                 evicted = evicted.saturating_add(outcome.evicted);
                                 evicted_bytes = evicted_bytes.saturating_add(outcome.evicted_bytes);
-                                true
+                                (true, should_observe_fee)
                             }
-                            Err(err) => err.kind == mempool::MempoolErrorKind::AlreadyInMempool,
+                            Err(err) => (
+                                err.kind == mempool::MempoolErrorKind::AlreadyInMempool,
+                                false,
+                            ),
                         },
                         Err(_) => {
                             eprintln!("mempool lock poisoned");
@@ -937,6 +975,11 @@ async fn run() -> Result<(), String> {
                     };
                     if inserted {
                         accepted += 1;
+                        if observe_fee {
+                            if let Ok(mut estimator) = fee_estimator.lock() {
+                                estimator.observe_tx(entry_fee, entry_size);
+                            }
+                        }
                     } else {
                         rejected += 1;
                     }
@@ -989,6 +1032,15 @@ async fn run() -> Result<(), String> {
         let interval_secs = config.mempool_persist_interval_secs;
         thread::spawn(move || {
             persist_mempool_loop(mempool, mempool_metrics, mempool_path, interval_secs)
+        });
+    }
+
+    if config.fee_estimates_persist_interval_secs > 0 {
+        let fee_estimator = Arc::clone(&fee_estimator);
+        let fee_estimates_path = fee_estimates_path.clone();
+        let interval_secs = config.fee_estimates_persist_interval_secs;
+        thread::spawn(move || {
+            persist_fee_estimates_loop(fee_estimator, fee_estimates_path, interval_secs)
         });
     }
 
@@ -1204,7 +1256,9 @@ async fn run() -> Result<(), String> {
         let relay_params = Arc::clone(&params);
         let relay_addr_book = Arc::clone(&addr_book);
         let relay_mempool = Arc::clone(&mempool);
+        let relay_mempool_policy = Arc::clone(&mempool_policy);
         let relay_mempool_metrics = Arc::clone(&mempool_metrics);
+        let relay_fee_estimator = Arc::clone(&fee_estimator);
         let relay_flags = flags.clone();
         let relay_tx_announce = tx_announce.clone();
         let relay_target = config.tx_peers;
@@ -1215,7 +1269,9 @@ async fn run() -> Result<(), String> {
                 relay_addr_book,
                 relay_peer_ctx,
                 relay_mempool,
+                relay_mempool_policy,
                 relay_mempool_metrics,
+                relay_fee_estimator,
                 relay_flags,
                 relay_tx_announce,
                 relay_target,
@@ -1716,6 +1772,45 @@ fn persist_mempool_loop(
             }
         };
         mempool_metrics.note_persisted(persisted);
+        last_revision = revision;
+    }
+}
+
+fn persist_fee_estimates_loop(
+    fee_estimator: Arc<Mutex<fee_estimator::FeeEstimator>>,
+    path: PathBuf,
+    interval_secs: u64,
+) {
+    if interval_secs == 0 {
+        return;
+    }
+    let mut last_revision = fee_estimator
+        .lock()
+        .map(|guard| guard.revision().saturating_sub(1))
+        .unwrap_or(0);
+
+    loop {
+        thread::sleep(Duration::from_secs(interval_secs));
+        let revision = {
+            let guard = match fee_estimator.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    eprintln!("fee estimator lock poisoned");
+                    continue;
+                }
+            };
+            let revision = guard.revision();
+            if revision == last_revision {
+                continue;
+            }
+            match guard.save(&path) {
+                Ok(_) => revision,
+                Err(err) => {
+                    eprintln!("failed to persist {}: {err}", path.display());
+                    continue;
+                }
+            }
+        };
         last_revision = revision;
     }
 }
@@ -5049,8 +5144,11 @@ fn parse_args() -> Result<Config, String> {
     let mut header_peer_addrs: Vec<String> = Vec::new();
     let mut tx_peers: usize = DEFAULT_TX_PEERS;
     let mut inflight_per_peer: usize = DEFAULT_INFLIGHT_PER_PEER;
+    let mut require_standard: Option<bool> = None;
+    let mut min_relay_fee_per_kb: i64 = 100;
     let mut mempool_max_mb: u64 = DEFAULT_MEMPOOL_MAX_MB;
     let mut mempool_persist_interval_secs: u64 = DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS;
+    let mut fee_estimates_persist_interval_secs: u64 = DEFAULT_FEE_ESTIMATES_PERSIST_INTERVAL_SECS;
     let mut status_interval_secs: u64 = 15;
     let mut dashboard_addr: Option<SocketAddr> = None;
     let mut db_cache_bytes: Option<u64> = None;
@@ -5198,6 +5296,19 @@ fn parse_args() -> Result<Config, String> {
                     return Err(format!("inflight per peer must be > 0\n{}", usage()));
                 }
             }
+            "--minrelaytxfee" | "--min-relay-tx-fee" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --minrelaytxfee\n{}", usage()))?;
+                min_relay_fee_per_kb =
+                    parse_fee_rate_per_kb(&value).map_err(|err| format!("{err}\n{}", usage()))?;
+            }
+            "--accept-non-standard" => {
+                require_standard = Some(false);
+            }
+            "--require-standard" => {
+                require_standard = Some(true);
+            }
             "--mempool-max-mb" | "--maxmempool" => {
                 let value = args
                     .next()
@@ -5212,6 +5323,20 @@ fn parse_args() -> Result<Config, String> {
                 })?;
                 mempool_persist_interval_secs = value.parse::<u64>().map_err(|_| {
                     format!("invalid mempool persist interval '{value}'\n{}", usage())
+                })?;
+            }
+            "--fee-estimates-persist-interval" => {
+                let value = args.next().ok_or_else(|| {
+                    format!(
+                        "missing value for --fee-estimates-persist-interval\n{}",
+                        usage()
+                    )
+                })?;
+                fee_estimates_persist_interval_secs = value.parse::<u64>().map_err(|_| {
+                    format!(
+                        "invalid fee estimates persist interval '{value}'\n{}",
+                        usage()
+                    )
                 })?;
             }
             "--status-interval" => {
@@ -5358,6 +5483,8 @@ fn parse_args() -> Result<Config, String> {
         }
     }
 
+    let require_standard = require_standard.unwrap_or(network != Network::Regtest);
+
     Ok(Config {
         backend,
         data_dir: data_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
@@ -5377,8 +5504,11 @@ fn parse_args() -> Result<Config, String> {
         header_peer_addrs,
         tx_peers,
         inflight_per_peer,
+        require_standard,
+        min_relay_fee_per_kb,
         mempool_max_bytes: mb_to_bytes(mempool_max_mb).try_into().unwrap_or(usize::MAX),
         mempool_persist_interval_secs,
+        fee_estimates_persist_interval_secs,
         status_interval_secs,
         dashboard_addr,
         db_cache_bytes,
@@ -5398,6 +5528,72 @@ fn parse_args() -> Result<Config, String> {
 
 fn mb_to_bytes(mb: u64) -> u64 {
     mb.saturating_mul(1024 * 1024)
+}
+
+fn parse_fee_rate_per_kb(value: &str) -> Result<i64, String> {
+    if value.contains('.') {
+        return parse_amount_zat(value);
+    }
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("invalid fee rate '{value}'"))
+        .and_then(|amount| {
+            if amount < 0 {
+                return Err("fee rate must be >= 0".to_string());
+            }
+            Ok(amount)
+        })
+}
+
+fn parse_amount_zat(value: &str) -> Result<i64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("amount is empty".to_string());
+    }
+    if value.starts_with('-') {
+        return Err("amount must be >= 0".to_string());
+    }
+
+    let (whole, frac) = match value.split_once('.') {
+        Some((whole, frac)) => (whole, Some(frac)),
+        None => (value, None),
+    };
+    if whole.is_empty() && frac.is_none() {
+        return Err(format!("invalid amount '{value}'"));
+    }
+
+    let whole = if whole.is_empty() {
+        0i64
+    } else {
+        whole
+            .parse::<i64>()
+            .map_err(|_| format!("invalid amount '{value}'"))?
+    };
+    if whole < 0 {
+        return Err("amount must be >= 0".to_string());
+    }
+
+    let mut frac_value = 0i64;
+    if let Some(frac) = frac {
+        if frac.len() > 8 {
+            return Err(format!("amount has too many decimal places '{value}'"));
+        }
+        if !frac.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(format!("invalid amount '{value}'"));
+        }
+        let mut frac_str = frac.to_string();
+        while frac_str.len() < 8 {
+            frac_str.push('0');
+        }
+        frac_value = frac_str
+            .parse::<i64>()
+            .map_err(|_| format!("invalid amount '{value}'"))?;
+    }
+
+    whole
+        .checked_mul(COIN)
+        .and_then(|whole_zat| whole_zat.checked_add(frac_value))
+        .ok_or_else(|| format!("amount out of range '{value}'"))
 }
 
 fn default_rpc_addr(network: Network) -> SocketAddr {
@@ -5454,7 +5650,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -5475,8 +5671,12 @@ fn usage() -> String {
         "  --header-lead  Target header lead over blocks (default: 20000, 0 disables cap)",
         "  --tx-peers  Number of relay peers for tx inventory/tx relay (0 disables, default: 2)",
         "  --inflight-per-peer  Concurrent getdata requests per peer (default: 2)",
+        "  --minrelaytxfee  Minimum relay fee-rate in zatoshis/kB (default: 100)",
+        "  --accept-non-standard  Disable standardness checks (default: off on mainnet/testnet)",
+        "  --require-standard  Force standardness checks on regtest (default: off)",
         "  --mempool-max-mb  Mempool max size in MiB (0 disables cap, default: 300)",
         "  --mempool-persist-interval  Persist mempool to disk every N seconds (0 disables, default: 60)",
+        "  --fee-estimates-persist-interval  Persist fee estimates every N seconds (0 disables, default: 300)",
         "  --status-interval  Status log interval in seconds (default: 15, 0 disables)",
         "  --db-cache-mb  Fjall block cache size in MiB (optional)",
         "  --db-write-buffer-mb  Fjall max write buffer in MiB (optional)",

@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 
 use crate::mempool;
-use crate::p2p::{parse_inv, InventoryVector, Peer, MSG_TX};
+use crate::p2p::{parse_feefilter, parse_inv, InventoryVector, Peer, MSG_TX};
 use crate::stats::MempoolMetrics;
 
 const TX_GETDATA_BATCH: usize = 128;
@@ -26,7 +26,9 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
     addr_book: Arc<crate::AddrBook>,
     peer_ctx: crate::PeerContext,
     mempool: Arc<Mutex<mempool::Mempool>>,
+    mempool_policy: Arc<mempool::MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
+    fee_estimator: Arc<Mutex<crate::fee_estimator::FeeEstimator>>,
     flags: ValidationFlags,
     tx_announce: broadcast::Sender<Hash256>,
     peer_target: usize,
@@ -61,7 +63,9 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
                         let chainstate = Arc::clone(&chainstate);
                         let params = Arc::clone(&params);
                         let mempool = Arc::clone(&mempool);
+                        let mempool_policy = Arc::clone(&mempool_policy);
                         let mempool_metrics = Arc::clone(&mempool_metrics);
+                        let fee_estimator = Arc::clone(&fee_estimator);
                         let flags = flags.clone();
                         let tx_announce = tx_announce.clone();
                         join_set.spawn(async move {
@@ -71,7 +75,9 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
                                 chainstate,
                                 params,
                                 mempool,
+                                mempool_policy,
                                 mempool_metrics,
+                                fee_estimator,
                                 flags,
                                 tx_announce,
                             )
@@ -108,7 +114,9 @@ async fn tx_relay_peer<S: KeyValueStore>(
     chainstate: Arc<ChainState<S>>,
     params: Arc<ChainParams>,
     mempool: Arc<Mutex<mempool::Mempool>>,
+    mempool_policy: Arc<mempool::MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
+    fee_estimator: Arc<Mutex<crate::fee_estimator::FeeEstimator>>,
     flags: ValidationFlags,
     tx_announce: broadcast::Sender<Hash256>,
 ) -> Result<(), String> {
@@ -116,6 +124,11 @@ async fn tx_relay_peer<S: KeyValueStore>(
     let mut known: HashSet<Hash256> = HashSet::new();
     let mut requested: HashSet<Hash256> = HashSet::new();
     let mut reject_stats = TxRejectStats::new();
+    let mut peer_fee_filter_per_kb: i64 = 0;
+
+    let _ = peer
+        .send_feefilter(mempool_policy.min_relay_fee_per_kb)
+        .await;
 
     let _ = peer.send_mempool().await;
 
@@ -130,12 +143,15 @@ async fn tx_relay_peer<S: KeyValueStore>(
                     chainstate.as_ref(),
                     params.as_ref(),
                     mempool.as_ref(),
+                    mempool_policy.as_ref(),
                     mempool_metrics.as_ref(),
+                    fee_estimator.as_ref(),
                     &flags,
                     &tx_announce,
                     &mut known,
                     &mut requested,
                     &mut reject_stats,
+                    &mut peer_fee_filter_per_kb,
                 )
                 .await?;
             }
@@ -145,10 +161,9 @@ async fn tx_relay_peer<S: KeyValueStore>(
                         if known.contains(&txid) {
                             continue;
                         }
-                        if mempool_has_tx(mempool.as_ref(), &txid) {
-                            if touch_known(&mut known, txid) {
-                                peer.send_inv_tx(&[txid]).await?;
-                            }
+                        if should_announce_tx(mempool.as_ref(), &txid, peer_fee_filter_per_kb) {
+                            let _ = touch_known(&mut known, txid);
+                            peer.send_inv_tx(&[txid]).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -166,12 +181,15 @@ async fn handle_peer_message<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     params: &ChainParams,
     mempool: &Mutex<mempool::Mempool>,
+    mempool_policy: &mempool::MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<crate::fee_estimator::FeeEstimator>,
     flags: &ValidationFlags,
     tx_announce: &broadcast::Sender<Hash256>,
     known: &mut HashSet<Hash256>,
     requested: &mut HashSet<Hash256>,
     reject_stats: &mut TxRejectStats,
+    peer_fee_filter_per_kb: &mut i64,
 ) -> Result<(), String> {
     match command {
         "inv" => {
@@ -202,7 +220,14 @@ async fn handle_peer_message<S: KeyValueStore>(
             let txid = tx.txid().map_err(|err| err.to_string())?;
             let raw = payload.to_vec();
 
-            let entry = match mempool::build_mempool_entry(chainstate, params, flags, tx, raw) {
+            let entry = match mempool::build_mempool_entry(
+                chainstate,
+                params,
+                flags,
+                mempool_policy,
+                tx,
+                raw,
+            ) {
                 Ok(entry) => entry,
                 Err(err) => {
                     if err.kind == mempool::MempoolErrorKind::Internal {
@@ -226,11 +251,19 @@ async fn handle_peer_message<S: KeyValueStore>(
                 if guard.contains(&txid) {
                     return Ok(());
                 }
+                let should_observe_fee = entry.tx.fluxnode.is_none();
+                let entry_fee = entry.fee;
+                let entry_size = entry.size();
                 match guard.insert(entry) {
                     Ok(outcome) => {
                         mempool_metrics.note_relay_accept();
                         if outcome.evicted > 0 {
                             mempool_metrics.note_evicted(outcome.evicted, outcome.evicted_bytes);
+                        }
+                        if should_observe_fee {
+                            if let Ok(mut estimator) = fee_estimator.lock() {
+                                estimator.observe_tx(entry_fee, entry_size);
+                            }
                         }
                     }
                     Err(err) => {
@@ -253,6 +286,11 @@ async fn handle_peer_message<S: KeyValueStore>(
             let _ = requested.remove(&txid);
             let _ = tx_announce.send(txid);
         }
+        "feefilter" => {
+            if let Ok(filter) = parse_feefilter(payload) {
+                *peer_fee_filter_per_kb = filter;
+            }
+        }
         "getdata" => {
             let vectors = parse_inv(payload)?;
             let txids = inventory_txids(&vectors);
@@ -265,7 +303,7 @@ async fn handle_peer_message<S: KeyValueStore>(
             }
         }
         "mempool" => {
-            let txids = mempool_txids(mempool, TX_KNOWN_CAP)?;
+            let txids = mempool_txids(mempool, TX_KNOWN_CAP, *peer_fee_filter_per_kb)?;
             if !txids.is_empty() {
                 for txid in &txids {
                     let _ = touch_known(known, *txid);
@@ -296,11 +334,24 @@ async fn request_txids(peer: &mut Peer, txids: &[Hash256]) -> Result<(), String>
     Ok(())
 }
 
-fn mempool_has_tx(mempool: &Mutex<mempool::Mempool>, txid: &Hash256) -> bool {
-    mempool
-        .lock()
-        .map(|guard| guard.contains(txid))
-        .unwrap_or(false)
+fn should_announce_tx(
+    mempool: &Mutex<mempool::Mempool>,
+    txid: &Hash256,
+    peer_fee_filter_per_kb: i64,
+) -> bool {
+    let peer_fee_filter_per_kb = peer_fee_filter_per_kb.max(0);
+    let guard = match mempool.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    let entry = match guard.get(txid) {
+        Some(entry) => entry,
+        None => return false,
+    };
+    if peer_fee_filter_per_kb == 0 {
+        return true;
+    }
+    fee_rate_per_kb(entry.fee, entry.size()) >= peer_fee_filter_per_kb
 }
 
 fn mempool_raws(
@@ -319,12 +370,27 @@ fn mempool_raws(
     Ok(raws)
 }
 
-fn mempool_txids(mempool: &Mutex<mempool::Mempool>, limit: usize) -> Result<Vec<Hash256>, String> {
+fn mempool_txids(
+    mempool: &Mutex<mempool::Mempool>,
+    limit: usize,
+    peer_fee_filter_per_kb: i64,
+) -> Result<Vec<Hash256>, String> {
     let guard = mempool
         .lock()
         .map_err(|_| "mempool lock poisoned".to_string())?;
+    let peer_fee_filter_per_kb = peer_fee_filter_per_kb.max(0);
     let mut out = Vec::new();
-    out.extend(guard.entries().map(|entry| entry.txid).take(limit));
+    for entry in guard.entries() {
+        if out.len() >= limit {
+            break;
+        }
+        if peer_fee_filter_per_kb > 0
+            && fee_rate_per_kb(entry.fee, entry.size()) < peer_fee_filter_per_kb
+        {
+            continue;
+        }
+        out.push(entry.txid);
+    }
     Ok(out)
 }
 
@@ -335,10 +401,17 @@ fn touch_known(known: &mut HashSet<Hash256>, txid: Hash256) -> bool {
     known.insert(txid)
 }
 
+fn fee_rate_per_kb(fee: i64, size: usize) -> i64 {
+    let size = i64::try_from(size.max(1)).unwrap_or(i64::MAX);
+    fee.saturating_mul(1000).saturating_div(size)
+}
+
 #[derive(Clone, Debug)]
 struct TxRejectStats {
     build_missing_input: u64,
     build_conflicting_input: u64,
+    build_insufficient_fee: u64,
+    build_non_standard: u64,
     build_invalid_transaction: u64,
     build_invalid_script: u64,
     build_invalid_shielded: u64,
@@ -354,6 +427,8 @@ impl TxRejectStats {
         Self {
             build_missing_input: 0,
             build_conflicting_input: 0,
+            build_insufficient_fee: 0,
+            build_non_standard: 0,
             build_invalid_transaction: 0,
             build_invalid_script: 0,
             build_invalid_shielded: 0,
@@ -369,6 +444,8 @@ impl TxRejectStats {
         match kind {
             mempool::MempoolErrorKind::MissingInput => self.build_missing_input += 1,
             mempool::MempoolErrorKind::ConflictingInput => self.build_conflicting_input += 1,
+            mempool::MempoolErrorKind::InsufficientFee => self.build_insufficient_fee += 1,
+            mempool::MempoolErrorKind::NonStandard => self.build_non_standard += 1,
             mempool::MempoolErrorKind::MempoolFull => self.insert_other += 1,
             mempool::MempoolErrorKind::InvalidTransaction => self.build_invalid_transaction += 1,
             mempool::MempoolErrorKind::InvalidScript => self.build_invalid_script += 1,
@@ -394,6 +471,8 @@ impl TxRejectStats {
 
         let total = self.build_missing_input
             + self.build_conflicting_input
+            + self.build_insufficient_fee
+            + self.build_non_standard
             + self.build_invalid_transaction
             + self.build_invalid_script
             + self.build_invalid_shielded
@@ -406,9 +485,11 @@ impl TxRejectStats {
         }
 
         eprintln!(
-            "tx relay peer {addr}: rejected {total} tx(s) (build_missing_input {} build_conflict {} build_invalid_tx {} build_invalid_script {} build_invalid_shielded {} build_internal {} insert_dupe {} insert_conflict {} insert_other {})",
+            "tx relay peer {addr}: rejected {total} tx(s) (build_missing_input {} build_conflict {} build_insufficient_fee {} build_nonstandard {} build_invalid_tx {} build_invalid_script {} build_invalid_shielded {} build_internal {} insert_dupe {} insert_conflict {} insert_other {})",
             self.build_missing_input,
             self.build_conflicting_input,
+            self.build_insufficient_fee,
+            self.build_non_standard,
             self.build_invalid_transaction,
             self.build_invalid_script,
             self.build_invalid_shielded,
@@ -420,6 +501,8 @@ impl TxRejectStats {
 
         self.build_missing_input = 0;
         self.build_conflicting_input = 0;
+        self.build_insufficient_fee = 0;
+        self.build_non_standard = 0;
         self.build_invalid_transaction = 0;
         self.build_invalid_script = 0;
         self.build_invalid_shielded = 0;

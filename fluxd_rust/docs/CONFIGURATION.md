@@ -16,6 +16,7 @@ and how they affect behavior.
     - `peers.dat` - persisted peer address manager (success/fail stats, last-seen, last-height).
     - `banlist.dat` - persisted peer bans (best-effort).
     - `mempool.dat` - persisted mempool transactions (when enabled).
+    - `fee_estimates.dat` - persisted fee estimator samples (when enabled).
     - `rpc.cookie` - RPC auth cookie when not using `--rpc-user`/`--rpc-pass`.
 
 ### Fjall tuning (optional)
@@ -77,6 +78,20 @@ RPC defaults:
 - `--mempool-persist-interval SECS`
   - Persist mempool to `mempool.dat` every N seconds (default: `60`).
   - Set to `0` to disable mempool persistence (no load and no save).
+- `--minrelaytxfee <rate>` (alias: `--min-relay-tx-fee`)
+  - Minimum relay fee-rate for non-fluxnode transactions, expressed as zatoshis/kB.
+  - Accepts either:
+    - an integer zatoshi-per-kB value (example: `100`), or
+    - a decimal FLUX-per-kB value (example: `0.00000100`).
+  - Default: `100` (0.00000100 FLUX/kB).
+- `--accept-non-standard`
+  - Disable standardness checks (script template policy, dust, scriptSig push-only, etc.).
+  - Default: standardness is required on mainnet/testnet and disabled on regtest.
+- `--require-standard`
+  - Force standardness checks even on regtest.
+- `--fee-estimates-persist-interval SECS`
+  - Persist fee estimator samples to `fee_estimates.dat` every N seconds (default: `300`).
+  - Set to `0` to disable persistence.
 
 Practical notes:
 - Increase `--header-peers` and `--header-verify-workers` to boost header throughput.

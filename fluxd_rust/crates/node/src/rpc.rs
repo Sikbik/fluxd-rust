@@ -32,7 +32,8 @@ use fluxd_primitives::{address_to_script_pubkey, script_pubkey_to_address, Addre
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
 
-use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind};
+use crate::fee_estimator::FeeEstimator;
+use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind, MempoolPolicy};
 use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::peer_book::HeaderPeerBook;
 use crate::stats::{hash256_to_hex, MempoolMetrics};
@@ -84,6 +85,7 @@ const RPC_METHODS: &[&str] = &[
     "getnetworkhashps",
     "getnetworksolps",
     "getlocalsolps",
+    "estimatefee",
     "getconnectioncount",
     "getnettotals",
     "listbanned",
@@ -140,7 +142,9 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     auth: RpcAuth,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<Mempool>>,
+    mempool_policy: Arc<MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
+    fee_estimator: Arc<Mutex<FeeEstimator>>,
     mempool_flags: ValidationFlags,
     params: ChainParams,
     data_dir: PathBuf,
@@ -163,7 +167,9 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let auth = Arc::clone(&auth);
         let chainstate = Arc::clone(&chainstate);
         let mempool = Arc::clone(&mempool);
+        let mempool_policy = Arc::clone(&mempool_policy);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let fee_estimator = Arc::clone(&fee_estimator);
         let mempool_flags = mempool_flags.clone();
         let params = params.clone();
         let data_dir = data_dir.clone();
@@ -177,7 +183,9 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 auth,
                 chainstate,
                 mempool,
+                mempool_policy,
                 mempool_metrics,
+                fee_estimator,
                 mempool_flags,
                 params,
                 data_dir,
@@ -200,7 +208,9 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     auth: Arc<RpcAuth>,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<Mempool>>,
+    mempool_policy: Arc<MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
+    fee_estimator: Arc<Mutex<FeeEstimator>>,
     mempool_flags: ValidationFlags,
     chain_params: ChainParams,
     data_dir: PathBuf,
@@ -252,7 +262,9 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
             &request,
             chainstate.as_ref(),
             mempool.as_ref(),
+            mempool_policy.as_ref(),
             mempool_metrics.as_ref(),
+            fee_estimator.as_ref(),
             &mempool_flags,
             &chain_params,
             &data_dir,
@@ -277,7 +289,9 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         &request.body,
         chainstate.as_ref(),
         mempool.as_ref(),
+        mempool_policy.as_ref(),
         mempool_metrics.as_ref(),
+        fee_estimator.as_ref(),
         &mempool_flags,
         &chain_params,
         &data_dir,
@@ -304,7 +318,9 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     request: &HttpRequest,
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
     data_dir: &Path,
@@ -325,7 +341,9 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
         params,
         chainstate,
         mempool,
+        mempool_policy,
         mempool_metrics,
+        fee_estimator,
         mempool_flags,
         chain_params,
         data_dir,
@@ -340,7 +358,9 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     body: &[u8],
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
     data_dir: &Path,
@@ -386,7 +406,9 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         params,
         chainstate,
         mempool,
+        mempool_policy,
         mempool_metrics,
+        fee_estimator,
         mempool_flags,
         chain_params,
         data_dir,
@@ -530,7 +552,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
     data_dir: &Path,
@@ -548,6 +572,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             data_dir,
             net_totals,
             peer_registry,
+            mempool_policy,
         ),
         "getblockcount" => rpc_getblockcount(chainstate, params),
         "getbestblockhash" => rpc_getbestblockhash(chainstate, params),
@@ -563,7 +588,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "sendrawtransaction" => rpc_sendrawtransaction(
             chainstate,
             mempool,
+            mempool_policy,
             mempool_metrics,
+            fee_estimator,
             mempool_flags,
             params,
             chain_params,
@@ -586,9 +613,10 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getnetworkhashps" => rpc_getnetworkhashps(params),
         "getnetworksolps" => rpc_getnetworksolps(params),
         "getlocalsolps" => rpc_getlocalsolps(params),
+        "estimatefee" => rpc_estimatefee(params, fee_estimator),
         "getconnectioncount" => rpc_getconnectioncount(params, peer_registry, net_totals),
         "getnettotals" => rpc_getnettotals(params, net_totals),
-        "getnetworkinfo" => rpc_getnetworkinfo(params, peer_registry, net_totals),
+        "getnetworkinfo" => rpc_getnetworkinfo(params, peer_registry, net_totals, mempool_policy),
         "getpeerinfo" => rpc_getpeerinfo(params, peer_registry),
         "listbanned" => rpc_listbanned(params, header_peer_book),
         "getfluxnodecount" => rpc_getfluxnodecount(chainstate, params),
@@ -632,6 +660,7 @@ fn rpc_getinfo<S: fluxd_storage::KeyValueStore>(
     _data_dir: &Path,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
+    mempool_policy: &MempoolPolicy,
 ) -> Result<Value, RpcError> {
     ensure_no_params(&rpc_params)?;
     let connections = net_totals.snapshot().connections.max(peer_registry.count());
@@ -664,7 +693,7 @@ fn rpc_getinfo<S: fluxd_storage::KeyValueStore>(
         "proxy": "",
         "difficulty": difficulty,
         "testnet": chain_params.network != Network::Mainnet,
-        "relayfee": 0.0,
+        "relayfee": amount_to_value(mempool_policy.min_relay_fee_per_kb),
         "errors": ""
     }))
 }
@@ -1138,7 +1167,9 @@ fn rpc_getrawtransaction<S: fluxd_storage::KeyValueStore>(
 fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
     mempool_flags: &ValidationFlags,
     params: Vec<Value>,
     chain_params: &ChainParams,
@@ -1196,29 +1227,40 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
             }
         }
 
-        let entry = build_mempool_entry(chainstate, chain_params, mempool_flags, tx, raw).map_err(
-            |err| match err.kind {
-                MempoolErrorKind::MissingInput => {
-                    RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs")
-                }
-                MempoolErrorKind::ConflictingInput => {
-                    RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
-                }
-                MempoolErrorKind::MempoolFull => {
-                    RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
-                }
-                MempoolErrorKind::InvalidTransaction
-                | MempoolErrorKind::InvalidScript
-                | MempoolErrorKind::InvalidShielded => {
-                    RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
-                }
-                MempoolErrorKind::AlreadyInMempool => {
-                    RpcError::new(RPC_INTERNAL_ERROR, "unexpected mempool duplicate")
-                }
-                MempoolErrorKind::Internal => RpcError::new(RPC_INTERNAL_ERROR, err.message),
-            },
-        )?;
+        let entry = build_mempool_entry(
+            chainstate,
+            chain_params,
+            mempool_flags,
+            mempool_policy,
+            tx,
+            raw,
+        )
+        .map_err(|err| match err.kind {
+            MempoolErrorKind::MissingInput => {
+                RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs")
+            }
+            MempoolErrorKind::ConflictingInput => {
+                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
+            }
+            MempoolErrorKind::InsufficientFee => {
+                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
+            }
+            MempoolErrorKind::MempoolFull => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+            MempoolErrorKind::NonStandard => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+            MempoolErrorKind::InvalidTransaction
+            | MempoolErrorKind::InvalidScript
+            | MempoolErrorKind::InvalidShielded => {
+                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
+            }
+            MempoolErrorKind::AlreadyInMempool => {
+                RpcError::new(RPC_INTERNAL_ERROR, "unexpected mempool duplicate")
+            }
+            MempoolErrorKind::Internal => RpcError::new(RPC_INTERNAL_ERROR, err.message),
+        })?;
 
+        let should_observe_fee = entry.tx.fluxnode.is_none();
+        let entry_fee = entry.fee;
+        let entry_size = entry.size();
         let txid = entry.txid;
         let mut guard = mempool
             .lock()
@@ -1227,6 +1269,11 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
             Ok(outcome) => {
                 if outcome.evicted > 0 {
                     mempool_metrics.note_evicted(outcome.evicted, outcome.evicted_bytes);
+                }
+                if should_observe_fee {
+                    if let Ok(mut estimator) = fee_estimator.lock() {
+                        estimator.observe_tx(entry_fee, entry_size);
+                    }
                 }
             }
             Err(err) => {
@@ -2078,10 +2125,37 @@ fn rpc_getlocalsolps(params: Vec<Value>) -> Result<Value, RpcError> {
     Ok(json!(0.0))
 }
 
+fn rpc_estimatefee(
+    params: Vec<Value>,
+    fee_estimator: &Mutex<FeeEstimator>,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "estimatefee expects 1 parameter",
+        ));
+    }
+    let mut blocks = parse_u32(&params[0], "nblocks")?;
+    if blocks < 1 {
+        blocks = 1;
+    }
+    let estimate = fee_estimator
+        .lock()
+        .map_err(|_| map_internal("fee estimator lock poisoned"))?
+        .estimate_fee_per_kb(blocks);
+    match estimate {
+        Some(amount) => Ok(amount_to_value(amount)),
+        None => Ok(Number::from_f64(-1.0)
+            .map(Value::Number)
+            .unwrap_or(Value::Number((-1).into()))),
+    }
+}
+
 fn rpc_getnetworkinfo(
     params: Vec<Value>,
     peer_registry: &PeerRegistry,
     net_totals: &NetTotals,
+    mempool_policy: &MempoolPolicy,
 ) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
     let snapshot = net_totals.snapshot();
@@ -2099,7 +2173,7 @@ fn rpc_getnetworkinfo(
         "timeoffset": 0,
         "connections": connections,
         "networks": networks,
-        "relayfee": 0.0,
+        "relayfee": amount_to_value(mempool_policy.min_relay_fee_per_kb),
         "localaddresses": [],
         "warnings": ""
     }))

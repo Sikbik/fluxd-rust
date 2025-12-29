@@ -382,6 +382,11 @@ impl Peer {
         let payload = build_inv_payload(hashes, MSG_TX);
         self.send_message("inv", &payload).await
     }
+
+    pub async fn send_feefilter(&mut self, fee_rate_per_kb: i64) -> Result<(), String> {
+        let payload = build_feefilter_payload(fee_rate_per_kb);
+        self.send_message("feefilter", &payload).await
+    }
 }
 
 impl Drop for Peer {
@@ -474,6 +479,16 @@ pub fn build_inv_payload(hashes: &[fluxd_consensus::Hash256], inv_type: u32) -> 
     encoder.into_inner()
 }
 
+pub fn parse_feefilter(payload: &[u8]) -> Result<i64, String> {
+    let mut decoder = Decoder::new(payload);
+    let raw = decoder.read_u64_le().map_err(|err| err.to_string())?;
+    if !decoder.is_empty() {
+        return Err("trailing bytes in feefilter payload".to_string());
+    }
+    let fee = i64::try_from(raw).unwrap_or(i64::MAX);
+    Ok(fee.max(0))
+}
+
 fn build_version_payload(start_height: i32, relay: bool) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.write_i32_le(PROTOCOL_VERSION);
@@ -489,6 +504,13 @@ fn build_version_payload(start_height: i32, relay: bool) -> Vec<u8> {
     encoder.write_var_str("/fluxd-rust:0.1.0/");
     encoder.write_i32_le(start_height);
     encoder.write_u8(relay as u8);
+    encoder.into_inner()
+}
+
+fn build_feefilter_payload(fee_rate_per_kb: i64) -> Vec<u8> {
+    let fee_rate_per_kb = fee_rate_per_kb.max(0);
+    let mut encoder = Encoder::new();
+    encoder.write_i64_le(fee_rate_per_kb);
     encoder.into_inner()
 }
 

@@ -3,14 +3,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::{validate_mempool_transaction, ValidationFlags};
-use fluxd_consensus::constants::COINBASE_MATURITY;
+use fluxd_consensus::constants::{COINBASE_MATURITY, MAX_BLOCK_SIGOPS};
 use fluxd_consensus::money::{money_range, MAX_MONEY};
 use fluxd_consensus::params::ChainParams;
 use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
 use fluxd_consensus::Hash256;
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::Transaction;
-use fluxd_script::interpreter::{verify_script, BLOCK_SCRIPT_VERIFY_FLAGS};
+use fluxd_script::interpreter::{
+    verify_script, BLOCK_SCRIPT_VERIFY_FLAGS, STANDARD_SCRIPT_VERIFY_FLAGS,
+};
+use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use fluxd_shielded::verify_transaction;
 
 use crate::stats::hash256_to_hex;
@@ -19,8 +22,10 @@ use crate::stats::hash256_to_hex;
 pub enum MempoolErrorKind {
     AlreadyInMempool,
     ConflictingInput,
+    InsufficientFee,
     MissingInput,
     MempoolFull,
+    NonStandard,
     InvalidTransaction,
     InvalidScript,
     InvalidShielded,
@@ -257,10 +262,40 @@ struct EvictCandidate {
     time: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct MempoolPolicy {
+    pub require_standard: bool,
+    /// Fee rate in zatoshis/KB.
+    pub min_relay_fee_per_kb: i64,
+    pub max_scriptsig_size: usize,
+    pub max_op_return_bytes: usize,
+    pub max_p2sh_sigops: u32,
+    pub max_standard_tx_sigops: u32,
+}
+
+impl MempoolPolicy {
+    pub fn standard(min_relay_fee_per_kb: i64, require_standard: bool) -> Self {
+        let min_relay_fee_per_kb = min_relay_fee_per_kb.max(0);
+        Self {
+            require_standard,
+            min_relay_fee_per_kb,
+            max_scriptsig_size: 1650,
+            max_op_return_bytes: 80,
+            max_p2sh_sigops: 15,
+            max_standard_tx_sigops: MAX_BLOCK_SIGOPS / 5,
+        }
+    }
+
+    pub fn min_relay_fee_for_size(&self, size: usize) -> i64 {
+        min_relay_fee_for_size(self.min_relay_fee_per_kb, size)
+    }
+}
+
 pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     chain_params: &ChainParams,
     flags: &ValidationFlags,
+    policy: &MempoolPolicy,
     tx: Transaction,
     raw: Vec<u8>,
 ) -> Result<MempoolEntry, MempoolError> {
@@ -299,9 +334,26 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
         &chain_params.consensus.upgrades,
         UpgradeIndex::Flux,
     );
+    let require_standard = policy.require_standard;
+    let mut prev_scripts = Vec::with_capacity(tx.vin.len());
     let mut spent_outpoints = Vec::with_capacity(tx.vin.len());
     let mut transparent_in = 0i64;
     for (input_index, input) in tx.vin.iter().enumerate() {
+        if require_standard {
+            if input.script_sig.len() > policy.max_scriptsig_size {
+                return Err(MempoolError::new(
+                    MempoolErrorKind::NonStandard,
+                    "scriptsig-size",
+                ));
+            }
+            if !is_push_only(&input.script_sig) {
+                return Err(MempoolError::new(
+                    MempoolErrorKind::NonStandard,
+                    "scriptsig-not-pushonly",
+                ));
+            }
+        }
+
         let entry = chainstate
             .utxo_entry(&input.prevout)
             .map_err(|err| MempoolError::new(MempoolErrorKind::Internal, err.to_string()))?
@@ -328,18 +380,52 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
             MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
         })?;
         if flags.check_script {
+            let script_flags = if require_standard {
+                STANDARD_SCRIPT_VERIFY_FLAGS
+            } else {
+                BLOCK_SCRIPT_VERIFY_FLAGS
+            };
             verify_script(
                 &input.script_sig,
                 &entry.script_pubkey,
                 &tx,
                 input_index,
                 entry.value,
-                BLOCK_SCRIPT_VERIFY_FLAGS,
+                script_flags,
                 branch_id,
             )
             .map_err(|err| MempoolError::new(MempoolErrorKind::InvalidScript, err.to_string()))?;
+
+            if require_standard {
+                verify_script(
+                    &input.script_sig,
+                    &entry.script_pubkey,
+                    &tx,
+                    input_index,
+                    entry.value,
+                    BLOCK_SCRIPT_VERIFY_FLAGS,
+                    branch_id,
+                )
+                .map_err(|err| {
+                    MempoolError::new(
+                        MempoolErrorKind::InvalidScript,
+                        format!(
+                            "BUG: failed against mandatory script flags but passed standard flags: {err}"
+                        ),
+                    )
+                })?;
+            }
         }
+        prev_scripts.push(entry.script_pubkey.clone());
         spent_outpoints.push(input.prevout.clone());
+    }
+
+    if require_standard {
+        enforce_standard_inputs(&tx, &prev_scripts, policy)?;
+    }
+
+    if require_standard {
+        enforce_standard_outputs(&tx, policy)?;
     }
 
     let value_out = tx_value_out(&tx)?;
@@ -356,6 +442,16 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
         ));
     }
     let fee = value_in - value_out;
+
+    if policy.min_relay_fee_per_kb > 0 && tx.fluxnode.is_none() {
+        let required_fee = policy.min_relay_fee_for_size(raw.len());
+        if fee < required_fee {
+            return Err(MempoolError::new(
+                MempoolErrorKind::InsufficientFee,
+                "insufficient fee",
+            ));
+        }
+    }
 
     if flags.check_shielded && tx_needs_shielded(&tx) {
         let params = flags.shielded_params.as_ref().ok_or_else(|| {
@@ -377,6 +473,142 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
         fee,
         spent_outpoints,
     })
+}
+
+fn enforce_standard_outputs(tx: &Transaction, policy: &MempoolPolicy) -> Result<(), MempoolError> {
+    let mut op_return_count = 0usize;
+    for output in &tx.vout {
+        if is_standard_op_return(&output.script_pubkey, policy.max_op_return_bytes) {
+            op_return_count += 1;
+            continue;
+        }
+
+        match classify_script_pubkey(&output.script_pubkey) {
+            ScriptType::P2Pk | ScriptType::P2Pkh | ScriptType::P2Sh => {}
+            ScriptType::P2Wpkh | ScriptType::P2Wsh => {
+                return Err(MempoolError::new(
+                    MempoolErrorKind::NonStandard,
+                    "witness-program",
+                ));
+            }
+            ScriptType::Unknown => {
+                return Err(MempoolError::new(
+                    MempoolErrorKind::NonStandard,
+                    "scriptpubkey",
+                ));
+            }
+        }
+
+        if is_dust(
+            output.value,
+            &output.script_pubkey,
+            policy.min_relay_fee_per_kb,
+        ) {
+            return Err(MempoolError::new(MempoolErrorKind::NonStandard, "dust"));
+        }
+    }
+
+    if op_return_count > 1 {
+        return Err(MempoolError::new(
+            MempoolErrorKind::NonStandard,
+            "multi-op-return",
+        ));
+    }
+
+    Ok(())
+}
+
+fn enforce_standard_inputs(
+    tx: &Transaction,
+    prev_scripts: &[Vec<u8>],
+    policy: &MempoolPolicy,
+) -> Result<(), MempoolError> {
+    let mut sigops: u32 = 0;
+
+    for (input, prev_script) in tx.vin.iter().zip(prev_scripts.iter()) {
+        let stack = parse_push_only_stack(&input.script_sig)
+            .ok_or_else(|| MempoolError::new(MempoolErrorKind::NonStandard, "scriptsig"))?;
+
+        let prev_type = classify_script_pubkey(prev_script);
+        match prev_type {
+            ScriptType::P2Pkh => {
+                if stack.len() != 2 {
+                    return Err(MempoolError::new(
+                        MempoolErrorKind::NonStandard,
+                        "scriptsig-args",
+                    ));
+                }
+            }
+            ScriptType::P2Pk => {
+                if stack.len() != 1 {
+                    return Err(MempoolError::new(
+                        MempoolErrorKind::NonStandard,
+                        "scriptsig-args",
+                    ));
+                }
+            }
+            ScriptType::P2Sh => {
+                let redeem = stack
+                    .last()
+                    .filter(|item| !item.is_empty())
+                    .ok_or_else(|| {
+                        MempoolError::new(MempoolErrorKind::NonStandard, "p2sh-redeem")
+                    })?;
+                if redeem.len() > 520 {
+                    return Err(MempoolError::new(
+                        MempoolErrorKind::NonStandard,
+                        "p2sh-redeem-size",
+                    ));
+                }
+                let redeem_sigops = count_sigops(redeem, true).ok_or_else(|| {
+                    MempoolError::new(MempoolErrorKind::NonStandard, "p2sh-redeem")
+                })?;
+                if redeem_sigops > policy.max_p2sh_sigops {
+                    return Err(MempoolError::new(
+                        MempoolErrorKind::NonStandard,
+                        "p2sh-sigops",
+                    ));
+                }
+                sigops = sigops.saturating_add(redeem_sigops);
+            }
+            ScriptType::P2Wpkh | ScriptType::P2Wsh | ScriptType::Unknown => {
+                return Err(MempoolError::new(
+                    MempoolErrorKind::NonStandard,
+                    "nonstandard-input",
+                ));
+            }
+        }
+    }
+
+    for input in &tx.vin {
+        if let Some(value) = count_sigops(&input.script_sig, false) {
+            sigops = sigops.saturating_add(value);
+        } else {
+            return Err(MempoolError::new(
+                MempoolErrorKind::NonStandard,
+                "scriptsig-sigops",
+            ));
+        }
+    }
+    for output in &tx.vout {
+        if let Some(value) = count_sigops(&output.script_pubkey, false) {
+            sigops = sigops.saturating_add(value);
+        } else {
+            return Err(MempoolError::new(
+                MempoolErrorKind::NonStandard,
+                "scriptpubkey-sigops",
+            ));
+        }
+    }
+
+    if sigops > policy.max_standard_tx_sigops {
+        return Err(MempoolError::new(
+            MempoolErrorKind::NonStandard,
+            "bad-txns-too-many-sigops",
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_shielded_state<S: fluxd_storage::KeyValueStore>(
@@ -508,4 +740,248 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn min_relay_fee_for_size(min_fee_per_kb: i64, size: usize) -> i64 {
+    if min_fee_per_kb <= 0 {
+        return 0;
+    }
+
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
+    let mut fee = min_fee_per_kb.saturating_mul(size).saturating_div(1000);
+    if fee == 0 {
+        fee = min_fee_per_kb;
+    }
+    fee
+}
+
+fn is_dust(value: i64, script_pubkey: &[u8], min_fee_per_kb: i64) -> bool {
+    if min_fee_per_kb <= 0 {
+        return false;
+    }
+    if is_unspendable(script_pubkey) {
+        return false;
+    }
+    if value < 0 {
+        return true;
+    }
+    let out_size = 8usize
+        .saturating_add(compact_size_len(script_pubkey.len()))
+        .saturating_add(script_pubkey.len());
+    let spend_size = out_size.saturating_add(148);
+    let fee = min_relay_fee_for_size(min_fee_per_kb, spend_size);
+    let dust_threshold = fee.saturating_mul(3);
+    value < dust_threshold
+}
+
+fn compact_size_len(value: usize) -> usize {
+    if value < 0xfd {
+        1
+    } else if value <= 0xffff {
+        3
+    } else if value <= 0xffff_ffff {
+        5
+    } else {
+        9
+    }
+}
+
+fn is_unspendable(script_pubkey: &[u8]) -> bool {
+    script_pubkey.first().copied() == Some(OP_RETURN)
+}
+
+const OP_0: u8 = 0x00;
+const OP_1NEGATE: u8 = 0x4f;
+const OP_PUSHDATA1: u8 = 0x4c;
+const OP_PUSHDATA2: u8 = 0x4d;
+const OP_PUSHDATA4: u8 = 0x4e;
+const OP_1: u8 = 0x51;
+const OP_16: u8 = 0x60;
+const OP_CHECKSIG: u8 = 0xac;
+const OP_CHECKSIGVERIFY: u8 = 0xad;
+const OP_CHECKMULTISIG: u8 = 0xae;
+const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+const OP_RETURN: u8 = 0x6a;
+
+fn is_push_only(script: &[u8]) -> bool {
+    parse_push_only_stack(script).is_some()
+}
+
+fn parse_push_only_stack(script: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut cursor = 0usize;
+    let mut stack = Vec::new();
+    while cursor < script.len() {
+        let opcode = *script.get(cursor)?;
+        cursor = cursor.saturating_add(1);
+        let (len, is_data) = match opcode {
+            0x01..=0x4b => (opcode as usize, true),
+            OP_PUSHDATA1 => (*script.get(cursor)? as usize, {
+                cursor = cursor.saturating_add(1);
+                true
+            }),
+            OP_PUSHDATA2 => {
+                let lo = *script.get(cursor)? as usize;
+                let hi = *script.get(cursor + 1)? as usize;
+                cursor = cursor.saturating_add(2);
+                ((hi << 8) | lo, true)
+            }
+            OP_PUSHDATA4 => {
+                let b0 = *script.get(cursor)? as usize;
+                let b1 = *script.get(cursor + 1)? as usize;
+                let b2 = *script.get(cursor + 2)? as usize;
+                let b3 = *script.get(cursor + 3)? as usize;
+                cursor = cursor.saturating_add(4);
+                ((b3 << 24) | (b2 << 16) | (b1 << 8) | b0, true)
+            }
+            OP_0 => {
+                stack.push(Vec::new());
+                (0, false)
+            }
+            OP_1NEGATE => {
+                stack.push(vec![0x81]);
+                (0, false)
+            }
+            OP_1..=OP_16 => {
+                stack.push(vec![opcode - OP_1 + 1]);
+                (0, false)
+            }
+            _ => return None,
+        };
+
+        if is_data {
+            if cursor.saturating_add(len) > script.len() {
+                return None;
+            }
+            let data = script[cursor..cursor + len].to_vec();
+            stack.push(data);
+            cursor = cursor.saturating_add(len);
+        }
+    }
+    Some(stack)
+}
+
+fn count_sigops(script: &[u8], accurate: bool) -> Option<u32> {
+    let mut cursor = 0usize;
+    let mut last_opcode = 0u8;
+    let mut count = 0u32;
+    while cursor < script.len() {
+        let opcode = *script.get(cursor)?;
+        cursor = cursor.saturating_add(1);
+        match opcode {
+            0x01..=0x4b => {
+                let len = opcode as usize;
+                cursor = cursor.saturating_add(len);
+            }
+            OP_PUSHDATA1 => {
+                let len = *script.get(cursor)? as usize;
+                cursor = cursor.saturating_add(1 + len);
+            }
+            OP_PUSHDATA2 => {
+                let lo = *script.get(cursor)? as usize;
+                let hi = *script.get(cursor + 1)? as usize;
+                let len = (hi << 8) | lo;
+                cursor = cursor.saturating_add(2 + len);
+            }
+            OP_PUSHDATA4 => {
+                let b0 = *script.get(cursor)? as usize;
+                let b1 = *script.get(cursor + 1)? as usize;
+                let b2 = *script.get(cursor + 2)? as usize;
+                let b3 = *script.get(cursor + 3)? as usize;
+                let len = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+                cursor = cursor.saturating_add(4 + len);
+            }
+            OP_CHECKSIG | OP_CHECKSIGVERIFY => {
+                count = count.saturating_add(1);
+            }
+            OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
+                let add = if accurate {
+                    decode_op_n(last_opcode).unwrap_or(20) as u32
+                } else {
+                    20
+                };
+                count = count.saturating_add(add);
+            }
+            _ => {}
+        }
+        if cursor > script.len() {
+            return None;
+        }
+        last_opcode = opcode;
+    }
+    Some(count)
+}
+
+fn decode_op_n(opcode: u8) -> Option<u8> {
+    match opcode {
+        OP_0 => Some(0),
+        OP_1..=OP_16 => Some(opcode - OP_1 + 1),
+        _ => None,
+    }
+}
+
+fn is_standard_op_return(script_pubkey: &[u8], max_bytes: usize) -> bool {
+    if script_pubkey.first().copied() != Some(OP_RETURN) {
+        return false;
+    }
+    if script_pubkey.len() == 1 {
+        return true;
+    }
+
+    let mut cursor = 1usize;
+    let opcode = match script_pubkey.get(cursor) {
+        Some(opcode) => *opcode,
+        None => return false,
+    };
+    cursor = cursor.saturating_add(1);
+
+    let len = match opcode {
+        0x01..=0x4b => opcode as usize,
+        OP_PUSHDATA1 => {
+            let len = match script_pubkey.get(cursor) {
+                Some(byte) => *byte as usize,
+                None => return false,
+            };
+            cursor = cursor.saturating_add(1);
+            len
+        }
+        OP_PUSHDATA2 => {
+            let lo = match script_pubkey.get(cursor) {
+                Some(byte) => *byte as usize,
+                None => return false,
+            };
+            let hi = match script_pubkey.get(cursor + 1) {
+                Some(byte) => *byte as usize,
+                None => return false,
+            };
+            cursor = cursor.saturating_add(2);
+            (hi << 8) | lo
+        }
+        OP_PUSHDATA4 => {
+            let b0 = match script_pubkey.get(cursor) {
+                Some(byte) => *byte as usize,
+                None => return false,
+            };
+            let b1 = match script_pubkey.get(cursor + 1) {
+                Some(byte) => *byte as usize,
+                None => return false,
+            };
+            let b2 = match script_pubkey.get(cursor + 2) {
+                Some(byte) => *byte as usize,
+                None => return false,
+            };
+            let b3 = match script_pubkey.get(cursor + 3) {
+                Some(byte) => *byte as usize,
+                None => return false,
+            };
+            cursor = cursor.saturating_add(4);
+            (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+        }
+        OP_0 | OP_1NEGATE | OP_1..=OP_16 => 0,
+        _ => return false,
+    };
+
+    if len > max_bytes {
+        return false;
+    }
+    cursor.saturating_add(len) == script_pubkey.len()
 }

@@ -68,7 +68,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - fundrawtransaction - Missing
 - sendrawtransaction - Partial (relays; confirmed inputs only)
 - createmultisig - Missing
-- estimatefee - Missing
+- estimatefee - Implemented
 - estimatepriority - Missing
 - validateaddress - Missing
 - verifymessage - Missing

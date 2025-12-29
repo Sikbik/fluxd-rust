@@ -106,6 +106,7 @@ Type notes:
 - `getnetworkhashps` (returns 0.0)
 - `getnetworksolps` (returns 0.0)
 - `getlocalsolps` (returns 0.0)
+- `estimatefee <nblocks>`
 
 ### Fluxnode
 
@@ -148,7 +149,7 @@ Fields:
 - `proxy` - empty string.
 - `difficulty`
 - `testnet` - boolean.
-- `relayfee` - 0.0.
+- `relayfee` - min relay fee-rate in FLUX/kB (from `--minrelaytxfee`).
 - `errors` - empty string.
 
 ### getblockcount
@@ -351,6 +352,19 @@ Returns the transaction ids for one or more transparent addresses.
 ### getnetworkhashps / getnetworksolps / getlocalsolps
 
 These currently return `0.0` and are placeholders for mining metrics.
+
+### estimatefee
+
+Estimates an approximate fee per kilobyte (kB) needed for a transaction to begin confirmation
+within `nblocks` blocks.
+
+- Params: `nblocks` (numeric).
+- Result: fee-per-kB as a numeric FLUX value.
+  - Returns `-1.0` when insufficient data is available.
+
+Notes:
+- This is currently based on a rolling sample of mempool-accepted transactions.
+- Samples are persisted to `fee_estimates.dat` in `--data-dir`.
 
 ### getconnectioncount
 
