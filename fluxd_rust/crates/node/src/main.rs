@@ -46,7 +46,7 @@ use fluxd_storage::memory::MemoryStore;
 use fluxd_storage::{KeyValueStore, StoreError, WriteBatch};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::p2p::{parse_addr, parse_headers, NetTotals, Peer, PeerKind, PeerRegistry};
@@ -792,6 +792,7 @@ async fn run() -> Result<(), String> {
     let rpc_addr = config.rpc_addr.unwrap_or_else(|| default_rpc_addr(network));
     let rpc_auth =
         rpc::load_or_create_auth(config.rpc_user.clone(), config.rpc_pass.clone(), data_dir)?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     if config.fetch_params {
         fetch_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
@@ -841,6 +842,7 @@ async fn run() -> Result<(), String> {
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
         let tx_announce = tx_announce.clone();
+        let shutdown_tx = shutdown_tx.clone();
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -862,6 +864,7 @@ async fn run() -> Result<(), String> {
                     peer_registry,
                     header_peer_book,
                     tx_announce,
+                    shutdown_tx,
                 )
                 .await
                 {
@@ -1302,8 +1305,13 @@ async fn run() -> Result<(), String> {
         header_lead,
         getdata_batch,
         inflight_per_peer,
+        shutdown_rx.clone(),
     )
     .await?;
+
+    if *shutdown_rx.borrow() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     Ok(())
 }
@@ -3498,6 +3506,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
     header_lead: i32,
     getdata_batch: usize,
     inflight_per_peer: usize,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let idle_sleep = Duration::from_secs(IDLE_SLEEP_SECS);
     let mut last_progress_height = chainstate
@@ -3508,6 +3517,10 @@ async fn sync_chain<S: KeyValueStore + 'static>(
     let mut last_progress_at = Instant::now();
     let mut last_peer_refill_at = Instant::now() - Duration::from_secs(BLOCK_PEER_REFILL_SECS);
     loop {
+        if *shutdown.borrow() {
+            println!("Shutdown requested; stopping sync loop.");
+            break;
+        }
         cap_header_gap(
             chainstate.as_ref(),
             header_lead,
@@ -3631,8 +3644,14 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                 Arc::clone(&header_cursor),
                 getdata_batch,
                 inflight_per_peer,
-            )
-            .await;
+            );
+            let fetch_result = tokio::select! {
+                _ = shutdown.changed() => {
+                    println!("Shutdown requested; aborting block fetch.");
+                    break;
+                }
+                result = fetch_result => result,
+            };
             if let Err(err) = fetch_result {
                 if is_transient_block_error(&err) {
                     eprintln!("block fetch failed: {err}");
@@ -3680,13 +3699,19 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                         }
                     }
                     last_progress_at = Instant::now();
-                    tokio::time::sleep(idle_sleep).await;
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        _ = tokio::time::sleep(idle_sleep) => {}
+                    }
                     continue;
                 }
                 return Err(err);
             }
         } else {
-            tokio::time::sleep(idle_sleep).await;
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = tokio::time::sleep(idle_sleep) => {}
+            }
         }
     }
 

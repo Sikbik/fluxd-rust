@@ -53,7 +53,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Network
 
 - getconnectioncount - Implemented
-- getdeprecationinfo - Missing
+- getdeprecationinfo - Implemented
 - getnettotals - Implemented
 - getnetworkinfo - Implemented
 - getpeerinfo - Implemented
@@ -98,7 +98,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - prioritisetransaction - Missing
 
 - reindex - Missing
-- stop - Missing
+- stop - Implemented
 - createfluxnodekey - Missing
 - listfluxnodeconf - Missing
 - getfluxnodeoutputs - Missing
@@ -165,8 +165,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Admin and benchmarking
 
 - start - Missing
-- restart - Missing
-- ping - Missing
+- restart - Implemented
+- ping - Implemented
 - zcbenchmark - Missing
 - startbenchmark - Missing
 - stopbenchmark - Missing

@@ -169,7 +169,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `help`<br>`getinfo`<br>`getnetworkinfo`<br>`getpeerinfo`<br>`getnettotals`<br>`getconnectioncount`<br>`listbanned` | - | `getdeprecationinfo`<br>`ping`<br>`start`<br>`stop`<br>`restart` |
+| `help`<br>`getinfo`<br>`ping`<br>`stop`<br>`restart`<br>`getnetworkinfo`<br>`getpeerinfo`<br>`getnettotals`<br>`getconnectioncount`<br>`listbanned`<br>`getdeprecationinfo` | - | `start` |
 
 ### Chain and blocks
 

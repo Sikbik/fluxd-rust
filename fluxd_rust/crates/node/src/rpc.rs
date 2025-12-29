@@ -11,7 +11,7 @@ use rand::RngCore;
 use serde_json::{json, Number, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::state::ChainState;
@@ -56,6 +56,9 @@ const RPC_INTERNAL_ERROR: i64 = -32603;
 const RPC_METHODS: &[&str] = &[
     "help",
     "getinfo",
+    "ping",
+    "stop",
+    "restart",
     "getblockcount",
     "getbestblockhash",
     "getblockhash",
@@ -91,6 +94,7 @@ const RPC_METHODS: &[&str] = &[
     "listbanned",
     "getnetworkinfo",
     "getpeerinfo",
+    "getdeprecationinfo",
     "getfluxnodecount",
     "listfluxnodes",
     "viewdeterministicfluxnodelist",
@@ -152,6 +156,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
     tx_announce: broadcast::Sender<Hash256>,
+    shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
         .await
@@ -177,6 +182,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
         let tx_announce = tx_announce.clone();
+        let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 stream,
@@ -193,6 +199,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 peer_registry,
                 header_peer_book,
                 tx_announce,
+                shutdown_tx,
             )
             .await
             {
@@ -218,6 +225,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
     tx_announce: broadcast::Sender<Hash256>,
+    shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), String> {
     let request = read_http_request(&mut stream).await?;
     let is_daemon = request.path.starts_with("/daemon/");
@@ -272,6 +280,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
             &peer_registry,
             &header_peer_book,
             &tx_announce,
+            &shutdown_tx,
         ) {
             Ok(value) => rpc_ok(Value::Null, value),
             Err(err) => rpc_error(Value::Null, err.code, err.message),
@@ -299,6 +308,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         &peer_registry,
         &header_peer_book,
         &tx_announce,
+        &shutdown_tx,
     ) {
         Ok(value) => value,
         Err(err) => err,
@@ -328,6 +338,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
     tx_announce: &broadcast::Sender<Hash256>,
+    shutdown_tx: &watch::Sender<bool>,
 ) -> Result<Value, RpcError> {
     let params = if request.method == "GET" {
         parse_query_params(request.query.as_deref().unwrap_or(""))?
@@ -351,6 +362,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
         peer_registry,
         header_peer_book,
         tx_announce,
+        shutdown_tx,
     )
 }
 
@@ -368,6 +380,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
     tx_announce: &broadcast::Sender<Hash256>,
+    shutdown_tx: &watch::Sender<bool>,
 ) -> Result<Value, Value> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| rpc_error(Value::Null, RPC_PARSE_ERROR, format!("parse error: {err}")))?;
@@ -416,6 +429,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         peer_registry,
         header_peer_book,
         tx_announce,
+        shutdown_tx,
     );
 
     match result {
@@ -562,6 +576,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
     tx_announce: &broadcast::Sender<Hash256>,
+    shutdown_tx: &watch::Sender<bool>,
 ) -> Result<Value, RpcError> {
     match method {
         "help" => rpc_help(params),
@@ -574,6 +589,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             peer_registry,
             mempool_policy,
         ),
+        "ping" => rpc_ping(params),
+        "stop" => rpc_stop(params, shutdown_tx),
+        "restart" => rpc_restart(params, shutdown_tx),
         "getblockcount" => rpc_getblockcount(chainstate, params),
         "getbestblockhash" => rpc_getbestblockhash(chainstate, params),
         "getblockhash" => rpc_getblockhash(chainstate, params),
@@ -618,6 +636,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getnettotals" => rpc_getnettotals(params, net_totals),
         "getnetworkinfo" => rpc_getnetworkinfo(params, peer_registry, net_totals, mempool_policy),
         "getpeerinfo" => rpc_getpeerinfo(params, peer_registry),
+        "getdeprecationinfo" => rpc_getdeprecationinfo(params),
         "listbanned" => rpc_listbanned(params, header_peer_book),
         "getfluxnodecount" => rpc_getfluxnodecount(chainstate, params),
         "listfluxnodes" => rpc_viewdeterministicfluxnodelist(chainstate, params),
@@ -627,6 +646,39 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getdoslist" => rpc_getdoslist(params),
         _ => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "method not found")),
     }
+}
+
+fn rpc_ping(params: Vec<Value>) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    Ok(Value::Null)
+}
+
+fn rpc_stop(params: Vec<Value>, shutdown_tx: &watch::Sender<bool>) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    shutdown_tx
+        .send(true)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "shutdown channel closed"))?;
+    Ok(Value::String("fluxd stopping".to_string()))
+}
+
+fn rpc_restart(params: Vec<Value>, shutdown_tx: &watch::Sender<bool>) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    shutdown_tx
+        .send(true)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "shutdown channel closed"))?;
+    Ok(Value::String(
+        "fluxd restarting (exit requested; restart requires a supervisor)".to_string(),
+    ))
+}
+
+fn rpc_getdeprecationinfo(params: Vec<Value>) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    Ok(json!({
+        "deprecated": false,
+        "version": node_version(),
+        "subversion": format!("/fluxd-rust:{}/", env!("CARGO_PKG_VERSION")),
+        "warnings": "",
+    }))
 }
 
 fn rpc_help(params: Vec<Value>) -> Result<Value, RpcError> {

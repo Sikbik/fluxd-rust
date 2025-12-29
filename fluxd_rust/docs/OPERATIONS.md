@@ -70,6 +70,12 @@ The daemon writes a few non-db helper files into `--data-dir`:
 ssh <vps-user>@<vps-host> "pkill -x fluxd"
 ```
 
+Or via RPC (requires Basic Auth):
+
+```bash
+ssh <vps-user>@<vps-host> "curl -u \"$(cat <remote-data-dir>/rpc.cookie)\" http://127.0.0.1:16124/daemon/stop"
+```
+
 ## Logs and monitoring
 
 - Log file: `<remote-log-dir>/longrun-public.log`

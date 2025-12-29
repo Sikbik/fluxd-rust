@@ -72,11 +72,15 @@ Type notes:
 
 - `help [method]`
 - `getinfo`
+- `ping`
+- `stop`
+- `restart`
 - `getnetworkinfo`
 - `getpeerinfo`
 - `getnettotals`
 - `getconnectioncount`
 - `listbanned`
+- `getdeprecationinfo`
 
 ### Chain and blocks
 
@@ -151,6 +155,23 @@ Fields:
 - `testnet` - boolean.
 - `relayfee` - min relay fee-rate in FLUX/kB (from `--minrelaytxfee`).
 - `errors` - empty string.
+
+### ping
+
+- Result: `null`
+
+### stop
+
+- Result: string (`"fluxd stopping"`)
+
+### restart
+
+- Result: string (`"fluxd restarting ..."`).
+- Note: this requests process exit; actual restart depends on your supervisor (systemd, docker, etc).
+
+### getdeprecationinfo
+
+- Result: object with `deprecated`, `version`, `subversion`, and `warnings`.
 
 ### getblockcount
 
