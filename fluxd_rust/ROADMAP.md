@@ -101,7 +101,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Address unspent index (`getaddressutxos`) (owner: TBD)
 - [x] [P1] UTXO set stats (`gettxoutsetinfo`) (owner: TBD)
 - [x] [P1] Shielded value pool totals (Sprout/Sapling) for supply tracking (owner: TBD)
-- [ ] [P1] Block deltas index (`getblockdeltas`) (owner: TBD)
+- [x] [P1] Block deltas index (`getblockdeltas`) (owner: TBD)
 - [ ] [P2] Reindex/rescan support for secondary indexes (owner: TBD)
 - [ ] [P2] DB inspection tools (index stats, supply, integrity) (owner: TBD)
 
@@ -175,7 +175,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getblockcount`<br>`getbestblockhash`<br>`getblockhash`<br>`getblockheader`<br>`getblock`<br>`getblockchaininfo`<br>`getdifficulty`<br>`getchaintips`<br>`getblocksubsidy`<br>`getblockhashes` | `gettxoutsetinfo` | `getblockdeltas` |
+| `getblockcount`<br>`getbestblockhash`<br>`getblockhash`<br>`getblockheader`<br>`getblock`<br>`getblockchaininfo`<br>`getdifficulty`<br>`getchaintips`<br>`getblocksubsidy`<br>`getblockhashes`<br>`getblockdeltas` | `gettxoutsetinfo` | - |
 
 ### Transactions and scripts
 

@@ -620,7 +620,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "gettxoutproof" => rpc_gettxoutproof(params),
         "verifytxoutproof" => rpc_verifytxoutproof(params),
         "gettxoutsetinfo" => rpc_gettxoutsetinfo(chainstate, params, data_dir),
-        "getblockdeltas" => rpc_getblockdeltas(params),
+        "getblockdeltas" => rpc_getblockdeltas(chainstate, params, chain_params),
         "getspentinfo" => rpc_getspentinfo(chainstate, params),
         "getaddressutxos" => rpc_getaddressutxos(chainstate, params, chain_params),
         "getaddressbalance" => rpc_getaddressbalance(chainstate, params, chain_params),
@@ -1519,12 +1519,146 @@ fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(
     }))
 }
 
-fn rpc_getblockdeltas(params: Vec<Value>) -> Result<Value, RpcError> {
-    let _ = params;
-    Err(RpcError::new(
-        RPC_INTERNAL_ERROR,
-        "getblockdeltas is not implemented",
-    ))
+fn rpc_getblockdeltas<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getblockdeltas expects 1 parameter",
+        ));
+    }
+    let (hash, entry) = resolve_block_hash(chainstate, &params[0])?;
+
+    let best_height = best_block_height(chainstate)?;
+    let main_hash = chainstate.height_hash(entry.height).map_err(map_internal)?;
+    if main_hash.as_ref() != Some(&hash) {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Block is an orphan",
+        ));
+    }
+
+    let location = chainstate
+        .block_location(&hash)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
+    let bytes = chainstate.read_block(location).map_err(map_internal)?;
+    let block = fluxd_primitives::block::Block::consensus_decode(&bytes).map_err(map_internal)?;
+
+    let mut deltas = Vec::with_capacity(block.transactions.len());
+    let mut tx_cache: HashMap<Hash256, Transaction> = HashMap::new();
+
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
+        let txid = tx.txid().map_err(map_internal)?;
+        let mut entry_obj = serde_json::Map::new();
+        entry_obj.insert("txid".to_string(), Value::String(hash256_to_hex(&txid)));
+        entry_obj.insert("index".to_string(), Value::Number((tx_index as i64).into()));
+
+        let mut inputs = Vec::new();
+        let is_coinbase =
+            tx.vin.len() == 1 && tx.vin[0].prevout == fluxd_primitives::outpoint::OutPoint::null();
+        if !is_coinbase {
+            for (vin_index, input) in tx.vin.iter().enumerate() {
+                let mut delta = serde_json::Map::new();
+
+                let (satoshis, address) = match chainstate
+                    .spent_info(&input.prevout)
+                    .map_err(map_internal)?
+                {
+                    Some(spent) => {
+                        if let Some(details) = spent.details {
+                            (
+                                details.satoshis,
+                                spent_details_address(
+                                    details.address_type,
+                                    &details.address_hash,
+                                    chain_params.network,
+                                ),
+                            )
+                        } else {
+                            resolve_prevout_via_txindex(
+                                chainstate,
+                                &mut tx_cache,
+                                &input.prevout,
+                                chain_params.network,
+                            )?
+                        }
+                    }
+                    None => resolve_prevout_via_txindex(
+                        chainstate,
+                        &mut tx_cache,
+                        &input.prevout,
+                        chain_params.network,
+                    )?,
+                };
+
+                if let Some(address) = address {
+                    delta.insert("address".to_string(), Value::String(address));
+                }
+
+                delta.insert("satoshis".to_string(), Value::from(-satoshis));
+                delta.insert(
+                    "index".to_string(),
+                    Value::Number((vin_index as i64).into()),
+                );
+                delta.insert(
+                    "prevtxid".to_string(),
+                    Value::String(hash256_to_hex(&input.prevout.hash)),
+                );
+                delta.insert(
+                    "prevout".to_string(),
+                    Value::Number((input.prevout.index as i64).into()),
+                );
+                inputs.push(Value::Object(delta));
+            }
+        }
+        entry_obj.insert("inputs".to_string(), Value::Array(inputs));
+
+        let mut outputs = Vec::with_capacity(tx.vout.len());
+        for (vout_index, output) in tx.vout.iter().enumerate() {
+            let address = script_pubkey_to_address(&output.script_pubkey, chain_params.network)
+                .unwrap_or_default();
+            outputs.push(json!({
+                "address": address,
+                "satoshis": output.value,
+                "index": vout_index,
+            }));
+        }
+        entry_obj.insert("outputs".to_string(), Value::Array(outputs));
+        deltas.push(Value::Object(entry_obj));
+    }
+
+    let confirmations = best_height - entry.height + 1;
+    let next_hash = next_hash_for_height(chainstate, entry.height, best_height, &hash)?;
+    let mediantime = median_time_past(chainstate, entry.height)?;
+
+    let mut result = json!({
+        "hash": hash256_to_hex(&hash),
+        "confirmations": confirmations,
+        "size": bytes.len(),
+        "height": entry.height,
+        "version": block.header.version,
+        "merkleroot": hash256_to_hex(&block.header.merkle_root),
+        "deltas": Value::Array(deltas),
+        "time": block.header.time,
+        "mediantime": mediantime,
+        "nonce": hash256_to_hex(&block.header.nonce),
+        "bits": format!("{:08x}", block.header.bits),
+        "difficulty": difficulty_from_bits(block.header.bits, chain_params).unwrap_or(0.0),
+        "chainwork": hex_bytes(&entry.chainwork),
+    });
+
+    if entry.height > 0 {
+        result["previousblockhash"] = Value::String(hash256_to_hex(&entry.prev_hash));
+    }
+    if let Some(next_hash) = next_hash {
+        result["nextblockhash"] = Value::String(hash256_to_hex(&next_hash));
+    }
+
+    Ok(result)
 }
 
 fn rpc_getspentinfo<S: fluxd_storage::KeyValueStore>(
@@ -2822,6 +2956,95 @@ fn next_hash_for_height<S: fluxd_storage::KeyValueStore>(
         return Ok(None);
     }
     chainstate.height_hash(height + 1).map_err(map_internal)
+}
+
+fn median_time_past<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    height: i32,
+) -> Result<i64, RpcError> {
+    let mut times = Vec::with_capacity(11);
+    let mut current = height;
+    for _ in 0..11 {
+        if current < 0 {
+            break;
+        }
+        let Some(hash) = chainstate.height_hash(current).map_err(map_internal)? else {
+            break;
+        };
+        let entry = chainstate
+            .header_entry(&hash)
+            .map_err(map_internal)?
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing header entry"))?;
+        times.push(entry.time as i64);
+        current -= 1;
+    }
+    times.sort_unstable();
+    Ok(times.get(times.len() / 2).copied().unwrap_or(0))
+}
+
+fn spent_details_address(
+    address_type: u32,
+    address_hash: &[u8; 20],
+    network: Network,
+) -> Option<String> {
+    match address_type {
+        1 => {
+            let mut script = Vec::with_capacity(25);
+            script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            script.extend_from_slice(address_hash);
+            script.extend_from_slice(&[0x88, 0xac]);
+            script_pubkey_to_address(&script, network)
+        }
+        2 => {
+            let mut script = Vec::with_capacity(23);
+            script.extend_from_slice(&[0xa9, 0x14]);
+            script.extend_from_slice(address_hash);
+            script.push(0x87);
+            script_pubkey_to_address(&script, network)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_prevout_via_txindex<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    tx_cache: &mut HashMap<Hash256, Transaction>,
+    outpoint: &fluxd_primitives::outpoint::OutPoint,
+    network: Network,
+) -> Result<(i64, Option<String>), RpcError> {
+    let prev_txid = outpoint.hash;
+    if !tx_cache.contains_key(&prev_txid) {
+        let location = chainstate
+            .tx_location(&prev_txid)
+            .map_err(map_internal)?
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "Spent information not available"))?;
+        let bytes = chainstate
+            .read_block(location.block)
+            .map_err(map_internal)?;
+        let block =
+            fluxd_primitives::block::Block::consensus_decode(&bytes).map_err(map_internal)?;
+        let tx_index = location.index as usize;
+        let tx = block
+            .transactions
+            .get(tx_index)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "Spent information not available"))?
+            .clone();
+        tx_cache.insert(prev_txid, tx);
+    }
+
+    let tx = tx_cache
+        .get(&prev_txid)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "Spent information not available"))?;
+    let output_index = usize::try_from(outpoint.index)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "Spent information not available"))?;
+    let output = tx
+        .vout
+        .get(output_index)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "Spent information not available"))?;
+    Ok((
+        output.value,
+        script_pubkey_to_address(&output.script_pubkey, network),
+    ))
 }
 
 fn build_upgrade_info(params: &ChainParams, height: i32) -> Value {

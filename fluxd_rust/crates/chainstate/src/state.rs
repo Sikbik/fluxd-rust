@@ -46,7 +46,7 @@ use crate::shielded::{
     sapling_root_hash, sapling_tree_from_bytes, sapling_tree_to_bytes, sprout_empty_root_hash,
     sprout_root_hash, sprout_tree_from_bytes, sprout_tree_to_bytes, SaplingTree, SproutTree,
 };
-use crate::spentindex::{SpentIndex, SpentIndexValue};
+use crate::spentindex::{SpentIndex, SpentIndexDetails, SpentIndexValue};
 use crate::txindex::{TxIndex, TxLocation};
 use crate::undo::{BlockUndo, FluxnodeUndo, SpentOutput};
 use crate::utxo::{outpoint_key_bytes, OutPointKey, UtxoEntry, UtxoSet};
@@ -1806,6 +1806,7 @@ impl<S: KeyValueStore> ChainState<S> {
                         }
                     };
                     spent_index_ops = spent_index_ops.saturating_add(1);
+                    let (address_type, address_hash) = spent_address_info(&entry.script_pubkey);
                     self.spent_index.insert(
                         &mut batch,
                         &input.prevout,
@@ -1813,6 +1814,11 @@ impl<S: KeyValueStore> ChainState<S> {
                             txid,
                             input_index: input_index as u32,
                             block_height: height as u32,
+                            details: Some(SpentIndexDetails {
+                                satoshis: entry.value,
+                                address_type,
+                                address_hash,
+                            }),
                         },
                     );
                     let spent_delta = entry
@@ -3344,6 +3350,30 @@ fn fluxnode_collateral(tx: &Transaction) -> Option<&OutPoint> {
     }
 }
 
+fn spent_address_info(script_pubkey: &[u8]) -> (u32, [u8; 20]) {
+    if script_pubkey.len() == 25
+        && script_pubkey[0] == 0x76
+        && script_pubkey[1] == 0xa9
+        && script_pubkey[2] == 0x14
+        && script_pubkey[23] == 0x88
+        && script_pubkey[24] == 0xac
+    {
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&script_pubkey[3..23]);
+        return (1, hash);
+    }
+    if script_pubkey.len() == 23
+        && script_pubkey[0] == 0xa9
+        && script_pubkey[1] == 0x14
+        && script_pubkey[22] == 0x87
+    {
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&script_pubkey[2..22]);
+        return (2, hash);
+    }
+    (0, [0u8; 20])
+}
+
 fn fluxnode_undo_entry<S: KeyValueStore>(
     store: &S,
     tx: &Transaction,
@@ -4836,7 +4866,12 @@ mod tests {
             SpentIndexValue {
                 txid: tx1id,
                 input_index: 0,
-                block_height: 0
+                block_height: 0,
+                details: Some(SpentIndexDetails {
+                    satoshis: seed_entry.value,
+                    address_type: 0,
+                    address_hash: [0u8; 20],
+                }),
             }
         );
         assert_eq!(
@@ -4847,7 +4882,12 @@ mod tests {
             SpentIndexValue {
                 txid: tx2id,
                 input_index: 0,
-                block_height: 0
+                block_height: 0,
+                details: Some(SpentIndexDetails {
+                    satoshis: seed_entry.value,
+                    address_type: 0,
+                    address_hash: [0u8; 20],
+                }),
             }
         );
 

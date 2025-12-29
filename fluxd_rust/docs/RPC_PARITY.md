@@ -25,7 +25,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getblock - Implemented
 - getblockchaininfo - Implemented
 - getblockcount - Implemented
-- getblockdeltas - Stub
+- getblockdeltas - Implemented
 - getblockhash - Implemented
 - getblockheader - Implemented
 - getchaintips - Implemented

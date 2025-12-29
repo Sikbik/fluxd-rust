@@ -49,13 +49,14 @@ curl -u "$(cat ./data/rpc.cookie)" \
   "http://127.0.0.1:16124/daemon/getblockhash?height=1000"
 
 # Explicit params array
-curl -u "$(cat ./data/rpc.cookie)" \
+curl -g -u "$(cat ./data/rpc.cookie)" \
   "http://127.0.0.1:16124/daemon/getblockhashes?params=[1700000000,1699990000,{\"noOrphans\":true}]"
 ```
 
 Type notes:
 - Some methods require strict booleans (for example `getblockheader` verbose). Use `true`/`false`, not `1`/`0`.
 - `verbosity` for `getblock` must be numeric (0, 1, or 2).
+- If you pass `params=[...]` in the URL, use `curl -g` (`--globoff`) so `[`/`]` are not treated as URL globs.
 
 ## Error codes
 
@@ -121,9 +122,9 @@ Type notes:
 - `getfluxnodestatus` (not implemented)
 - `getdoslist` (not implemented)
 
-### Indexer endpoints (placeholders)
+### Indexer endpoints (insight-style)
 
-- `getblockdeltas` (not implemented)
+- `getblockdeltas`
 - `getspentinfo`
 - `getaddressutxos`
 - `getaddressbalance`
@@ -326,6 +327,14 @@ Notes:
 - UTXO stats are maintained incrementally in the chainstate `Meta` column under `utxo_stats_v1`.
 - Shielded value pools are maintained incrementally in the chainstate `Meta` column under `value_pools_v1`.
 - `*_zat` fields are provided for exact integer values.
+
+### getblockdeltas
+
+Returns an insight-style block+transaction summary with per-input/per-output balance deltas.
+
+- Params: `<blockhash>` (hex string) or `<height>` (number).
+- Result: object with `hash`, `confirmations`, `size`, `height`, `version`, `merkleroot`, `deltas`, `time`, `mediantime`,
+  `nonce`, `bits`, `difficulty`, `chainwork`, `previousblockhash`, `nextblockhash`.
 
 ### getspentinfo
 
