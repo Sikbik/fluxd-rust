@@ -120,7 +120,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Address discovery: `getaddr` + `addr` ingest (owner: TBD)
   - [x] Tx relay: `inv`/`getdata`/`tx` + `mempool` (owner: TBD)
   - [x] `feefilter` and fee-based relay policies (owner: TBD)
-  - [ ] `reject`/`notfound` handling parity (owner: TBD)
+  - [x] `reject`/`notfound` handling parity (owner: TBD)
 - [ ] [P2] Service flags and user agent compatibility (owner: TBD)
 
 ## Mempool and mining

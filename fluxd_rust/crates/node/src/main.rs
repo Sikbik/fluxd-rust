@@ -49,7 +49,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
-use crate::p2p::{parse_addr, parse_headers, NetTotals, Peer, PeerKind, PeerRegistry};
+use crate::p2p::{
+    parse_addr, parse_headers, parse_inv, parse_reject, NetTotals, Peer, PeerKind, PeerRegistry,
+};
 use crate::peer_book::HeaderPeerBook;
 use crate::stats::{hash256_to_hex, snapshot_stats, HeaderMetrics, SyncMetrics};
 
@@ -3725,6 +3727,7 @@ fn is_transient_block_error(err: &str) -> bool {
         "timeout",
         "timed out",
         "notfound",
+        "reject",
         "connection",
         "broken pipe",
         "reset by peer",
@@ -3740,6 +3743,9 @@ fn block_peer_ban_secs(err: &str) -> Option<u64> {
     let err = err.to_lowercase();
     if err.contains("notfound") {
         return Some(BLOCK_PEER_BAN_SECS_NOTFOUND);
+    }
+    if err.contains("reject") {
+        return Some(BLOCK_PEER_BAN_SECS_PROTOCOL);
     }
     if err.contains("stalled") || err.contains("timeout") || err.contains("timed out") {
         return Some(BLOCK_PEER_BAN_SECS_TIMEOUT);
@@ -4715,9 +4721,39 @@ async fn fetch_blocks_on_peer_queue_inner(
                 last_block_at = Instant::now();
             }
             "notfound" => {
+                let message = match parse_inv(&payload) {
+                    Ok(items) if !items.is_empty() => {
+                        let first = hash256_to_hex(&items[0].hash);
+                        format!(
+                            "peer returned notfound for {} item(s) (first {})",
+                            items.len(),
+                            first
+                        )
+                    }
+                    _ => "peer returned notfound for block request".to_string(),
+                };
                 return BlockPeerFetchOutcome {
                     received,
-                    error: Some("peer returned notfound for block request".to_string()),
+                    error: Some(message),
+                };
+            }
+            "reject" => {
+                let message = match parse_reject(&payload) {
+                    Ok(reject) => {
+                        let suffix = reject
+                            .data
+                            .map(|hash| format!(" {}", hash256_to_hex(&hash)))
+                            .unwrap_or_default();
+                        format!(
+                            "peer sent reject for {} (code {} reason {}){}",
+                            reject.message, reject.code, reject.reason, suffix
+                        )
+                    }
+                    Err(err) => format!("peer sent reject (unparseable): {err}"),
+                };
+                return BlockPeerFetchOutcome {
+                    received,
+                    error: Some(message),
                 };
             }
             _ => {
@@ -4793,7 +4829,34 @@ async fn fetch_blocks_on_peer_inner(
                 last_block_at = Instant::now();
             }
             "notfound" => {
-                return Err("peer returned notfound for block request".to_string());
+                let message = match parse_inv(&payload) {
+                    Ok(items) if !items.is_empty() => {
+                        let first = hash256_to_hex(&items[0].hash);
+                        format!(
+                            "peer returned notfound for {} item(s) (first {})",
+                            items.len(),
+                            first
+                        )
+                    }
+                    _ => "peer returned notfound for block request".to_string(),
+                };
+                return Err(message);
+            }
+            "reject" => {
+                let message = match parse_reject(&payload) {
+                    Ok(reject) => {
+                        let suffix = reject
+                            .data
+                            .map(|hash| format!(" {}", hash256_to_hex(&hash)))
+                            .unwrap_or_default();
+                        format!(
+                            "peer sent reject for {} (code {} reason {}){}",
+                            reject.message, reject.code, reject.reason, suffix
+                        )
+                    }
+                    Err(err) => format!("peer sent reject (unparseable): {err}"),
+                };
+                return Err(message);
             }
             _ => handle_aux_message(peer, &command, &payload).await?,
         }

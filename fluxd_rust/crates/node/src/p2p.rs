@@ -469,6 +469,32 @@ pub fn parse_inv(payload: &[u8]) -> Result<Vec<InventoryVector>, String> {
     Ok(out)
 }
 
+#[derive(Clone, Debug)]
+pub struct RejectMessage {
+    pub message: String,
+    pub code: u8,
+    pub reason: String,
+    pub data: Option<fluxd_consensus::Hash256>,
+}
+
+pub fn parse_reject(payload: &[u8]) -> Result<RejectMessage, String> {
+    let mut decoder = Decoder::new(payload);
+    let message = decoder.read_var_str().map_err(|err| err.to_string())?;
+    let code = decoder.read_u8().map_err(|err| err.to_string())?;
+    let reason = decoder.read_var_str().map_err(|err| err.to_string())?;
+    let data = match decoder.remaining() {
+        0 => None,
+        32 => Some(decoder.read_hash_le().map_err(|err| err.to_string())?),
+        _ => None,
+    };
+    Ok(RejectMessage {
+        message,
+        code,
+        reason,
+        data,
+    })
+}
+
 pub fn build_inv_payload(hashes: &[fluxd_consensus::Hash256], inv_type: u32) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.write_varint(hashes.len() as u64);

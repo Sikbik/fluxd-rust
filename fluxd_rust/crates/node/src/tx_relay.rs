@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 
 use crate::mempool;
-use crate::p2p::{parse_feefilter, parse_inv, InventoryVector, Peer, MSG_TX};
+use crate::p2p::{parse_feefilter, parse_inv, parse_reject, InventoryVector, Peer, MSG_TX};
 use crate::stats::MempoolMetrics;
 
 const TX_GETDATA_BATCH: usize = 128;
@@ -311,7 +311,30 @@ async fn handle_peer_message<S: KeyValueStore>(
                 peer.send_inv_tx(&txids).await?;
             }
         }
-        "notfound" => {}
+        "notfound" => {
+            let vectors = parse_inv(payload)?;
+            let txids = inventory_txids(&vectors);
+            if txids.is_empty() {
+                return Ok(());
+            }
+            let count = txids.len() as u64;
+            for txid in txids {
+                let _ = requested.remove(&txid);
+            }
+            reject_stats.note_peer_notfound(count);
+            reject_stats.maybe_log(peer.addr());
+        }
+        "reject" => {
+            if let Ok(reject) = parse_reject(payload) {
+                if reject.message == "tx" {
+                    if let Some(txid) = reject.data {
+                        let _ = requested.remove(&txid);
+                    }
+                }
+                reject_stats.note_peer_reject();
+                reject_stats.maybe_log(peer.addr());
+            }
+        }
         "ping" => peer.send_message("pong", payload).await?,
         "version" => peer.send_message("verack", &[]).await?,
         _ => {}
@@ -408,6 +431,8 @@ fn fee_rate_per_kb(fee: i64, size: usize) -> i64 {
 
 #[derive(Clone, Debug)]
 struct TxRejectStats {
+    peer_notfound: u64,
+    peer_reject: u64,
     build_missing_input: u64,
     build_conflicting_input: u64,
     build_insufficient_fee: u64,
@@ -425,6 +450,8 @@ struct TxRejectStats {
 impl TxRejectStats {
     fn new() -> Self {
         Self {
+            peer_notfound: 0,
+            peer_reject: 0,
             build_missing_input: 0,
             build_conflicting_input: 0,
             build_insufficient_fee: 0,
@@ -438,6 +465,14 @@ impl TxRejectStats {
             insert_other: 0,
             last_log: Instant::now(),
         }
+    }
+
+    fn note_peer_notfound(&mut self, count: u64) {
+        self.peer_notfound = self.peer_notfound.saturating_add(count);
+    }
+
+    fn note_peer_reject(&mut self) {
+        self.peer_reject = self.peer_reject.saturating_add(1);
     }
 
     fn note_build_error(&mut self, kind: mempool::MempoolErrorKind) {
@@ -469,7 +504,9 @@ impl TxRejectStats {
         }
         self.last_log = Instant::now();
 
-        let total = self.build_missing_input
+        let total = self.peer_notfound
+            + self.peer_reject
+            + self.build_missing_input
             + self.build_conflicting_input
             + self.build_insufficient_fee
             + self.build_non_standard
@@ -485,7 +522,9 @@ impl TxRejectStats {
         }
 
         eprintln!(
-            "tx relay peer {addr}: rejected {total} tx(s) (build_missing_input {} build_conflict {} build_insufficient_fee {} build_nonstandard {} build_invalid_tx {} build_invalid_script {} build_invalid_shielded {} build_internal {} insert_dupe {} insert_conflict {} insert_other {})",
+            "tx relay peer {addr}: rejected {total} tx(s) (peer_notfound {} peer_reject {} build_missing_input {} build_conflict {} build_insufficient_fee {} build_nonstandard {} build_invalid_tx {} build_invalid_script {} build_invalid_shielded {} build_internal {} insert_dupe {} insert_conflict {} insert_other {})",
+            self.peer_notfound,
+            self.peer_reject,
             self.build_missing_input,
             self.build_conflicting_input,
             self.build_insufficient_fee,
@@ -499,6 +538,8 @@ impl TxRejectStats {
             self.insert_other,
         );
 
+        self.peer_notfound = 0;
+        self.peer_reject = 0;
         self.build_missing_input = 0;
         self.build_conflicting_input = 0;
         self.build_insufficient_fee = 0;
