@@ -19,6 +19,21 @@ Example (per-block):
 - `verify_ms_per_block = (Δverify_us / 1000) / Δverify_blocks`
 - `commit_ms_per_block = (Δcommit_us / 1000) / Δcommit_blocks`
 
+## Mempool and tx relay
+
+`/stats` includes both current mempool size and cumulative counters about transaction relay:
+
+- Current state:
+  - `mempool_size`, `mempool_bytes`, `mempool_max_bytes`
+- RPC vs relay acceptance:
+  - `mempool_rpc_accept`, `mempool_rpc_reject`
+  - `mempool_relay_accept`, `mempool_relay_reject`
+- Evictions:
+  - `mempool_evicted`, `mempool_evicted_bytes`
+- Persistence (`mempool.dat`):
+  - `mempool_loaded`, `mempool_load_reject`
+  - `mempool_persisted_writes`, `mempool_persisted_bytes`
+
 ## Connect-stage breakdown
 
 Block connect is where we update UTXOs and indexes and generate undo data. `/stats` exposes

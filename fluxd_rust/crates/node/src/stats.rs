@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fluxd_chainstate::metrics::ConnectMetrics;
@@ -8,6 +9,7 @@ use fluxd_consensus::params::Network;
 use fluxd_consensus::Hash256;
 use fluxd_storage::KeyValueStore;
 
+use crate::mempool::Mempool;
 use crate::Backend;
 use crate::Store;
 
@@ -25,6 +27,19 @@ pub struct StatsSnapshot {
     pub uptime_secs: u64,
     pub unix_time_secs: u64,
     pub sync_state: String,
+    pub mempool_size: u64,
+    pub mempool_bytes: u64,
+    pub mempool_max_bytes: u64,
+    pub mempool_rpc_accept: u64,
+    pub mempool_rpc_reject: u64,
+    pub mempool_relay_accept: u64,
+    pub mempool_relay_reject: u64,
+    pub mempool_evicted: u64,
+    pub mempool_evicted_bytes: u64,
+    pub mempool_loaded: u64,
+    pub mempool_load_reject: u64,
+    pub mempool_persisted_writes: u64,
+    pub mempool_persisted_bytes: u64,
     pub download_us: u64,
     pub download_blocks: u64,
     pub verify_us: u64,
@@ -128,6 +143,32 @@ impl StatsSnapshot {
         json.push_str(&self.unix_time_secs.to_string());
         json.push_str(",\"sync_state\":");
         json.push_str(&json_string(&self.sync_state));
+        json.push_str(",\"mempool_size\":");
+        json.push_str(&self.mempool_size.to_string());
+        json.push_str(",\"mempool_bytes\":");
+        json.push_str(&self.mempool_bytes.to_string());
+        json.push_str(",\"mempool_max_bytes\":");
+        json.push_str(&self.mempool_max_bytes.to_string());
+        json.push_str(",\"mempool_rpc_accept\":");
+        json.push_str(&self.mempool_rpc_accept.to_string());
+        json.push_str(",\"mempool_rpc_reject\":");
+        json.push_str(&self.mempool_rpc_reject.to_string());
+        json.push_str(",\"mempool_relay_accept\":");
+        json.push_str(&self.mempool_relay_accept.to_string());
+        json.push_str(",\"mempool_relay_reject\":");
+        json.push_str(&self.mempool_relay_reject.to_string());
+        json.push_str(",\"mempool_evicted\":");
+        json.push_str(&self.mempool_evicted.to_string());
+        json.push_str(",\"mempool_evicted_bytes\":");
+        json.push_str(&self.mempool_evicted_bytes.to_string());
+        json.push_str(",\"mempool_loaded\":");
+        json.push_str(&self.mempool_loaded.to_string());
+        json.push_str(",\"mempool_load_reject\":");
+        json.push_str(&self.mempool_load_reject.to_string());
+        json.push_str(",\"mempool_persisted_writes\":");
+        json.push_str(&self.mempool_persisted_writes.to_string());
+        json.push_str(",\"mempool_persisted_bytes\":");
+        json.push_str(&self.mempool_persisted_bytes.to_string());
         json.push_str(",\"download_us\":");
         json.push_str(&self.download_us.to_string());
         json.push_str(",\"download_blocks\":");
@@ -383,6 +424,85 @@ pub struct HeaderMetricsSnapshot {
     pub pow_headers: u64,
 }
 
+#[derive(Debug, Default)]
+pub struct MempoolMetrics {
+    rpc_accept: AtomicU64,
+    rpc_reject: AtomicU64,
+    relay_accept: AtomicU64,
+    relay_reject: AtomicU64,
+    evicted: AtomicU64,
+    evicted_bytes: AtomicU64,
+    loaded: AtomicU64,
+    load_reject: AtomicU64,
+    persisted_writes: AtomicU64,
+    persisted_bytes: AtomicU64,
+}
+
+impl MempoolMetrics {
+    pub fn note_rpc_accept(&self) {
+        self.rpc_accept.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_rpc_reject(&self) {
+        self.rpc_reject.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_relay_accept(&self) {
+        self.relay_accept.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_relay_reject(&self) {
+        self.relay_reject.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_evicted(&self, count: u64, bytes: u64) {
+        self.evicted.fetch_add(count, Ordering::Relaxed);
+        self.evicted_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_loaded(&self, count: u64) {
+        self.loaded.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn note_load_reject(&self, count: u64) {
+        self.load_reject.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn note_persisted(&self, bytes: u64) {
+        self.persisted_writes.fetch_add(1, Ordering::Relaxed);
+        self.persisted_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> MempoolMetricsSnapshot {
+        MempoolMetricsSnapshot {
+            rpc_accept: self.rpc_accept.load(Ordering::Relaxed),
+            rpc_reject: self.rpc_reject.load(Ordering::Relaxed),
+            relay_accept: self.relay_accept.load(Ordering::Relaxed),
+            relay_reject: self.relay_reject.load(Ordering::Relaxed),
+            evicted: self.evicted.load(Ordering::Relaxed),
+            evicted_bytes: self.evicted_bytes.load(Ordering::Relaxed),
+            loaded: self.loaded.load(Ordering::Relaxed),
+            load_reject: self.load_reject.load(Ordering::Relaxed),
+            persisted_writes: self.persisted_writes.load(Ordering::Relaxed),
+            persisted_bytes: self.persisted_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MempoolMetricsSnapshot {
+    pub rpc_accept: u64,
+    pub rpc_reject: u64,
+    pub relay_accept: u64,
+    pub relay_reject: u64,
+    pub evicted: u64,
+    pub evicted_bytes: u64,
+    pub loaded: u64,
+    pub load_reject: u64,
+    pub persisted_writes: u64,
+    pub persisted_bytes: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn snapshot_stats<S: KeyValueStore>(
     chainstate: &ChainState<S>,
@@ -394,6 +514,8 @@ pub fn snapshot_stats<S: KeyValueStore>(
     header_metrics: Option<&HeaderMetrics>,
     validation_metrics: Option<&ValidationMetrics>,
     connect_metrics: Option<&ConnectMetrics>,
+    mempool: Option<&Mutex<Mempool>>,
+    mempool_metrics: Option<&MempoolMetrics>,
 ) -> Result<StatsSnapshot, String> {
     let best_header = chainstate.best_header().map_err(|err| err.to_string())?;
     let best_block = chainstate.best_block().map_err(|err| err.to_string())?;
@@ -435,6 +557,20 @@ pub fn snapshot_stats<S: KeyValueStore>(
         .map(ConnectMetrics::snapshot)
         .unwrap_or_default();
     let db = store.and_then(|store| store.fjall_telemetry_snapshot());
+    let (mempool_size, mempool_bytes, mempool_max_bytes) = match mempool {
+        Some(mempool) => match mempool.lock() {
+            Ok(guard) => (
+                guard.size() as u64,
+                guard.bytes() as u64,
+                guard.max_bytes() as u64,
+            ),
+            Err(_) => (0, 0, 0),
+        },
+        None => (0, 0, 0),
+    };
+    let mempool_metrics_snapshot = mempool_metrics
+        .map(MempoolMetrics::snapshot)
+        .unwrap_or_default();
 
     Ok(StatsSnapshot {
         network: format!("{network:?}"),
@@ -449,6 +585,19 @@ pub fn snapshot_stats<S: KeyValueStore>(
         uptime_secs,
         unix_time_secs,
         sync_state: sync_state.to_string(),
+        mempool_size,
+        mempool_bytes,
+        mempool_max_bytes,
+        mempool_rpc_accept: mempool_metrics_snapshot.rpc_accept,
+        mempool_rpc_reject: mempool_metrics_snapshot.rpc_reject,
+        mempool_relay_accept: mempool_metrics_snapshot.relay_accept,
+        mempool_relay_reject: mempool_metrics_snapshot.relay_reject,
+        mempool_evicted: mempool_metrics_snapshot.evicted,
+        mempool_evicted_bytes: mempool_metrics_snapshot.evicted_bytes,
+        mempool_loaded: mempool_metrics_snapshot.loaded,
+        mempool_load_reject: mempool_metrics_snapshot.load_reject,
+        mempool_persisted_writes: mempool_metrics_snapshot.persisted_writes,
+        mempool_persisted_bytes: mempool_metrics_snapshot.persisted_bytes,
         download_us: metrics.download_us,
         download_blocks: metrics.download_blocks,
         verify_us: metrics.verify_us,

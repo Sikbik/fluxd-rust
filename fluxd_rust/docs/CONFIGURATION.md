@@ -13,6 +13,9 @@ and how they affect behavior.
   - Layout:
     - `db/` - Fjall keyspace.
     - `blocks/` - flatfile block store.
+    - `peers.dat` - persisted peer addresses (best-effort).
+    - `banlist.dat` - persisted peer bans (best-effort).
+    - `mempool.dat` - persisted mempool transactions (when enabled).
     - `rpc.cookie` - RPC auth cookie when not using `--rpc-user`/`--rpc-pass`.
 
 ### Fjall tuning (optional)
@@ -63,6 +66,17 @@ RPC defaults:
 - `--tx-peers N` - relay peers for transaction inventory/tx relay (default: 2, 0 disables).
 - `--inflight-per-peer N` - concurrent getdata requests per peer (default: 2).
 - `--status-interval SECS` - status log interval (default: 15, 0 disables).
+
+## Mempool
+
+- `--mempool-max-mb N` (alias: `--maxmempool N`)
+  - Maximum mempool size in MiB (default: `300`).
+  - Set to `0` to disable the size cap.
+  - When the cap is exceeded, the daemon evicts transactions by lowest fee-rate first (tie-break:
+    oldest first).
+- `--mempool-persist-interval SECS`
+  - Persist mempool to `mempool.dat` every N seconds (default: `60`).
+  - Set to `0` to disable mempool persistence (no load and no save).
 
 Practical notes:
 - Increase `--header-peers` and `--header-verify-workers` to boost header throughput.

@@ -34,6 +34,7 @@ use fluxd_consensus::{
 };
 use fluxd_pow::validation as pow_validation;
 use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
+use fluxd_primitives::encoding::{Decoder, Encoder};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{Transaction, TxIn, TxOut};
 use fluxd_shielded::{
@@ -61,6 +62,8 @@ const DEFAULT_HEADER_PEERS: usize = 4;
 const DEFAULT_HEADER_LEAD: i32 = 20000;
 const DEFAULT_INFLIGHT_PER_PEER: usize = 2;
 const DEFAULT_TX_PEERS: usize = 2;
+const DEFAULT_MEMPOOL_MAX_MB: u64 = 300;
+const DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS: u64 = 60;
 const DEFAULT_UTXO_CACHE_ENTRIES: usize = 200_000;
 const READ_TIMEOUT_SECS: u64 = 120;
 const READ_TIMEOUT_RETRIES: usize = 3;
@@ -95,7 +98,9 @@ const ADDR_DISCOVERY_INTERVAL_SECS: u64 = 120;
 const ADDR_DISCOVERY_TIMEOUT_SECS: u64 = 6;
 const PEERS_FILE_NAME: &str = "peers.dat";
 const BANLIST_FILE_NAME: &str = "banlist.dat";
+const MEMPOOL_FILE_NAME: &str = "mempool.dat";
 const PEERS_FILE_VERSION: u32 = 1;
+const MEMPOOL_FILE_VERSION: u32 = 1;
 const PEERS_PERSIST_INTERVAL_SECS: u64 = 60;
 const BANLIST_PERSIST_INTERVAL_SECS: u64 = 60;
 const GENESIS_TIMESTAMP: &str =
@@ -162,6 +167,8 @@ struct Config {
     header_peer_addrs: Vec<String>,
     tx_peers: usize,
     inflight_per_peer: usize,
+    mempool_max_bytes: usize,
+    mempool_persist_interval_secs: u64,
     status_interval_secs: u64,
     dashboard_addr: Option<SocketAddr>,
     db_cache_bytes: Option<u64>,
@@ -477,6 +484,7 @@ async fn run() -> Result<(), String> {
     let addr_book = Arc::new(AddrBook::default());
     let peers_path = data_dir.join(PEERS_FILE_NAME);
     let banlist_path = data_dir.join(BANLIST_FILE_NAME);
+    let mempool_path = data_dir.join(MEMPOOL_FILE_NAME);
 
     match load_peers_file(&peers_path) {
         Ok(addrs) => {
@@ -539,11 +547,13 @@ async fn run() -> Result<(), String> {
         config.check_script,
         Some(Arc::clone(&validation_metrics)),
     );
-    let mempool = Arc::new(Mutex::new(mempool::Mempool::default()));
+    let mempool = Arc::new(Mutex::new(mempool::Mempool::new(config.mempool_max_bytes)));
+    let mempool_metrics = Arc::new(stats::MempoolMetrics::default());
     let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
     {
         let chainstate = Arc::clone(&chainstate);
         let mempool = Arc::clone(&mempool);
+        let mempool_metrics = Arc::clone(&mempool_metrics);
         let mempool_flags = flags.clone();
         let params = params.as_ref().clone();
         let data_dir = data_dir.clone();
@@ -562,6 +572,7 @@ async fn run() -> Result<(), String> {
                     rpc_auth,
                     chainstate,
                     mempool,
+                    mempool_metrics,
                     mempool_flags,
                     params,
                     data_dir,
@@ -622,6 +633,113 @@ async fn run() -> Result<(), String> {
         println!("Shielded value pools rebuilt.");
     }
 
+    if config.mempool_persist_interval_secs > 0 {
+        match load_mempool_file(&mempool_path) {
+            Ok(raws) => {
+                if !raws.is_empty() {
+                    println!(
+                        "Loading {} mempool tx(s) from {}",
+                        raws.len(),
+                        mempool_path.display()
+                    );
+                }
+                let mut accepted = 0u64;
+                let mut rejected = 0u64;
+                let mut evicted = 0u64;
+                let mut evicted_bytes = 0u64;
+                for raw in raws {
+                    let tx = match Transaction::consensus_decode(&raw) {
+                        Ok(tx) => tx,
+                        Err(_) => {
+                            rejected += 1;
+                            continue;
+                        }
+                    };
+                    let entry = match mempool::build_mempool_entry(
+                        chainstate.as_ref(),
+                        params.as_ref(),
+                        &flags,
+                        tx,
+                        raw,
+                    ) {
+                        Ok(entry) => entry,
+                        Err(_) => {
+                            rejected += 1;
+                            continue;
+                        }
+                    };
+                    let inserted = match mempool.lock() {
+                        Ok(mut guard) => match guard.insert(entry) {
+                            Ok(outcome) => {
+                                evicted = evicted.saturating_add(outcome.evicted);
+                                evicted_bytes = evicted_bytes.saturating_add(outcome.evicted_bytes);
+                                true
+                            }
+                            Err(err) => err.kind == mempool::MempoolErrorKind::AlreadyInMempool,
+                        },
+                        Err(_) => {
+                            eprintln!("mempool lock poisoned");
+                            rejected += 1;
+                            continue;
+                        }
+                    };
+                    if inserted {
+                        accepted += 1;
+                    } else {
+                        rejected += 1;
+                    }
+                }
+                if accepted > 0 || rejected > 0 || evicted > 0 {
+                    println!(
+                        "Mempool load complete: accepted {} rejected {} evicted {} ({} bytes)",
+                        accepted, rejected, evicted, evicted_bytes
+                    );
+                }
+                if accepted > 0 {
+                    mempool_metrics.note_loaded(accepted);
+                }
+                if rejected > 0 {
+                    mempool_metrics.note_load_reject(rejected);
+                }
+                if evicted > 0 {
+                    mempool_metrics.note_evicted(evicted, evicted_bytes);
+                }
+
+                if rejected > 0 || evicted > 0 {
+                    let mut snapshot = match mempool.lock() {
+                        Ok(guard) => guard
+                            .entries()
+                            .map(|entry| (entry.txid, entry.raw.clone()))
+                            .collect::<Vec<_>>(),
+                        Err(_) => {
+                            eprintln!("mempool lock poisoned; skipping mempool rewrite");
+                            Vec::new()
+                        }
+                    };
+                    snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+                    match save_mempool_file(&mempool_path, &snapshot) {
+                        Ok(bytes) => mempool_metrics.note_persisted(bytes as u64),
+                        Err(err) => {
+                            eprintln!(
+                                "failed to rewrite {} after load: {err}",
+                                mempool_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => eprintln!("failed to load mempool file: {err}"),
+        }
+
+        let mempool = Arc::clone(&mempool);
+        let mempool_metrics = Arc::clone(&mempool_metrics);
+        let mempool_path = mempool_path.clone();
+        let interval_secs = config.mempool_persist_interval_secs;
+        thread::spawn(move || {
+            persist_mempool_loop(mempool, mempool_metrics, mempool_path, interval_secs)
+        });
+    }
+
     let sync_metrics = Arc::new(SyncMetrics::default());
     let header_metrics = Arc::new(HeaderMetrics::default());
     spawn_status_logger(
@@ -631,6 +749,8 @@ async fn run() -> Result<(), String> {
         Arc::clone(&header_metrics),
         Arc::clone(&validation_metrics),
         Arc::clone(&connect_metrics),
+        Arc::clone(&mempool),
+        Arc::clone(&mempool_metrics),
         network,
         backend,
         start_time,
@@ -643,6 +763,8 @@ async fn run() -> Result<(), String> {
         let header_metrics = Arc::clone(&header_metrics);
         let validation_metrics = Arc::clone(&validation_metrics);
         let connect_metrics = Arc::clone(&connect_metrics);
+        let mempool = Arc::clone(&mempool);
+        let mempool_metrics = Arc::clone(&mempool_metrics);
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -657,6 +779,8 @@ async fn run() -> Result<(), String> {
                     header_metrics,
                     validation_metrics,
                     connect_metrics,
+                    mempool,
+                    mempool_metrics,
                     network,
                     backend,
                     start_time,
@@ -828,6 +952,7 @@ async fn run() -> Result<(), String> {
         let relay_params = Arc::clone(&params);
         let relay_addr_book = Arc::clone(&addr_book);
         let relay_mempool = Arc::clone(&mempool);
+        let relay_mempool_metrics = Arc::clone(&mempool_metrics);
         let relay_flags = flags.clone();
         let relay_tx_announce = tx_announce.clone();
         let relay_target = config.tx_peers;
@@ -838,6 +963,7 @@ async fn run() -> Result<(), String> {
                 relay_addr_book,
                 relay_peer_ctx,
                 relay_mempool,
+                relay_mempool_metrics,
                 relay_flags,
                 relay_tx_announce,
                 relay_target,
@@ -1150,6 +1276,52 @@ fn save_peers_file(path: &Path, addrs: &[SocketAddr]) -> Result<(), String> {
     write_file_atomic(path, &json)
 }
 
+fn load_mempool_file(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.to_string()),
+    };
+
+    let mut decoder = Decoder::new(&bytes);
+    let version = decoder
+        .read_u32_le()
+        .map_err(|err| format!("invalid mempool file: {err}"))?;
+    if version != MEMPOOL_FILE_VERSION {
+        return Err(format!(
+            "unsupported mempool file version {version} (expected {MEMPOOL_FILE_VERSION})"
+        ));
+    }
+    let count = decoder
+        .read_varint()
+        .map_err(|err| format!("invalid mempool file: {err}"))?;
+    let count = usize::try_from(count).map_err(|_| "mempool file count too large".to_string())?;
+    let mut out = Vec::with_capacity(count.min(16_384));
+    for _ in 0..count {
+        let raw = decoder
+            .read_var_bytes()
+            .map_err(|err| format!("invalid mempool file: {err}"))?;
+        out.push(raw);
+    }
+    if !decoder.is_empty() {
+        return Err("invalid mempool file: trailing bytes".to_string());
+    }
+    Ok(out)
+}
+
+fn save_mempool_file(path: &Path, entries: &[(Hash256, Vec<u8>)]) -> Result<usize, String> {
+    let mut encoder = Encoder::new();
+    encoder.write_u32_le(MEMPOOL_FILE_VERSION);
+    encoder.write_varint(entries.len() as u64);
+    for (_, raw) in entries {
+        encoder.write_var_bytes(raw);
+    }
+    let bytes = encoder.into_inner();
+    let len = bytes.len();
+    write_file_atomic(path, &bytes)?;
+    Ok(len)
+}
+
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -1192,6 +1364,51 @@ fn persist_banlist_loop(peer_book: Arc<HeaderPeerBook>, path: PathBuf) {
             eprintln!("failed to persist {}: {err}", path.display());
             continue;
         }
+        last_revision = revision;
+    }
+}
+
+fn persist_mempool_loop(
+    mempool: Arc<Mutex<mempool::Mempool>>,
+    mempool_metrics: Arc<stats::MempoolMetrics>,
+    path: PathBuf,
+    interval_secs: u64,
+) {
+    if interval_secs == 0 {
+        return;
+    }
+    let mut last_revision = mempool.lock().map(|guard| guard.revision()).unwrap_or(0);
+
+    loop {
+        thread::sleep(Duration::from_secs(interval_secs));
+        let (revision, mut snapshot) = {
+            let guard = match mempool.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    eprintln!("mempool lock poisoned");
+                    continue;
+                }
+            };
+            let revision = guard.revision();
+            if revision == last_revision {
+                continue;
+            }
+            let snapshot: Vec<(Hash256, Vec<u8>)> = guard
+                .entries()
+                .map(|entry| (entry.txid, entry.raw.clone()))
+                .collect();
+            (revision, snapshot)
+        };
+
+        snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+        let persisted = match save_mempool_file(&path, &snapshot) {
+            Ok(bytes) => bytes as u64,
+            Err(err) => {
+                eprintln!("failed to persist {}: {err}", path.display());
+                continue;
+            }
+        };
+        mempool_metrics.note_persisted(persisted);
         last_revision = revision;
     }
 }
@@ -3013,6 +3230,8 @@ fn spawn_status_logger<S: KeyValueStore + Send + Sync + 'static>(
     header_metrics: Arc<HeaderMetrics>,
     validation_metrics: Arc<ValidationMetrics>,
     connect_metrics: Arc<ConnectMetrics>,
+    mempool: Arc<Mutex<mempool::Mempool>>,
+    mempool_metrics: Arc<stats::MempoolMetrics>,
     network: Network,
     backend: Backend,
     start_time: Instant,
@@ -3038,6 +3257,8 @@ fn spawn_status_logger<S: KeyValueStore + Send + Sync + 'static>(
                 Some(&header_metrics),
                 Some(&validation_metrics),
                 Some(&connect_metrics),
+                Some(mempool.as_ref()),
+                Some(mempool_metrics.as_ref()),
             ) {
                 Ok(stats) => {
                     let header_hash = short_hash(stats.best_header_hash.as_ref());
@@ -4420,6 +4641,8 @@ fn parse_args() -> Result<Config, String> {
     let mut header_peer_addrs: Vec<String> = Vec::new();
     let mut tx_peers: usize = DEFAULT_TX_PEERS;
     let mut inflight_per_peer: usize = DEFAULT_INFLIGHT_PER_PEER;
+    let mut mempool_max_mb: u64 = DEFAULT_MEMPOOL_MAX_MB;
+    let mut mempool_persist_interval_secs: u64 = DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS;
     let mut status_interval_secs: u64 = 15;
     let mut dashboard_addr: Option<SocketAddr> = None;
     let mut db_cache_bytes: Option<u64> = None;
@@ -4566,6 +4789,22 @@ fn parse_args() -> Result<Config, String> {
                 if inflight_per_peer == 0 {
                     return Err(format!("inflight per peer must be > 0\n{}", usage()));
                 }
+            }
+            "--mempool-max-mb" | "--maxmempool" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --mempool-max-mb\n{}", usage()))?;
+                mempool_max_mb = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid mempool max mb '{value}'\n{}", usage()))?;
+            }
+            "--mempool-persist-interval" => {
+                let value = args.next().ok_or_else(|| {
+                    format!("missing value for --mempool-persist-interval\n{}", usage())
+                })?;
+                mempool_persist_interval_secs = value.parse::<u64>().map_err(|_| {
+                    format!("invalid mempool persist interval '{value}'\n{}", usage())
+                })?;
             }
             "--status-interval" => {
                 let value = args
@@ -4730,6 +4969,8 @@ fn parse_args() -> Result<Config, String> {
         header_peer_addrs,
         tx_peers,
         inflight_per_peer,
+        mempool_max_bytes: mb_to_bytes(mempool_max_mb).try_into().unwrap_or(usize::MAX),
+        mempool_persist_interval_secs,
         status_interval_secs,
         dashboard_addr,
         db_cache_bytes,
@@ -4805,7 +5046,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -4826,6 +5067,8 @@ fn usage() -> String {
         "  --header-lead  Target header lead over blocks (default: 20000, 0 disables cap)",
         "  --tx-peers  Number of relay peers for tx inventory/tx relay (0 disables, default: 2)",
         "  --inflight-per-peer  Concurrent getdata requests per peer (default: 2)",
+        "  --mempool-max-mb  Mempool max size in MiB (0 disables cap, default: 300)",
+        "  --mempool-persist-interval  Persist mempool to disk every N seconds (0 disables, default: 60)",
         "  --status-interval  Status log interval in seconds (default: 15, 0 disables)",
         "  --db-cache-mb  Fjall block cache size in MiB (optional)",
         "  --db-write-buffer-mb  Fjall max write buffer in MiB (optional)",

@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 
 use crate::mempool;
 use crate::p2p::{parse_inv, InventoryVector, Peer, MSG_TX};
+use crate::stats::MempoolMetrics;
 
 const TX_GETDATA_BATCH: usize = 128;
 const TX_KNOWN_CAP: usize = 50_000;
@@ -25,6 +26,7 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
     addr_book: Arc<crate::AddrBook>,
     peer_ctx: crate::PeerContext,
     mempool: Arc<Mutex<mempool::Mempool>>,
+    mempool_metrics: Arc<MempoolMetrics>,
     flags: ValidationFlags,
     tx_announce: broadcast::Sender<Hash256>,
     peer_target: usize,
@@ -59,6 +61,7 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
                         let chainstate = Arc::clone(&chainstate);
                         let params = Arc::clone(&params);
                         let mempool = Arc::clone(&mempool);
+                        let mempool_metrics = Arc::clone(&mempool_metrics);
                         let flags = flags.clone();
                         let tx_announce = tx_announce.clone();
                         join_set.spawn(async move {
@@ -68,6 +71,7 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
                                 chainstate,
                                 params,
                                 mempool,
+                                mempool_metrics,
                                 flags,
                                 tx_announce,
                             )
@@ -104,6 +108,7 @@ async fn tx_relay_peer<S: KeyValueStore>(
     chainstate: Arc<ChainState<S>>,
     params: Arc<ChainParams>,
     mempool: Arc<Mutex<mempool::Mempool>>,
+    mempool_metrics: Arc<MempoolMetrics>,
     flags: ValidationFlags,
     tx_announce: broadcast::Sender<Hash256>,
 ) -> Result<(), String> {
@@ -125,6 +130,7 @@ async fn tx_relay_peer<S: KeyValueStore>(
                     chainstate.as_ref(),
                     params.as_ref(),
                     mempool.as_ref(),
+                    mempool_metrics.as_ref(),
                     &flags,
                     &tx_announce,
                     &mut known,
@@ -160,6 +166,7 @@ async fn handle_peer_message<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     params: &ChainParams,
     mempool: &Mutex<mempool::Mempool>,
+    mempool_metrics: &MempoolMetrics,
     flags: &ValidationFlags,
     tx_announce: &broadcast::Sender<Hash256>,
     known: &mut HashSet<Hash256>,
@@ -207,6 +214,7 @@ async fn handle_peer_message<S: KeyValueStore>(
                     }
                     reject_stats.note_build_error(err.kind);
                     reject_stats.maybe_log(peer.addr());
+                    mempool_metrics.note_relay_reject();
                     return Ok(());
                 }
             };
@@ -218,17 +226,26 @@ async fn handle_peer_message<S: KeyValueStore>(
                 if guard.contains(&txid) {
                     return Ok(());
                 }
-                if let Err(err) = guard.insert(entry) {
-                    if err.kind == mempool::MempoolErrorKind::Internal {
-                        eprintln!(
-                            "mempool insert failed {}: {}",
-                            crate::stats::hash256_to_hex(&txid),
-                            err
-                        );
+                match guard.insert(entry) {
+                    Ok(outcome) => {
+                        mempool_metrics.note_relay_accept();
+                        if outcome.evicted > 0 {
+                            mempool_metrics.note_evicted(outcome.evicted, outcome.evicted_bytes);
+                        }
                     }
-                    reject_stats.note_insert_error(err.kind);
-                    reject_stats.maybe_log(peer.addr());
-                    return Ok(());
+                    Err(err) => {
+                        if err.kind == mempool::MempoolErrorKind::Internal {
+                            eprintln!(
+                                "mempool insert failed {}: {}",
+                                crate::stats::hash256_to_hex(&txid),
+                                err
+                            );
+                        }
+                        reject_stats.note_insert_error(err.kind);
+                        reject_stats.maybe_log(peer.addr());
+                        mempool_metrics.note_relay_reject();
+                        return Ok(());
+                    }
                 }
             }
 
@@ -352,6 +369,7 @@ impl TxRejectStats {
         match kind {
             mempool::MempoolErrorKind::MissingInput => self.build_missing_input += 1,
             mempool::MempoolErrorKind::ConflictingInput => self.build_conflicting_input += 1,
+            mempool::MempoolErrorKind::MempoolFull => self.insert_other += 1,
             mempool::MempoolErrorKind::InvalidTransaction => self.build_invalid_transaction += 1,
             mempool::MempoolErrorKind::InvalidScript => self.build_invalid_script += 1,
             mempool::MempoolErrorKind::InvalidShielded => self.build_invalid_shielded += 1,

@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fluxd_chainstate::metrics::ConnectMetrics;
@@ -14,6 +14,7 @@ use fluxd_chainstate::validation::ValidationMetrics;
 use crate::stats::{snapshot_stats, HeaderMetrics, SyncMetrics};
 use crate::Backend;
 use crate::Store;
+use crate::{mempool::Mempool, stats::MempoolMetrics};
 
 const MAX_REQUEST_BYTES: usize = 8192;
 
@@ -26,6 +27,8 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
     header_metrics: Arc<HeaderMetrics>,
     validation_metrics: Arc<ValidationMetrics>,
     connect_metrics: Arc<ConnectMetrics>,
+    mempool: Arc<Mutex<Mempool>>,
+    mempool_metrics: Arc<MempoolMetrics>,
     network: Network,
     backend: Backend,
     start_time: Instant,
@@ -46,6 +49,8 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
         let header_metrics = Arc::clone(&header_metrics);
         let validation_metrics = Arc::clone(&validation_metrics);
         let connect_metrics = Arc::clone(&connect_metrics);
+        let mempool = Arc::clone(&mempool);
+        let mempool_metrics = Arc::clone(&mempool_metrics);
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 stream,
@@ -55,6 +60,8 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
                 header_metrics,
                 validation_metrics,
                 connect_metrics,
+                mempool,
+                mempool_metrics,
                 network,
                 backend,
                 start_time,
@@ -76,6 +83,8 @@ async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
     header_metrics: Arc<HeaderMetrics>,
     validation_metrics: Arc<ValidationMetrics>,
     connect_metrics: Arc<ConnectMetrics>,
+    mempool: Arc<Mutex<Mempool>>,
+    mempool_metrics: Arc<MempoolMetrics>,
     network: Network,
     backend: Backend,
     start_time: Instant,
@@ -110,6 +119,8 @@ async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
             Some(&header_metrics),
             Some(&validation_metrics),
             Some(&connect_metrics),
+            Some(mempool.as_ref()),
+            Some(mempool_metrics.as_ref()),
         ) {
             Ok(stats) => ("200 OK", "application/json", stats.to_json()),
             Err(err) => (

@@ -20,6 +20,7 @@ pub enum MempoolErrorKind {
     AlreadyInMempool,
     ConflictingInput,
     MissingInput,
+    MempoolFull,
     InvalidTransaction,
     InvalidScript,
     InvalidShielded,
@@ -70,9 +71,25 @@ pub struct Mempool {
     entries: HashMap<Hash256, MempoolEntry>,
     spent: HashMap<OutPoint, Hash256>,
     total_bytes: usize,
+    max_bytes: usize,
+    revision: u64,
 }
 
 impl Mempool {
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            spent: HashMap::new(),
+            total_bytes: 0,
+            max_bytes,
+            revision: 0,
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn contains(&self, txid: &Hash256) -> bool {
         self.entries.contains_key(txid)
     }
@@ -111,7 +128,14 @@ impl Mempool {
         self.entries.values()
     }
 
-    pub fn insert(&mut self, entry: MempoolEntry) -> Result<(), MempoolError> {
+    pub fn insert(&mut self, entry: MempoolEntry) -> Result<MempoolInsertOutcome, MempoolError> {
+        let inserted_txid = entry.txid;
+        if self.max_bytes > 0 && entry.size() > self.max_bytes {
+            return Err(MempoolError::new(
+                MempoolErrorKind::MempoolFull,
+                "transaction too large for mempool",
+            ));
+        }
         if self.entries.contains_key(&entry.txid) {
             return Err(MempoolError::new(
                 MempoolErrorKind::AlreadyInMempool,
@@ -136,7 +160,21 @@ impl Mempool {
         }
         self.total_bytes = self.total_bytes.saturating_add(entry.raw.len());
         self.entries.insert(entry.txid, entry);
-        Ok(())
+        self.revision = self.revision.saturating_add(1);
+
+        let mut outcome = MempoolInsertOutcome::default();
+        if self.max_bytes > 0 && self.total_bytes > self.max_bytes {
+            outcome = self.evict_to_fit();
+        }
+
+        if self.max_bytes > 0 && !self.entries.contains_key(&inserted_txid) {
+            return Err(MempoolError::new(
+                MempoolErrorKind::MempoolFull,
+                "mempool full",
+            ));
+        }
+
+        Ok(outcome)
     }
 
     #[allow(dead_code)]
@@ -148,8 +186,75 @@ impl Mempool {
                 self.spent.remove(outpoint);
             }
         }
+        self.revision = self.revision.saturating_add(1);
         Some(entry)
     }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    fn evict_to_fit(&mut self) -> MempoolInsertOutcome {
+        let max_bytes = self.max_bytes;
+
+        let mut candidates: Vec<EvictCandidate> = self
+            .entries
+            .values()
+            .map(|entry| EvictCandidate {
+                txid: entry.txid,
+                fee: entry.fee,
+                size: entry.size().max(1),
+                time: entry.time,
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            let fee_a = i128::from(a.fee);
+            let fee_b = i128::from(b.fee);
+            let size_a = a.size as i128;
+            let size_b = b.size as i128;
+            let left = fee_a.saturating_mul(size_b);
+            let right = fee_b.saturating_mul(size_a);
+            match left.cmp(&right) {
+                std::cmp::Ordering::Equal => match a.time.cmp(&b.time) {
+                    std::cmp::Ordering::Equal => a.txid.cmp(&b.txid),
+                    other => other,
+                },
+                other => other,
+            }
+        });
+
+        let mut evicted = 0u64;
+        let mut evicted_bytes = 0u64;
+        for candidate in candidates {
+            if self.total_bytes <= max_bytes {
+                break;
+            }
+            if let Some(removed) = self.remove(&candidate.txid) {
+                evicted += 1;
+                evicted_bytes += removed.raw.len() as u64;
+            }
+        }
+
+        MempoolInsertOutcome {
+            evicted,
+            evicted_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MempoolInsertOutcome {
+    pub evicted: u64,
+    pub evicted_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct EvictCandidate {
+    txid: Hash256,
+    fee: i64,
+    size: usize,
+    time: u64,
 }
 
 pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(

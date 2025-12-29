@@ -35,7 +35,7 @@ use primitive_types::U256;
 use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind};
 use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::peer_book::HeaderPeerBook;
-use crate::stats::hash256_to_hex;
+use crate::stats::{hash256_to_hex, MempoolMetrics};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const RPC_REALM: &str = "fluxd";
@@ -140,6 +140,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     auth: RpcAuth,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<Mempool>>,
+    mempool_metrics: Arc<MempoolMetrics>,
     mempool_flags: ValidationFlags,
     params: ChainParams,
     data_dir: PathBuf,
@@ -162,6 +163,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let auth = Arc::clone(&auth);
         let chainstate = Arc::clone(&chainstate);
         let mempool = Arc::clone(&mempool);
+        let mempool_metrics = Arc::clone(&mempool_metrics);
         let mempool_flags = mempool_flags.clone();
         let params = params.clone();
         let data_dir = data_dir.clone();
@@ -175,6 +177,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 auth,
                 chainstate,
                 mempool,
+                mempool_metrics,
                 mempool_flags,
                 params,
                 data_dir,
@@ -197,6 +200,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     auth: Arc<RpcAuth>,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<Mempool>>,
+    mempool_metrics: Arc<MempoolMetrics>,
     mempool_flags: ValidationFlags,
     chain_params: ChainParams,
     data_dir: PathBuf,
@@ -248,6 +252,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
             &request,
             chainstate.as_ref(),
             mempool.as_ref(),
+            mempool_metrics.as_ref(),
             &mempool_flags,
             &chain_params,
             &data_dir,
@@ -272,6 +277,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         &request.body,
         chainstate.as_ref(),
         mempool.as_ref(),
+        mempool_metrics.as_ref(),
         &mempool_flags,
         &chain_params,
         &data_dir,
@@ -298,6 +304,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     request: &HttpRequest,
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_metrics: &MempoolMetrics,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
     data_dir: &Path,
@@ -318,6 +325,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
         params,
         chainstate,
         mempool,
+        mempool_metrics,
         mempool_flags,
         chain_params,
         data_dir,
@@ -332,6 +340,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     body: &[u8],
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_metrics: &MempoolMetrics,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
     data_dir: &Path,
@@ -377,6 +386,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         params,
         chainstate,
         mempool,
+        mempool_metrics,
         mempool_flags,
         chain_params,
         data_dir,
@@ -520,6 +530,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_metrics: &MempoolMetrics,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
     data_dir: &Path,
@@ -552,6 +563,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "sendrawtransaction" => rpc_sendrawtransaction(
             chainstate,
             mempool,
+            mempool_metrics,
             mempool_flags,
             params,
             chain_params,
@@ -1126,69 +1138,73 @@ fn rpc_getrawtransaction<S: fluxd_storage::KeyValueStore>(
 fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_metrics: &MempoolMetrics,
     mempool_flags: &ValidationFlags,
     params: Vec<Value>,
     chain_params: &ChainParams,
     tx_announce: &broadcast::Sender<Hash256>,
 ) -> Result<Value, RpcError> {
-    if params.is_empty() || params.len() > 2 {
-        return Err(RpcError::new(
-            RPC_INVALID_PARAMETER,
-            "sendrawtransaction expects 1 or 2 parameters",
-        ));
-    }
-    let hex = params[0]
-        .as_str()
-        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
-    let _allow_high_fees = if params.len() > 1 {
-        parse_bool(&params[1])?
-    } else {
-        false
-    };
-    let raw = bytes_from_hex(hex)
-        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
-    let tx = Transaction::consensus_decode(&raw)
-        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
-    let txid = tx
-        .txid()
-        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
-
-    if chainstate
-        .tx_location(&txid)
-        .map_err(map_internal)?
-        .is_some()
-    {
-        return Err(RpcError::new(
-            RPC_TRANSACTION_ALREADY_IN_CHAIN,
-            "transaction already in block chain",
-        ));
-    }
-
-    {
-        let guard = mempool
-            .lock()
-            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
-        if guard.contains(&txid) {
-            let _ = tx_announce.send(txid);
-            return Ok(Value::String(hash256_to_hex(&txid)));
+    let result = (|| {
+        if params.is_empty() || params.len() > 2 {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "sendrawtransaction expects 1 or 2 parameters",
+            ));
         }
-        for input in &tx.vin {
-            if let Some(spender) = guard.spender(&input.prevout) {
-                return Err(RpcError::new(
-                    RPC_TRANSACTION_REJECTED,
-                    format!("input already spent by {}", hash256_to_hex(&spender)),
-                ));
+        let hex = params[0]
+            .as_str()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
+        let _allow_high_fees = if params.len() > 1 {
+            parse_bool(&params[1])?
+        } else {
+            false
+        };
+        let raw = bytes_from_hex(hex)
+            .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+        let tx = Transaction::consensus_decode(&raw)
+            .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+        let txid = tx
+            .txid()
+            .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+
+        if chainstate
+            .tx_location(&txid)
+            .map_err(map_internal)?
+            .is_some()
+        {
+            return Err(RpcError::new(
+                RPC_TRANSACTION_ALREADY_IN_CHAIN,
+                "transaction already in block chain",
+            ));
+        }
+
+        {
+            let guard = mempool
+                .lock()
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
+            if guard.contains(&txid) {
+                let _ = tx_announce.send(txid);
+                return Ok(Value::String(hash256_to_hex(&txid)));
+            }
+            for input in &tx.vin {
+                if let Some(spender) = guard.spender(&input.prevout) {
+                    return Err(RpcError::new(
+                        RPC_TRANSACTION_REJECTED,
+                        format!("input already spent by {}", hash256_to_hex(&spender)),
+                    ));
+                }
             }
         }
-    }
 
-    let entry =
-        build_mempool_entry(chainstate, chain_params, mempool_flags, tx, raw).map_err(|err| {
-            match err.kind {
+        let entry = build_mempool_entry(chainstate, chain_params, mempool_flags, tx, raw).map_err(
+            |err| match err.kind {
                 MempoolErrorKind::MissingInput => {
                     RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs")
                 }
                 MempoolErrorKind::ConflictingInput => {
+                    RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
+                }
+                MempoolErrorKind::MempoolFull => {
                     RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
                 }
                 MempoolErrorKind::InvalidTransaction
@@ -1200,20 +1216,39 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
                     RpcError::new(RPC_INTERNAL_ERROR, "unexpected mempool duplicate")
                 }
                 MempoolErrorKind::Internal => RpcError::new(RPC_INTERNAL_ERROR, err.message),
-            }
-        })?;
+            },
+        )?;
 
-    let txid = entry.txid;
-    let mut guard = mempool
-        .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
-    if let Err(err) = guard.insert(entry) {
-        if err.kind != MempoolErrorKind::AlreadyInMempool {
-            return Err(RpcError::new(RPC_TRANSACTION_REJECTED, err.message));
+        let txid = entry.txid;
+        let mut guard = mempool
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
+        match guard.insert(entry) {
+            Ok(outcome) => {
+                if outcome.evicted > 0 {
+                    mempool_metrics.note_evicted(outcome.evicted, outcome.evicted_bytes);
+                }
+            }
+            Err(err) => {
+                if err.kind != MempoolErrorKind::AlreadyInMempool {
+                    return Err(RpcError::new(RPC_TRANSACTION_REJECTED, err.message));
+                }
+            }
+        }
+        let _ = tx_announce.send(txid);
+        Ok(Value::String(hash256_to_hex(&txid)))
+    })();
+
+    match result {
+        Ok(value) => {
+            mempool_metrics.note_rpc_accept();
+            Ok(value)
+        }
+        Err(err) => {
+            mempool_metrics.note_rpc_reject();
+            Err(err)
         }
     }
-    let _ = tx_announce.send(txid);
-    Ok(Value::String(hash256_to_hex(&txid)))
 }
 
 fn rpc_getmempoolinfo(params: Vec<Value>, mempool: &Mutex<Mempool>) -> Result<Value, RpcError> {

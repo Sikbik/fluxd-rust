@@ -118,7 +118,9 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Mempool and mining
 
-- [ ] [P1] Mempool persistence + eviction policy parity (owner: TBD)
+- [x] [P1] Mempool persistence + eviction policy parity (owner: TBD)
+  - [x] `mempool.dat` load/save (`--mempool-persist-interval`)
+  - [x] Size cap + fee-rate eviction (`--mempool-max-mb` / `--maxmempool`)
 - [ ] [P1] Fee estimator persistence (owner: TBD)
 - [ ] [P1] Standardness policy parity (mempool accept rules) (owner: TBD)
 - [x] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
