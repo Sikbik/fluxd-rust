@@ -13,7 +13,7 @@ and how they affect behavior.
   - Layout:
     - `db/` - Fjall keyspace.
     - `blocks/` - flatfile block store.
-    - `peers.dat` - persisted peer addresses (best-effort).
+    - `peers.dat` - persisted peer address manager (success/fail stats, last-seen, last-height).
     - `banlist.dat` - persisted peer bans (best-effort).
     - `mempool.dat` - persisted mempool transactions (when enabled).
     - `rpc.cookie` - RPC auth cookie when not using `--rpc-user`/`--rpc-pass`.

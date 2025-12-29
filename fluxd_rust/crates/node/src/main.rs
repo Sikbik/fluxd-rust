@@ -99,7 +99,8 @@ const ADDR_DISCOVERY_TIMEOUT_SECS: u64 = 6;
 const PEERS_FILE_NAME: &str = "peers.dat";
 const BANLIST_FILE_NAME: &str = "banlist.dat";
 const MEMPOOL_FILE_NAME: &str = "mempool.dat";
-const PEERS_FILE_VERSION: u32 = 1;
+const PEERS_FILE_VERSION: u32 = 2;
+const PEERS_FILE_VERSION_V1: u32 = 1;
 const MEMPOOL_FILE_VERSION: u32 = 1;
 const PEERS_PERSIST_INTERVAL_SECS: u64 = 60;
 const BANLIST_PERSIST_INTERVAL_SECS: u64 = 60;
@@ -239,9 +240,21 @@ impl HeaderDownloadState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+struct AddrBookEntry {
+    last_seen: u64,
+    last_success: u64,
+    last_failure: u64,
+    last_attempt: u64,
+    successes: u32,
+    failures: u32,
+    last_height: i32,
+    last_version: i32,
+}
+
 #[derive(Default)]
 struct AddrBook {
-    addrs: Mutex<HashSet<SocketAddr>>,
+    entries: Mutex<HashMap<SocketAddr, AddrBookEntry>>,
     revision: AtomicU64,
 }
 
@@ -250,19 +263,61 @@ impl AddrBook {
         self.revision.load(AtomicOrdering::Relaxed)
     }
 
+    fn record_attempt(&self, addr: SocketAddr) {
+        let now = unix_now_secs();
+        if let Ok(mut book) = self.entries.lock() {
+            let entry = book.entry(addr).or_default();
+            entry.last_attempt = now;
+        }
+    }
+
+    fn record_success(&self, addr: SocketAddr, peer: &Peer) {
+        let now = unix_now_secs();
+        if let Ok(mut book) = self.entries.lock() {
+            let entry = book.entry(addr).or_default();
+            entry.last_seen = now;
+            entry.last_success = now;
+            entry.successes = entry.successes.saturating_add(1);
+            entry.failures = entry.failures.saturating_sub(1);
+            entry.last_height = peer.remote_height();
+            entry.last_version = peer.remote_version();
+            self.revision.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn record_failure(&self, addr: SocketAddr) {
+        let now = unix_now_secs();
+        if let Ok(mut book) = self.entries.lock() {
+            let entry = book.entry(addr).or_default();
+            entry.last_seen = now;
+            entry.last_failure = now;
+            entry.failures = entry.failures.saturating_add(1);
+            self.revision.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
     fn insert_many(&self, addrs: Vec<SocketAddr>) -> usize {
         if addrs.is_empty() {
             return 0;
         }
+        let now = unix_now_secs();
         let mut inserted = 0;
-        if let Ok(mut book) = self.addrs.lock() {
+        if let Ok(mut book) = self.entries.lock() {
             for addr in addrs {
-                if book.len() >= ADDR_BOOK_MAX {
-                    break;
+                if addr.port() == 0 {
+                    continue;
                 }
-                if book.insert(addr) {
+                if !book.contains_key(&addr) && book.len() >= ADDR_BOOK_MAX {
+                    prune_addr_book(&mut book, now);
+                    if book.len() >= ADDR_BOOK_MAX {
+                        break;
+                    }
+                }
+                let entry = book.entry(addr).or_default();
+                if entry.last_seen == 0 {
                     inserted += 1;
                 }
+                entry.last_seen = now;
             }
         }
         if inserted > 0 {
@@ -271,42 +326,239 @@ impl AddrBook {
         inserted
     }
 
+    fn load_entries(&self, entries: Vec<(SocketAddr, AddrBookEntry)>) -> usize {
+        if entries.is_empty() {
+            return 0;
+        }
+        let now = unix_now_secs();
+        let mut inserted = 0;
+        if let Ok(mut book) = self.entries.lock() {
+            for (addr, mut entry) in entries {
+                if addr.port() == 0 {
+                    continue;
+                }
+                entry.last_attempt = 0;
+                if !book.contains_key(&addr) && book.len() >= ADDR_BOOK_MAX {
+                    prune_addr_book(&mut book, now);
+                    if book.len() >= ADDR_BOOK_MAX {
+                        break;
+                    }
+                }
+                match book.get_mut(&addr) {
+                    Some(existing) => merge_addr_entry(existing, &entry),
+                    None => {
+                        book.insert(addr, entry);
+                        inserted += 1;
+                    }
+                }
+            }
+        }
+        self.revision.fetch_add(1, AtomicOrdering::Relaxed);
+        inserted
+    }
+
     fn sample(&self, limit: usize) -> Vec<SocketAddr> {
+        self.sample_for_height(limit, i32::MIN)
+    }
+
+    fn sample_for_height(&self, limit: usize, min_height: i32) -> Vec<SocketAddr> {
         if limit == 0 {
             return Vec::new();
         }
-        let book = match self.addrs.lock() {
+        let now = unix_now_secs();
+        let book = match self.entries.lock() {
             Ok(book) => book,
             Err(_) => return Vec::new(),
         };
-        let mut addrs: Vec<SocketAddr> = book.iter().copied().collect();
-        if addrs.is_empty() {
-            return addrs;
+        let mut scored: Vec<(SocketAddr, i64)> = Vec::with_capacity(book.len());
+        for (addr, entry) in book.iter() {
+            if !addr_is_eligible(addr, entry, now, min_height) {
+                continue;
+            }
+            scored.push((*addr, addr_score(entry, now, min_height)));
         }
+
+        if scored.is_empty() {
+            return Vec::new();
+        }
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let top = scored
+            .len()
+            .min(limit.saturating_mul(8).max(limit).min(512));
+        let mut addrs: Vec<SocketAddr> = scored.iter().take(top).map(|(addr, _)| *addr).collect();
         addrs.shuffle(&mut rand::thread_rng());
         addrs.truncate(limit);
         addrs
     }
 
     fn len(&self) -> usize {
-        match self.addrs.lock() {
+        match self.entries.lock() {
             Ok(book) => book.len(),
             Err(_) => 0,
         }
     }
 
-    fn snapshot(&self) -> Vec<SocketAddr> {
-        match self.addrs.lock() {
-            Ok(book) => book.iter().copied().collect(),
+    fn snapshot(&self) -> Vec<(SocketAddr, AddrBookEntry)> {
+        let now = unix_now_secs();
+        match self.entries.lock() {
+            Ok(mut book) => {
+                prune_addr_book(&mut book, now);
+                book.iter().map(|(addr, entry)| (*addr, *entry)).collect()
+            }
             Err(_) => Vec::new(),
         }
     }
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn addr_is_eligible(addr: &SocketAddr, entry: &AddrBookEntry, now: u64, min_height: i32) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+
+    if entry.last_attempt > 0 && now.saturating_sub(entry.last_attempt) < 5 {
+        return false;
+    }
+
+    if min_height > 0 && entry.last_height > 0 && entry.last_height + 100 < min_height {
+        return false;
+    }
+
+    if entry.last_failure > entry.last_success && entry.last_failure > 0 {
+        let cooldown = addr_failure_cooldown_secs(entry.failures);
+        if now < entry.last_failure.saturating_add(cooldown) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn addr_failure_cooldown_secs(failures: u32) -> u64 {
+    let failures = failures.min(10);
+    let base = 5u64;
+    base.saturating_mul(2u64.saturating_pow(failures)).min(3600)
+}
+
+fn addr_score(entry: &AddrBookEntry, now: u64, min_height: i32) -> i64 {
+    let mut score: i64 = 0;
+    if entry.last_success > 0 {
+        let age = now.saturating_sub(entry.last_success);
+        if age < 3600 {
+            score += 2000;
+        } else if age < 86_400 {
+            score += 800;
+        } else if age < 604_800 {
+            score += 200;
+        }
+    }
+
+    score += i64::from(entry.successes).saturating_mul(15);
+    score -= i64::from(entry.failures).saturating_mul(25);
+
+    if min_height > 0 && entry.last_height > 0 {
+        let delta = entry.last_height.saturating_sub(min_height);
+        if delta >= -10 {
+            score += 300;
+        } else if delta >= -100 {
+            score += 100;
+        } else if delta < -1000 {
+            score -= 1000;
+        }
+    }
+
+    if entry.last_failure > entry.last_success && entry.last_failure > 0 {
+        let fail_age = now.saturating_sub(entry.last_failure);
+        if fail_age < 600 {
+            score -= 500;
+        }
+    }
+
+    score
+}
+
+fn merge_addr_entry(existing: &mut AddrBookEntry, incoming: &AddrBookEntry) {
+    existing.last_seen = existing.last_seen.max(incoming.last_seen);
+    existing.last_success = existing.last_success.max(incoming.last_success);
+    existing.last_failure = existing.last_failure.max(incoming.last_failure);
+    existing.successes = existing.successes.max(incoming.successes);
+    existing.failures = existing.failures.max(incoming.failures);
+    if incoming.last_height > existing.last_height {
+        existing.last_height = incoming.last_height;
+        existing.last_version = incoming.last_version;
+    } else if incoming.last_height == existing.last_height
+        && incoming.last_version > existing.last_version
+    {
+        existing.last_version = incoming.last_version;
+    }
+}
+
+fn prune_addr_book(book: &mut HashMap<SocketAddr, AddrBookEntry>, now: u64) {
+    let stale_cutoff = now.saturating_sub(14 * 86_400);
+    book.retain(|_addr, entry| {
+        let last_activity = entry
+            .last_success
+            .max(entry.last_failure)
+            .max(entry.last_seen);
+        if last_activity == 0 {
+            return true;
+        }
+        if entry.successes == 0 && last_activity < stale_cutoff {
+            return false;
+        }
+        if entry.failures >= 8
+            && entry.last_success == 0
+            && last_activity < now.saturating_sub(86_400)
+        {
+            return false;
+        }
+        true
+    });
+
+    if book.len() <= ADDR_BOOK_MAX {
+        return;
+    }
+
+    let mut scored: Vec<(SocketAddr, i64)> = book
+        .iter()
+        .map(|(addr, entry)| (*addr, addr_score(entry, now, i32::MIN)))
+        .collect();
+    scored.sort_by(|a, b| a.1.cmp(&b.1));
+    let excess = book.len().saturating_sub(ADDR_BOOK_MAX);
+    for (addr, _) in scored.into_iter().take(excess) {
+        book.remove(&addr);
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
-struct PeersFile {
+struct PeersFileV1 {
     version: u32,
     addrs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PeersFileV2 {
+    version: u32,
+    peers: Vec<PeersFileV2Entry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PeersFileV2Entry {
+    addr: String,
+    last_seen: u64,
+    last_success: u64,
+    last_failure: u64,
+    successes: u32,
+    failures: u32,
+    last_height: i32,
+    last_version: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -487,8 +739,8 @@ async fn run() -> Result<(), String> {
     let mempool_path = data_dir.join(MEMPOOL_FILE_NAME);
 
     match load_peers_file(&peers_path) {
-        Ok(addrs) => {
-            let loaded = addr_book.insert_many(addrs);
+        Ok(entries) => {
+            let loaded = addr_book.load_entries(entries);
             if loaded > 0 {
                 println!("Loaded {loaded} peers from {}", peers_path.display());
             }
@@ -1228,49 +1480,104 @@ fn open_store(backend: Backend, db_path: &PathBuf, config: &Config) -> Result<St
     }
 }
 
-fn load_peers_file(path: &Path) -> Result<Vec<SocketAddr>, String> {
+fn load_peers_file(path: &Path) -> Result<Vec<(SocketAddr, AddrBookEntry)>, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.to_string()),
     };
-    let file: PeersFile =
+    let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|err| format!("invalid peers file: {err}"))?;
-    if file.version != PEERS_FILE_VERSION {
-        return Err(format!(
-            "unsupported peers file version {} (expected {})",
-            file.version, PEERS_FILE_VERSION
-        ));
+    let version = value
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32;
+
+    match version {
+        PEERS_FILE_VERSION_V1 => {
+            let file: PeersFileV1 = serde_json::from_value(value)
+                .map_err(|err| format!("invalid peers file: {err}"))?;
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            for raw in file.addrs {
+                if out.len() >= ADDR_BOOK_MAX {
+                    break;
+                }
+                let Ok(addr) = raw.parse::<SocketAddr>() else {
+                    continue;
+                };
+                if addr.port() == 0 {
+                    continue;
+                }
+                if seen.insert(addr) {
+                    out.push((addr, AddrBookEntry::default()));
+                }
+            }
+            Ok(out)
+        }
+        PEERS_FILE_VERSION => {
+            let file: PeersFileV2 = serde_json::from_value(value)
+                .map_err(|err| format!("invalid peers file: {err}"))?;
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            for peer in file.peers {
+                if out.len() >= ADDR_BOOK_MAX {
+                    break;
+                }
+                let Ok(addr) = peer.addr.parse::<SocketAddr>() else {
+                    continue;
+                };
+                if addr.port() == 0 {
+                    continue;
+                }
+                if seen.insert(addr) {
+                    out.push((
+                        addr,
+                        AddrBookEntry {
+                            last_seen: peer.last_seen,
+                            last_success: peer.last_success,
+                            last_failure: peer.last_failure,
+                            last_attempt: 0,
+                            successes: peer.successes,
+                            failures: peer.failures,
+                            last_height: peer.last_height,
+                            last_version: peer.last_version,
+                        },
+                    ));
+                }
+            }
+            Ok(out)
+        }
+        other => Err(format!(
+            "unsupported peers file version {} (expected {} or {})",
+            other, PEERS_FILE_VERSION, PEERS_FILE_VERSION_V1
+        )),
     }
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for raw in file.addrs {
-        if out.len() >= ADDR_BOOK_MAX {
-            break;
-        }
-        let Ok(addr) = raw.parse::<SocketAddr>() else {
-            continue;
-        };
-        if addr.port() == 0 {
-            continue;
-        }
-        if seen.insert(addr) {
-            out.push(addr);
-        }
-    }
-    Ok(out)
 }
 
-fn save_peers_file(path: &Path, addrs: &[SocketAddr]) -> Result<(), String> {
-    let mut entries: Vec<String> = addrs.iter().map(ToString::to_string).collect();
-    entries.sort();
-    entries.dedup();
+fn save_peers_file(path: &Path, peers: &[(SocketAddr, AddrBookEntry)]) -> Result<(), String> {
+    let mut entries = peers
+        .iter()
+        .map(|(addr, entry)| PeersFileV2Entry {
+            addr: addr.to_string(),
+            last_seen: entry.last_seen,
+            last_success: entry.last_success,
+            last_failure: entry.last_failure,
+            successes: entry.successes,
+            failures: entry.failures,
+            last_height: entry.last_height,
+            last_version: entry.last_version,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.addr.cmp(&b.addr));
+    entries.dedup_by(|a, b| a.addr == b.addr);
     if entries.len() > ADDR_BOOK_MAX {
         entries.truncate(ADDR_BOOK_MAX);
     }
-    let file = PeersFile {
+
+    let file = PeersFileV2 {
         version: PEERS_FILE_VERSION,
-        addrs: entries,
+        peers: entries,
     };
     let json = serde_json::to_vec_pretty(&file).map_err(|err| err.to_string())?;
     write_file_atomic(path, &json)
@@ -1336,7 +1643,7 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn persist_peers_loop(addr_book: Arc<AddrBook>, path: PathBuf) {
-    let mut last_revision = addr_book.revision();
+    let mut last_revision = addr_book.revision().saturating_sub(1);
     loop {
         thread::sleep(Duration::from_secs(PEERS_PERSIST_INTERVAL_SECS));
         let revision = addr_book.revision();
@@ -1451,9 +1758,14 @@ async fn connect_to_peer(
     peer_ctx: &PeerContext,
     peer_book: Option<&HeaderPeerBook>,
 ) -> Result<Peer, String> {
+    let probe_target = if min_height > 0 && addr_book.len() > 0 {
+        12
+    } else {
+        HEADER_PEER_PROBE_COUNT
+    };
     let peers = connect_to_peers(
         params,
-        HEADER_PEER_PROBE_COUNT,
+        probe_target,
         start_height,
         min_height,
         Some(addr_book),
@@ -1496,7 +1808,7 @@ async fn connect_to_peers(
 
     let mut addrs = resolve_seed_addresses(params).await?;
     if let Some(addr_book) = addr_book {
-        for addr in addr_book.sample(ADDR_BOOK_SAMPLE) {
+        for addr in addr_book.sample_for_height(ADDR_BOOK_SAMPLE, min_height) {
             addrs.push(addr);
         }
     }
@@ -1514,6 +1826,12 @@ async fn connect_to_peers(
 
     let mut peers = Vec::new();
     let mut behind = Vec::new();
+    let mut behind_peers = 0usize;
+    let mut behind_logged = 0usize;
+    const MAX_BEHIND_LOGGED: usize = 8;
+    let mut failures = 0usize;
+    let mut failures_logged = 0usize;
+    const MAX_CONNECT_ERRORS_LOGGED: usize = 8;
     let mut join_set = JoinSet::new();
     let mut next_index = 0usize;
     let max_parallel = candidates.len().min(count.saturating_mul(2).max(4));
@@ -1522,22 +1840,35 @@ async fn connect_to_peers(
         let addr = candidates[next_index];
         let magic = params.message_start;
         let peer_ctx = peer_ctx.clone();
-        join_set
-            .spawn(async move { connect_and_handshake(addr, magic, start_height, peer_ctx).await });
+        if let Some(addr_book) = addr_book {
+            addr_book.record_attempt(addr);
+        }
+        join_set.spawn(async move {
+            let result = connect_and_handshake(addr, magic, start_height, peer_ctx).await;
+            (addr, result.map(|(_addr, peer)| peer))
+        });
         next_index += 1;
     }
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok((addr, peer))) => {
+            Ok((addr, Ok(peer))) => {
+                if let Some(addr_book) = addr_book {
+                    addr_book.record_success(addr, &peer);
+                }
+
                 let remote_height = peer.remote_height();
                 let remote_version = peer.remote_version();
-                let remote_agent = peer.remote_user_agent();
+                let remote_agent = peer.remote_user_agent().to_string();
                 if min_height > 0 && remote_height >= 0 && remote_height < min_height {
-                    eprintln!(
-                        "Peer {addr} behind (height {} < {}), skipping (ver {} ua {})",
-                        remote_height, min_height, remote_version, remote_agent
-                    );
+                    behind_peers = behind_peers.saturating_add(1);
+                    if behind_logged < MAX_BEHIND_LOGGED {
+                        eprintln!(
+                            "Peer {addr} behind (height {} < {}), skipping (ver {} ua {})",
+                            remote_height, min_height, remote_version, remote_agent
+                        );
+                        behind_logged += 1;
+                    }
                     behind.push(peer);
                 } else {
                     println!(
@@ -1550,8 +1881,15 @@ async fn connect_to_peers(
                     break;
                 }
             }
-            Ok(Err(err)) => {
-                eprintln!("{err}");
+            Ok((addr, Err(err))) => {
+                if let Some(addr_book) = addr_book {
+                    addr_book.record_failure(addr);
+                }
+                failures = failures.saturating_add(1);
+                if failures_logged < MAX_CONNECT_ERRORS_LOGGED {
+                    eprintln!("{err}");
+                    failures_logged += 1;
+                }
             }
             Err(err) => {
                 eprintln!("peer task failed: {err}");
@@ -1562,11 +1900,28 @@ async fn connect_to_peers(
             let addr = candidates[next_index];
             let magic = params.message_start;
             let peer_ctx = peer_ctx.clone();
+            if let Some(addr_book) = addr_book {
+                addr_book.record_attempt(addr);
+            }
             join_set.spawn(async move {
-                connect_and_handshake(addr, magic, start_height, peer_ctx).await
+                let result = connect_and_handshake(addr, magic, start_height, peer_ctx).await;
+                (addr, result.map(|(_addr, peer)| peer))
             });
             next_index += 1;
         }
+    }
+
+    if failures > failures_logged {
+        eprintln!(
+            "peer connect: {} additional failure(s) suppressed",
+            failures - failures_logged
+        );
+    }
+    if behind_peers > behind_logged {
+        eprintln!(
+            "peer connect: {} additional behind peer(s) suppressed",
+            behind_peers - behind_logged
+        );
     }
 
     if peers.is_empty() && !behind.is_empty() {
@@ -1734,7 +2089,15 @@ async fn discover_addrs_from_peer(
     addr_book: Arc<AddrBook>,
     peer_ctx: PeerContext,
 ) -> Result<(), String> {
-    let (_addr, mut peer) = connect_and_handshake(addr, magic, start_height, peer_ctx).await?;
+    addr_book.record_attempt(addr);
+    let (_addr, mut peer) = match connect_and_handshake(addr, magic, start_height, peer_ctx).await {
+        Ok(value) => value,
+        Err(err) => {
+            addr_book.record_failure(addr);
+            return Err(err);
+        }
+    };
+    addr_book.record_success(addr, &peer);
     peer.send_getaddr().await?;
     let deadline = Instant::now() + Duration::from_secs(ADDR_DISCOVERY_TIMEOUT_SECS);
     let mut new_addrs = Vec::new();
@@ -2156,6 +2519,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                     peer_book.ban_for(peer_addr, HEADER_BEHIND_BAN_SECS);
                 }
                 peer_book.record_failure(peer_addr);
+                addr_book.record_failure(peer_addr);
                 eprintln!(
                     "header peer behind (remote {} < tip {}), reconnecting",
                     remote_height, download_state.tip_height
@@ -2198,6 +2562,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                         if behind {
                             eprintln!("header peer returned no headers while behind");
                             peer_book.record_failure(peer_addr);
+                            addr_book.record_failure(peer_addr);
                         } else if last_headers_at.elapsed()
                             > Duration::from_secs(HEADER_IDLE_REPROBE_SECS)
                         {
@@ -2207,6 +2572,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                                 last_headers_at.elapsed()
                             );
                             peer_book.record_failure(peer_addr);
+                            addr_book.record_failure(peer_addr);
                             break;
                         }
                         tokio::time::sleep(idle_sleep).await;
@@ -2216,6 +2582,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                     if !headers_are_contiguous(&headers) {
                         eprintln!("non-continuous headers sequence from peer");
                         peer_book.record_bad_chain(peer_addr, HEADER_BAD_CHAIN_BAN_SECS);
+                        addr_book.record_failure(peer_addr);
                         break;
                     }
                     if headers[0].prev_block != download_state.tip_hash {
@@ -2243,6 +2610,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                             );
                             download_state.reset(chainstate.as_ref(), &params)?;
                             peer_book.record_bad_chain(peer_addr, HEADER_BAD_CHAIN_BAN_SECS);
+                            addr_book.record_failure(peer_addr);
                             break;
                         }
                     }
@@ -2257,6 +2625,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                         eprintln!("header validation failed: {err}");
                         download_state.reset(chainstate.as_ref(), &params)?;
                         peer_book.record_failure(peer_addr);
+                        addr_book.record_failure(peer_addr);
                         break;
                     }
                     header_metrics.record_validate(headers.len() as u64, validate_start.elapsed());
@@ -2268,6 +2637,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                         }
                     }
                     peer.bump_remote_height(download_state.tip_height);
+                    addr_book.record_success(peer_addr, &peer);
                     probing = false;
                     last_headers_at = Instant::now();
                     println!("Received {} headers", headers.len());
@@ -2280,6 +2650,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                         eprintln!("header request failed: {err}");
                     }
                     peer_book.record_failure(peer_addr);
+                    addr_book.record_failure(peer_addr);
                     break;
                 }
                 Err(_) => {
@@ -2287,6 +2658,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                         eprintln!("header request timed out");
                     }
                     peer_book.record_failure(peer_addr);
+                    addr_book.record_failure(peer_addr);
                     timeout_failures = timeout_failures.saturating_add(1);
                     if behind && timeout_failures >= HEADER_TIMEOUT_RETRIES_BEHIND {
                         eprintln!("header peer timed out while behind; reconnecting");
@@ -2337,6 +2709,7 @@ async fn connect_to_cached_seed(
             params.message_start,
             start_height,
             1,
+            addr_book,
             peer_ctx,
         )
         .await;
@@ -2353,7 +2726,7 @@ async fn connect_to_cached_seed(
         }
     }
     if let Some(addr_book) = addr_book {
-        for addr in addr_book.sample(ADDR_BOOK_SAMPLE) {
+        for addr in addr_book.sample_for_height(ADDR_BOOK_SAMPLE, start_height) {
             if seen.insert(addr) && is_allowed(addr) {
                 candidates.push(addr);
             }
@@ -2368,6 +2741,7 @@ async fn connect_to_cached_seed(
         params.message_start,
         start_height,
         target_peers,
+        addr_book,
         peer_ctx,
     )
     .await;
@@ -2379,6 +2753,7 @@ async fn connect_to_candidates(
     magic: [u8; 4],
     start_height: i32,
     target_peers: usize,
+    addr_book: Option<&AddrBook>,
     peer_ctx: &PeerContext,
 ) -> Vec<Peer> {
     if candidates.is_empty() {
@@ -2391,30 +2766,63 @@ async fn connect_to_candidates(
     let mut join_set = JoinSet::new();
     let mut next_index = 0usize;
     let mut peers = Vec::new();
+    let mut failures = 0usize;
+    let mut failures_logged = 0usize;
+    const MAX_CONNECT_ERRORS_LOGGED: usize = 4;
 
     while next_index < attempt_target && join_set.len() < max_parallel {
         let addr = candidates[next_index];
         let peer_ctx = peer_ctx.clone();
-        join_set
-            .spawn(async move { connect_and_handshake(addr, magic, start_height, peer_ctx).await });
+        if let Some(addr_book) = addr_book {
+            addr_book.record_attempt(addr);
+        }
+        join_set.spawn(async move {
+            let result = connect_and_handshake(addr, magic, start_height, peer_ctx).await;
+            (addr, result.map(|(_addr, peer)| peer))
+        });
         next_index += 1;
     }
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok((_addr, peer))) => peers.push(peer),
-            Ok(Err(err)) => eprintln!("{err}"),
+            Ok((addr, Ok(peer))) => {
+                if let Some(addr_book) = addr_book {
+                    addr_book.record_success(addr, &peer);
+                }
+                peers.push(peer);
+            }
+            Ok((addr, Err(err))) => {
+                if let Some(addr_book) = addr_book {
+                    addr_book.record_failure(addr);
+                }
+                failures = failures.saturating_add(1);
+                if failures_logged < MAX_CONNECT_ERRORS_LOGGED {
+                    eprintln!("{err}");
+                    failures_logged += 1;
+                }
+            }
             Err(err) => eprintln!("peer task failed: {err}"),
         }
 
         if next_index < attempt_target {
             let addr = candidates[next_index];
             let peer_ctx = peer_ctx.clone();
+            if let Some(addr_book) = addr_book {
+                addr_book.record_attempt(addr);
+            }
             join_set.spawn(async move {
-                connect_and_handshake(addr, magic, start_height, peer_ctx).await
+                let result = connect_and_handshake(addr, magic, start_height, peer_ctx).await;
+                (addr, result.map(|(_addr, peer)| peer))
             });
             next_index += 1;
         }
+    }
+
+    if failures > failures_logged {
+        eprintln!(
+            "peer connect: {} additional failure(s) suppressed",
+            failures - failures_logged
+        );
     }
 
     peers

@@ -107,8 +107,12 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] `peers.dat` persistence (owner: TBD)
 - [x] [P1] `banlist.dat` persistence (owner: TBD)
 - [x] [P1] Header peer probing (probe more candidates before selecting best height peer) (owner: TBD)
-- [ ] [P1] Peer scoring and eviction parity (owner: TBD)
-- [ ] [P1] Address manager parity (stochastic buckets, last-seen timestamps) (owner: TBD)
+- [x] [P1] Peer scoring and eviction parity (owner: TBD)
+  - [x] Persist peer health stats in `peers.dat` (success/fail, last-seen, last-height, last-version)
+  - [x] Prefer recently-good peers and apply exponential backoff after failures
+  - [x] Prune stale/unreachable addresses and suppress dial spam
+- [x] [P1] Address manager v1 (last-seen timestamps + persistence) (owner: TBD)
+- [ ] [P2] Address manager parity (bucket-based selection like C++) (owner: TBD)
 - [ ] [P2] P2P message coverage parity (addr/getaddr/feefilter/mempool, etc.) (owner: TBD)
   - [x] Address discovery: `getaddr` + `addr` ingest (owner: TBD)
   - [x] Tx relay: `inv`/`getdata`/`tx` + `mempool` (owner: TBD)
