@@ -51,7 +51,23 @@ impl<S: KeyValueStore> AddressDeltaIndex<S> {
         let Some(prefix) = address_index::address_prefix(script_pubkey) else {
             return;
         };
-        let key = address_delta_key(&prefix, height, tx_index, txid, index, spending);
+        self.insert_with_prefix(
+            batch, &prefix, height, tx_index, txid, index, spending, satoshis,
+        );
+    }
+
+    pub fn insert_with_prefix(
+        &self,
+        batch: &mut WriteBatch,
+        script_hash: &Hash256,
+        height: u32,
+        tx_index: u32,
+        txid: &Hash256,
+        index: u32,
+        spending: bool,
+        satoshis: i64,
+    ) {
+        let key = address_delta_key(script_hash, height, tx_index, txid, index, spending);
         batch.put(Column::AddressDelta, key, satoshis.to_le_bytes());
     }
 
@@ -68,7 +84,20 @@ impl<S: KeyValueStore> AddressDeltaIndex<S> {
         let Some(prefix) = address_index::address_prefix(script_pubkey) else {
             return;
         };
-        let key = address_delta_key(&prefix, height, tx_index, txid, index, spending);
+        self.delete_with_prefix(batch, &prefix, height, tx_index, txid, index, spending);
+    }
+
+    pub fn delete_with_prefix(
+        &self,
+        batch: &mut WriteBatch,
+        script_hash: &Hash256,
+        height: u32,
+        tx_index: u32,
+        txid: &Hash256,
+        index: u32,
+        spending: bool,
+    ) {
+        let key = address_delta_key(script_hash, height, tx_index, txid, index, spending);
         batch.delete(Column::AddressDelta, key);
     }
 
@@ -107,7 +136,7 @@ impl<S: KeyValueStore> AddressDeltaIndex<S> {
 }
 
 fn address_delta_key(
-    script_hash: &[u8; SCRIPT_HASH_LEN],
+    script_hash: &Hash256,
     height: u32,
     tx_index: u32,
     txid: &Hash256,

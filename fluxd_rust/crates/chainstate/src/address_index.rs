@@ -31,6 +31,17 @@ pub fn address_outpoint_key(
     Some(key)
 }
 
+pub fn address_outpoint_key_with_script_hash(
+    script_hash: &Hash256,
+    outpoint: &OutPoint,
+) -> [u8; SCRIPT_HASH_LEN + OUTPOINT_KEY_LEN] {
+    let mut key = [0u8; SCRIPT_HASH_LEN + OUTPOINT_KEY_LEN];
+    key[..SCRIPT_HASH_LEN].copy_from_slice(script_hash);
+    let outpoint_key = outpoint_key_bytes(outpoint);
+    key[SCRIPT_HASH_LEN..].copy_from_slice(outpoint_key.as_bytes());
+    key
+}
+
 pub fn address_prefix(script_pubkey: &[u8]) -> Option<[u8; SCRIPT_HASH_LEN]> {
     script_hash(script_pubkey)
 }
@@ -53,10 +64,30 @@ impl<S: KeyValueStore> AddressIndex<S> {
         batch.put(Column::AddressOutpoint, key, []);
     }
 
+    pub fn insert_with_script_hash(
+        &self,
+        batch: &mut WriteBatch,
+        script_hash: &Hash256,
+        outpoint: &OutPoint,
+    ) {
+        let key = address_outpoint_key_with_script_hash(script_hash, outpoint);
+        batch.put(Column::AddressOutpoint, key, []);
+    }
+
     pub fn delete(&self, batch: &mut WriteBatch, script_pubkey: &[u8], outpoint: &OutPoint) {
         let Some(key) = address_outpoint_key(script_pubkey, outpoint) else {
             return;
         };
+        batch.delete(Column::AddressOutpoint, key);
+    }
+
+    pub fn delete_with_script_hash(
+        &self,
+        batch: &mut WriteBatch,
+        script_hash: &Hash256,
+        outpoint: &OutPoint,
+    ) {
+        let key = address_outpoint_key_with_script_hash(script_hash, outpoint);
         batch.delete(Column::AddressOutpoint, key);
     }
 

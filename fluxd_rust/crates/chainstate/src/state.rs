@@ -102,6 +102,13 @@ struct UtxoCacheStats {
     misses: u64,
 }
 
+#[derive(Clone, Debug)]
+struct CreatedUtxo {
+    outpoint: OutPoint,
+    entry: UtxoEntry,
+    address_key: Option<Hash256>,
+}
+
 #[derive(Debug)]
 pub enum ChainStateError {
     Validation(ValidationError),
@@ -1118,7 +1125,7 @@ impl<S: KeyValueStore> ChainState<S> {
         txid: &Hash256,
         height: i32,
         params: &ChainParams,
-        created_utxos: &HashMap<OutPointKey, UtxoEntry>,
+        created_utxos: &HashMap<OutPointKey, CreatedUtxo>,
         operator_pubkeys: &HashMap<OutPoint, Vec<u8>>,
         signature_checks: Option<&mut Vec<FluxnodeSigCheck>>,
     ) -> Result<(), ChainStateError> {
@@ -1433,11 +1440,11 @@ impl<S: KeyValueStore> ChainState<S> {
     fn lookup_fluxnode_collateral(
         &self,
         outpoint: &OutPoint,
-        created_utxos: &HashMap<OutPointKey, UtxoEntry>,
+        created_utxos: &HashMap<OutPointKey, CreatedUtxo>,
     ) -> Result<UtxoEntry, ChainStateError> {
         let key = outpoint_key_bytes(outpoint);
         if let Some(entry) = created_utxos.get(&key) {
-            return Ok(entry.clone());
+            return Ok(entry.entry.clone());
         }
         self.utxo_entry_cached(key)?.ok_or_else(|| {
             ChainStateError::Validation(ValidationError::Fluxnode("fluxnode collateral not found"))
@@ -1646,7 +1653,14 @@ impl<S: KeyValueStore> ChainState<S> {
             .iter()
             .map(|tx| tx.vout.len())
             .sum::<usize>();
-        let mut created_utxos: HashMap<OutPointKey, UtxoEntry> =
+        batch.reserve(
+            estimated_inputs
+                .saturating_mul(4)
+                .saturating_add(estimated_outputs.saturating_mul(4))
+                .saturating_add(block.transactions.len())
+                .saturating_add(64),
+        );
+        let mut created_utxos: HashMap<OutPointKey, CreatedUtxo> =
             HashMap::with_capacity(estimated_outputs);
         let mut spent_outpoints: HashSet<OutPointKey> = HashSet::with_capacity(estimated_inputs);
         let mut block_script_checks: Vec<ScriptCheck> = Vec::new();
@@ -1759,8 +1773,10 @@ impl<S: KeyValueStore> ChainState<S> {
                         return Err(ChainStateError::MissingInput);
                     }
 
-                    let entry = match created_utxos.remove(&outpoint_key) {
-                        Some(entry) => entry,
+                    let created = created_utxos.remove(&outpoint_key);
+                    let created_in_block = created.is_some();
+                    let (entry, address_key) = match created {
+                        Some(created) => (created.entry, created.address_key),
                         None => {
                             let utxo_start = Instant::now();
                             let entry = self
@@ -1770,7 +1786,11 @@ impl<S: KeyValueStore> ChainState<S> {
                             utxo_get_ops = utxo_get_ops.saturating_add(1);
                             utxo_get_us = utxo_get_us.saturating_add(elapsed.as_micros() as u64);
                             match entry {
-                                Some(entry) => entry,
+                                Some(entry) => {
+                                    let address_key =
+                                        crate::address_index::script_hash(&entry.script_pubkey);
+                                    (entry, address_key)
+                                }
                                 None => {
                                     eprintln!(
                                         "missing input for tx {} input {} prevout {}:{} at height {}",
@@ -1836,27 +1856,33 @@ impl<S: KeyValueStore> ChainState<S> {
                         .checked_add(entry.value)
                         .ok_or(ChainStateError::ValueOutOfRange)?;
                     let prevout = input.prevout.clone();
-                    let utxo_start = Instant::now();
-                    self.utxos.delete(&mut batch, &prevout);
-                    let elapsed = utxo_start.elapsed();
-                    utxo_time += elapsed;
-                    utxo_delete_ops = utxo_delete_ops.saturating_add(1);
-                    utxo_delete_us = utxo_delete_us.saturating_add(elapsed.as_micros() as u64);
+                    if !created_in_block {
+                        let utxo_start = Instant::now();
+                        self.utxos.delete(&mut batch, &prevout);
+                        let elapsed = utxo_start.elapsed();
+                        utxo_time += elapsed;
+                        utxo_delete_ops = utxo_delete_ops.saturating_add(1);
+                        utxo_delete_us = utxo_delete_us.saturating_add(elapsed.as_micros() as u64);
+                    }
                     let index_start = Instant::now();
-                    address_index_deletes = address_index_deletes.saturating_add(1);
-                    self.address_index
-                        .delete(&mut batch, &entry.script_pubkey, &prevout);
-                    address_delta_inserts = address_delta_inserts.saturating_add(1);
-                    self.address_deltas.insert(
-                        &mut batch,
-                        &entry.script_pubkey,
-                        height as u32,
-                        index as u32,
-                        &txid,
-                        input_index as u32,
-                        true,
-                        spent_delta,
-                    );
+                    if let Some(key) = address_key.as_ref() {
+                        if !created_in_block {
+                            address_index_deletes = address_index_deletes.saturating_add(1);
+                            self.address_index
+                                .delete_with_script_hash(&mut batch, key, &prevout);
+                        }
+                        address_delta_inserts = address_delta_inserts.saturating_add(1);
+                        self.address_deltas.insert_with_prefix(
+                            &mut batch,
+                            key,
+                            height as u32,
+                            index as u32,
+                            &txid,
+                            input_index as u32,
+                            true,
+                            spent_delta,
+                        );
+                    }
                     index_time += index_start.elapsed();
                     undo.spent.push(SpentOutput {
                         outpoint: prevout,
@@ -1947,6 +1973,7 @@ impl<S: KeyValueStore> ChainState<S> {
                     hash: txid,
                     index: out_index as u32,
                 };
+                let address_key = crate::address_index::script_hash(&output.script_pubkey);
                 let entry = UtxoEntry {
                     value: output.value,
                     script_pubkey: output.script_pubkey.clone(),
@@ -1959,28 +1986,47 @@ impl<S: KeyValueStore> ChainState<S> {
                 value_created = value_created
                     .checked_add(output.value)
                     .ok_or(ChainStateError::ValueOutOfRange)?;
-                let utxo_start = Instant::now();
-                self.utxos.put(&mut batch, &outpoint, &entry);
-                let elapsed = utxo_start.elapsed();
-                utxo_time += elapsed;
-                utxo_put_ops = utxo_put_ops.saturating_add(1);
-                utxo_put_us = utxo_put_us.saturating_add(elapsed.as_micros() as u64);
-                created_utxos.insert(outpoint_key_bytes(&outpoint), entry);
+                let index_start = Instant::now();
+                if let Some(key) = address_key.as_ref() {
+                    address_delta_inserts = address_delta_inserts.saturating_add(1);
+                    self.address_deltas.insert_with_prefix(
+                        &mut batch,
+                        key,
+                        height as u32,
+                        index as u32,
+                        &txid,
+                        out_index as u32,
+                        false,
+                        output.value,
+                    );
+                }
+                index_time += index_start.elapsed();
+
+                created_utxos.insert(
+                    outpoint_key_bytes(&outpoint),
+                    CreatedUtxo {
+                        outpoint,
+                        entry,
+                        address_key,
+                    },
+                );
+            }
+        }
+
+        for created in created_utxos.values() {
+            let utxo_start = Instant::now();
+            self.utxos
+                .put(&mut batch, &created.outpoint, &created.entry);
+            let elapsed = utxo_start.elapsed();
+            utxo_time += elapsed;
+            utxo_put_ops = utxo_put_ops.saturating_add(1);
+            utxo_put_us = utxo_put_us.saturating_add(elapsed.as_micros() as u64);
+
+            if let Some(key) = created.address_key.as_ref() {
                 let index_start = Instant::now();
                 address_index_inserts = address_index_inserts.saturating_add(1);
                 self.address_index
-                    .insert(&mut batch, &output.script_pubkey, &outpoint);
-                address_delta_inserts = address_delta_inserts.saturating_add(1);
-                self.address_deltas.insert(
-                    &mut batch,
-                    &output.script_pubkey,
-                    height as u32,
-                    index as u32,
-                    &txid,
-                    out_index as u32,
-                    false,
-                    output.value,
-                );
+                    .insert_with_script_hash(&mut batch, key, &created.outpoint);
                 index_time += index_start.elapsed();
             }
         }

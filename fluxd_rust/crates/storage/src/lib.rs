@@ -156,6 +156,10 @@ impl WriteBatch {
         Self::default()
     }
 
+    pub fn reserve(&mut self, additional: usize) {
+        self.ops.reserve(additional);
+    }
+
     pub fn put(&mut self, column: Column, key: impl Into<WriteKey>, value: impl Into<Vec<u8>>) {
         self.ops.push(WriteOp::Put {
             column,
@@ -173,6 +177,10 @@ impl WriteBatch {
 
     pub fn iter(&self) -> impl Iterator<Item = &WriteOp> {
         self.ops.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
     }
 
     pub fn into_ops(self) -> Vec<WriteOp> {

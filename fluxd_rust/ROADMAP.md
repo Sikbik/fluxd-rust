@@ -15,7 +15,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
 - [x] [P1] Address mempool deltas + `getaddressmempool` (owner: TBD)
 - [x] [P1] Remove header-gap bottleneck (fast header ancestry + block queue selection) (owner: TBD)
-- [ ] [P1] Header-first sync speed parity with C++ (owner: TBD)
+- [x] [P1] Header-first sync speed parity with C++ (owner: TBD)
 
 ## Completed (core)
 
@@ -54,7 +54,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Warn when `--db-write-buffer-mb` is below `--db-memtable-mb × partitions` (prevents hidden L0 stalls)
   - [x] Surface Fjall health stats in `/stats` (write buffer, compactions, per-partition segments/flushes)
   - [x] Add detailed connect-stage telemetry in `/stats` (UTXO get/put/delete, undo encode/append, index op counts)
-  - [ ] Review index write amplification (txindex/address index) and batching opportunities
+  - [x] Review index write amplification (txindex/address index) and batching opportunities
+    - [x] Reuse address script hash across indexes (avoid double hashing per I/O)
+    - [x] Defer UTXO + address-outpoint writes to end-of-block (eliminate intrablock put+delete pairs)
+    - [x] Reserve `WriteBatch` capacity per block (reduce allocator churn)
   - [x] Capture throughput stats (8-core mainnet: `ver_ms` ~5–6ms, ~110–120 b/s typical; block download becomes limiter)
 - [ ] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)
 
