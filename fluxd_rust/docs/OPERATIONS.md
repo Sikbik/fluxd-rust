@@ -27,6 +27,16 @@ Build on VPS:
 ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && /home/dev/.cargo/bin/cargo build -p fluxd --release\"'"
 ```
 
+## Smoke test (recommended)
+
+After building, run a short-lived smoke test instance (separate data dir + RPC port):
+
+```bash
+ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/remote_smoke_test.sh --profile high\"'"
+```
+
+Use `--keep` to preserve the temporary data dir/log for debugging.
+
 ## Run
 
 ```bash
