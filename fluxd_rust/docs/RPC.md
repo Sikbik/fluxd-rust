@@ -447,6 +447,30 @@ Returns the transaction ids for one or more transparent addresses.
 
 These currently return `0.0` and are placeholders for mining metrics.
 
+### getblocktemplate
+
+Returns a block template suitable for pools/miners, modeled after the C++ daemon output.
+
+- Params: optional request object (currently required to include a miner address):
+  - `{"mineraddress":"t1..."}`
+  - `{"address":"t1..."}` (alias)
+- Result: object including standard BIP22-style fields:
+  - `version`, `previousblockhash`, `finalsaplingroothash`
+  - `transactions` (array of hex txs + fee/depends/sigops)
+  - `coinbasetxn` (hex coinbase tx + `fee` as negative total block fees)
+  - `longpollid`, `target`, `mintime`, `mutable`, `noncerange`, `sigoplimit`, `sizelimit`
+  - `curtime`, `bits`, `height`, `miner_reward`
+- Flux-specific payout fields (when applicable):
+  - `cumulus_fluxnode_address` / `cumulus_fluxnode_payout`
+  - `nimbus_fluxnode_address` / `nimbus_fluxnode_payout`
+  - `stratus_fluxnode_address` / `stratus_fluxnode_payout`
+  - Legacy aliases: `basic_zelnode_*`, `super_zelnode_*`, `bamf_zelnode_*`, plus `cumulus_zelnode_*`, `nimbus_zelnode_*`, `stratus_zelnode_*`.
+  - Funding events: `flux_creation_address` / `flux_creation_amount` at exchange/foundation/swap heights.
+
+Notes:
+- Longpoll wait behavior and proposal mode are not implemented yet (only `longpollid` is returned).
+- Until wallet/`flux.conf` miner address parity is implemented, `mineraddress`/`address` is required.
+
 ### estimatefee
 
 Estimates an approximate fee per kilobyte (kB) needed for a transaction to begin confirmation

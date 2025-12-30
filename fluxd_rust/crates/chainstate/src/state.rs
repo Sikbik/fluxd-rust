@@ -1930,11 +1930,18 @@ impl<S: KeyValueStore> ChainState<S> {
         &self,
         height: i32,
         params: &ChainParams,
-    ) -> Result<Vec<(OutPoint, Vec<u8>, i64)>, ChainStateError> {
+    ) -> Result<Vec<(u8, OutPoint, Vec<u8>, i64)>, ChainStateError> {
         Ok(self
             .expected_fluxnode_payouts(height, params)?
             .into_iter()
-            .map(|payout| (payout.outpoint, payout.script_pubkey, payout.amount))
+            .map(|payout| {
+                (
+                    payout.tier,
+                    payout.outpoint,
+                    payout.script_pubkey,
+                    payout.amount,
+                )
+            })
             .collect())
     }
 
@@ -3915,6 +3922,27 @@ impl<S: KeyValueStore> ChainState<S> {
             .as_ref()
             .ok_or(ChainStateError::CorruptIndex("missing shielded cache"))?
             .sapling_root)
+    }
+
+    pub fn sapling_root_after_commitments(
+        &self,
+        commitments: &[Hash256],
+    ) -> Result<Hash256, ChainStateError> {
+        if commitments.is_empty() {
+            return self.sapling_root();
+        }
+        let mut sapling_tree = self.shielded_cache_sapling_tree()?;
+        for commitment in commitments {
+            let node = sapling_node_from_hash(commitment).ok_or(ChainStateError::Validation(
+                ValidationError::InvalidTransaction("sapling note commitment invalid"),
+            ))?;
+            sapling_tree.append(node).map_err(|_| {
+                ChainStateError::Validation(ValidationError::InvalidTransaction(
+                    "sapling tree append failed",
+                ))
+            })?;
+        }
+        Ok(sapling_root_hash(&sapling_tree))
     }
 
     fn shielded_cache_snapshot(

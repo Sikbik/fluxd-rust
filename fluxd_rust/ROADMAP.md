@@ -145,7 +145,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] `getmininginfo`, `submitblock` (owner: TBD)
 - [ ] [P1] `getblocktemplate` (coinbase + deterministic payouts; tx selection/assembly WIP) (owner: TBD)
   - [x] Basic mempool tx selection + dependency ordering
-  - [ ] Template fields parity (sigops/weight, longpoll, rules/mutable, etc.)
+  - [x] Template field parity (BIP22-ish keys + Flux deterministic payout fields)
+  - [ ] Longpoll wait behavior (honor request `longpollid`) (owner: TBD)
+  - [ ] Proposal mode support (`{"mode":"proposal","data":"..."}`) (owner: TBD)
+  - [ ] Miner address configuration parity (flux.conf / wallet integration) (owner: TBD)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
 
 ## Wallet

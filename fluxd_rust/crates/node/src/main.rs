@@ -1696,21 +1696,11 @@ fn debug_print_expected_fluxnode_payouts<S: KeyValueStore>(
 
     let block_value = fluxd_consensus::block_subsidy(height, &params.consensus);
     println!("Expected fluxnode payouts at height {height} (block_value={block_value})");
-    for (outpoint, script_pubkey, amount) in payouts {
-        let inferred_tier = (1u8..=3u8)
-            .find(|tier| {
-                fluxd_consensus::fluxnode_subsidy(
-                    height,
-                    block_value,
-                    *tier as i32,
-                    &params.consensus,
-                ) == amount
-            })
-            .unwrap_or(0);
+    for (tier, outpoint, script_pubkey, amount) in payouts {
         let key = outpoint_to_string(&outpoint);
         println!(
             "- tier={} outpoint={} amount={} script={}",
-            inferred_tier,
+            tier,
             key,
             amount,
             hex_encode(&script_pubkey)

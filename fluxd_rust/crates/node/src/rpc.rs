@@ -18,7 +18,7 @@ use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::ValidationFlags;
 use fluxd_consensus::constants::{
     FLUXNODE_DOS_REMOVE_AMOUNT, FLUXNODE_DOS_REMOVE_AMOUNT_V2, FLUXNODE_START_TX_EXPIRATION_HEIGHT,
-    FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2, MAX_BLOCK_SIZE, PROTOCOL_VERSION,
+    FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2, MAX_BLOCK_SIGOPS, MAX_BLOCK_SIZE, PROTOCOL_VERSION,
 };
 use fluxd_consensus::money::COIN;
 use fluxd_consensus::params::{hash256_from_hex, ChainParams, Network};
@@ -2634,33 +2634,38 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         ));
     }
 
-    let miner_address = if params.is_empty() {
-        None
-    } else {
-        let obj = params[0].as_object().ok_or_else(|| {
+    let miner_address = params
+        .get(0)
+        .map(|value| {
+            value.as_object().ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "getblocktemplate param must be an object",
+                )
+            })
+        })
+        .transpose()?
+        .and_then(|obj| {
+            obj.get("mineraddress")
+                .or_else(|| obj.get("address"))
+                .and_then(|val| val.as_str())
+                .map(|val| val.to_string())
+        })
+        .ok_or_else(|| {
             RpcError::new(
                 RPC_INVALID_PARAMETER,
-                "getblocktemplate param must be an object",
+                "missing mineraddress (wallet support not implemented)",
             )
         })?;
-        obj.get("mineraddress")
-            .or_else(|| obj.get("address"))
-            .and_then(|val| val.as_str())
-            .map(|val| val.to_string())
-    };
 
-    let miner_script_pubkey = match miner_address.as_deref() {
-        Some(addr) => {
-            address_to_script_pubkey(addr, chain_params.network).map_err(|err| match err {
-                AddressError::UnknownPrefix => RpcError::new(
-                    RPC_INVALID_ADDRESS_OR_KEY,
-                    "miner address has invalid prefix",
-                ),
-                _ => RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "invalid miner address"),
-            })?
-        }
-        None => vec![0x51],
-    };
+    let miner_script_pubkey = address_to_script_pubkey(&miner_address, chain_params.network)
+        .map_err(|err| match err {
+            AddressError::UnknownPrefix => RpcError::new(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "miner address has invalid prefix",
+            ),
+            _ => RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "invalid miner address"),
+        })?;
 
     let best = chainstate.best_block().map_err(map_internal)?;
     let (prev_hash, height) = match best {
@@ -2668,11 +2673,17 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         None => ([0u8; 32], 0),
     };
 
-    let curtime = SystemTime::now()
+    let mintime = median_time_past(chainstate, height - 1)?
+        .saturating_add(1)
+        .max(0);
+    let mintime_u32 = u32::try_from(mintime).unwrap_or(0);
+
+    let mut curtime = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
         .min(u32::MAX as u64) as u32;
+    curtime = curtime.max(mintime_u32);
 
     let bits = chainstate
         .next_work_required_bits(&prev_hash, height, curtime as i64, &chain_params.consensus)
@@ -2686,8 +2697,6 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         UpgradeIndex::Acadia,
     );
 
-    let sapling_root = chainstate.sapling_root().map_err(map_internal)?;
-
     let payouts = chainstate
         .deterministic_fluxnode_payouts(height, chain_params)
         .map_err(map_internal)?;
@@ -2695,7 +2704,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     let subsidy = block_subsidy(height, &chain_params.consensus);
     let payout_sum = payouts
         .iter()
-        .try_fold(0i64, |acc, (_, _, amount)| acc.checked_add(*amount))
+        .try_fold(0i64, |acc, (_, _, _, amount)| acc.checked_add(*amount))
         .ok_or_else(|| map_internal("fluxnode payout sum out of range"))?;
     let remainder = subsidy
         .checked_sub(payout_sum)
@@ -2711,7 +2720,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
             value: miner_value,
             script_pubkey: miner_script_pubkey.clone(),
         });
-        for (_, script_pubkey, amount) in &payouts {
+        for (_, _, script_pubkey, amount) in &payouts {
             outputs.push(TxOut {
                 value: *amount,
                 script_pubkey: script_pubkey.clone(),
@@ -2792,6 +2801,73 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         })
     };
 
+    fn legacy_sigops(script: &[u8]) -> u32 {
+        const OP_CHECKSIG: u8 = 0xac;
+        const OP_CHECKSIGVERIFY: u8 = 0xad;
+        const OP_CHECKMULTISIG: u8 = 0xae;
+        const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+        const OP_PUSHDATA1: u8 = 0x4c;
+        const OP_PUSHDATA2: u8 = 0x4d;
+        const OP_PUSHDATA4: u8 = 0x4e;
+
+        let mut count = 0u32;
+        let mut cursor = 0usize;
+        while cursor < script.len() {
+            let opcode = script[cursor];
+            cursor = cursor.saturating_add(1);
+            match opcode {
+                OP_CHECKSIG | OP_CHECKSIGVERIFY => count = count.saturating_add(1),
+                OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => count = count.saturating_add(20),
+                0x01..=0x4b => cursor = cursor.saturating_add(opcode as usize),
+                OP_PUSHDATA1 => {
+                    if let Some(len) = script.get(cursor).copied() {
+                        cursor = cursor.saturating_add(1 + len as usize);
+                    } else {
+                        break;
+                    }
+                }
+                OP_PUSHDATA2 => {
+                    if cursor + 1 >= script.len() {
+                        break;
+                    }
+                    let len = u16::from_le_bytes([script[cursor], script[cursor + 1]]) as usize;
+                    cursor = cursor.saturating_add(2 + len);
+                }
+                OP_PUSHDATA4 => {
+                    if cursor + 3 >= script.len() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes([
+                        script[cursor],
+                        script[cursor + 1],
+                        script[cursor + 2],
+                        script[cursor + 3],
+                    ]) as usize;
+                    cursor = cursor.saturating_add(4 + len);
+                }
+                _ => {}
+            }
+            if cursor > script.len() {
+                break;
+            }
+        }
+        count
+    }
+
+    fn tx_sigops(tx: &Transaction) -> u32 {
+        let input_ops: u32 = tx
+            .vin
+            .iter()
+            .map(|input| legacy_sigops(&input.script_sig))
+            .sum();
+        let output_ops: u32 = tx
+            .vout
+            .iter()
+            .map(|output| legacy_sigops(&output.script_pubkey))
+            .sum();
+        input_ops.saturating_add(output_ops)
+    }
+
     #[derive(Clone)]
     struct TemplateTx {
         fee: i64,
@@ -2836,10 +2912,11 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         .saturating_sub(coinbase_size)
         .saturating_sub(coinbase_overhead_bytes);
 
-    let (selected_fees, transactions_json) = {
+    let (mempool_revision, selected_fees, transactions_json, sapling_commitments) = {
         let mempool_snapshot = mempool
             .lock()
             .map_err(|_| map_internal("mempool lock poisoned"))?;
+        let mempool_revision = mempool_snapshot.revision();
 
         let mut templates: HashMap<Hash256, TemplateTx> = HashMap::new();
         for entry in mempool_snapshot.entries() {
@@ -2933,6 +3010,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         }
 
         let mut transactions_json = Vec::with_capacity(selected.len());
+        let mut sapling_commitments = Vec::new();
         for txid in &selected {
             let Some(entry) = mempool_snapshot.get(txid) else {
                 continue;
@@ -2942,16 +3020,24 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                 .iter()
                 .filter_map(|parent| tx_index_by_id.get(parent).copied())
                 .collect::<Vec<_>>();
+            for output in &entry.tx.shielded_outputs {
+                sapling_commitments.push(output.cm);
+            }
             transactions_json.push(json!({
                 "data": hex_bytes(&entry.raw),
                 "hash": hash256_to_hex(txid),
                 "fee": entry.fee,
                 "depends": depends,
-                "sigops": 0,
+                "sigops": tx_sigops(&entry.tx),
             }));
         }
 
-        Ok::<_, RpcError>((selected_fees, transactions_json))
+        Ok::<_, RpcError>((
+            mempool_revision,
+            selected_fees,
+            transactions_json,
+            sapling_commitments,
+        ))
     }?;
 
     let miner_value = if pon_active {
@@ -2966,44 +3052,140 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
 
     let coinbase_bytes = coinbase.consensus_encode().map_err(map_internal)?;
     let coinbase_txid = coinbase.txid().map_err(map_internal)?;
-
-    let coinbase_value = coinbase
-        .vout
-        .iter()
-        .try_fold(0i64, |acc, out| acc.checked_add(out.value))
-        .ok_or_else(|| map_internal("coinbase output value out of range"))?;
+    let miner_reward = coinbase.vout.first().map(|out| out.value).unwrap_or(0);
+    let coinbase_sigops = tx_sigops(&coinbase);
 
     let target = compact_to_u256(bits).map_err(|err| map_internal(err.to_string()))?;
     let target_hex = hex_bytes(&target.to_big_endian());
 
-    let payouts_json = payouts
-        .iter()
-        .map(|(outpoint, script_pubkey, amount)| {
-            json!({
-                "outpoint": format_outpoint(outpoint),
-                "scriptPubKey": hex_bytes(script_pubkey),
-                "amount": Number::from(*amount),
-            })
-        })
-        .collect::<Vec<_>>();
+    let final_sapling_root = chainstate
+        .sapling_root_after_commitments(&sapling_commitments)
+        .map_err(map_internal)?;
 
-    Ok(json!({
-        "capabilities": ["proposal"],
-        "version": if pon_active { PON_VERSION } else { CURRENT_VERSION },
-        "previousblockhash": hash256_to_hex(&prev_hash),
-        "height": height,
-        "curtime": curtime,
-        "bits": format!("{:08x}", bits),
-        "target": target_hex,
-        "defaultsaplingroot": hash256_to_hex(&sapling_root),
-        "transactions": transactions_json,
-        "coinbasetxn": {
+    let longpollid = format!("{}{}", hash256_to_hex(&prev_hash), mempool_revision);
+
+    let mut result = serde_json::Map::new();
+    result.insert("capabilities".to_string(), json!(["proposal"]));
+    result.insert(
+        "version".to_string(),
+        Value::Number(Number::from(if pon_active {
+            PON_VERSION
+        } else {
+            CURRENT_VERSION
+        })),
+    );
+    result.insert(
+        "previousblockhash".to_string(),
+        Value::String(hash256_to_hex(&prev_hash)),
+    );
+    result.insert(
+        "finalsaplingroothash".to_string(),
+        Value::String(hash256_to_hex(&final_sapling_root)),
+    );
+    result.insert("transactions".to_string(), Value::Array(transactions_json));
+    result.insert(
+        "coinbasetxn".to_string(),
+        json!({
             "data": hex_bytes(&coinbase_bytes),
             "hash": hash256_to_hex(&coinbase_txid),
-        },
-        "coinbasevalue": coinbase_value,
-        "fluxnodepayouts": payouts_json,
-    }))
+            "depends": [],
+            "fee": -selected_fees,
+            "sigops": coinbase_sigops,
+            "required": true,
+        }),
+    );
+    result.insert("longpollid".to_string(), Value::String(longpollid));
+    result.insert("target".to_string(), Value::String(target_hex));
+    result.insert("mintime".to_string(), Value::Number(Number::from(mintime)));
+    result.insert(
+        "mutable".to_string(),
+        json!(["time", "transactions", "prevblock"]),
+    );
+    result.insert(
+        "noncerange".to_string(),
+        Value::String("00000000ffffffff".to_string()),
+    );
+    result.insert(
+        "sigoplimit".to_string(),
+        Value::Number(Number::from(MAX_BLOCK_SIGOPS)),
+    );
+    result.insert(
+        "sizelimit".to_string(),
+        Value::Number(Number::from(MAX_BLOCK_SIZE)),
+    );
+    result.insert("curtime".to_string(), Value::Number(Number::from(curtime)));
+    result.insert("bits".to_string(), Value::String(format!("{:08x}", bits)));
+    result.insert("height".to_string(), Value::Number(Number::from(height)));
+    result.insert(
+        "miner_reward".to_string(),
+        Value::Number(Number::from(miner_reward)),
+    );
+
+    for (tier, _outpoint, script_pubkey, amount) in &payouts {
+        let (legacy_name, renamed) = match *tier {
+            2 => ("super", "nimbus"),
+            3 => ("bamf", "stratus"),
+            _ => ("basic", "cumulus"),
+        };
+        let address =
+            script_pubkey_to_address(script_pubkey, chain_params.network).unwrap_or_default();
+        result.insert(
+            format!("{renamed}_fluxnode_address"),
+            Value::String(address.clone()),
+        );
+        result.insert(
+            format!("{renamed}_fluxnode_payout"),
+            Value::Number(Number::from(*amount)),
+        );
+
+        result.insert(
+            format!("{legacy_name}_zelnode_address"),
+            Value::String(address.clone()),
+        );
+        result.insert(
+            format!("{legacy_name}_zelnode_payout"),
+            Value::Number(Number::from(*amount)),
+        );
+        result.insert(
+            format!("{renamed}_zelnode_address"),
+            Value::String(address.clone()),
+        );
+        result.insert(
+            format!("{renamed}_zelnode_payout"),
+            Value::Number(Number::from(*amount)),
+        );
+    }
+
+    if exchange_fund > 0 {
+        result.insert(
+            "flux_creation_address".to_string(),
+            Value::String(chain_params.funding.exchange_address.to_string()),
+        );
+        result.insert(
+            "flux_creation_amount".to_string(),
+            Value::Number(Number::from(exchange_fund)),
+        );
+    } else if foundation_fund > 0 {
+        result.insert(
+            "flux_creation_address".to_string(),
+            Value::String(chain_params.funding.foundation_address.to_string()),
+        );
+        result.insert(
+            "flux_creation_amount".to_string(),
+            Value::Number(Number::from(foundation_fund)),
+        );
+    } else if swap_pool > 0 {
+        result.insert(
+            "flux_creation_address".to_string(),
+            Value::String(chain_params.swap_pool.address.to_string()),
+        );
+        result.insert(
+            "flux_creation_amount".to_string(),
+            Value::Number(Number::from(swap_pool)),
+        );
+    }
+
+    Ok(Value::Object(result))
 }
 
 fn script_push_int(value: i64) -> Vec<u8> {
