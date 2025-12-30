@@ -231,7 +231,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | - | `addnode`<br>`disconnectnode`<br>`getaddednodeinfo`<br>`setban`<br>`clearbanned`<br>`verifychain`<br>`reindex`<br>`rescanblockchain` |
+| `addnode`<br>`disconnectnode`<br>`getaddednodeinfo`<br>`setban`<br>`clearbanned`<br>`verifychain` | - | `reindex`<br>`rescanblockchain` |
 
 ### Wallet (transparent)
 

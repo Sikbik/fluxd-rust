@@ -40,7 +40,10 @@ use crate::filemeta::{
     META_UNDO_FILES_LAST_FILE_KEY, META_UNDO_FILES_LAST_LEN_KEY,
 };
 use crate::flatfiles::{FileLocation, FlatFileError, FlatFileStore};
-use crate::index::{status_with_block, status_with_header, ChainIndex, ChainTip, HeaderEntry};
+use crate::index::{
+    decode_header_entry, has_block as index_has_block, status_with_block, status_with_header,
+    ChainIndex, ChainTip, HeaderEntry,
+};
 use crate::metrics::{ConnectMetrics, ConnectMetricsDelta};
 use crate::shielded::{
     empty_sapling_tree, empty_sprout_tree, sapling_empty_root_hash, sapling_node_from_hash,
@@ -3187,21 +3190,45 @@ impl<S: KeyValueStore> ChainState<S> {
     pub fn commit_batch(&self, batch: WriteBatch) -> Result<(), ChainStateError> {
         let mut sprout_bytes = None;
         let mut sapling_bytes = None;
+        let mut header_cache_updates: Vec<(Hash256, HeaderEntry)> = Vec::new();
         for op in batch.iter() {
             if let WriteOp::Put { column, key, value } = op {
-                if *column != Column::Meta {
-                    continue;
-                }
-                if key.as_slice() == SPROUT_TREE_KEY {
-                    sprout_bytes = Some(value.clone());
-                } else if key.as_slice() == SAPLING_TREE_KEY {
-                    sapling_bytes = Some(value.clone());
+                match *column {
+                    Column::Meta => {
+                        if key.as_slice() == SPROUT_TREE_KEY {
+                            sprout_bytes = Some(value.clone());
+                        } else if key.as_slice() == SAPLING_TREE_KEY {
+                            sapling_bytes = Some(value.clone());
+                        }
+                    }
+                    Column::HeaderIndex => {
+                        const STATUS_OFFSET: usize = 32 + 4 + 4 + 4 + 32;
+                        if key.as_slice().len() == 32
+                            && value.len() > STATUS_OFFSET
+                            && index_has_block(value[STATUS_OFFSET])
+                        {
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(key.as_slice());
+                            let entry = decode_header_entry(value).map_err(|_| {
+                                ChainStateError::CorruptIndex("invalid header index entry in batch")
+                            })?;
+                            header_cache_updates.push((hash, entry));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         self.store.write_batch(&batch)?;
         if sprout_bytes.is_some() || sapling_bytes.is_some() {
             self.update_shielded_cache(sprout_bytes, sapling_bytes)?;
+        }
+        if !header_cache_updates.is_empty() {
+            if let Ok(mut cache) = self.header_cache.lock() {
+                for (hash, entry) in header_cache_updates {
+                    cache.insert(hash, entry);
+                }
+            }
         }
         let ops = batch.into_ops();
         if let Ok(mut meta_cache) = self.file_meta.lock() {

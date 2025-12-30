@@ -100,6 +100,7 @@ Type notes:
 - `getchaintips`
 - `getblocksubsidy [height]`
 - `getblockhashes <high> <low> [options]`
+- `verifychain [checklevel] [numblocks]`
 
 ### Transactions and UTXO
 
@@ -396,6 +397,19 @@ Notes:
 - UTXO stats are maintained incrementally in the chainstate `Meta` column under `utxo_stats_v1`.
 - Shielded value pools are maintained incrementally in the chainstate `Meta` column under `value_pools_v1`.
 - `*_zat` fields are provided for exact integer values.
+
+### verifychain
+
+Verifies the blockchain database (best-effort parity).
+
+- Params: `(checklevel numblocks)`
+  - `checklevel` (optional number, 0–4, default 3)
+  - `numblocks` (optional number, default 288, 0=all)
+- Result: boolean
+
+Notes:
+- This is currently a read-only consistency check (flatfile decode + header linkage + merkle root + txindex).
+- It does not re-apply full UTXO/script validation like the C++ daemon.
 
 ### getblockdeltas
 

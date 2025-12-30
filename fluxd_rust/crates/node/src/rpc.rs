@@ -33,7 +33,7 @@ use fluxd_consensus::{
 use fluxd_fluxnode::storage::FluxnodeRecord;
 use fluxd_pow::difficulty::compact_to_u256;
 use fluxd_primitives::block::{Block, CURRENT_VERSION, PON_VERSION};
-use fluxd_primitives::hash::hash160;
+use fluxd_primitives::hash::{hash160, sha256d};
 use fluxd_primitives::merkleblock::{MerkleBlock, PartialMerkleTree};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
@@ -141,6 +141,7 @@ const RPC_METHODS: &[&str] = &[
     "startzelnode",
     "startdeterministicfluxnode",
     "startdeterministiczelnode",
+    "verifychain",
     "addnode",
     "disconnectnode",
     "getaddednodeinfo",
@@ -1031,6 +1032,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
                 data_dir,
             )
         }
+        "verifychain" => rpc_verifychain(chainstate, params),
         "validateaddress" => rpc_validateaddress(params, chain_params),
         "verifymessage" => rpc_verifymessage(params, chain_params),
         "createmultisig" => rpc_createmultisig(params, chain_params),
@@ -2397,6 +2399,178 @@ fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(
         "total_supply": amount_to_value(total_supply),
         "total_supply_zat": total_supply,
     }))
+}
+
+fn rpc_verifychain<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
+    if params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "verifychain expects 0 to 2 parameters",
+        ));
+    }
+
+    let checklevel = if let Some(value) = params.get(0) {
+        parse_u32(value, "checklevel")?
+    } else {
+        3
+    };
+    if checklevel > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "checklevel must be 0-4",
+        ));
+    }
+
+    let numblocks = if let Some(value) = params.get(1) {
+        parse_u32(value, "numblocks")?
+    } else {
+        288
+    };
+
+    let result = verify_chain_impl(chainstate, checklevel, numblocks);
+    if let Err(reason) = result.as_ref() {
+        eprintln!("verifychain failed: {reason}");
+    }
+    Ok(Value::Bool(result.is_ok()))
+}
+
+fn verify_chain_impl<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    checklevel: u32,
+    numblocks: u32,
+) -> Result<(), String> {
+    if checklevel == 0 {
+        return Ok(());
+    }
+
+    let best = chainstate.best_block().map_err(|err| err.to_string())?;
+    let Some(best) = best else {
+        return Ok(());
+    };
+    let best_height = best.height.max(0) as u32;
+    let mut remaining = if numblocks == 0 {
+        best_height.saturating_add(1)
+    } else {
+        numblocks.min(best_height.saturating_add(1))
+    };
+
+    let mut current_hash = best.hash;
+    while remaining > 0 {
+        let entry = chainstate
+            .header_entry(&current_hash)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("missing header entry {}", hash256_to_hex(&current_hash)))?;
+        if !entry.has_block() {
+            return Err(format!(
+                "missing block data at height {}",
+                entry.height.max(0)
+            ));
+        }
+        let main_hash = chainstate
+            .height_hash(entry.height)
+            .map_err(|err| err.to_string())?;
+        if main_hash.as_ref() != Some(&current_hash) {
+            return Err(format!("height index mismatch at {}", entry.height.max(0)));
+        }
+
+        if checklevel >= 1 {
+            let block_location = chainstate
+                .block_location(&current_hash)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| format!("missing block index {}", hash256_to_hex(&current_hash)))?;
+            let bytes = chainstate
+                .read_block(block_location)
+                .map_err(|err| err.to_string())?;
+            let block = fluxd_primitives::block::Block::consensus_decode(&bytes)
+                .map_err(|err| err.to_string())?;
+            if block.header.hash() != current_hash {
+                return Err(format!(
+                    "block hash mismatch at height {}",
+                    entry.height.max(0)
+                ));
+            }
+            if block.header.prev_block != entry.prev_hash {
+                return Err(format!(
+                    "block prev-hash mismatch at height {}",
+                    entry.height.max(0)
+                ));
+            }
+
+            if checklevel >= 2 {
+                let mut txids = Vec::with_capacity(block.transactions.len());
+                for tx in &block.transactions {
+                    txids.push(tx.txid().map_err(|err| err.to_string())?);
+                }
+                let root = compute_merkle_root(&txids);
+                if root != block.header.merkle_root {
+                    return Err(format!(
+                        "merkle root mismatch at height {}",
+                        entry.height.max(0)
+                    ));
+                }
+
+                if checklevel >= 3 {
+                    for (index, txid) in txids.into_iter().enumerate() {
+                        let tx_location = chainstate
+                            .tx_location(&txid)
+                            .map_err(|err| err.to_string())?
+                            .ok_or_else(|| {
+                                format!("missing txindex entry {}", hash256_to_hex(&txid))
+                            })?;
+                        if tx_location.block != block_location {
+                            return Err(format!(
+                                "txindex block location mismatch {}",
+                                hash256_to_hex(&txid)
+                            ));
+                        }
+                        if tx_location.index != index as u32 {
+                            return Err(format!(
+                                "txindex position mismatch {}",
+                                hash256_to_hex(&txid)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        remaining = remaining.saturating_sub(1);
+        if entry.height == 0 {
+            break;
+        }
+        current_hash = entry.prev_hash;
+    }
+
+    Ok(())
+}
+
+fn compute_merkle_root(txids: &[Hash256]) -> Hash256 {
+    if txids.is_empty() {
+        return [0u8; 32];
+    }
+    let mut layer = txids.to_vec();
+    while layer.len() > 1 {
+        if layer.len() % 2 == 1 {
+            let last = *layer.last().expect("non-empty");
+            layer.push(last);
+        }
+        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        for pair in layer.chunks(2) {
+            next.push(merkle_hash_pair(&pair[0], &pair[1]));
+        }
+        layer = next;
+    }
+    layer[0]
+}
+
+fn merkle_hash_pair(left: &Hash256, right: &Hash256) -> Hash256 {
+    let mut buf = [0u8; 64];
+    buf[0..32].copy_from_slice(left);
+    buf[32..64].copy_from_slice(right);
+    sha256d(&buf)
 }
 
 fn rpc_getblockdeltas<S: fluxd_storage::KeyValueStore>(

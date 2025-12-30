@@ -152,7 +152,7 @@ fn encode_header_entry(entry: &HeaderEntry) -> Vec<u8> {
     encoder.into_inner()
 }
 
-fn decode_header_entry(bytes: &[u8]) -> Result<HeaderEntry, String> {
+pub(crate) fn decode_header_entry(bytes: &[u8]) -> Result<HeaderEntry, String> {
     let mut decoder = Decoder::new(bytes);
     let prev_hash = decoder.read_hash_le().map_err(|err| err.to_string())?;
     let height = decoder.read_i32_le().map_err(|err| err.to_string())?;
