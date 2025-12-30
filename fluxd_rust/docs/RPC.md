@@ -128,6 +128,7 @@ Type notes:
 
 ### Fluxnode
 
+- `createfluxnodekey` / `createzelnodekey`
 - `getfluxnodecount`
 - `listfluxnodes`
 - `viewdeterministicfluxnodelist [filter]`
@@ -561,6 +562,15 @@ Requests disconnect of an active peer connection.
 
 - Params: `<node>`
 - Result: `null`
+
+### createfluxnodekey / createzelnodekey
+
+Generates a new fluxnode private key (WIF), matching the C++ daemon.
+
+- Params: none
+- Result: WIF-encoded secp256k1 private key string (uncompressed)
+- Notes:
+  - Use this value as the `privkey` field in `fluxnode.conf`.
 
 ### getfluxnodecount
 

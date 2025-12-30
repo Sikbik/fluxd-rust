@@ -37,11 +37,13 @@ use fluxd_primitives::hash::hash160;
 use fluxd_primitives::merkleblock::{MerkleBlock, PartialMerkleTree};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{Transaction, TxIn, TxOut, SAPLING_VERSION_GROUP_ID};
-use fluxd_primitives::{address_to_script_pubkey, script_pubkey_to_address, AddressError};
+use fluxd_primitives::{
+    address_to_script_pubkey, script_pubkey_to_address, secret_key_to_wif, AddressError,
+};
 use fluxd_script::message::recover_signed_message_pubkey;
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
-use secp256k1::PublicKey;
+use secp256k1::{PublicKey, SecretKey};
 
 use crate::fee_estimator::FeeEstimator;
 use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind, MempoolPolicy};
@@ -123,6 +125,8 @@ const RPC_METHODS: &[&str] = &[
     "getfluxnodestatus",
     "getdoslist",
     "getstartlist",
+    "createfluxnodekey",
+    "createzelnodekey",
     "addnode",
     "disconnectnode",
     "getaddednodeinfo",
@@ -980,6 +984,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getfluxnodestatus" => rpc_getfluxnodestatus(chainstate, params, chain_params, data_dir),
         "getdoslist" => rpc_getdoslist(chainstate, params, chain_params),
         "getstartlist" => rpc_getstartlist(chainstate, params, chain_params),
+        "createfluxnodekey" | "createzelnodekey" => rpc_createfluxnodekey(params, chain_params),
         "validateaddress" => rpc_validateaddress(params, chain_params),
         "verifymessage" => rpc_verifymessage(params, chain_params),
         "createmultisig" => rpc_createmultisig(params, chain_params),
@@ -2281,6 +2286,28 @@ fn rpc_verifytxoutproof<S: fluxd_storage::KeyValueStore>(
         out.push(Value::String(hash256_to_hex(&txid)));
     }
     Ok(Value::Array(out))
+}
+
+fn rpc_createfluxnodekey(
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+
+    let mut rng = rand::rngs::OsRng;
+    let mut seed = [0u8; 32];
+    for _ in 0..100 {
+        rng.fill_bytes(&mut seed);
+        if let Ok(secret) = SecretKey::from_slice(&seed) {
+            let wif = secret_key_to_wif(&secret.secret_bytes(), chain_params.network, false);
+            return Ok(Value::String(wif));
+        }
+    }
+
+    Err(RpcError::new(
+        RPC_INTERNAL_ERROR,
+        "failed to generate secret key",
+    ))
 }
 
 fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(

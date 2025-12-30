@@ -99,7 +99,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - reindex - Missing
 - stop - Implemented
-- createfluxnodekey - Missing
+- createfluxnodekey - Implemented (alias: createzelnodekey)
+- createzelnodekey - Implemented (alias of createfluxnodekey)
 - listfluxnodeconf - Missing
 - getfluxnodeoutputs - Missing
 - startfluxnode - Missing

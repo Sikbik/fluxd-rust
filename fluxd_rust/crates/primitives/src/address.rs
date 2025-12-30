@@ -53,6 +53,20 @@ pub fn script_pubkey_to_address(script: &[u8], network: Network) -> Option<Strin
     None
 }
 
+pub fn secret_key_to_wif(secret: &[u8; 32], network: Network, compressed: bool) -> String {
+    let prefix = match network {
+        Network::Mainnet => 0x80,
+        Network::Testnet | Network::Regtest => 0xEF,
+    };
+    let mut payload = Vec::with_capacity(1 + secret.len() + usize::from(compressed));
+    payload.push(prefix);
+    payload.extend_from_slice(secret);
+    if compressed {
+        payload.push(0x01);
+    }
+    base58check_encode(&payload)
+}
+
 fn network_prefixes(network: Network) -> (&'static [u8], &'static [u8]) {
     match network {
         Network::Mainnet => (&[0x1C, 0xB8], &[0x1C, 0xBD]),
