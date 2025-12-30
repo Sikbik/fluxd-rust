@@ -139,7 +139,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `feefilter` and fee-based relay policies (owner: TBD)
   - [x] `reject`/`notfound` handling parity (owner: TBD)
   - [x] Ignore unsolicited `block` messages during getdata download (prevents sync stalls) (owner: TBD)
-- [ ] [P2] Service flags and user agent compatibility (owner: TBD)
+- [x] [P2] Service flags and user agent compatibility (owner: TBD)
 
 ## Mempool and mining
 

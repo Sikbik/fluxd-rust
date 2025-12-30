@@ -21,6 +21,7 @@ pub const MSG_TX: u32 = 1;
 pub const MSG_BLOCK: u32 = 2;
 const SEND_TIMEOUT_SECS: u64 = 10;
 const HANDSHAKE_READ_TIMEOUT_SECS: u64 = 30;
+const USER_AGENT: &str = concat!("/fluxd-rust:", env!("CARGO_PKG_VERSION"), "/");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerKind {
@@ -34,6 +35,7 @@ pub struct PeerInfoSnapshot {
     pub addr: SocketAddr,
     pub kind: PeerKind,
     pub version: i32,
+    pub services: u64,
     pub user_agent: String,
     pub start_height: i32,
     pub connected_since: SystemTime,
@@ -48,6 +50,7 @@ struct PeerEntry {
     addr: SocketAddr,
     kind: PeerKind,
     version: i32,
+    services: u64,
     user_agent: String,
     start_height: i32,
     connected_since: SystemTime,
@@ -83,6 +86,7 @@ impl PeerRegistry {
             addr,
             kind,
             version: 0,
+            services: 0,
             user_agent: String::new(),
             start_height: -1,
             connected_since: now,
@@ -100,12 +104,14 @@ impl PeerRegistry {
         &self,
         addr: SocketAddr,
         version: i32,
+        services: u64,
         user_agent: String,
         start_height: i32,
     ) {
         if let Ok(mut peers) = self.peers.lock() {
             if let Some(entry) = peers.get_mut(&addr) {
                 entry.version = version;
+                entry.services = services;
                 entry.user_agent = user_agent;
                 entry.start_height = start_height;
             }
@@ -154,6 +160,7 @@ impl PeerRegistry {
                 addr: entry.addr,
                 kind: entry.kind,
                 version: entry.version,
+                services: entry.services,
                 user_agent: entry.user_agent,
                 start_height: entry.start_height,
                 connected_since: entry.connected_since,
@@ -215,6 +222,7 @@ pub struct Peer {
     magic: [u8; 4],
     remote_height: i32,
     remote_version: i32,
+    remote_services: u64,
     remote_user_agent: String,
     kind: PeerKind,
     addr: SocketAddr,
@@ -240,6 +248,7 @@ impl Peer {
             magic,
             remote_height: -1,
             remote_version: 0,
+            remote_services: 0,
             remote_user_agent: String::new(),
             kind,
             addr,
@@ -330,10 +339,12 @@ impl Peer {
                     if let Ok(info) = parse_version(&payload) {
                         self.remote_height = info.start_height;
                         self.remote_version = info.version;
+                        self.remote_services = info.services;
                         self.remote_user_agent = info.user_agent;
                         self.registry.update_version(
                             self.addr,
                             self.remote_version,
+                            self.remote_services,
                             self.remote_user_agent.clone(),
                             self.remote_height,
                         );
@@ -556,7 +567,7 @@ fn build_version_payload(start_height: i32, relay: bool) -> Vec<u8> {
     write_net_addr(&mut encoder, NODE_NETWORK, [0u8; 16], 0);
     write_net_addr(&mut encoder, NODE_NETWORK, [0u8; 16], 0);
     encoder.write_u64_le(rand::random());
-    encoder.write_var_str("/fluxd-rust:0.1.0/");
+    encoder.write_var_str(USER_AGENT);
     encoder.write_i32_le(start_height);
     encoder.write_u8(relay as u8);
     encoder.into_inner()
@@ -598,6 +609,7 @@ fn write_net_addr(encoder: &mut Encoder, services: u64, ip: [u8; 16], port: u16)
 
 struct VersionInfo {
     version: i32,
+    services: u64,
     user_agent: String,
     start_height: i32,
 }
@@ -605,7 +617,7 @@ struct VersionInfo {
 fn parse_version(payload: &[u8]) -> Result<VersionInfo, String> {
     let mut decoder = Decoder::new(payload);
     let version = decoder.read_i32_le().map_err(|err| err.to_string())?;
-    let _services = decoder.read_u64_le().map_err(|err| err.to_string())?;
+    let services = decoder.read_u64_le().map_err(|err| err.to_string())?;
     let _timestamp = decoder.read_i64_le().map_err(|err| err.to_string())?;
     read_net_addr(&mut decoder)?;
     read_net_addr(&mut decoder)?;
@@ -614,6 +626,7 @@ fn parse_version(payload: &[u8]) -> Result<VersionInfo, String> {
     let start_height = decoder.read_i32_le().map_err(|err| err.to_string())?;
     Ok(VersionInfo {
         version,
+        services,
         user_agent,
         start_height,
     })

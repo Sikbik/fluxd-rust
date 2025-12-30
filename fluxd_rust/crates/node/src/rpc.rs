@@ -5499,6 +5499,8 @@ fn rpc_getnetworkinfo(
     mempool_policy: &MempoolPolicy,
 ) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
+    let local_services: u64 = 1;
+    let local_services_hex = format!("{:016x}", local_services);
     let snapshot = net_totals.snapshot();
     let connections = snapshot.connections.max(peer_registry.count());
     let networks = json!([
@@ -5510,7 +5512,8 @@ fn rpc_getnetworkinfo(
         "version": node_version(),
         "subversion": format!("/fluxd-rust:{}/", env!("CARGO_PKG_VERSION")),
         "protocolversion": PROTOCOL_VERSION,
-        "localservices": "0000000000000000",
+        "localservices": local_services_hex,
+        "localservicesnames": service_flag_names(local_services),
         "timeoffset": 0,
         "connections": connections,
         "networks": networks,
@@ -5550,10 +5553,14 @@ fn rpc_getpeerinfo(params: Vec<Value>, peer_registry: &PeerRegistry) -> Result<V
     let peers = peer_registry.snapshot();
     let mut out = Vec::with_capacity(peers.len());
     for peer in peers {
+        let services_hex = format!("{:016x}", peer.services);
+        let services_names = service_flag_names(peer.services);
         out.push(json!({
             "addr": peer.addr.to_string(),
             "subver": peer.user_agent,
             "version": peer.version,
+            "services": services_hex,
+            "servicesnames": services_names,
             "startingheight": peer.start_height,
             "conntime": system_time_to_unix(peer.connected_since),
             "lastsend": system_time_to_unix(peer.last_send),
@@ -5565,6 +5572,40 @@ fn rpc_getpeerinfo(params: Vec<Value>, peer_registry: &PeerRegistry) -> Result<V
         }));
     }
     Ok(Value::Array(out))
+}
+
+fn service_flag_names(services: u64) -> Vec<&'static str> {
+    const NODE_NETWORK: u64 = 1;
+    const NODE_GETUTXO: u64 = 1 << 1;
+    const NODE_BLOOM: u64 = 1 << 2;
+    const NODE_WITNESS: u64 = 1 << 3;
+    const NODE_COMPACT_FILTERS: u64 = 1 << 6;
+    const NODE_NETWORK_LIMITED: u64 = 1 << 10;
+    const NODE_P2P_V2: u64 = 1 << 11;
+
+    let mut out = Vec::new();
+    if services & NODE_NETWORK != 0 {
+        out.push("NETWORK");
+    }
+    if services & NODE_GETUTXO != 0 {
+        out.push("GETUTXO");
+    }
+    if services & NODE_BLOOM != 0 {
+        out.push("BLOOM");
+    }
+    if services & NODE_WITNESS != 0 {
+        out.push("WITNESS");
+    }
+    if services & NODE_COMPACT_FILTERS != 0 {
+        out.push("COMPACT_FILTERS");
+    }
+    if services & NODE_NETWORK_LIMITED != 0 {
+        out.push("NETWORK_LIMITED");
+    }
+    if services & NODE_P2P_V2 != 0 {
+        out.push("P2P_V2");
+    }
+    out
 }
 
 fn rpc_listbanned(

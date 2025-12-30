@@ -545,11 +545,11 @@ version, connection count, and network reachability.
 ### getpeerinfo
 
 Returns per-peer details:
-- `addr`, `subver`, `version`, `startingheight`
+- `addr`, `subver`, `version`, `services`, `servicesnames`, `startingheight`
 - `conntime`, `lastsend`, `lastrecv`
 - `bytessent`, `bytesrecv`
 - `inbound` (currently always false)
-- `kind` ("block" or "header")
+- `kind` ("block", "header", or "relay")
 
 ### listbanned
 
