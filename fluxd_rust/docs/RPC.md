@@ -121,8 +121,9 @@ Type notes:
 - `listfluxnodes`
 - `viewdeterministicfluxnodelist [filter]`
 - `fluxnodecurrentwinner`
-- `getfluxnodestatus` (not implemented)
-- `getdoslist` (not implemented)
+- `getfluxnodestatus [alias|txid:vout]` (partial; uses `--data-dir/fluxnode.conf` when called with no params)
+- `getdoslist`
+- `getstartlist`
 
 ### Indexer endpoints (insight-style)
 
@@ -443,3 +444,38 @@ and may be empty.
 
 Returns a per-tier winner selection derived from indexed fluxnode records.
 This logic is a best-effort placeholder and will evolve toward C++ parity.
+
+### getstartlist
+
+Returns unconfirmed fluxnode start entries that have not yet expired.
+
+Fields:
+- `collateral` (`txid:vout`)
+- `added_height`
+- `payment_address`
+- `expires_in` (blocks remaining before it expires)
+- `amount` (collateral amount, FLUX)
+
+### getdoslist
+
+Returns unconfirmed fluxnode start entries that have expired, but are still in the DoS cooldown.
+
+Fields:
+- `collateral` (`txid:vout`)
+- `added_height`
+- `payment_address`
+- `eligible_in` (blocks remaining until it can be started again)
+- `amount` (collateral amount, FLUX)
+
+### getfluxnodestatus
+
+Partial parity implementation.
+
+- Params:
+  - no params: attempts to read the first entry in `fluxnode.conf` under `--data-dir`
+  - one param: either an alias from `fluxnode.conf` or an explicit `txid:vout`
+- Result:
+  - object with collateral fields, tier, payment address, and time/height metadata
+  - `ip` / `network` are currently empty (not yet stored in the DB)
+
+`fluxnode.conf` parsing uses the standard C++ layout: `<alias> <ip:port> <privkey> <txid> <vout>`.

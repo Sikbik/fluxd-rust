@@ -163,7 +163,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P0] Automated consensus vector tests vs C++ (embedded sighash vectors) (owner: TBD)
 - [ ] [P1] RPC golden tests against C++ behavior (owner: TBD)
 - [ ] [P1] Long-run sync tests with regression gates (owner: TBD)
-- [ ] [P1] Reorg and fork simulation tests (owner: TBD)
+- [x] [P1] Reorg and fork simulation tests (owner: TBD)
 - [ ] [P2] Snapshot/fast-sync evaluation (optional) (owner: TBD)
 - [ ] [P2] Performance profiling harness (owner: TBD)
 
@@ -205,7 +205,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getfluxnodecount`<br>`listfluxnodes`<br>`viewdeterministicfluxnodelist` | `fluxnodecurrentwinner` | `getfluxnodestatus`<br>`getdoslist`<br>`getstartlist`<br>`createfluxnodekey`<br>`listfluxnodeconf`<br>`getfluxnodeoutputs`<br>`startfluxnode`<br>`startdeterministicfluxnode` |
+| `getfluxnodecount`<br>`listfluxnodes`<br>`viewdeterministicfluxnodelist`<br>`getdoslist`<br>`getstartlist` | `fluxnodecurrentwinner`<br>`getfluxnodestatus` | `createfluxnodekey`<br>`listfluxnodeconf`<br>`getfluxnodeoutputs`<br>`startfluxnode`<br>`startdeterministicfluxnode` |
 
 ### Address and insight-style indexes
 

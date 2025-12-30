@@ -11,12 +11,12 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - help - Implemented
 - getinfo - Implemented
-- getfluxnodestatus - Stub
+- getfluxnodestatus - Partial (looks up a collateral outpoint; local fluxnode config parsing is basic; IP fields not yet stored)
 - listfluxnodes - Implemented (via deterministic list)
 - viewdeterministicfluxnodelist - Implemented
 - getfluxnodecount - Implemented
-- getdoslist - Stub
-- getstartlist - Missing
+- getdoslist - Implemented
+- getstartlist - Implemented
 - fluxnodecurrentwinner - Partial (best-effort selection)
 
 ## Chain and block
