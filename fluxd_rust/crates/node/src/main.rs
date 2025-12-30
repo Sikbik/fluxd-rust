@@ -39,6 +39,7 @@ use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
 use fluxd_primitives::encoding::{Decoder, Encoder};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{Transaction, TxIn, TxOut};
+use fluxd_primitives::{address_to_script_pubkey, AddressError};
 use fluxd_shielded::{
     default_params_dir, fetch_params, load_params, verify_transaction, ShieldedParams,
 };
@@ -169,6 +170,7 @@ struct Config {
     network: Network,
     params_dir: PathBuf,
     fetch_params: bool,
+    miner_address: Option<String>,
     scan_flatfiles: bool,
     scan_supply: bool,
     scan_fluxnodes: bool,
@@ -898,6 +900,7 @@ async fn run() -> Result<(), String> {
         let mempool_metrics = Arc::clone(&mempool_metrics);
         let fee_estimator = Arc::clone(&fee_estimator);
         let mempool_flags = flags.clone();
+        let miner_address = config.miner_address.clone();
         let params = params.as_ref().clone();
         let data_dir = data_dir.clone();
         let net_totals = Arc::clone(&net_totals);
@@ -923,6 +926,7 @@ async fn run() -> Result<(), String> {
                     mempool_metrics,
                     fee_estimator,
                     mempool_flags,
+                    miner_address,
                     params,
                     data_dir,
                     net_totals,
@@ -5983,6 +5987,8 @@ fn parse_args() -> Result<Config, String> {
     let mut inflight_per_peer: usize = DEFAULT_INFLIGHT_PER_PEER;
     let mut require_standard: Option<bool> = None;
     let mut min_relay_fee_per_kb: i64 = 100;
+    let mut miner_address: Option<String> = None;
+    let mut miner_address_set = false;
     let mut mempool_max_mb: u64 = DEFAULT_MEMPOOL_MAX_MB;
     let mut mempool_persist_interval_secs: u64 = DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS;
     let mut fee_estimates_persist_interval_secs: u64 = DEFAULT_FEE_ESTIMATES_PERSIST_INTERVAL_SECS;
@@ -6098,6 +6104,13 @@ fn parse_args() -> Result<Config, String> {
             }
             "--skip-script" => {
                 check_script = false;
+            }
+            "--miner-address" | "--mineraddress" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --miner-address\n{}", usage()))?;
+                miner_address = Some(value);
+                miner_address_set = true;
             }
             "--rpc-addr" => {
                 let value = args
@@ -6448,6 +6461,14 @@ fn parse_args() -> Result<Config, String> {
             }
         }
 
+        if !miner_address_set {
+            if let Some(values) = conf.get("mineraddress") {
+                if let Some(value) = values.last() {
+                    miner_address = Some(value.clone());
+                }
+            }
+        }
+
         if let Some(values) = conf.get("addnode") {
             let mut seen = HashSet::new();
             for raw in values {
@@ -6465,6 +6486,16 @@ fn parse_args() -> Result<Config, String> {
             "rpcuser and rpcpassword must both be set (via CLI or flux.conf)\n{}",
             usage()
         ));
+    }
+
+    if let Some(address) = miner_address.as_deref() {
+        address_to_script_pubkey(address, network).map_err(|err| {
+            let message = match err {
+                AddressError::UnknownPrefix => "miner address has invalid prefix",
+                _ => "invalid miner address",
+            };
+            format!("{message} '{address}'\n{}", usage())
+        })?;
     }
 
     let require_standard = require_standard.unwrap_or(network != Network::Regtest);
@@ -6525,6 +6556,7 @@ fn parse_args() -> Result<Config, String> {
         network,
         params_dir: params_dir.unwrap_or_else(default_params_dir),
         fetch_params,
+        miner_address,
         scan_flatfiles,
         scan_supply,
         scan_fluxnodes,
@@ -6784,7 +6816,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -6800,6 +6832,7 @@ fn usage() -> String {
         "  --debug-fluxnode-payee-candidates  Print ordered deterministic payee candidates for a tier+height, then exit",
         "  --skip-script  Disable script validation (testing only)",
         "  --network   Network selection (default: mainnet)",
+        "  --miner-address  Default miner address for getblocktemplate when wallet is not available",
         "  --rpc-addr  Bind JSON-RPC server (default: 127.0.0.1:16124 mainnet, 26124 testnet)",
         "  --rpc-user  JSON-RPC basic auth username (required unless cookie exists)",
         "  --rpc-pass  JSON-RPC basic auth password (required unless cookie exists)",

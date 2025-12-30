@@ -178,6 +178,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     mempool_metrics: Arc<MempoolMetrics>,
     fee_estimator: Arc<Mutex<FeeEstimator>>,
     mempool_flags: ValidationFlags,
+    miner_address: Option<String>,
     params: ChainParams,
     data_dir: PathBuf,
     net_totals: Arc<NetTotals>,
@@ -207,6 +208,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let mempool_metrics = Arc::clone(&mempool_metrics);
         let fee_estimator = Arc::clone(&fee_estimator);
         let mempool_flags = mempool_flags.clone();
+        let miner_address = miner_address.clone();
         let params = params.clone();
         let data_dir = data_dir.clone();
         let net_totals = Arc::clone(&net_totals);
@@ -227,6 +229,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 mempool_metrics,
                 fee_estimator,
                 mempool_flags,
+                miner_address,
                 params,
                 data_dir,
                 net_totals,
@@ -256,6 +259,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     mempool_metrics: Arc<MempoolMetrics>,
     fee_estimator: Arc<Mutex<FeeEstimator>>,
     mempool_flags: ValidationFlags,
+    miner_address: Option<String>,
     chain_params: ChainParams,
     data_dir: PathBuf,
     net_totals: Arc<NetTotals>,
@@ -355,6 +359,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
                             fee_estimator.as_ref(),
                             &mempool_flags,
                             &chain_params,
+                            miner_address.as_deref(),
                             &data_dir,
                             &net_totals,
                             &peer_registry,
@@ -382,6 +387,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
                 fee_estimator.as_ref(),
                 &mempool_flags,
                 &chain_params,
+                miner_address.as_deref(),
                 &data_dir,
                 &net_totals,
                 &peer_registry,
@@ -414,6 +420,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         fee_estimator.as_ref(),
         &mempool_flags,
         &chain_params,
+        miner_address.as_deref(),
         &data_dir,
         &net_totals,
         &peer_registry,
@@ -444,6 +451,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         fee_estimator.as_ref(),
         &mempool_flags,
         &chain_params,
+        miner_address.as_deref(),
         &data_dir,
         &net_totals,
         &peer_registry,
@@ -523,6 +531,7 @@ async fn handle_json_rpc_getblocktemplate_longpoll<S: fluxd_storage::KeyValueSto
     fee_estimator: &Mutex<FeeEstimator>,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
+    miner_address: Option<&str>,
     data_dir: &Path,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
@@ -591,6 +600,7 @@ async fn handle_json_rpc_getblocktemplate_longpoll<S: fluxd_storage::KeyValueSto
         fee_estimator,
         mempool_flags,
         chain_params,
+        miner_address,
         data_dir,
         net_totals,
         peer_registry,
@@ -618,6 +628,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     fee_estimator: &Mutex<FeeEstimator>,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
+    miner_address: Option<&str>,
     data_dir: &Path,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
@@ -645,6 +656,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
         fee_estimator,
         mempool_flags,
         chain_params,
+        miner_address,
         data_dir,
         net_totals,
         peer_registry,
@@ -666,6 +678,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     fee_estimator: &Mutex<FeeEstimator>,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
+    miner_address: Option<&str>,
     data_dir: &Path,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
@@ -718,6 +731,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         fee_estimator,
         mempool_flags,
         chain_params,
+        miner_address,
         data_dir,
         net_totals,
         peer_registry,
@@ -868,6 +882,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     fee_estimator: &Mutex<FeeEstimator>,
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
+    miner_address: Option<&str>,
     data_dir: &Path,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
@@ -930,9 +945,14 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getaddresstxids" => rpc_getaddresstxids(chainstate, params, chain_params),
         "getaddressmempool" => rpc_getaddressmempool(chainstate, mempool, params, chain_params),
         "getmininginfo" => rpc_getmininginfo(chainstate, mempool, params, chain_params),
-        "getblocktemplate" => {
-            rpc_getblocktemplate(chainstate, mempool, params, chain_params, mempool_flags)
-        }
+        "getblocktemplate" => rpc_getblocktemplate(
+            chainstate,
+            mempool,
+            params,
+            chain_params,
+            mempool_flags,
+            miner_address,
+        ),
         "submitblock" => {
             rpc_submitblock(chainstate, write_lock, params, chain_params, mempool_flags)
         }
@@ -2868,6 +2888,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chain_params: &ChainParams,
     flags: &ValidationFlags,
+    default_miner_address: Option<&str>,
 ) -> Result<Value, RpcError> {
     if params.len() > 1 {
         return Err(RpcError::new(
@@ -2976,16 +2997,16 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
             obj.get("mineraddress")
                 .or_else(|| obj.get("address"))
                 .and_then(|val| val.as_str())
-                .map(|val| val.to_string())
         })
+        .or(default_miner_address)
         .ok_or_else(|| {
             RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "missing mineraddress (wallet support not implemented)",
+                RPC_METHOD_NOT_FOUND,
+                "wallet support not implemented and mineraddress not set",
             )
         })?;
 
-    let miner_script_pubkey = address_to_script_pubkey(&miner_address, chain_params.network)
+    let miner_script_pubkey = address_to_script_pubkey(miner_address, chain_params.network)
         .map_err(|err| match err {
             AddressError::UnknownPrefix => RpcError::new(
                 RPC_INVALID_ADDRESS_OR_KEY,

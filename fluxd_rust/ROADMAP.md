@@ -148,7 +148,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Template field parity (BIP22-ish keys + Flux deterministic payout fields)
   - [x] Longpoll wait behavior (honor request `longpollid`) (owner: TBD)
   - [x] Proposal mode support (`{"mode":"proposal","data":"..."}`) (owner: TBD)
-  - [ ] Miner address configuration parity (flux.conf / wallet integration) (owner: TBD)
+  - [x] Miner address config (`--miner-address` / `flux.conf` `mineraddress=`) (owner: TBD)
+  - [ ] Wallet-backed miner script (coinbase script from wallet) (owner: TBD)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
 
 ## Wallet
@@ -163,7 +164,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 - [ ] [P2] Sync/run profiles (`--profile low|default|high`) for worker + DB presets (owner: TBD)
 - [ ] [P2] Config file support (`flux.conf` parity) (owner: TBD)
-  - [x] Basic `flux.conf` parsing (`rpcuser`, `rpcpassword`, `rpcbind`, `rpcport`, `addnode`)
+  - [x] Basic `flux.conf` parsing (`rpcuser`, `rpcpassword`, `rpcbind`, `rpcport`, `addnode`, `mineraddress`)
   - [ ] Remaining `flux.conf` keys parity
 - [ ] [P2] Structured CLI help output and subcommands (owner: TBD)
 - [ ] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)

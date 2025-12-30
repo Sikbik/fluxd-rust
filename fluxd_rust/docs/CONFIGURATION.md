@@ -34,6 +34,7 @@ Currently supported keys:
 - `rpcuser`, `rpcpassword`
 - `rpcbind`, `rpcport`
 - `addnode` (repeatable)
+- `mineraddress` (default coinbase/miner address for `getblocktemplate`)
 
 ### Fjall tuning
 
@@ -147,6 +148,13 @@ block connect/DB work.
 - `--rpc-user USER` and `--rpc-pass PASS` - explicit RPC credentials.
 
 If you do not specify user/pass, the daemon writes `rpc.cookie` into `--data-dir`.
+
+## Mining
+
+- `--miner-address TADDR`
+  - Default miner address used by `getblocktemplate` when the request does not include
+    `mineraddress` / `address`.
+  - Equivalent `flux.conf` key: `mineraddress=t1...` (CLI overrides config file).
 
 ## Dashboard
 
