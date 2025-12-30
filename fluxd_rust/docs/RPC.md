@@ -140,8 +140,8 @@ Type notes:
 - `getaddressdeltas`
 - `getaddresstxids`
 - `getaddressmempool`
-- `gettxoutproof` (not implemented)
-- `verifytxoutproof` (not implemented)
+- `gettxoutproof ["txid", ...] (blockhash)`
+- `verifytxoutproof <proof>`
 
 ## Method details
 

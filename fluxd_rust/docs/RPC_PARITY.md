@@ -36,9 +36,9 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getmempoolinfo - Implemented
 - getrawmempool - Implemented
 - gettxout - Implemented
-- gettxoutproof - Stub
+- gettxoutproof - Implemented
 - gettxoutsetinfo - Partial
-- verifytxoutproof - Stub
+- verifytxoutproof - Implemented
 - getspentinfo - Implemented
 
 ## Mining

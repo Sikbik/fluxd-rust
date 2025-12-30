@@ -34,6 +34,7 @@ use fluxd_fluxnode::storage::FluxnodeRecord;
 use fluxd_pow::difficulty::compact_to_u256;
 use fluxd_primitives::block::{Block, CURRENT_VERSION, PON_VERSION};
 use fluxd_primitives::hash::hash160;
+use fluxd_primitives::merkleblock::{MerkleBlock, PartialMerkleTree};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{Transaction, TxIn, TxOut, SAPLING_VERSION_GROUP_ID};
 use fluxd_primitives::{address_to_script_pubkey, script_pubkey_to_address, AddressError};
@@ -651,8 +652,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getmempoolinfo" => rpc_getmempoolinfo(params, mempool),
         "getrawmempool" => rpc_getrawmempool(params, mempool),
         "gettxout" => rpc_gettxout(chainstate, mempool, params, chain_params),
-        "gettxoutproof" => rpc_gettxoutproof(params),
-        "verifytxoutproof" => rpc_verifytxoutproof(params),
+        "gettxoutproof" => rpc_gettxoutproof(chainstate, params),
+        "verifytxoutproof" => rpc_verifytxoutproof(chainstate, params),
         "gettxoutsetinfo" => rpc_gettxoutsetinfo(chainstate, params, data_dir),
         "getblockdeltas" => rpc_getblockdeltas(chainstate, params, chain_params),
         "getspentinfo" => rpc_getspentinfo(chainstate, params),
@@ -1842,20 +1843,146 @@ fn rpc_gettxout<S: fluxd_storage::KeyValueStore>(
     }))
 }
 
-fn rpc_gettxoutproof(params: Vec<Value>) -> Result<Value, RpcError> {
-    let _ = params;
-    Err(RpcError::new(
-        RPC_INTERNAL_ERROR,
-        "gettxoutproof is not implemented",
-    ))
+fn rpc_gettxoutproof<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "gettxoutproof expects 1 or 2 parameters",
+        ));
+    }
+
+    let txids_value = params[0]
+        .as_array()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "txids must be an array"))?;
+    if txids_value.is_empty() {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "txids must be a non-empty array",
+        ));
+    }
+
+    let mut set_txids = HashSet::with_capacity(txids_value.len());
+    let mut one_txid = None;
+    for value in txids_value {
+        let text = value
+            .as_str()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "txid must be a string"))?;
+        if text.len() != 64 {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                format!("Invalid txid {text}"),
+            ));
+        }
+        let txid = hash256_from_hex(text)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, format!("Invalid txid {text}")))?;
+        if !set_txids.insert(txid) {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                format!("Invalid parameter, duplicated txid: {text}"),
+            ));
+        }
+        one_txid = Some(txid);
+    }
+    let one_txid = one_txid.expect("non-empty txids array");
+
+    let location = if params.len() > 1 {
+        let block_hash = parse_hash(&params[1])?;
+        chainstate
+            .block_location(&block_hash)
+            .map_err(map_internal)?
+            .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Block not found"))?
+    } else {
+        let tx_location = chainstate
+            .tx_location(&one_txid)
+            .map_err(map_internal)?
+            .ok_or_else(|| {
+                RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not yet in block")
+            })?;
+        tx_location.block
+    };
+
+    let bytes = chainstate.read_block(location).map_err(map_internal)?;
+    let block = Block::consensus_decode(&bytes).map_err(map_internal)?;
+
+    let mut txids = Vec::with_capacity(block.transactions.len());
+    let mut matches = Vec::with_capacity(block.transactions.len());
+    let mut found = 0usize;
+    for tx in &block.transactions {
+        let txid = tx.txid().map_err(map_internal)?;
+        let matched = set_txids.contains(&txid);
+        if matched {
+            found = found.saturating_add(1);
+        }
+        txids.push(txid);
+        matches.push(matched);
+    }
+
+    if found != set_txids.len() {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "(Not all) transactions not found in specified block",
+        ));
+    }
+
+    let tree = PartialMerkleTree::from_txids(&txids, &matches).map_err(map_internal)?;
+    let proof = MerkleBlock {
+        header: block.header,
+        txn: tree,
+    };
+    Ok(Value::String(hex_bytes(&proof.consensus_encode())))
 }
 
-fn rpc_verifytxoutproof(params: Vec<Value>) -> Result<Value, RpcError> {
-    let _ = params;
-    Err(RpcError::new(
-        RPC_INTERNAL_ERROR,
-        "verifytxoutproof is not implemented",
-    ))
+fn rpc_verifytxoutproof<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "verifytxoutproof expects 1 parameter",
+        ));
+    }
+
+    let hex = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "proof must be a string"))?;
+    let bytes = bytes_from_hex(hex)
+        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "Merkle block decode failed"))?;
+    let merkle_block = MerkleBlock::consensus_decode(&bytes)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "Merkle block decode failed"))?;
+
+    let (root, matches) = match merkle_block.txn.extract_matches() {
+        Some(value) => value,
+        None => return Ok(Value::Array(Vec::new())),
+    };
+    if root != merkle_block.header.merkle_root {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let block_hash = merkle_block.header.hash();
+    let entry = chainstate
+        .header_entry(&block_hash)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain"))?;
+    let best_at_height = chainstate
+        .height_hash(entry.height)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain"))?;
+    if best_at_height != block_hash {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Block not found in chain",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(matches.len());
+    for txid in matches {
+        out.push(Value::String(hash256_to_hex(&txid)));
+    }
+    Ok(Value::Array(out))
 }
 
 fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(
