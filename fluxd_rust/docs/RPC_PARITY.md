@@ -101,7 +101,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - stop - Implemented
 - createfluxnodekey - Implemented (alias: createzelnodekey)
 - createzelnodekey - Implemented (alias of createfluxnodekey)
-- listfluxnodeconf - Missing
+- listfluxnodeconf - Implemented (alias: listzelnodeconf)
+- listzelnodeconf - Implemented (alias of listfluxnodeconf)
 - getfluxnodeoutputs - Missing
 - startfluxnode - Missing
 - startdeterministicfluxnode - Missing

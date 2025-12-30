@@ -129,6 +129,7 @@ Type notes:
 ### Fluxnode
 
 - `createfluxnodekey` / `createzelnodekey`
+- `listfluxnodeconf [filter]` / `listzelnodeconf [filter]`
 - `getfluxnodecount`
 - `listfluxnodes`
 - `viewdeterministicfluxnodelist [filter]`
@@ -571,6 +572,14 @@ Generates a new fluxnode private key (WIF), matching the C++ daemon.
 - Result: WIF-encoded secp256k1 private key string (uncompressed)
 - Notes:
   - Use this value as the `privkey` field in `fluxnode.conf`.
+
+### listfluxnodeconf / listzelnodeconf
+
+Returns `fluxnode.conf` entries in a JSON array, augmented with best-effort on-chain fluxnode index data.
+
+- Params: optional `filter` string (case-insensitive substring match on alias/address/txhash/status)
+- Notes:
+  - Fields follow the C++ daemon shape (`alias`, `status`, `privateKey`, `address`, etc.).
 
 ### getfluxnodecount
 

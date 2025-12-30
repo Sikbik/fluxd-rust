@@ -127,6 +127,8 @@ const RPC_METHODS: &[&str] = &[
     "getstartlist",
     "createfluxnodekey",
     "createzelnodekey",
+    "listfluxnodeconf",
+    "listzelnodeconf",
     "addnode",
     "disconnectnode",
     "getaddednodeinfo",
@@ -985,6 +987,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getdoslist" => rpc_getdoslist(chainstate, params, chain_params),
         "getstartlist" => rpc_getstartlist(chainstate, params, chain_params),
         "createfluxnodekey" | "createzelnodekey" => rpc_createfluxnodekey(params, chain_params),
+        "listfluxnodeconf" | "listzelnodeconf" => {
+            rpc_listfluxnodeconf(chainstate, params, chain_params, data_dir)
+        }
         "validateaddress" => rpc_validateaddress(params, chain_params),
         "verifymessage" => rpc_verifymessage(params, chain_params),
         "createmultisig" => rpc_createmultisig(params, chain_params),
@@ -3857,6 +3862,170 @@ fn rpc_fluxnodecurrentwinner<S: fluxd_storage::KeyValueStore>(
     Ok(Value::Object(result))
 }
 
+fn rpc_listfluxnodeconf<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    data_dir: &Path,
+) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "listfluxnodeconf expects 0 or 1 parameter",
+        ));
+    }
+    let filter = params
+        .get(0)
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let conf_entries = read_fluxnode_conf(data_dir)?;
+    if conf_entries.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let best_height = best_block_height(chainstate)?;
+    let pon_active = network_upgrade_active(
+        best_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Pon,
+    );
+    let expiration = if pon_active {
+        FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2
+    } else {
+        FLUXNODE_START_TX_EXPIRATION_HEIGHT
+    };
+    let dos_remove = if pon_active {
+        FLUXNODE_DOS_REMOVE_AMOUNT_V2
+    } else {
+        FLUXNODE_DOS_REMOVE_AMOUNT
+    };
+
+    let mut records_by_outpoint: HashMap<OutPoint, FluxnodeRecord> = HashMap::new();
+    for record in chainstate.fluxnode_records().map_err(map_internal)? {
+        records_by_outpoint.insert(record.collateral.clone(), record);
+    }
+
+    let mut out = Vec::with_capacity(conf_entries.len());
+    for entry in conf_entries {
+        let record = records_by_outpoint.get(&entry.collateral);
+        let status = match record {
+            Some(record) if record.confirmed_height != 0 => "CONFIRMED",
+            Some(record) if best_height >= record.start_height as i32 => {
+                let age = best_height.saturating_sub(record.start_height as i32);
+                if age <= expiration {
+                    "STARTED"
+                } else if age <= dos_remove {
+                    "DOS"
+                } else {
+                    "OFFLINE"
+                }
+            }
+            Some(_) => "STARTED",
+            None => "OFFLINE",
+        };
+
+        let (ip, network) = fluxnode_network_info(&entry.address);
+        let collateral_str = format_outpoint(&entry.collateral);
+        let txhash_hex = hash256_to_hex(&entry.collateral.hash);
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("alias".to_string(), Value::String(entry.alias));
+        obj.insert("status".to_string(), Value::String(status.to_string()));
+        obj.insert(
+            "collateral".to_string(),
+            Value::String(collateral_str.clone()),
+        );
+        obj.insert("txHash".to_string(), Value::String(txhash_hex.clone()));
+        obj.insert(
+            "outputIndex".to_string(),
+            Value::Number((entry.collateral.index as i64).into()),
+        );
+        obj.insert("privateKey".to_string(), Value::String(entry.privkey));
+        obj.insert("address".to_string(), Value::String(entry.address));
+
+        obj.insert("ip".to_string(), Value::String(ip));
+        obj.insert("network".to_string(), Value::String(network));
+
+        if let Some(record) = record {
+            let payment_address =
+                fluxnode_payment_address(chainstate, record, chain_params.network)?
+                    .unwrap_or_else(|| "UNKNOWN".to_string());
+            obj.insert(
+                "added_height".to_string(),
+                Value::Number((record.start_height as i64).into()),
+            );
+            obj.insert(
+                "confirmed_height".to_string(),
+                Value::Number((record.confirmed_height as i64).into()),
+            );
+            obj.insert(
+                "last_confirmed_height".to_string(),
+                Value::Number((record.last_confirmed_height as i64).into()),
+            );
+            obj.insert(
+                "last_paid_height".to_string(),
+                Value::Number((record.last_paid_height as i64).into()),
+            );
+            obj.insert(
+                "tier".to_string(),
+                Value::String(fluxnode_tier_name(record.tier).to_string()),
+            );
+            obj.insert(
+                "payment_address".to_string(),
+                Value::String(payment_address),
+            );
+            let activesince = header_time_at_height(chainstate, record.start_height as i32)
+                .unwrap_or_default() as i64;
+            let lastpaid =
+                if record.last_paid_height == 0 || best_height < record.last_paid_height as i32 {
+                    0
+                } else {
+                    header_time_at_height(chainstate, record.last_paid_height as i32)
+                        .unwrap_or_default() as i64
+                };
+            obj.insert("activesince".to_string(), Value::Number(activesince.into()));
+            obj.insert("lastpaid".to_string(), Value::Number(lastpaid.into()));
+        } else {
+            obj.insert("added_height".to_string(), Value::Number(0.into()));
+            obj.insert("confirmed_height".to_string(), Value::Number(0.into()));
+            obj.insert("last_confirmed_height".to_string(), Value::Number(0.into()));
+            obj.insert("last_paid_height".to_string(), Value::Number(0.into()));
+            obj.insert("tier".to_string(), Value::String("UNKNOWN".to_string()));
+            obj.insert(
+                "payment_address".to_string(),
+                Value::String("UNKNOWN".to_string()),
+            );
+            obj.insert("activesince".to_string(), Value::Number(0.into()));
+            obj.insert("lastpaid".to_string(), Value::Number(0.into()));
+        }
+
+        if !filter.is_empty() {
+            let haystack = format!(
+                "{} {} {} {} {}",
+                obj.get("alias")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default(),
+                obj.get("address")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default(),
+                txhash_hex,
+                status,
+                collateral_str
+            )
+            .to_ascii_lowercase();
+            if !haystack.contains(&filter) {
+                continue;
+            }
+        }
+
+        out.push(Value::Object(obj));
+    }
+
+    Ok(Value::Array(out))
+}
+
 fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
@@ -3871,12 +4040,26 @@ fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
     }
 
     let conf_entries = read_fluxnode_conf(data_dir)?;
-    let collateral = match params.first() {
+    let (collateral, selected_conf): (OutPoint, Option<&FluxnodeConfEntry>) = match params.first() {
         Some(value) => {
             let arg = value
                 .as_str()
                 .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "argument must be a string"))?;
-            resolve_fluxnode_conf_arg(&conf_entries, arg)?
+            if arg.contains(':') {
+                let outpoint = parse_outpoint(arg)?;
+                let selected = conf_entries
+                    .iter()
+                    .find(|entry| entry.collateral == outpoint);
+                (outpoint, selected)
+            } else {
+                let entry = conf_entries
+                    .iter()
+                    .find(|entry| entry.alias == arg)
+                    .ok_or_else(|| {
+                        RpcError::new(RPC_INVALID_PARAMETER, "unknown fluxnode alias")
+                    })?;
+                (entry.collateral.clone(), Some(entry))
+            }
         }
         None => {
             if conf_entries.is_empty() {
@@ -3891,7 +4074,7 @@ fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
                     "Multiple entries in fluxnode.conf; pass an alias or collateral outpoint",
                 ));
             }
-            conf_entries[0].1.clone()
+            (conf_entries[0].collateral.clone(), Some(&conf_entries[0]))
         }
     };
 
@@ -3928,18 +4111,18 @@ fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
     };
 
     let status = if record.confirmed_height != 0 {
-        "confirmed"
+        "CONFIRMED"
     } else if best_height >= record.start_height as i32 {
         let age = best_height.saturating_sub(record.start_height as i32);
         if age <= expiration {
-            "start_list"
+            "STARTED"
         } else if age <= dos_remove {
-            "dos_list"
+            "DOS"
         } else {
-            "expired"
+            "OFFLINE"
         }
     } else {
-        "start_list"
+        "STARTED"
     };
 
     let payment_address =
@@ -3968,8 +4151,14 @@ fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
         "outidx".to_string(),
         Value::Number((record.collateral.index as i64).into()),
     );
-    info.insert("ip".to_string(), Value::String(String::new()));
-    info.insert("network".to_string(), Value::String(String::new()));
+    if let Some(entry) = selected_conf {
+        let (ip, network) = fluxnode_network_info(&entry.address);
+        info.insert("ip".to_string(), Value::String(ip));
+        info.insert("network".to_string(), Value::String(network));
+    } else {
+        info.insert("ip".to_string(), Value::String(String::new()));
+        info.insert("network".to_string(), Value::String(String::new()));
+    }
     info.insert(
         "added_height".to_string(),
         Value::Number((record.start_height as i64).into()),
@@ -5436,7 +5625,57 @@ fn parse_outpoint(input: &str) -> Result<OutPoint, RpcError> {
     Ok(OutPoint { hash, index })
 }
 
-fn read_fluxnode_conf(data_dir: &Path) -> Result<Vec<(String, OutPoint)>, RpcError> {
+fn fluxnode_network_info(address: &str) -> (String, String) {
+    let address = address.trim();
+    if address.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    if let Ok(addr) = address.parse::<SocketAddr>() {
+        let ip = addr.ip();
+        let network = match ip {
+            IpAddr::V4(_) => "ipv4",
+            IpAddr::V6(_) => "ipv6",
+        };
+        return (ip.to_string(), network.to_string());
+    }
+
+    let host = if let Some(rest) = address.strip_prefix('[') {
+        rest.split_once(']')
+            .map(|(host, _)| host)
+            .unwrap_or(address)
+    } else if let Some((host, port)) = address.rsplit_once(':') {
+        if !host.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) {
+            host
+        } else {
+            address
+        }
+    } else {
+        address
+    };
+
+    let network = if host.ends_with(".onion") {
+        "onion"
+    } else if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        "ipv4"
+    } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        "ipv6"
+    } else {
+        "unknown"
+    };
+
+    (host.to_string(), network.to_string())
+}
+
+#[derive(Clone, Debug)]
+struct FluxnodeConfEntry {
+    alias: String,
+    address: String,
+    privkey: String,
+    collateral: OutPoint,
+}
+
+fn read_fluxnode_conf(data_dir: &Path) -> Result<Vec<FluxnodeConfEntry>, RpcError> {
     let path = data_dir.join("fluxnode.conf");
     if !path.exists() {
         return Ok(Vec::new());
@@ -5455,6 +5694,8 @@ fn read_fluxnode_conf(data_dir: &Path) -> Result<Vec<(String, OutPoint)>, RpcErr
             continue;
         }
         let alias = parts[0].to_string();
+        let address = parts[1].to_string();
+        let privkey = parts[2].to_string();
         let txhash = parts[3];
         let outidx = parts[4];
         let Ok(hash) = hash256_from_hex(txhash) else {
@@ -5465,7 +5706,12 @@ fn read_fluxnode_conf(data_dir: &Path) -> Result<Vec<(String, OutPoint)>, RpcErr
             invalid = invalid.saturating_add(1);
             continue;
         };
-        entries.push((alias, OutPoint { hash, index }));
+        entries.push(FluxnodeConfEntry {
+            alias,
+            address,
+            privkey,
+            collateral: OutPoint { hash, index },
+        });
     }
     if entries.is_empty() && invalid > 0 {
         return Err(RpcError::new(
@@ -5474,20 +5720,6 @@ fn read_fluxnode_conf(data_dir: &Path) -> Result<Vec<(String, OutPoint)>, RpcErr
         ));
     }
     Ok(entries)
-}
-
-fn resolve_fluxnode_conf_arg(
-    entries: &[(String, OutPoint)],
-    arg: &str,
-) -> Result<OutPoint, RpcError> {
-    if arg.contains(':') {
-        return parse_outpoint(arg);
-    }
-    entries
-        .iter()
-        .find(|(alias, _)| alias == arg)
-        .map(|(_, outpoint)| outpoint.clone())
-        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "unknown fluxnode alias"))
 }
 
 fn fluxnode_payment_address<S: fluxd_storage::KeyValueStore>(
