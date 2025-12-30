@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxd_chainstate::state::ChainState;
@@ -63,6 +63,7 @@ pub struct MempoolEntry {
     pub height: i32,
     pub fee: i64,
     pub spent_outpoints: Vec<OutPoint>,
+    pub parents: Vec<Hash256>,
 }
 
 impl MempoolEntry {
@@ -71,10 +72,17 @@ impl MempoolEntry {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct MempoolPrevout {
+    pub value: i64,
+    pub script_pubkey: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct Mempool {
     entries: HashMap<Hash256, MempoolEntry>,
     spent: HashMap<OutPoint, Hash256>,
+    children: HashMap<Hash256, Vec<Hash256>>,
     total_bytes: usize,
     max_bytes: usize,
     revision: u64,
@@ -85,6 +93,7 @@ impl Mempool {
         Self {
             entries: HashMap::new(),
             spent: HashMap::new(),
+            children: HashMap::new(),
             total_bytes: 0,
             max_bytes,
             revision: 0,
@@ -129,12 +138,36 @@ impl Mempool {
         self.entries.get(txid)
     }
 
+    pub fn prevout(&self, outpoint: &OutPoint) -> Option<MempoolPrevout> {
+        let entry = self.entries.get(&outpoint.hash)?;
+        let index = usize::try_from(outpoint.index).ok()?;
+        let txout = entry.tx.vout.get(index)?;
+        Some(MempoolPrevout {
+            value: txout.value,
+            script_pubkey: txout.script_pubkey.clone(),
+        })
+    }
+
+    pub fn prevouts_for_tx(&self, tx: &Transaction) -> HashMap<OutPoint, MempoolPrevout> {
+        let mut out = HashMap::new();
+        for input in &tx.vin {
+            if out.contains_key(&input.prevout) {
+                continue;
+            }
+            if let Some(prevout) = self.prevout(&input.prevout) {
+                out.insert(input.prevout.clone(), prevout);
+            }
+        }
+        out
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = &MempoolEntry> {
         self.entries.values()
     }
 
     pub fn insert(&mut self, entry: MempoolEntry) -> Result<MempoolInsertOutcome, MempoolError> {
         let inserted_txid = entry.txid;
+        let parents = entry.parents.clone();
         if self.max_bytes > 0 && entry.size() > self.max_bytes {
             return Err(MempoolError::new(
                 MempoolErrorKind::MempoolFull,
@@ -165,6 +198,12 @@ impl Mempool {
         }
         self.total_bytes = self.total_bytes.saturating_add(entry.raw.len());
         self.entries.insert(entry.txid, entry);
+        for parent in parents {
+            let children = self.children.entry(parent).or_default();
+            if !children.contains(&inserted_txid) {
+                children.push(inserted_txid);
+            }
+        }
         self.revision = self.revision.saturating_add(1);
 
         let mut outcome = MempoolInsertOutcome::default();
@@ -191,8 +230,59 @@ impl Mempool {
                 self.spent.remove(outpoint);
             }
         }
+        for parent in &entry.parents {
+            let should_remove_parent = match self.children.get_mut(parent) {
+                Some(children) => {
+                    children.retain(|child| child != txid);
+                    children.is_empty()
+                }
+                None => false,
+            };
+            if should_remove_parent {
+                self.children.remove(parent);
+            }
+        }
+        if let Some(children) = self.children.remove(txid) {
+            for child in children {
+                if let Some(child_entry) = self.entries.get_mut(&child) {
+                    child_entry.parents.retain(|parent| parent != txid);
+                }
+            }
+        }
         self.revision = self.revision.saturating_add(1);
         Some(entry)
+    }
+
+    pub fn remove_with_descendants(&mut self, txid: &Hash256) -> Vec<MempoolEntry> {
+        let mut visited: HashSet<Hash256> = HashSet::new();
+        let mut order: Vec<Hash256> = Vec::new();
+
+        fn visit(
+            mempool: &Mempool,
+            txid: Hash256,
+            visited: &mut HashSet<Hash256>,
+            order: &mut Vec<Hash256>,
+        ) {
+            if !visited.insert(txid) {
+                return;
+            }
+            if let Some(children) = mempool.children.get(&txid) {
+                for child in children {
+                    visit(mempool, *child, visited, order);
+                }
+            }
+            order.push(txid);
+        }
+
+        visit(self, *txid, &mut visited, &mut order);
+
+        let mut removed = Vec::new();
+        for txid in order {
+            if let Some(entry) = self.remove(&txid) {
+                removed.push(entry);
+            }
+        }
+        removed
     }
 
     pub fn max_bytes(&self) -> usize {
@@ -235,10 +325,17 @@ impl Mempool {
             if self.total_bytes <= max_bytes {
                 break;
             }
-            if let Some(removed) = self.remove(&candidate.txid) {
-                evicted += 1;
-                evicted_bytes += removed.raw.len() as u64;
+            let removed = self.remove_with_descendants(&candidate.txid);
+            if removed.is_empty() {
+                continue;
             }
+            evicted = evicted.saturating_add(removed.len() as u64);
+            evicted_bytes = evicted_bytes.saturating_add(
+                removed
+                    .iter()
+                    .map(|entry| entry.raw.len() as u64)
+                    .sum::<u64>(),
+            );
         }
 
         MempoolInsertOutcome {
@@ -293,6 +390,7 @@ impl MempoolPolicy {
 
 pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
+    mempool_prevouts: &HashMap<OutPoint, MempoolPrevout>,
     chain_params: &ChainParams,
     flags: &ValidationFlags,
     policy: &MempoolPolicy,
@@ -337,6 +435,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
     let require_standard = policy.require_standard;
     let mut prev_scripts = Vec::with_capacity(tx.vin.len());
     let mut spent_outpoints = Vec::with_capacity(tx.vin.len());
+    let mut parents: HashSet<Hash256> = HashSet::new();
     let mut transparent_in = 0i64;
     for (input_index, input) in tx.vin.iter().enumerate() {
         if require_standard {
@@ -354,12 +453,27 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
             }
         }
 
-        let entry = chainstate
+        let (prev_value, prev_script_pubkey, prev_is_coinbase, prev_height) = match chainstate
             .utxo_entry(&input.prevout)
             .map_err(|err| MempoolError::new(MempoolErrorKind::Internal, err.to_string()))?
-            .ok_or_else(|| MempoolError::new(MempoolErrorKind::MissingInput, "missing inputs"))?;
-        if entry.is_coinbase {
-            let spend_height = next_height as i64 - entry.height as i64;
+        {
+            Some(entry) => (
+                entry.value,
+                entry.script_pubkey,
+                entry.is_coinbase,
+                entry.height,
+            ),
+            None => {
+                let prevout = mempool_prevouts.get(&input.prevout).ok_or_else(|| {
+                    MempoolError::new(MempoolErrorKind::MissingInput, "missing inputs")
+                })?;
+                parents.insert(input.prevout.hash);
+                (prevout.value, prevout.script_pubkey.clone(), false, 0)
+            }
+        };
+
+        if prev_is_coinbase {
+            let spend_height = next_height as i64 - prev_height as i64;
             if spend_height < COINBASE_MATURITY as i64 {
                 return Err(MempoolError::new(
                     MempoolErrorKind::InvalidTransaction,
@@ -376,7 +490,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
                 ));
             }
         }
-        transparent_in = transparent_in.checked_add(entry.value).ok_or_else(|| {
+        transparent_in = transparent_in.checked_add(prev_value).ok_or_else(|| {
             MempoolError::new(MempoolErrorKind::InvalidTransaction, "value out of range")
         })?;
         if flags.check_script {
@@ -387,10 +501,10 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
             };
             verify_script(
                 &input.script_sig,
-                &entry.script_pubkey,
+                &prev_script_pubkey,
                 &tx,
                 input_index,
-                entry.value,
+                prev_value,
                 script_flags,
                 branch_id,
             )
@@ -399,10 +513,10 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
             if require_standard {
                 verify_script(
                     &input.script_sig,
-                    &entry.script_pubkey,
+                    &prev_script_pubkey,
                     &tx,
                     input_index,
-                    entry.value,
+                    prev_value,
                     BLOCK_SCRIPT_VERIFY_FLAGS,
                     branch_id,
                 )
@@ -416,7 +530,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
                 })?;
             }
         }
-        prev_scripts.push(entry.script_pubkey.clone());
+        prev_scripts.push(prev_script_pubkey.clone());
         spent_outpoints.push(input.prevout.clone());
     }
 
@@ -464,6 +578,9 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
             .map_err(|err| MempoolError::new(MempoolErrorKind::InvalidShielded, err.to_string()))?;
     }
 
+    let mut parents: Vec<Hash256> = parents.into_iter().collect();
+    parents.sort();
+
     Ok(MempoolEntry {
         txid,
         tx,
@@ -472,6 +589,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
         height: best_height,
         fee,
         spent_outpoints,
+        parents,
     })
 }
 
@@ -909,6 +1027,153 @@ fn count_sigops(script: &[u8], accurate: bool) -> Option<u32> {
         last_opcode = opcode;
     }
     Some(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxd_primitives::transaction::{TxIn, TxOut};
+
+    fn dummy_tx(vin: Vec<TxIn>, vout: Vec<TxOut>) -> Transaction {
+        Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin,
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        }
+    }
+
+    #[test]
+    fn remove_mined_parent_detaches_children() {
+        let parent_txid: Hash256 = [1u8; 32];
+        let child_txid: Hash256 = [2u8; 32];
+        let parent_outpoint = OutPoint {
+            hash: parent_txid,
+            index: 0,
+        };
+
+        let parent_entry = MempoolEntry {
+            txid: parent_txid,
+            tx: dummy_tx(
+                Vec::new(),
+                vec![TxOut {
+                    value: 50,
+                    script_pubkey: vec![0x51],
+                }],
+            ),
+            raw: vec![0u8; 10],
+            time: 0,
+            height: 0,
+            fee: 0,
+            spent_outpoints: Vec::new(),
+            parents: Vec::new(),
+        };
+        let child_entry = MempoolEntry {
+            txid: child_txid,
+            tx: dummy_tx(
+                vec![TxIn {
+                    prevout: parent_outpoint.clone(),
+                    script_sig: Vec::new(),
+                    sequence: 0,
+                }],
+                vec![TxOut {
+                    value: 25,
+                    script_pubkey: vec![0x51],
+                }],
+            ),
+            raw: vec![0u8; 10],
+            time: 0,
+            height: 0,
+            fee: 0,
+            spent_outpoints: vec![parent_outpoint],
+            parents: vec![parent_txid],
+        };
+
+        let mut mempool = Mempool::new(0);
+        mempool.insert(parent_entry).expect("insert parent");
+        mempool.insert(child_entry).expect("insert child");
+
+        assert!(mempool
+            .children
+            .get(&parent_txid)
+            .is_some_and(|children| children.contains(&child_txid)));
+
+        let removed = mempool.remove(&parent_txid).expect("remove parent");
+        assert_eq!(removed.txid, parent_txid);
+
+        let child = mempool.entries.get(&child_txid).expect("child remains");
+        assert!(child.parents.is_empty());
+        assert!(mempool.children.get(&parent_txid).is_none());
+    }
+
+    #[test]
+    fn remove_with_descendants_removes_entire_subtree() {
+        let parent_txid: Hash256 = [1u8; 32];
+        let child_txid: Hash256 = [2u8; 32];
+        let parent_outpoint = OutPoint {
+            hash: parent_txid,
+            index: 0,
+        };
+
+        let parent_entry = MempoolEntry {
+            txid: parent_txid,
+            tx: dummy_tx(
+                Vec::new(),
+                vec![TxOut {
+                    value: 50,
+                    script_pubkey: vec![0x51],
+                }],
+            ),
+            raw: vec![0u8; 10],
+            time: 0,
+            height: 0,
+            fee: 0,
+            spent_outpoints: Vec::new(),
+            parents: Vec::new(),
+        };
+        let child_entry = MempoolEntry {
+            txid: child_txid,
+            tx: dummy_tx(
+                vec![TxIn {
+                    prevout: parent_outpoint.clone(),
+                    script_sig: Vec::new(),
+                    sequence: 0,
+                }],
+                vec![TxOut {
+                    value: 25,
+                    script_pubkey: vec![0x51],
+                }],
+            ),
+            raw: vec![0u8; 10],
+            time: 0,
+            height: 0,
+            fee: 0,
+            spent_outpoints: vec![parent_outpoint],
+            parents: vec![parent_txid],
+        };
+
+        let mut mempool = Mempool::new(0);
+        mempool.insert(parent_entry).expect("insert parent");
+        mempool.insert(child_entry).expect("insert child");
+
+        let removed = mempool.remove_with_descendants(&parent_txid);
+        let removed_ids: HashSet<Hash256> = removed.into_iter().map(|entry| entry.txid).collect();
+        assert!(removed_ids.contains(&parent_txid));
+        assert!(removed_ids.contains(&child_txid));
+        assert!(mempool.entries.is_empty());
+        assert!(mempool.children.is_empty());
+    }
 }
 
 fn decode_op_n(opcode: u8) -> Option<u8> {

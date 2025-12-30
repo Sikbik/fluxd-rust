@@ -44,7 +44,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Mining
 
 - getblocksubsidy - Implemented
-- getblocktemplate - Partial (coinbase + deterministic payouts; tx selection/assembly WIP)
+- getblocktemplate - Partial (coinbase + deterministic payouts; basic mempool tx selection)
 - getlocalsolps - Stub (returns 0.0)
 - getmininginfo - Partial (rates and mining fields are placeholders)
 - getnetworkhashps - Stub (returns 0.0)
@@ -66,7 +66,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - decodescript - Implemented
 - getrawtransaction - Implemented (chain + mempool)
 - fundrawtransaction - Missing
-- sendrawtransaction - Partial (relays; confirmed inputs only)
+- sendrawtransaction - Partial (supports spending mempool parents; orphan pool + full policy parity WIP)
 - createmultisig - Partial (hex pubkeys only; wallet address lookup not available)
 - estimatefee - Implemented
 - estimatepriority - Missing

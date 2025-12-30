@@ -144,6 +144,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Basic P2P tx relay (inv/getdata/tx + `mempool`) (owner: TBD)
 - [x] [P1] `getmininginfo`, `submitblock` (owner: TBD)
 - [ ] [P1] `getblocktemplate` (coinbase + deterministic payouts; tx selection/assembly WIP) (owner: TBD)
+  - [x] Basic mempool tx selection + dependency ordering
+  - [ ] Template fields parity (sigops/weight, longpoll, rules/mutable, etc.)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
 
 ## Wallet

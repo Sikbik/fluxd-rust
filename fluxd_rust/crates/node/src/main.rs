@@ -996,8 +996,17 @@ async fn run() -> Result<(), String> {
                             continue;
                         }
                     };
+                    let mempool_prevouts = match mempool.lock() {
+                        Ok(guard) => guard.prevouts_for_tx(&tx),
+                        Err(_) => {
+                            eprintln!("mempool lock poisoned");
+                            rejected += 1;
+                            continue;
+                        }
+                    };
                     let entry = match mempool::build_mempool_entry(
                         chainstate.as_ref(),
+                        &mempool_prevouts,
                         params.as_ref(),
                         &flags,
                         mempool_policy.as_ref(),
@@ -5828,23 +5837,29 @@ fn purge_mempool_for_connected_block(
     let mut guard = mempool
         .lock()
         .map_err(|_| "mempool lock poisoned".to_string())?;
-    let mut to_remove: HashSet<Hash256> = HashSet::new();
+    let mut mined: HashSet<Hash256> = HashSet::new();
+    let mut conflicts: HashSet<Hash256> = HashSet::new();
     for (txid, tx) in txids
         .iter()
         .copied()
         .skip(1)
         .zip(block.transactions.iter().skip(1))
     {
-        to_remove.insert(txid);
+        mined.insert(txid);
         for input in &tx.vin {
             if let Some(conflict) = guard.spender(&input.prevout) {
-                to_remove.insert(conflict);
+                if !mined.contains(&conflict) {
+                    conflicts.insert(conflict);
+                }
             }
         }
     }
 
-    for txid in to_remove {
+    for txid in mined {
         guard.remove(&txid);
+    }
+    for txid in conflicts {
+        guard.remove_with_descendants(&txid);
     }
     Ok(())
 }

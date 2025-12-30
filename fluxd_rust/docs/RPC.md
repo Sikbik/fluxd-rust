@@ -114,7 +114,7 @@ Type notes:
 - `getmempoolinfo`
 - `getrawmempool [verbose]`
 - `getmininginfo` (partial; rate fields return 0.0)
-- `getblocktemplate` (partial; coinbase-only, includes deterministic fluxnode payouts)
+- `getblocktemplate` (partial; includes deterministic fluxnode payouts + basic mempool tx selection)
 - `submitblock <hexdata>` (partial)
 - `getnetworkhashps` (returns 0.0)
 - `getnetworksolps` (returns 0.0)

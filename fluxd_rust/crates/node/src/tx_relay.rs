@@ -220,8 +220,21 @@ async fn handle_peer_message<S: KeyValueStore>(
             let txid = tx.txid().map_err(|err| err.to_string())?;
             let raw = payload.to_vec();
 
+            let mempool_prevouts = {
+                let guard = mempool
+                    .lock()
+                    .map_err(|_| "mempool lock poisoned".to_string())?;
+                if guard.contains(&txid) {
+                    let _ = touch_known(known, txid);
+                    let _ = requested.remove(&txid);
+                    return Ok(());
+                }
+                guard.prevouts_for_tx(&tx)
+            };
+
             let entry = match mempool::build_mempool_entry(
                 chainstate,
+                &mempool_prevouts,
                 params,
                 flags,
                 mempool_policy,
@@ -230,6 +243,9 @@ async fn handle_peer_message<S: KeyValueStore>(
             ) {
                 Ok(entry) => entry,
                 Err(err) => {
+                    if err.kind == mempool::MempoolErrorKind::MissingInput {
+                        let _ = requested.remove(&txid);
+                    }
                     if err.kind == mempool::MempoolErrorKind::Internal {
                         eprintln!(
                             "mempool reject {}: {}",

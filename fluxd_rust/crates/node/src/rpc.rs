@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -18,7 +18,7 @@ use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::ValidationFlags;
 use fluxd_consensus::constants::{
     FLUXNODE_DOS_REMOVE_AMOUNT, FLUXNODE_DOS_REMOVE_AMOUNT_V2, FLUXNODE_START_TX_EXPIRATION_HEIGHT,
-    FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2, PROTOCOL_VERSION,
+    FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2, MAX_BLOCK_SIZE, PROTOCOL_VERSION,
 };
 use fluxd_consensus::money::COIN;
 use fluxd_consensus::params::{hash256_from_hex, ChainParams, Network};
@@ -1644,7 +1644,7 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
             ));
         }
 
-        {
+        let mempool_prevouts = {
             let guard = mempool
                 .lock()
                 .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
@@ -1660,10 +1660,12 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
                     ));
                 }
             }
-        }
+            guard.prevouts_for_tx(&tx)
+        };
 
         let entry = build_mempool_entry(
             chainstate,
+            &mempool_prevouts,
             chain_params,
             mempool_flags,
             mempool_policy,
@@ -2586,7 +2588,7 @@ fn rpc_getaddressmempool<S: fluxd_storage::KeyValueStore>(
 
 fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
-    _mempool: &Mutex<Mempool>,
+    mempool: &Mutex<Mempool>,
     params: Vec<Value>,
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
@@ -2668,89 +2670,264 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     let foundation_fund = foundation_fund_amount(height, &chain_params.funding);
     let swap_pool = swap_pool_amount(height as i64, &chain_params.swap_pool);
 
-    let fees = 0i64;
-    let miner_value = if pon_active { fees } else { remainder + fees };
-
-    let mut outputs = Vec::new();
-    outputs.push(TxOut {
-        value: miner_value,
-        script_pubkey: miner_script_pubkey,
-    });
-    for (_, script_pubkey, amount) in &payouts {
+    let make_coinbase = |miner_value: i64| -> Result<Transaction, RpcError> {
+        let mut outputs = Vec::new();
         outputs.push(TxOut {
-            value: *amount,
-            script_pubkey: script_pubkey.clone(),
+            value: miner_value,
+            script_pubkey: miner_script_pubkey.clone(),
         });
-    }
+        for (_, script_pubkey, amount) in &payouts {
+            outputs.push(TxOut {
+                value: *amount,
+                script_pubkey: script_pubkey.clone(),
+            });
+        }
 
-    if pon_active {
-        let dev_script =
-            address_to_script_pubkey(chain_params.funding.dev_fund_address, chain_params.network)
-                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid dev fund address"))?;
-        outputs.push(TxOut {
-            value: remainder,
-            script_pubkey: dev_script,
-        });
-    }
+        if pon_active {
+            let dev_script = address_to_script_pubkey(
+                chain_params.funding.dev_fund_address,
+                chain_params.network,
+            )
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid dev fund address"))?;
+            outputs.push(TxOut {
+                value: remainder,
+                script_pubkey: dev_script,
+            });
+        }
 
-    if exchange_fund > 0 {
-        let exchange_script =
-            address_to_script_pubkey(chain_params.funding.exchange_address, chain_params.network)
-                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid exchange fund address"))?;
-        outputs.push(TxOut {
-            value: exchange_fund,
-            script_pubkey: exchange_script,
-        });
-    }
-    if foundation_fund > 0 {
-        let foundation_script = address_to_script_pubkey(
-            chain_params.funding.foundation_address,
-            chain_params.network,
-        )
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid foundation fund address"))?;
-        outputs.push(TxOut {
-            value: foundation_fund,
-            script_pubkey: foundation_script,
-        });
-    }
-    if swap_pool > 0 {
-        let swap_script =
-            address_to_script_pubkey(chain_params.swap_pool.address, chain_params.network)
-                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid swap pool address"))?;
-        outputs.push(TxOut {
-            value: swap_pool,
-            script_pubkey: swap_script,
-        });
-    }
+        if exchange_fund > 0 {
+            let exchange_script = address_to_script_pubkey(
+                chain_params.funding.exchange_address,
+                chain_params.network,
+            )
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid exchange fund address"))?;
+            outputs.push(TxOut {
+                value: exchange_fund,
+                script_pubkey: exchange_script,
+            });
+        }
+        if foundation_fund > 0 {
+            let foundation_script = address_to_script_pubkey(
+                chain_params.funding.foundation_address,
+                chain_params.network,
+            )
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid foundation fund address"))?;
+            outputs.push(TxOut {
+                value: foundation_fund,
+                script_pubkey: foundation_script,
+            });
+        }
+        if swap_pool > 0 {
+            let swap_script =
+                address_to_script_pubkey(chain_params.swap_pool.address, chain_params.network)
+                    .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid swap pool address"))?;
+            outputs.push(TxOut {
+                value: swap_pool,
+                script_pubkey: swap_script,
+            });
+        }
 
-    let mut script_sig = script_push_int(height as i64);
-    crate::push_data(&mut script_sig, b"fluxd-rust");
+        let mut script_sig = script_push_int(height as i64);
+        crate::push_data(&mut script_sig, b"fluxd-rust");
 
-    let coinbase = Transaction {
-        f_overwintered: sapling_active,
-        version: if sapling_active { 4 } else { 1 },
-        version_group_id: if sapling_active {
-            SAPLING_VERSION_GROUP_ID
-        } else {
-            0
-        },
-        vin: vec![TxIn {
-            prevout: OutPoint::null(),
-            script_sig,
-            sequence: u32::MAX,
-        }],
-        vout: outputs,
-        lock_time: 0,
-        expiry_height: 0,
-        value_balance: 0,
-        shielded_spends: Vec::new(),
-        shielded_outputs: Vec::new(),
-        join_splits: Vec::new(),
-        join_split_pub_key: [0u8; 32],
-        join_split_sig: [0u8; 64],
-        binding_sig: [0u8; 64],
-        fluxnode: None,
+        Ok(Transaction {
+            f_overwintered: sapling_active,
+            version: if sapling_active { 4 } else { 1 },
+            version_group_id: if sapling_active {
+                SAPLING_VERSION_GROUP_ID
+            } else {
+                0
+            },
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig,
+                sequence: u32::MAX,
+            }],
+            vout: outputs,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        })
     };
+
+    #[derive(Clone)]
+    struct TemplateTx {
+        fee: i64,
+        size: usize,
+        parents: Vec<Hash256>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FeeRateTx {
+        txid: Hash256,
+        fee: i64,
+        size: usize,
+    }
+
+    impl Ord for FeeRateTx {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            let fee_a = i128::from(self.fee);
+            let fee_b = i128::from(other.fee);
+            let size_a = i128::try_from(self.size.max(1)).unwrap_or(i128::MAX);
+            let size_b = i128::try_from(other.size.max(1)).unwrap_or(i128::MAX);
+            let left = fee_a.saturating_mul(size_b);
+            let right = fee_b.saturating_mul(size_a);
+            match left.cmp(&right) {
+                std::cmp::Ordering::Equal => self.txid.cmp(&other.txid),
+                other => other,
+            }
+        }
+    }
+
+    impl PartialOrd for FeeRateTx {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let coinbase_size = make_coinbase(0)
+        .and_then(|tx| tx.consensus_encode().map_err(map_internal))
+        .map(|bytes| bytes.len())?;
+    let coinbase_overhead_bytes = 1024usize;
+    let mut block_bytes_limit = usize::try_from(MAX_BLOCK_SIZE).unwrap_or(0);
+    block_bytes_limit = block_bytes_limit
+        .saturating_sub(coinbase_size)
+        .saturating_sub(coinbase_overhead_bytes);
+
+    let (selected_fees, transactions_json) = {
+        let mempool_snapshot = mempool
+            .lock()
+            .map_err(|_| map_internal("mempool lock poisoned"))?;
+
+        let mut templates: HashMap<Hash256, TemplateTx> = HashMap::new();
+        for entry in mempool_snapshot.entries() {
+            templates.insert(
+                entry.txid,
+                TemplateTx {
+                    fee: entry.fee,
+                    size: entry.size(),
+                    parents: entry.parents.clone(),
+                },
+            );
+        }
+
+        let mut children: HashMap<Hash256, Vec<Hash256>> = HashMap::new();
+        let mut remaining_parents: HashMap<Hash256, usize> = HashMap::new();
+        for (txid, tx) in &templates {
+            let in_mempool_parents = tx
+                .parents
+                .iter()
+                .filter(|parent| templates.contains_key(*parent))
+                .count();
+            remaining_parents.insert(*txid, in_mempool_parents);
+            for parent in &tx.parents {
+                if templates.contains_key(parent) {
+                    children.entry(*parent).or_default().push(*txid);
+                }
+            }
+        }
+
+        let mut heap: BinaryHeap<FeeRateTx> = BinaryHeap::new();
+        for (txid, tx) in &templates {
+            let parent_count = remaining_parents
+                .get(txid)
+                .copied()
+                .unwrap_or(tx.parents.len());
+            if parent_count == 0 {
+                heap.push(FeeRateTx {
+                    txid: *txid,
+                    fee: tx.fee,
+                    size: tx.size,
+                });
+            }
+        }
+
+        let mut selected: Vec<Hash256> = Vec::new();
+        let mut selected_set: HashSet<Hash256> = HashSet::new();
+        let mut selected_fees: i64 = 0;
+        let mut selected_bytes: usize = 0;
+
+        while let Some(candidate) = heap.pop() {
+            if selected_set.contains(&candidate.txid) {
+                continue;
+            }
+            let Some(entry) = templates.get(&candidate.txid) else {
+                continue;
+            };
+
+            if selected_bytes.saturating_add(entry.size) > block_bytes_limit {
+                continue;
+            }
+
+            selected_fees = selected_fees
+                .checked_add(entry.fee)
+                .ok_or_else(|| map_internal("mempool fee overflow"))?;
+            selected_bytes = selected_bytes.saturating_add(entry.size);
+            selected_set.insert(candidate.txid);
+            selected.push(candidate.txid);
+
+            if let Some(outgoing) = children.get(&candidate.txid) {
+                for child in outgoing {
+                    let Some(count) = remaining_parents.get_mut(child) else {
+                        continue;
+                    };
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        if let Some(child_tx) = templates.get(child) {
+                            heap.push(FeeRateTx {
+                                txid: *child,
+                                fee: child_tx.fee,
+                                size: child_tx.size,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut tx_index_by_id: HashMap<Hash256, usize> = HashMap::new();
+        for (idx, txid) in selected.iter().copied().enumerate() {
+            tx_index_by_id.insert(txid, idx + 1);
+        }
+
+        let mut transactions_json = Vec::with_capacity(selected.len());
+        for txid in &selected {
+            let Some(entry) = mempool_snapshot.get(txid) else {
+                continue;
+            };
+            let depends = entry
+                .parents
+                .iter()
+                .filter_map(|parent| tx_index_by_id.get(parent).copied())
+                .collect::<Vec<_>>();
+            transactions_json.push(json!({
+                "data": hex_bytes(&entry.raw),
+                "hash": hash256_to_hex(txid),
+                "fee": entry.fee,
+                "depends": depends,
+                "sigops": 0,
+            }));
+        }
+
+        Ok::<_, RpcError>((selected_fees, transactions_json))
+    }?;
+
+    let miner_value = if pon_active {
+        selected_fees
+    } else {
+        remainder
+            .checked_add(selected_fees)
+            .ok_or_else(|| map_internal("coinbase value out of range"))?
+    };
+
+    let coinbase = make_coinbase(miner_value)?;
 
     let coinbase_bytes = coinbase.consensus_encode().map_err(map_internal)?;
     let coinbase_txid = coinbase.txid().map_err(map_internal)?;
@@ -2784,7 +2961,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         "bits": format!("{:08x}", bits),
         "target": target_hex,
         "defaultsaplingroot": hash256_to_hex(&sapling_root),
-        "transactions": [],
+        "transactions": transactions_json,
         "coinbasetxn": {
             "data": hex_bytes(&coinbase_bytes),
             "hash": hash256_to_hex(&coinbase_txid),
