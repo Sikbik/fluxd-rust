@@ -64,6 +64,7 @@ const RPC_COOKIE_FILE: &str = "rpc.cookie";
 
 const RPC_INVALID_PARAMETER: i64 = -8;
 const RPC_TYPE_ERROR: i64 = -3;
+const RPC_WALLET_ERROR: i64 = -4;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 const RPC_DESERIALIZATION_ERROR: i64 = -22;
 const RPC_TRANSACTION_ERROR: i64 = -25;
@@ -80,6 +81,8 @@ const RPC_METHODS: &[&str] = &[
     "ping",
     "stop",
     "restart",
+    "reindex",
+    "rescanblockchain",
     "getblockcount",
     "getbestblockhash",
     "getblockhash",
@@ -925,6 +928,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "ping" => rpc_ping(params),
         "stop" => rpc_stop(params, shutdown_tx),
         "restart" => rpc_restart(params, shutdown_tx),
+        "reindex" => rpc_reindex(params, data_dir, shutdown_tx),
+        "rescanblockchain" => rpc_rescanblockchain(params),
         "getblockcount" => rpc_getblockcount(chainstate, params),
         "getbestblockhash" => rpc_getbestblockhash(chainstate, params),
         "getblockhash" => rpc_getblockhash(chainstate, params),
@@ -1061,6 +1066,37 @@ fn rpc_restart(params: Vec<Value>, shutdown_tx: &watch::Sender<bool>) -> Result<
     Ok(Value::String(
         "fluxd restarting (exit requested; restart requires a supervisor)".to_string(),
     ))
+}
+
+fn rpc_reindex(
+    params: Vec<Value>,
+    data_dir: &Path,
+    shutdown_tx: &watch::Sender<bool>,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    let flag_path = data_dir.join(crate::REINDEX_REQUEST_FILE_NAME);
+    fs::write(&flag_path, b"reindex\n").map_err(|err| {
+        RpcError::new(
+            RPC_INTERNAL_ERROR,
+            &format!("failed to write {}: {err}", flag_path.display()),
+        )
+    })?;
+    shutdown_tx
+        .send(true)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "shutdown channel closed"))?;
+    Ok(Value::String(
+        "fluxd reindex requested (exit requested; restart required)".to_string(),
+    ))
+}
+
+fn rpc_rescanblockchain(params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "rescanblockchain expects 0 to 2 parameters",
+        ));
+    }
+    Err(RpcError::new(RPC_WALLET_ERROR, "wallet not implemented"))
 }
 
 fn rpc_getdeprecationinfo(params: Vec<Value>) -> Result<Value, RpcError> {

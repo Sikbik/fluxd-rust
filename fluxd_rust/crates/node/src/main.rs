@@ -112,6 +112,7 @@ const PEERS_FILE_NAME: &str = "peers.dat";
 const BANLIST_FILE_NAME: &str = "banlist.dat";
 const MEMPOOL_FILE_NAME: &str = "mempool.dat";
 const FEE_ESTIMATES_FILE_NAME: &str = "fee_estimates.dat";
+const REINDEX_REQUEST_FILE_NAME: &str = "reindex.flag";
 const PEERS_FILE_VERSION: u32 = 2;
 const PEERS_FILE_VERSION_V1: u32 = 1;
 const MEMPOOL_FILE_VERSION: u32 = 1;
@@ -170,6 +171,7 @@ struct Config {
     network: Network,
     params_dir: PathBuf,
     fetch_params: bool,
+    reindex: bool,
     miner_address: Option<String>,
     scan_flatfiles: bool,
     scan_supply: bool,
@@ -745,8 +747,36 @@ async fn run() -> Result<(), String> {
     let data_dir = &config.data_dir;
     let db_path = data_dir.join("db");
     let blocks_path = data_dir.join("blocks");
+    let reindex_flag_path = data_dir.join(REINDEX_REQUEST_FILE_NAME);
 
     fs::create_dir_all(data_dir).map_err(|err| err.to_string())?;
+
+    if config.reindex || reindex_flag_path.exists() {
+        println!(
+            "Reindex requested; removing {} and {}",
+            db_path.display(),
+            blocks_path.display()
+        );
+        if let Err(err) = fs::remove_dir_all(&db_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "failed to remove db dir {}: {err}",
+                    db_path.display()
+                ));
+            }
+        }
+        if let Err(err) = fs::remove_dir_all(&blocks_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "failed to remove blocks dir {}: {err}",
+                    blocks_path.display()
+                ));
+            }
+        }
+        let _ = fs::remove_file(data_dir.join(MEMPOOL_FILE_NAME));
+        let _ = fs::remove_file(data_dir.join(FEE_ESTIMATES_FILE_NAME));
+        let _ = fs::remove_file(&reindex_flag_path);
+    }
 
     let store = open_store(config.backend, &db_path, &config)?;
     let store = Arc::new(store);
@@ -5963,6 +5993,7 @@ fn parse_args() -> Result<Config, String> {
     let mut conf_path: Option<PathBuf> = None;
     let mut params_dir: Option<PathBuf> = None;
     let mut fetch_params = false;
+    let mut reindex = false;
     let mut scan_flatfiles = false;
     let mut scan_supply = false;
     let mut scan_fluxnodes = false;
@@ -6039,6 +6070,9 @@ fn parse_args() -> Result<Config, String> {
             }
             "--fetch-params" => {
                 fetch_params = true;
+            }
+            "--reindex" => {
+                reindex = true;
             }
             "--scan-flatfiles" => {
                 scan_flatfiles = true;
@@ -6556,6 +6590,7 @@ fn parse_args() -> Result<Config, String> {
         network,
         params_dir: params_dir.unwrap_or_else(default_params_dir),
         fetch_params,
+        reindex,
         miner_address,
         scan_flatfiles,
         scan_supply,
@@ -6816,7 +6851,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--fetch-params] [--reindex] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -6824,6 +6859,7 @@ fn usage() -> String {
         "  --conf  Config file path (default: <data-dir>/flux.conf)",
         "  --params-dir    Shielded params directory (default: ~/.zcash-params)",
         "  --fetch-params  Download shielded params into --params-dir",
+        "  --reindex  Wipe db/blocks for --data-dir and restart from genesis",
         "  --scan-flatfiles  Scan flatfiles for block index mismatches, then exit",
         "  --scan-supply  Scan blocks in the local DB and print coinbase totals, then exit",
         "  --scan-fluxnodes  Scan fluxnode records in the local DB and print summary stats, then exit",

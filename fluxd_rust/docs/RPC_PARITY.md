@@ -97,7 +97,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zcrawreceive - Missing
 - prioritisetransaction - Missing
 
-- reindex - Missing
+- reindex - Partial (requests shutdown + wipes `db/` + `blocks/` on next start; does not rebuild indexes from existing flatfiles)
 - stop - Implemented
 - createfluxnodekey - Implemented (alias: createzelnodekey)
 - createzelnodekey - Implemented (alias of createfluxnodekey)
@@ -136,7 +136,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listtransactions - Missing
 - listunspent - Missing
 - lockunspent - Missing
-- rescanblockchain - Missing
+- rescanblockchain - Stub (wallet not implemented)
 
 - sendmany - Missing
 - sendtoaddress - Missing

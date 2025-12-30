@@ -107,6 +107,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Shielded value pool totals (Sprout/Sapling) for supply tracking (owner: TBD)
 - [x] [P1] Block deltas index (`getblockdeltas`) (owner: TBD)
 - [ ] [P2] Reindex/rescan support for secondary indexes (owner: TBD)
+  - [x] `reindex` RPC + `--reindex` startup flag (wipe `db/` + `blocks/`, then resync)
+  - [x] `rescanblockchain` RPC stub (wallet not implemented)
+  - [ ] Reindex from existing flatfiles (no network)
+  - [ ] Selective index rebuild (txindex/address/spent only)
 - [ ] [P2] DB inspection tools (index stats, supply, integrity) (owner: TBD)
 
 ## Networking state and P2P parity
@@ -231,7 +235,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `addnode`<br>`disconnectnode`<br>`getaddednodeinfo`<br>`setban`<br>`clearbanned`<br>`verifychain` | - | `reindex`<br>`rescanblockchain` |
+| `addnode`<br>`disconnectnode`<br>`getaddednodeinfo`<br>`setban`<br>`clearbanned`<br>`verifychain` | `reindex`<br>`rescanblockchain` | - |
 
 ### Wallet (transparent)
 

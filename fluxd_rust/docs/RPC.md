@@ -65,6 +65,7 @@ Type notes:
 - `-32603` internal error
 - `-32700` parse error
 - `-8` invalid parameter
+- `-4` wallet error
 - `-5` invalid address or key
 
 ## Supported methods
@@ -76,6 +77,8 @@ Type notes:
 - `ping`
 - `stop`
 - `restart`
+- `reindex`
+- `rescanblockchain [start_height] [stop_height]` (stub; wallet not implemented)
 - `getnetworkinfo`
 - `getpeerinfo`
 - `getnettotals`
@@ -189,6 +192,16 @@ Fields:
 
 - Result: string (`"fluxd restarting ..."`).
 - Note: this requests process exit; actual restart depends on your supervisor (systemd, docker, etc).
+
+### reindex
+
+- Result: string (`"fluxd reindex requested ..."`).
+- Note: writes `--data-dir/reindex.flag` and requests process exit; on next start the daemon wipes `db/` and `blocks/` and re-syncs from genesis.
+
+### rescanblockchain
+
+- Params: optional `start_height`, `stop_height`.
+- Result: error `-4` (`wallet not implemented`).
 
 ### getdeprecationinfo
 
