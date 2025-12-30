@@ -20,6 +20,7 @@ Mitigations:
 - Increase `--inflight-per-peer` if requests are underutilized.
 - Pin known-good header peers with `--header-peer`.
 - Temporarily set `--header-lead 0` to remove the cap during initial bootstrap.
+- Consider `--profile high` on large hosts (applies a throughput-oriented preset).
 
 ## Blocks are far behind headers
 
@@ -34,6 +35,7 @@ Mitigations:
 - Increase `--block-peers` and `--getdata-batch`.
 - Increase `--verify-workers` or `--verify-queue`.
 - Ensure storage is not I/O bound (monitor disk and CPU).
+- Consider `--profile high` on large hosts (applies a throughput-oriented preset).
 
 ## Sync stalls at a specific height
 
@@ -162,8 +164,7 @@ A known-good mainnet sync configuration is:
 
 ```bash
 ./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --fetch-params \
-  --db-cache-mb 256 --db-write-buffer-mb 4096 --db-journal-mb 16384 --db-memtable-mb 128 \
-  --db-flush-workers 4 --db-compaction-workers 6
+  --profile high
 ```
 
 ## Sync stalls with peers connected (no network progress)
@@ -195,6 +196,7 @@ Mitigations:
 - Reduce Fjall memory usage via `--db-cache-mb`, `--db-write-buffer-mb`,
   and `--db-memtable-mb`.
 - Reduce worker counts for validation.
+- Use `--profile low` as a baseline for constrained hosts.
 
 ## Dashboard not reachable
 

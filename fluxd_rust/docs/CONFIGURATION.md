@@ -36,7 +36,40 @@ Currently supported keys:
 - `addnode` (repeatable)
 - `mineraddress` (default coinbase/miner address for `getblocktemplate`)
 
-### Fjall tuning
+## Run profiles
+
+`--profile low|default|high` applies a preset for performance-related tuning knobs (sync, Fjall,
+and worker configuration).
+
+Precedence (highest to lowest):
+1. Explicit CLI flags (e.g. `--db-cache-mb 512`)
+2. `--profile ...`
+3. Built-in defaults
+
+The daemon prints `Using profile <name>` at startup when a non-default profile is selected.
+
+Current presets:
+
+- `low` (constrained hosts)
+  - Sync: `--getdata-batch 64`, `--block-peers 1`, `--header-peers 2`, `--tx-peers 0`,
+    `--inflight-per-peer 1`
+  - Mempool: `--mempool-max-mb 100`, `--mempool-persist-interval 0`,
+    `--fee-estimates-persist-interval 0`
+  - DB: `--db-cache-mb 128`, `--db-write-buffer-mb 512`, `--db-journal-mb 1024`,
+    `--db-memtable-mb 16`, `--db-flush-workers 1`, `--db-compaction-workers 2`
+  - Cache/workers: `--utxo-cache-entries 50000`, `--header-verify-workers 1`,
+    `--shielded-workers 1`
+- `default`
+  - No overrides; uses built-in defaults.
+- `high` (throughput-oriented)
+  - Sync: `--getdata-batch 256`, `--block-peers 6`, `--header-peers 8`, `--tx-peers 4`,
+    `--inflight-per-peer 2`
+  - Mempool: `--mempool-max-mb 1000`
+  - DB: `--db-write-buffer-mb 4096`, `--db-journal-mb 16384`, `--db-memtable-mb 128`,
+    `--db-flush-workers 4`, `--db-compaction-workers 6`
+  - Cache: `--utxo-cache-entries 1000000`
+
+## Fjall tuning
 
 These flags control Fjall memory usage.
 

@@ -170,7 +170,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## UX, ops, and tooling
 
-- [ ] [P2] Sync/run profiles (`--profile low|default|high`) for worker + DB presets (owner: TBD)
+- [x] [P2] Sync/run profiles (`--profile low|default|high`) for worker + DB presets (owner: TBD)
 - [ ] [P2] Config file support (`flux.conf` parity) (owner: TBD)
   - [x] Basic `flux.conf` parsing (`rpcuser`, `rpcpassword`, `rpcbind`, `rpcport`, `addnode`, `mineraddress`)
   - [ ] Remaining `flux.conf` keys parity

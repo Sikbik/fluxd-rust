@@ -27,6 +27,10 @@ cargo build -p fluxd --release
   --dashboard-addr 127.0.0.1:8080
 ```
 
+Optional performance presets:
+- `--profile high` for faster sync on larger hosts.
+- `--profile low` for constrained hosts (reduces DB + worker defaults).
+
 What this does:
 - Creates `./data/db` (Fjall) and `./data/blocks` (flatfiles).
 - Downloads shielded parameters to `~/.zcash-params` unless overridden.

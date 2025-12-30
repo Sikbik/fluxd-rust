@@ -35,26 +35,17 @@ ssh <vps-user>@<vps-host> "nohup stdbuf -oL -eL <remote-repo-path>/target/releas
   --backend fjall \
   --data-dir <remote-data-dir> \
   --fetch-params \
+  --profile high \
   --dashboard-addr 0.0.0.0:8080 \
-  --getdata-batch 128 \
-  --block-peers 3 \
-  --header-peers 4 \
-  --inflight-per-peer 2 \
-  --header-lead 20000 \
-  --status-interval 15 \
-  --db-cache-mb 256 \
-  --db-write-buffer-mb 256 \
-  --db-journal-mb 512 \
-  --db-memtable-mb 32 \
-  --header-verify-workers 6 \
-  --verify-workers 4 \
-  --shielded-workers 6 \
   > <remote-log-dir>/longrun-public.log 2>&1 &"
 ```
 
 Note: do not run multiple `fluxd` instances pointing at the same `--data-dir` at the same time.
 There is no cross-process locking for the database / flatfiles, so concurrent writers can corrupt
 or stall the node.
+
+If you need a lower-resource run (or are debugging OOM issues), use `--profile low` or override the
+individual `--db-*` / worker flags explicitly.
 
 ## Data dir notes
 

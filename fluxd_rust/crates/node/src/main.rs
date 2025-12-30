@@ -166,6 +166,32 @@ impl Backend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunProfile {
+    Low,
+    Default,
+    High,
+}
+
+impl RunProfile {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "default" => Some(Self::Default),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Default => "default",
+            Self::High => "high",
+        }
+    }
+}
+
 struct Config {
     backend: Backend,
     data_dir: PathBuf,
@@ -6001,6 +6027,7 @@ async fn handle_aux_message(peer: &mut Peer, command: &str, payload: &[u8]) -> R
 
 fn parse_args() -> Result<Config, String> {
     let mut backend = Backend::Fjall;
+    let mut profile: Option<RunProfile> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut conf_path: Option<PathBuf> = None;
     let mut params_dir: Option<PathBuf> = None;
@@ -6022,23 +6049,34 @@ fn parse_args() -> Result<Config, String> {
     let mut rpc_pass_set = false;
     let mut network = Network::Mainnet;
     let mut getdata_batch: usize = DEFAULT_GETDATA_BATCH;
+    let mut getdata_batch_set = false;
     let mut block_peers: usize = DEFAULT_BLOCK_PEERS;
+    let mut block_peers_set = false;
     let mut header_peers: usize = DEFAULT_HEADER_PEERS;
+    let mut header_peers_set = false;
     let mut header_lead: i32 = DEFAULT_HEADER_LEAD;
+    let mut header_lead_set = false;
     let mut header_peer_addrs: Vec<String> = Vec::new();
     let mut addnode_addrs: Vec<SocketAddr> = Vec::new();
     let mut tx_peers: usize = DEFAULT_TX_PEERS;
+    let mut tx_peers_set = false;
     let mut inflight_per_peer: usize = DEFAULT_INFLIGHT_PER_PEER;
+    let mut inflight_per_peer_set = false;
     let mut require_standard: Option<bool> = None;
     let mut min_relay_fee_per_kb: i64 = 100;
     let mut miner_address: Option<String> = None;
     let mut miner_address_set = false;
     let mut mempool_max_mb: u64 = DEFAULT_MEMPOOL_MAX_MB;
+    let mut mempool_max_mb_set = false;
     let mut mempool_persist_interval_secs: u64 = DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS;
+    let mut mempool_persist_interval_set = false;
     let mut fee_estimates_persist_interval_secs: u64 = DEFAULT_FEE_ESTIMATES_PERSIST_INTERVAL_SECS;
+    let mut fee_estimates_persist_interval_set = false;
     let mut status_interval_secs: u64 = 15;
+    let mut status_interval_set = false;
     let mut dashboard_addr: Option<SocketAddr> = None;
     let mut db_cache_mb: u64 = DEFAULT_DB_CACHE_MB;
+    let mut db_cache_set = false;
     let mut db_write_buffer_mb: u64 = DEFAULT_DB_WRITE_BUFFER_MB;
     let mut db_journal_mb: u64 = DEFAULT_DB_JOURNAL_MB;
     let mut db_memtable_mb: u64 = DEFAULT_DB_MEMTABLE_MB;
@@ -6047,12 +6085,20 @@ fn parse_args() -> Result<Config, String> {
     let mut db_write_buffer_set = false;
     let mut db_journal_set = false;
     let mut db_memtable_set = false;
+    let mut db_flush_workers_set = false;
+    let mut db_compaction_workers_set = false;
+    let mut db_fsync_ms_set = false;
     let mut db_fsync_ms: Option<u16> = None;
     let mut utxo_cache_entries: usize = DEFAULT_UTXO_CACHE_ENTRIES;
+    let mut utxo_cache_entries_set = false;
     let mut header_verify_workers: usize = 0;
+    let mut header_verify_workers_set = false;
     let mut verify_workers: usize = 0;
+    let mut verify_workers_set = false;
     let mut verify_queue: usize = 0;
+    let mut verify_queue_set = false;
     let mut shielded_workers: usize = 0;
+    let mut shielded_workers_set = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -6080,6 +6126,17 @@ fn parse_args() -> Result<Config, String> {
                     .next()
                     .ok_or_else(|| format!("missing value for --params-dir\n{}", usage()))?;
                 params_dir = Some(PathBuf::from(value));
+            }
+            "--profile" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --profile\n{}", usage()))?;
+                profile = Some(RunProfile::parse(&value).ok_or_else(|| {
+                    format!(
+                        "invalid profile '{value}' (expected low|default|high)\n{}",
+                        usage()
+                    )
+                })?);
             }
             "--fetch-params" => {
                 fetch_params = true;
@@ -6205,6 +6262,7 @@ fn parse_args() -> Result<Config, String> {
                 getdata_batch = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid getdata batch '{value}'\n{}", usage()))?;
+                getdata_batch_set = true;
                 if getdata_batch == 0 {
                     return Err(format!("getdata batch must be > 0\n{}", usage()));
                 }
@@ -6216,6 +6274,7 @@ fn parse_args() -> Result<Config, String> {
                 block_peers = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid block peers '{value}'\n{}", usage()))?;
+                block_peers_set = true;
             }
             "--header-peers" => {
                 let value = args
@@ -6224,6 +6283,7 @@ fn parse_args() -> Result<Config, String> {
                 header_peers = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid header peers '{value}'\n{}", usage()))?;
+                header_peers_set = true;
                 if header_peers == 0 {
                     return Err(format!("header peers must be > 0\n{}", usage()));
                 }
@@ -6241,6 +6301,7 @@ fn parse_args() -> Result<Config, String> {
                 header_lead = value
                     .parse::<i32>()
                     .map_err(|_| format!("invalid header lead '{value}'\n{}", usage()))?;
+                header_lead_set = true;
                 if header_lead < 0 {
                     return Err(format!("header lead must be >= 0\n{}", usage()));
                 }
@@ -6252,6 +6313,7 @@ fn parse_args() -> Result<Config, String> {
                 tx_peers = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid tx peers '{value}'\n{}", usage()))?;
+                tx_peers_set = true;
             }
             "--inflight-per-peer" => {
                 let value = args
@@ -6260,6 +6322,7 @@ fn parse_args() -> Result<Config, String> {
                 inflight_per_peer = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid inflight per peer '{value}'\n{}", usage()))?;
+                inflight_per_peer_set = true;
                 if inflight_per_peer == 0 {
                     return Err(format!("inflight per peer must be > 0\n{}", usage()));
                 }
@@ -6284,6 +6347,7 @@ fn parse_args() -> Result<Config, String> {
                 mempool_max_mb = value
                     .parse::<u64>()
                     .map_err(|_| format!("invalid mempool max mb '{value}'\n{}", usage()))?;
+                mempool_max_mb_set = true;
             }
             "--mempool-persist-interval" => {
                 let value = args.next().ok_or_else(|| {
@@ -6292,6 +6356,7 @@ fn parse_args() -> Result<Config, String> {
                 mempool_persist_interval_secs = value.parse::<u64>().map_err(|_| {
                     format!("invalid mempool persist interval '{value}'\n{}", usage())
                 })?;
+                mempool_persist_interval_set = true;
             }
             "--fee-estimates-persist-interval" => {
                 let value = args.next().ok_or_else(|| {
@@ -6306,6 +6371,7 @@ fn parse_args() -> Result<Config, String> {
                         usage()
                     )
                 })?;
+                fee_estimates_persist_interval_set = true;
             }
             "--status-interval" => {
                 let value = args
@@ -6314,6 +6380,7 @@ fn parse_args() -> Result<Config, String> {
                 status_interval_secs = value
                     .parse::<u64>()
                     .map_err(|_| format!("invalid status interval '{value}'\n{}", usage()))?;
+                status_interval_set = true;
             }
             "--db-cache-mb" => {
                 let value = args
@@ -6323,6 +6390,7 @@ fn parse_args() -> Result<Config, String> {
                     .parse::<u64>()
                     .map_err(|_| format!("invalid db cache '{value}'\n{}", usage()))?;
                 db_cache_mb = mb;
+                db_cache_set = true;
             }
             "--db-write-buffer-mb" => {
                 let value = args.next().ok_or_else(|| {
@@ -6369,6 +6437,7 @@ fn parse_args() -> Result<Config, String> {
                     return Err(format!("db flush workers must be > 0\n{}", usage()));
                 }
                 db_flush_workers = workers;
+                db_flush_workers_set = true;
             }
             "--db-compaction-workers" => {
                 let value = args.next().ok_or_else(|| {
@@ -6381,6 +6450,7 @@ fn parse_args() -> Result<Config, String> {
                     return Err(format!("db compaction workers must be > 0\n{}", usage()));
                 }
                 db_compaction_workers = workers;
+                db_compaction_workers_set = true;
             }
             "--db-fsync-ms" => {
                 let value = args
@@ -6394,6 +6464,7 @@ fn parse_args() -> Result<Config, String> {
                 }
                 let ms = ms as u16;
                 db_fsync_ms = if ms == 0 { None } else { Some(ms) };
+                db_fsync_ms_set = true;
             }
             "--utxo-cache-entries" => {
                 let value = args.next().ok_or_else(|| {
@@ -6402,6 +6473,7 @@ fn parse_args() -> Result<Config, String> {
                 utxo_cache_entries = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid utxo cache entries '{value}'\n{}", usage()))?;
+                utxo_cache_entries_set = true;
             }
             "--header-verify-workers" => {
                 let value = args.next().ok_or_else(|| {
@@ -6410,6 +6482,7 @@ fn parse_args() -> Result<Config, String> {
                 header_verify_workers = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid header verify workers '{value}'\n{}", usage()))?;
+                header_verify_workers_set = true;
             }
             "--verify-workers" => {
                 let value = args
@@ -6418,6 +6491,7 @@ fn parse_args() -> Result<Config, String> {
                 verify_workers = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid verify workers '{value}'\n{}", usage()))?;
+                verify_workers_set = true;
             }
             "--verify-queue" => {
                 let value = args
@@ -6426,6 +6500,7 @@ fn parse_args() -> Result<Config, String> {
                 verify_queue = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid verify queue '{value}'\n{}", usage()))?;
+                verify_queue_set = true;
             }
             "--shielded-workers" => {
                 let value = args
@@ -6434,6 +6509,7 @@ fn parse_args() -> Result<Config, String> {
                 shielded_workers = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid shielded workers '{value}'\n{}", usage()))?;
+                shielded_workers_set = true;
             }
             "--dashboard-addr" => {
                 let value = args
@@ -6528,6 +6604,79 @@ fn parse_args() -> Result<Config, String> {
                     addnode_addrs.push(addr);
                 }
             }
+        }
+    }
+
+    if let Some(profile) = profile {
+        macro_rules! set_default {
+            ($var:ident, $set:ident, $value:expr) => {
+                if !$set {
+                    $var = $value;
+                }
+            };
+        }
+
+        match profile {
+            RunProfile::Low => {
+                set_default!(getdata_batch, getdata_batch_set, 64);
+                set_default!(block_peers, block_peers_set, 1);
+                set_default!(header_peers, header_peers_set, 2);
+                set_default!(tx_peers, tx_peers_set, 0);
+                set_default!(inflight_per_peer, inflight_per_peer_set, 1);
+                set_default!(header_lead, header_lead_set, DEFAULT_HEADER_LEAD);
+
+                set_default!(mempool_max_mb, mempool_max_mb_set, 100);
+                set_default!(
+                    mempool_persist_interval_secs,
+                    mempool_persist_interval_set,
+                    0
+                );
+                set_default!(
+                    fee_estimates_persist_interval_secs,
+                    fee_estimates_persist_interval_set,
+                    0
+                );
+                set_default!(status_interval_secs, status_interval_set, 30);
+
+                set_default!(db_cache_mb, db_cache_set, 128);
+                set_default!(db_write_buffer_mb, db_write_buffer_set, 512);
+                set_default!(db_journal_mb, db_journal_set, 1024);
+                set_default!(db_memtable_mb, db_memtable_set, 16);
+                set_default!(db_flush_workers, db_flush_workers_set, 1);
+                set_default!(db_compaction_workers, db_compaction_workers_set, 2);
+                set_default!(db_fsync_ms, db_fsync_ms_set, None);
+
+                set_default!(utxo_cache_entries, utxo_cache_entries_set, 50_000);
+                set_default!(header_verify_workers, header_verify_workers_set, 1);
+                set_default!(verify_workers, verify_workers_set, 0);
+                set_default!(verify_queue, verify_queue_set, 0);
+                set_default!(shielded_workers, shielded_workers_set, 1);
+            }
+            RunProfile::Default => {}
+            RunProfile::High => {
+                set_default!(getdata_batch, getdata_batch_set, 256);
+                set_default!(block_peers, block_peers_set, 6);
+                set_default!(header_peers, header_peers_set, 8);
+                set_default!(tx_peers, tx_peers_set, 4);
+                set_default!(inflight_per_peer, inflight_per_peer_set, 2);
+                set_default!(header_lead, header_lead_set, DEFAULT_HEADER_LEAD);
+
+                set_default!(mempool_max_mb, mempool_max_mb_set, 1000);
+
+                set_default!(db_cache_mb, db_cache_set, DEFAULT_DB_CACHE_MB);
+                set_default!(db_write_buffer_mb, db_write_buffer_set, 4096);
+                set_default!(db_journal_mb, db_journal_set, 16384);
+                set_default!(db_memtable_mb, db_memtable_set, 128);
+                set_default!(db_flush_workers, db_flush_workers_set, 4);
+                set_default!(db_compaction_workers, db_compaction_workers_set, 6);
+                set_default!(db_fsync_ms, db_fsync_ms_set, None);
+
+                set_default!(utxo_cache_entries, utxo_cache_entries_set, 1_000_000);
+            }
+        }
+
+        if profile != RunProfile::Default {
+            println!("Using profile {}", profile.as_str());
         }
     }
 
@@ -6868,13 +7017,14 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
         "  --data-dir  Base data directory (default: ./data)",
         "  --conf  Config file path (default: <data-dir>/flux.conf)",
         "  --params-dir    Shielded params directory (default: ~/.zcash-params)",
+        "  --profile  Apply a preset for sync/DB/worker tuning (low|default|high)",
         "  --fetch-params  Download shielded params into --params-dir",
         "  --reindex  Wipe db/blocks for --data-dir and restart from genesis",
         "  --db-info  Print DB/flatfile size breakdown and fjall telemetry, then exit",
