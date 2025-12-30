@@ -77,6 +77,10 @@ const RPC_METHODS: &[&str] = &[
     "getchaintips",
     "getblocksubsidy",
     "getblockhashes",
+    "createrawtransaction",
+    "decoderawtransaction",
+    "decodescript",
+    "validateaddress",
     "getrawtransaction",
     "sendrawtransaction",
     "getmempoolinfo",
@@ -624,6 +628,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getchaintips" => rpc_getchaintips(chainstate, params),
         "getblocksubsidy" => rpc_getblocksubsidy(chainstate, params, chain_params),
         "getblockhashes" => rpc_getblockhashes(chainstate, params),
+        "createrawtransaction" => rpc_createrawtransaction(chainstate, params, chain_params),
+        "decoderawtransaction" => rpc_decoderawtransaction(params, chain_params),
+        "decodescript" => rpc_decodescript(params, chain_params),
         "getrawtransaction" => rpc_getrawtransaction(chainstate, mempool, params, chain_params),
         "sendrawtransaction" => rpc_sendrawtransaction(
             chainstate,
@@ -671,6 +678,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getfluxnodestatus" => rpc_getfluxnodestatus(chainstate, params, chain_params, data_dir),
         "getdoslist" => rpc_getdoslist(chainstate, params, chain_params),
         "getstartlist" => rpc_getstartlist(chainstate, params, chain_params),
+        "validateaddress" => rpc_validateaddress(params, chain_params),
         _ => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "method not found")),
     }
 }
@@ -1164,6 +1172,223 @@ fn rpc_getblocksubsidy<S: fluxd_storage::KeyValueStore>(
     let subsidy = block_subsidy(height, &chain_params.consensus);
     Ok(json!({
         "miner": amount_to_value(subsidy),
+    }))
+}
+
+fn rpc_createrawtransaction<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    const DEFAULT_TX_EXPIRY_DELTA: u32 = 20;
+    const TX_EXPIRING_SOON_THRESHOLD: u32 = 3;
+
+    if params.len() < 2 || params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "createrawtransaction expects 2 to 4 parameters",
+        ));
+    }
+    let inputs = params[0]
+        .as_array()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "transactions must be a json array"))?;
+    let outputs = params[1]
+        .as_object()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "addresses must be a json object"))?;
+
+    let next_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height.saturating_add(1))
+        .unwrap_or(1);
+    let sapling_active = network_upgrade_active(
+        next_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Acadia,
+    );
+
+    let mut tx = Transaction {
+        f_overwintered: sapling_active,
+        version: if sapling_active { 4 } else { 1 },
+        version_group_id: if sapling_active {
+            SAPLING_VERSION_GROUP_ID
+        } else {
+            0
+        },
+        vin: Vec::new(),
+        vout: Vec::new(),
+        lock_time: 0,
+        expiry_height: if sapling_active {
+            (next_height as u32).saturating_add(DEFAULT_TX_EXPIRY_DELTA)
+        } else {
+            0
+        },
+        value_balance: 0,
+        shielded_spends: Vec::new(),
+        shielded_outputs: Vec::new(),
+        join_splits: Vec::new(),
+        join_split_pub_key: [0u8; 32],
+        join_split_sig: [0u8; 64],
+        binding_sig: [0u8; 64],
+        fluxnode: None,
+    };
+
+    if params.len() > 2 && !params[2].is_null() {
+        tx.lock_time = parse_u32(&params[2], "locktime")?;
+    }
+    if params.len() > 3 && !params[3].is_null() {
+        if !sapling_active {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "expiryheight can only be used if sapling is active when the transaction is mined",
+            ));
+        }
+        let expiry_height = parse_u32(&params[3], "expiryheight")?;
+        if expiry_height >= fluxd_consensus::constants::TX_EXPIRY_HEIGHT_THRESHOLD {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "expiryheight too high",
+            ));
+        }
+        if expiry_height != 0
+            && (next_height as u32).saturating_add(TX_EXPIRING_SOON_THRESHOLD) > expiry_height
+        {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "expiryheight too soon",
+            ));
+        }
+        tx.expiry_height = expiry_height;
+    }
+
+    let default_sequence = if tx.lock_time != 0 {
+        u32::MAX.saturating_sub(1)
+    } else {
+        u32::MAX
+    };
+    for input in inputs {
+        let obj = input.as_object().ok_or_else(|| {
+            RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "transactions entries must be objects",
+            )
+        })?;
+        let txid_value = obj
+            .get("txid")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing txid key"))?;
+        let vout_value = obj
+            .get("vout")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing vout key"))?;
+        let txid = parse_hash(txid_value)?;
+        let vout = parse_u32(vout_value, "vout")?;
+
+        let sequence = match obj.get("sequence") {
+            Some(value) => parse_u32(value, "sequence")?,
+            None => default_sequence,
+        };
+
+        tx.vin.push(TxIn {
+            prevout: OutPoint {
+                hash: txid,
+                index: vout,
+            },
+            script_sig: Vec::new(),
+            sequence,
+        });
+    }
+
+    for (address, amount) in outputs {
+        let script_pubkey =
+            address_to_script_pubkey(address, chain_params.network).map_err(|err| match err {
+                AddressError::InvalidLength
+                | AddressError::InvalidCharacter
+                | AddressError::InvalidChecksum
+                | AddressError::UnknownPrefix => RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    format!("Invalid Flux address: {address}"),
+                ),
+            })?;
+        let value = parse_amount(amount)?;
+        tx.vout.push(TxOut {
+            value,
+            script_pubkey,
+        });
+    }
+
+    let encoded = tx.consensus_encode().map_err(map_internal)?;
+    Ok(Value::String(hex_bytes(&encoded)))
+}
+
+fn rpc_decoderawtransaction(
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "decoderawtransaction expects 1 parameter",
+        ));
+    }
+    let hex = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
+    let raw = bytes_from_hex(hex)
+        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    let tx = Transaction::consensus_decode(&raw)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    tx_to_json(&tx, chain_params.network)
+}
+
+fn rpc_decodescript(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "decodescript expects 1 parameter",
+        ));
+    }
+    let hex = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
+    let script = if hex.is_empty() {
+        Vec::new()
+    } else {
+        bytes_from_hex(hex)
+            .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "script decode failed"))?
+    };
+
+    let mut map = match script_pubkey_json(&script, chain_params.network) {
+        Value::Object(map) => map,
+        _ => return Err(RpcError::new(RPC_INTERNAL_ERROR, "invalid script json")),
+    };
+    map.insert(
+        "p2sh".to_string(),
+        Value::String(script_p2sh_address(&script, chain_params.network)),
+    );
+    Ok(Value::Object(map))
+}
+
+fn rpc_validateaddress(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "validateaddress expects 1 parameter",
+        ));
+    }
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
+    let script_pubkey = match address_to_script_pubkey(address, chain_params.network) {
+        Ok(script) => script,
+        Err(_) => {
+            return Ok(json!({
+                "isvalid": false,
+            }))
+        }
+    };
+    Ok(json!({
+        "isvalid": true,
+        "address": address,
+        "scriptPubKey": hex_bytes(&script_pubkey),
     }))
 }
 
@@ -3223,6 +3448,16 @@ fn script_pubkey_json(script: &[u8], network: Network) -> Value {
     Value::Object(map)
 }
 
+fn script_p2sh_address(script: &[u8], network: Network) -> String {
+    let hash = hash160(script);
+    let mut script_pubkey = Vec::with_capacity(23);
+    script_pubkey.push(0xa9);
+    script_pubkey.push(0x14);
+    script_pubkey.extend_from_slice(&hash);
+    script_pubkey.push(0x87);
+    script_pubkey_to_address(&script_pubkey, network).unwrap_or_default()
+}
+
 fn script_req_sigs(script_type: &str) -> Option<i64> {
     match script_type {
         "pubkeyhash" | "scripthash" | "witness_v0_keyhash" => Some(1),
@@ -3354,6 +3589,111 @@ fn amount_to_value(amount: i64) -> Value {
     Number::from_f64(value)
         .map(Value::Number)
         .unwrap_or(Value::Number(0.into()))
+}
+
+fn parse_amount(value: &Value) -> Result<i64, RpcError> {
+    let text = match value {
+        Value::Number(num) => num.to_string(),
+        Value::String(text) => text.clone(),
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "amount must be a number or string",
+            ))
+        }
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "amount is empty"));
+    }
+
+    let negative = text.starts_with('-');
+    let text = text.strip_prefix('-').unwrap_or(text);
+
+    let (whole, fractional) = match text.split_once('.') {
+        Some((whole, fractional)) => (whole, fractional),
+        None => (text, ""),
+    };
+    if whole.is_empty() && fractional.is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "invalid amount"));
+    }
+    if !whole.is_empty() && !whole.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "invalid amount"));
+    }
+    if !fractional.is_empty() && !fractional.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "invalid amount"));
+    }
+    if fractional.len() > 8 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "amount has too many decimal places",
+        ));
+    }
+
+    let whole_value = if whole.is_empty() {
+        0i64
+    } else {
+        whole
+            .parse::<i64>()
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "invalid amount"))?
+    };
+    let fractional_value = if fractional.is_empty() {
+        0i64
+    } else {
+        let parsed = fractional
+            .parse::<i64>()
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "invalid amount"))?;
+        let scale = 10i64.pow(8u32.saturating_sub(fractional.len() as u32));
+        parsed
+            .checked_mul(scale)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "invalid amount"))?
+    };
+
+    let amount = whole_value
+        .checked_mul(COIN)
+        .and_then(|value| value.checked_add(fractional_value))
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "invalid amount"))?;
+    let amount = if negative {
+        amount
+            .checked_neg()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "invalid amount"))?
+    } else {
+        amount
+    };
+    if amount < 0 {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"));
+    }
+    if !fluxd_consensus::money::money_range(amount) {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"));
+    }
+    Ok(amount)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_amount_accepts_basic_inputs() {
+        assert_eq!(parse_amount(&json!(0)).unwrap(), 0);
+        assert_eq!(parse_amount(&json!(1)).unwrap(), COIN);
+        assert_eq!(parse_amount(&json!("1")).unwrap(), COIN);
+        assert_eq!(parse_amount(&json!("1.00000001")).unwrap(), COIN + 1);
+        assert_eq!(parse_amount(&json!("0.1")).unwrap(), COIN / 10);
+        assert_eq!(parse_amount(&json!(".1")).unwrap(), COIN / 10);
+        assert_eq!(parse_amount(&json!("1.")).unwrap(), COIN);
+    }
+
+    #[test]
+    fn parse_amount_rejects_invalid_inputs() {
+        assert!(parse_amount(&json!(-1)).is_err());
+        assert!(parse_amount(&json!("-1")).is_err());
+        assert!(parse_amount(&json!("1.000000001")).is_err());
+        assert!(parse_amount(&json!("foo")).is_err());
+        assert!(parse_amount(&json!("1e-8")).is_err());
+        assert!(parse_amount(&json!("")).is_err());
+    }
 }
 
 fn system_time_to_unix(time: SystemTime) -> i64 {
@@ -4006,6 +4346,7 @@ fn write_cookie(path: &Path, user: &str, pass: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct RpcError {
     code: i64,
     message: String,

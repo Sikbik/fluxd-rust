@@ -187,7 +187,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `gettxout`<br>`getrawtransaction`<br>`estimatefee` | `sendrawtransaction` (relays; confirmed inputs only) | `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`createmultisig`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`estimatepriority`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`prioritisetransaction` |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`gettxout`<br>`getrawtransaction`<br>`estimatefee`<br>`validateaddress` | `sendrawtransaction` (relays; confirmed inputs only) | `fundrawtransaction`<br>`signrawtransaction`<br>`createmultisig`<br>`verifymessage`<br>`signmessage`<br>`estimatepriority`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`prioritisetransaction` |
 
 ### Mempool and relay
 

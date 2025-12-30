@@ -98,10 +98,14 @@ Type notes:
 
 ### Transactions and UTXO
 
+- `createrawtransaction <transactions> <addresses> [locktime] [expiryheight]`
+- `decoderawtransaction <hexstring>`
+- `decodescript <hex>`
 - `getrawtransaction <txid> [verbose]`
 - `sendrawtransaction <hexstring> [allowhighfees]`
 - `gettxout <txid> <vout> [include_mempool]`
 - `gettxoutsetinfo`
+- `validateaddress <fluxaddress>`
 
 ### Mining and mempool
 
@@ -269,6 +273,37 @@ Notes:
   when multiple blocks share the same second.
 - Timestamp index entries are created on block connect; a fresh sync is required
   to populate older data.
+
+### createrawtransaction
+
+- Params:
+  - `transactions` (array) - `[{"txid":"...","vout":n,"sequence":n?}, ...]`
+  - `addresses` (object) - `{"taddr": amount, ...}`
+  - optional `locktime` (number, default 0)
+  - optional `expiryheight` (number, Sapling-era only)
+- Result: hex-encoded raw transaction bytes.
+
+Notes:
+- The transaction is unsigned; inputs have empty `scriptSig`.
+- If Sapling is active for the next block, `expiryheight` defaults to `next_height + 20`.
+- If `locktime != 0`, input sequences default to `u32::MAX - 1` (unless overridden).
+
+### decoderawtransaction
+
+- Params: `hexstring` (string)
+- Result: decoded transaction object (same shape as `getrawtransaction` verbose output, without block metadata).
+
+### decodescript
+
+- Params: `hex` (string)
+- Result: decoded script object with `asm`, `hex`, `type`, optional `reqSigs`/`addresses`, and `p2sh`.
+
+### validateaddress
+
+- Params: `fluxaddress` (string)
+- Result:
+  - If invalid: `{ "isvalid": false }`
+  - If valid: `{ "isvalid": true, "address": "...", "scriptPubKey": "..." }`
 
 ### getrawtransaction
 

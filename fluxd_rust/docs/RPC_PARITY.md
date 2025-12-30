@@ -61,16 +61,16 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Raw transactions and scripts
 
-- createrawtransaction - Missing
-- decoderawtransaction - Missing
-- decodescript - Missing
+- createrawtransaction - Implemented
+- decoderawtransaction - Implemented
+- decodescript - Implemented
 - getrawtransaction - Implemented (chain + mempool)
 - fundrawtransaction - Missing
 - sendrawtransaction - Partial (relays; confirmed inputs only)
 - createmultisig - Missing
 - estimatefee - Implemented
 - estimatepriority - Missing
-- validateaddress - Missing
+- validateaddress - Implemented
 - verifymessage - Missing
 
 ## Extra queries
