@@ -49,6 +49,10 @@ Fjall write throttling due to L0 segment buildup. Practical mitigations:
 When `--db-write-buffer-mb` or `--db-journal-mb` is set below these minima, `fluxd` clamps the values
 upward at startup (and prints a warning) to avoid long write halts.
 
+`fluxd` also monitors Fjall write-buffer and journal pressure at runtime and may rotate memtables to
+proactively trigger flush + journal GC. When this happens it prints a periodic warning and `/stats`
+will show the relevant `db_*` counters.
+
 ## Chainstate caching
 
 - `--utxo-cache-entries N`

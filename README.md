@@ -54,7 +54,7 @@ Notes:
 ## RPC and dashboard
 
 - RPC uses HTTP Basic Auth. A cookie is written to `data/rpc.cookie` if you do not pass `--rpc-user` and `--rpc-pass`.
-- JSON-RPC and `/daemon` HTTP endpoints are both supported. See `docs/RPC.md`.
+- JSON-RPC and `/daemon` HTTP endpoints are both supported. See `fluxd_rust/docs/RPC.md`.
 - Dashboard (optional): `--dashboard-addr 127.0.0.1:8080` serves `/` (UI), `/stats`, and `/healthz`.
 
 Example (JSON-RPC):
@@ -100,12 +100,13 @@ Consensus-critical logic lives in `consensus`, `chainstate`, `script`, `pow`, `p
 
 ## Documentation
 
-- `docs/README.md` - documentation index.
-- `docs/QUICKSTART.md` - step-by-step setup and usage.
-- `docs/CONFIGURATION.md` - CLI flags and tuning.
-- `docs/RPC.md` - RPC interface and method reference.
-- `docs/RPC_PARITY.md` - parity checklist vs C++ RPC surface.
-- `docs/ARCHITECTURE.md` - internal design and data flow.
-- `docs/INDEXES.md` - on-disk indexes and schema.
-- `docs/OPERATIONS.md` - VPS runbook and ops tasks.
-- `docs/TROUBLESHOOTING.md` - common issues and fixes.
+- `fluxd_rust/docs/README.md` - documentation index.
+- `fluxd_rust/docs/QUICKSTART.md` - step-by-step setup and usage.
+- `fluxd_rust/docs/CONFIGURATION.md` - CLI flags and tuning.
+- `fluxd_rust/docs/RPC.md` - RPC interface and method reference.
+- `fluxd_rust/docs/RPC_PARITY.md` - parity checklist vs C++ RPC surface.
+- `fluxd_rust/docs/ARCHITECTURE.md` - internal design and data flow.
+- `fluxd_rust/docs/INDEXES.md` - on-disk indexes and schema.
+- `fluxd_rust/docs/OPERATIONS.md` - ops runbook and tasks.
+- `fluxd_rust/docs/TELEMETRY.md` - metrics and performance debugging.
+- `fluxd_rust/docs/TROUBLESHOOTING.md` - common issues and fixes.

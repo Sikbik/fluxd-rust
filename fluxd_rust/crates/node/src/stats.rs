@@ -87,7 +87,10 @@ pub struct StatsSnapshot {
     pub undo_bytes: u64,
     pub undo_append_us: u64,
     pub db_write_buffer_bytes: Option<u64>,
+    pub db_max_write_buffer_bytes: Option<u64>,
     pub db_journal_count: Option<u64>,
+    pub db_journal_disk_space_bytes: Option<u64>,
+    pub db_max_journal_bytes: Option<u64>,
     pub db_flushes_completed: Option<u64>,
     pub db_active_compactions: Option<u64>,
     pub db_compactions_completed: Option<u64>,
@@ -264,8 +267,14 @@ impl StatsSnapshot {
 
         json.push_str(",\"db_write_buffer_bytes\":");
         push_json_u64_opt(&mut json, self.db_write_buffer_bytes);
+        json.push_str(",\"db_max_write_buffer_bytes\":");
+        push_json_u64_opt(&mut json, self.db_max_write_buffer_bytes);
         json.push_str(",\"db_journal_count\":");
         push_json_u64_opt(&mut json, self.db_journal_count);
+        json.push_str(",\"db_journal_disk_space_bytes\":");
+        push_json_u64_opt(&mut json, self.db_journal_disk_space_bytes);
+        json.push_str(",\"db_max_journal_bytes\":");
+        push_json_u64_opt(&mut json, self.db_max_journal_bytes);
         json.push_str(",\"db_flushes_completed\":");
         push_json_u64_opt(&mut json, self.db_flushes_completed);
         json.push_str(",\"db_active_compactions\":");
@@ -645,7 +654,10 @@ pub fn snapshot_stats<S: KeyValueStore>(
         undo_bytes: connect.undo_bytes,
         undo_append_us: connect.undo_append_us,
         db_write_buffer_bytes: db.as_ref().map(|db| db.write_buffer_bytes),
+        db_max_write_buffer_bytes: db.as_ref().and_then(|db| db.max_write_buffer_bytes),
         db_journal_count: db.as_ref().map(|db| db.journal_count),
+        db_journal_disk_space_bytes: db.as_ref().map(|db| db.journal_disk_space_bytes),
+        db_max_journal_bytes: db.as_ref().and_then(|db| db.max_journal_bytes),
         db_flushes_completed: db.as_ref().map(|db| db.flushes_completed),
         db_active_compactions: db.as_ref().map(|db| db.active_compactions),
         db_compactions_completed: db.as_ref().map(|db| db.compactions_completed),

@@ -79,7 +79,10 @@ When using the `fjall` backend, `/stats` includes `db_*` fields:
 
 - Keyspace-level:
   - `db_write_buffer_bytes` - current global write buffer usage (active + sealed memtables).
+  - `db_max_write_buffer_bytes` - configured max write buffer (after any startup clamping).
   - `db_journal_count` - journals currently on disk.
+  - `db_journal_disk_space_bytes` - current journal file size on disk (write-ahead log).
+  - `db_max_journal_bytes` - configured max journal size (after any startup clamping).
   - `db_flushes_completed` - completed memtable flushes.
   - `db_active_compactions` - compactions currently running.
   - `db_compactions_completed` - completed compactions.
@@ -94,6 +97,9 @@ Interpreting stalls:
 - If block connect “pauses” while the process is alive, and `db_*_segments` grows quickly while
   `db_compactions_completed` grows slowly, compaction is likely the limiter.
 - If `db_write_buffer_bytes` stays high, flush/compaction may be falling behind.
+- If `db_journal_disk_space_bytes` grows toward `db_max_journal_bytes`, the DB can temporarily halt
+  commits until flush + journal GC catch up. `fluxd` will proactively rotate memtables under journal
+  pressure to keep the process moving.
 
 See `docs/CONFIGURATION.md` for the primary tuning knobs:
 

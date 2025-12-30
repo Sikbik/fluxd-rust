@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fjall::{AbstractTree, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
@@ -13,21 +14,29 @@ const WRITE_BUFFER_RELIEF_LOG_INTERVAL_SECS: u64 = 30;
 const WRITE_BUFFER_RELIEF_COOLDOWN_SECS: u64 = 1;
 
 const WRITE_BUFFER_HIGH_WATERMARK_PCT: u64 = 90;
+const JOURNAL_HIGH_WATERMARK_PCT: u64 = 80;
+const JOURNAL_RELIEF_LOG_INTERVAL_SECS: u64 = 30;
+const JOURNAL_RELIEF_COOLDOWN_SECS: u64 = 2;
 
 static LAST_SLOW_COMMIT_LOG_SECS: AtomicU64 = AtomicU64::new(0);
 static LAST_WRITE_BUFFER_RELIEF_LOG_SECS: AtomicU64 = AtomicU64::new(0);
+static LAST_JOURNAL_RELIEF_LOG_SECS: AtomicU64 = AtomicU64::new(0);
 
 pub struct FjallStore {
     keyspace: Keyspace,
     partitions: HashMap<Column, PartitionHandle>,
     max_write_buffer_bytes: Option<u64>,
+    max_journal_bytes: Option<u64>,
     last_pressure_relief_secs: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct FjallTelemetrySnapshot {
     pub write_buffer_bytes: u64,
+    pub max_write_buffer_bytes: Option<u64>,
     pub journal_count: u64,
+    pub journal_disk_space_bytes: u64,
+    pub max_journal_bytes: Option<u64>,
     pub flushes_completed: u64,
     pub active_compactions: u64,
     pub compactions_completed: u64,
@@ -95,7 +104,7 @@ impl FjallStore {
     }
 
     pub fn open_with_config(config: Config) -> Result<Self, StoreError> {
-        Self::open_with_config_and_options(config, PartitionCreateOptions::default(), None)
+        Self::open_with_config_and_options(config, PartitionCreateOptions::default(), None, None)
     }
 
     pub fn open_with_options(
@@ -104,13 +113,19 @@ impl FjallStore {
     ) -> Result<Self, StoreError> {
         let config = options.apply_config(Config::new(path));
         let partition_options = options.partition_options();
-        Self::open_with_config_and_options(config, partition_options, options.write_buffer_bytes)
+        Self::open_with_config_and_options(
+            config,
+            partition_options,
+            options.write_buffer_bytes,
+            options.journal_bytes,
+        )
     }
 
     pub fn open_with_config_and_options(
         config: Config,
         partition_options: PartitionCreateOptions,
         max_write_buffer_bytes: Option<u64>,
+        max_journal_bytes: Option<u64>,
     ) -> Result<Self, StoreError> {
         let keyspace = config.open().map_err(map_err)?;
         let mut partitions = HashMap::new();
@@ -120,12 +135,15 @@ impl FjallStore {
                 .map_err(map_err)?;
             partitions.insert(column, handle);
         }
-        Ok(Self {
+        let store = Self {
             keyspace,
             partitions,
             max_write_buffer_bytes,
+            max_journal_bytes,
             last_pressure_relief_secs: AtomicU64::new(0),
-        })
+        };
+        store.spawn_journal_pressure_watchdog();
+        Ok(store)
     }
 
     fn partition(&self, column: Column) -> Result<&PartitionHandle, StoreError> {
@@ -149,7 +167,10 @@ impl FjallStore {
 
         FjallTelemetrySnapshot {
             write_buffer_bytes: self.keyspace.write_buffer_size(),
+            max_write_buffer_bytes: self.max_write_buffer_bytes,
             journal_count: self.keyspace.journal_count() as u64,
+            journal_disk_space_bytes: self.keyspace.journal_disk_space(),
+            max_journal_bytes: self.max_journal_bytes,
             flushes_completed: self.keyspace.flushes_completed() as u64,
             active_compactions: self.keyspace.active_compactions() as u64,
             compactions_completed: self.keyspace.compactions_completed() as u64,
@@ -259,6 +280,75 @@ impl FjallStore {
                 );
             }
         }
+    }
+
+    fn spawn_journal_pressure_watchdog(&self) {
+        let Some(limit) = self.max_journal_bytes else {
+            return;
+        };
+        if limit == 0 {
+            return;
+        }
+        let keyspace = self.keyspace.clone();
+        let partitions: Vec<PartitionHandle> = self.partitions.values().cloned().collect();
+        let _ = thread::Builder::new()
+            .name("fjall-journal-watchdog".to_string())
+            .spawn(move || {
+                let mut last_relief = Instant::now()
+                    .checked_sub(Duration::from_secs(JOURNAL_RELIEF_COOLDOWN_SECS))
+                    .unwrap_or_else(Instant::now);
+                let cooldown = Duration::from_secs(JOURNAL_RELIEF_COOLDOWN_SECS);
+                let watermark = limit.saturating_mul(JOURNAL_HIGH_WATERMARK_PCT) / 100;
+                loop {
+                    thread::sleep(Duration::from_millis(500));
+                    let current = keyspace.journal_disk_space();
+                    if current < watermark {
+                        continue;
+                    }
+                    if last_relief.elapsed() < cooldown {
+                        continue;
+                    }
+                    last_relief = Instant::now();
+
+                    let mut candidates: Vec<(u32, &PartitionHandle)> = partitions
+                        .iter()
+                        .map(|partition| (partition.tree.active_memtable_size(), partition))
+                        .collect();
+                    candidates.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
+                    let mut rotated = 0usize;
+                    for (size, partition) in candidates {
+                        if rotated >= 3 {
+                            break;
+                        }
+                        if size == 0 {
+                            continue;
+                        }
+                        if matches!(partition.rotate_memtable(), Ok(true)) {
+                            rotated = rotated.saturating_add(1);
+                        }
+                    }
+
+                    if rotated == 0 {
+                        continue;
+                    }
+
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let last = LAST_JOURNAL_RELIEF_LOG_SECS.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) >= JOURNAL_RELIEF_LOG_INTERVAL_SECS
+                        && LAST_JOURNAL_RELIEF_LOG_SECS
+                            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        eprintln!(
+                            "Warning: Fjall journal pressure {pressure:.1}% ({current}B/{limit}B); rotated {rotated} memtable(s) to trigger flush + journal GC",
+                            pressure = current as f64 / limit as f64 * 100.0,
+                        );
+                    }
+                }
+            });
     }
 }
 

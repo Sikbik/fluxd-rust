@@ -119,6 +119,7 @@ Fix:
 Symptoms:
 - Heights stop moving for long periods while the process stays alive.
 - Log may include: `Warning: Fjall write_batch commit took ...ms ...`
+- Log may include: `Warning: Fjall journal pressure ...`
 
 Cause:
 - Fjall is throttling writes due to flush/compaction backpressure (similar to an L0 stall).
@@ -126,12 +127,20 @@ Cause:
   A second common cause is hitting the Fjall journal / write-buffer limits, which can halt writes until
   background flushes catch up.
 
+Checks:
+- Query `/stats` and compare:
+  - `db_write_buffer_bytes` vs `db_max_write_buffer_bytes`
+  - `db_journal_disk_space_bytes` vs `db_max_journal_bytes`
+- If the DB is at/near its max journal size, flush + journal GC may need time to catch up.
+
 Fix:
 - Prefer running with no explicit `--db-*` flags first (the daemon auto-tunes/clamps the most dangerous
   combinations), then only override if needed.
 - If you do override:
   - `--db-write-buffer-mb` should be at least `partitions × --db-memtable-mb`.
   - `--db-journal-mb` should be at least `2 × partitions × --db-memtable-mb`.
+  - If you see sustained journal pressure, increase `--db-journal-mb`, reduce `--db-memtable-mb`, and/or
+    increase `--db-flush-workers`.
 
 A known-good mainnet sync configuration is:
 
