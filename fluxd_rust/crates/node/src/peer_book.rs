@@ -77,6 +77,29 @@ impl HeaderPeerBook {
         }
     }
 
+    pub fn unban(&self, addr: SocketAddr) -> bool {
+        let Ok(mut banned) = self.banned.lock() else {
+            return false;
+        };
+        let removed = banned.remove(&addr).is_some();
+        if removed {
+            self.revision.fetch_add(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    pub fn clear_banned(&self) -> usize {
+        let Ok(mut banned) = self.banned.lock() else {
+            return 0;
+        };
+        let removed = banned.len();
+        if removed > 0 {
+            banned.clear();
+            self.revision.fetch_add(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
     pub fn preferred(&self, limit: usize) -> Vec<SocketAddr> {
         if limit == 0 {
             return Vec::new();

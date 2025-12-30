@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,9 +60,23 @@ struct PeerEntry {
 #[derive(Debug, Default)]
 pub struct PeerRegistry {
     peers: Mutex<HashMap<SocketAddr, PeerEntry>>,
+    disconnect_requests: Mutex<HashSet<SocketAddr>>,
 }
 
 impl PeerRegistry {
+    pub fn request_disconnect(&self, addr: SocketAddr) {
+        if let Ok(mut requests) = self.disconnect_requests.lock() {
+            requests.insert(addr);
+        }
+    }
+
+    pub fn take_disconnect_request(&self, addr: SocketAddr) -> bool {
+        self.disconnect_requests
+            .lock()
+            .map(|mut requests| requests.remove(&addr))
+            .unwrap_or(false)
+    }
+
     pub fn register(&self, addr: SocketAddr, kind: PeerKind) {
         let now = SystemTime::now();
         let entry = PeerEntry {
@@ -335,6 +349,10 @@ impl Peer {
             }
         }
         Ok(())
+    }
+
+    pub fn take_disconnect_request(&self) -> bool {
+        self.registry.take_disconnect_request(self.addr)
     }
 
     pub fn remote_height(&self) -> i32 {

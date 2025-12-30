@@ -105,11 +105,11 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - startfluxnode - Missing
 - startdeterministicfluxnode - Missing
 - verifychain - Missing
-- addnode - Missing
-- clearbanned - Missing
-- disconnectnode - Missing
-- getaddednodeinfo - Missing
-- setban - Missing
+- addnode - Implemented (IP/IP:PORT only; no DNS resolution yet)
+- clearbanned - Implemented
+- disconnectnode - Implemented (address-based; best-effort)
+- getaddednodeinfo - Implemented (simplified fields; `dns` param ignored)
+- setban - Implemented (SocketAddr bans; `absolute` supported)
 
 ## Wallet
 

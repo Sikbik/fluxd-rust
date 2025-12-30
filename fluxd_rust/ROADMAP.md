@@ -160,6 +160,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 - [ ] [P2] Sync/run profiles (`--profile low|default|high`) for worker + DB presets (owner: TBD)
 - [ ] [P2] Config file support (`flux.conf` parity) (owner: TBD)
+  - [x] Basic `flux.conf` parsing (`rpcuser`, `rpcpassword`, `rpcbind`, `rpcport`, `addnode`)
+  - [ ] Remaining `flux.conf` keys parity
 - [ ] [P2] Structured CLI help output and subcommands (owner: TBD)
 - [ ] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
 - [ ] [P2] Metrics export (Prometheus or similar) (owner: TBD)
@@ -183,7 +185,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `help`<br>`getinfo`<br>`ping`<br>`stop`<br>`restart`<br>`getnetworkinfo`<br>`getpeerinfo`<br>`getnettotals`<br>`getconnectioncount`<br>`listbanned`<br>`getdeprecationinfo` | - | `start` |
+| `help`<br>`getinfo`<br>`ping`<br>`stop`<br>`restart`<br>`getnetworkinfo`<br>`getpeerinfo`<br>`getnettotals`<br>`getconnectioncount`<br>`listbanned`<br>`clearbanned`<br>`setban`<br>`addnode`<br>`getaddednodeinfo`<br>`disconnectnode`<br>`getdeprecationinfo` | - | `start` |
 
 ### Chain and blocks
 

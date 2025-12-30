@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -184,6 +184,7 @@ struct Config {
     header_peers: usize,
     header_lead: i32,
     header_peer_addrs: Vec<String>,
+    addnode_addrs: Vec<SocketAddr>,
     tx_peers: usize,
     inflight_per_peer: usize,
     require_standard: bool,
@@ -762,6 +763,7 @@ async fn run() -> Result<(), String> {
     let peer_registry = Arc::new(PeerRegistry::default());
     let header_peer_book = Arc::new(HeaderPeerBook::default());
     let addr_book = Arc::new(AddrBook::default());
+    let added_nodes = Arc::new(Mutex::new(HashSet::<SocketAddr>::new()));
     let peers_path = data_dir.join(PEERS_FILE_NAME);
     let banlist_path = data_dir.join(BANLIST_FILE_NAME);
     let mempool_path = data_dir.join(MEMPOOL_FILE_NAME);
@@ -774,6 +776,18 @@ async fn run() -> Result<(), String> {
             }
         }
         Err(err) => eprintln!("failed to load peers file: {err}"),
+    }
+
+    if !config.addnode_addrs.is_empty() {
+        if let Ok(mut guard) = added_nodes.lock() {
+            guard.extend(config.addnode_addrs.iter().copied());
+        }
+        let inserted = addr_book.insert_many(config.addnode_addrs.clone());
+        println!(
+            "Loaded {} addnode(s) from flux.conf (new {})",
+            config.addnode_addrs.len(),
+            inserted
+        );
     }
     match header_peer_book.load_banlist(&banlist_path) {
         Ok(loaded) => {
@@ -889,6 +903,8 @@ async fn run() -> Result<(), String> {
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
+        let addr_book = Arc::clone(&addr_book);
+        let added_nodes = Arc::clone(&added_nodes);
         let tx_announce = tx_announce.clone();
         let shutdown_tx = shutdown_tx.clone();
         thread::spawn(move || {
@@ -912,6 +928,8 @@ async fn run() -> Result<(), String> {
                     net_totals,
                     peer_registry,
                     header_peer_book,
+                    addr_book,
+                    added_nodes,
                     tx_announce,
                     shutdown_tx,
                 )
@@ -3236,6 +3254,10 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
         let mut probing = true;
 
         loop {
+            if peer_ctx.registry.take_disconnect_request(peer_addr) {
+                println!("Disconnect requested for header peer {peer_addr}; reconnecting");
+                break;
+            }
             let remote_height = peer.remote_height();
             if let Some(best_header) = chainstate.best_header().map_err(|err| err.to_string())? {
                 if best_header.height > download_state.tip_height {
@@ -4175,6 +4197,47 @@ async fn sync_chain<S: KeyValueStore + 'static>(
             last_progress_at = Instant::now();
         }
         let (gap, best_header_height) = header_gap(chainstate.as_ref())?;
+
+        if peer_ctx.registry.take_disconnect_request(block_peer.addr()) {
+            let addr = block_peer.addr();
+            println!("Disconnect requested for block peer {addr}; reconnecting");
+            match connect_to_peer(
+                params.as_ref(),
+                best_block_height,
+                best_header_height,
+                addr_book,
+                peer_ctx,
+                peer_book,
+            )
+            .await
+            {
+                Ok(new_peer) => {
+                    *block_peer = new_peer;
+                }
+                Err(err) => {
+                    eprintln!("disconnect reconnect failed for block peer {addr}: {err}");
+                }
+            }
+        }
+
+        let mut disconnected_block_peers: Vec<SocketAddr> = Vec::new();
+        block_peers.retain(|peer| {
+            let addr = peer.addr();
+            if peer_ctx.registry.take_disconnect_request(addr) {
+                disconnected_block_peers.push(addr);
+                false
+            } else {
+                true
+            }
+        });
+        if !disconnected_block_peers.is_empty() {
+            println!(
+                "Disconnect requested for {} additional block peer(s)",
+                disconnected_block_peers.len()
+            );
+            last_peer_refill_at = Instant::now() - Duration::from_secs(BLOCK_PEER_REFILL_SECS);
+        }
+
         if block_peers_target > 0
             && block_peers.len() < block_peers_target
             && last_peer_refill_at.elapsed() > Duration::from_secs(BLOCK_PEER_REFILL_SECS)
@@ -5903,6 +5966,7 @@ async fn handle_aux_message(peer: &mut Peer, command: &str, payload: &[u8]) -> R
 fn parse_args() -> Result<Config, String> {
     let mut backend = Backend::Fjall;
     let mut data_dir: Option<PathBuf> = None;
+    let mut conf_path: Option<PathBuf> = None;
     let mut params_dir: Option<PathBuf> = None;
     let mut fetch_params = false;
     let mut scan_flatfiles = false;
@@ -5913,14 +5977,18 @@ fn parse_args() -> Result<Config, String> {
     let mut debug_fluxnode_payee_candidates: Option<DebugFluxnodePayeeCandidates> = None;
     let mut check_script = true;
     let mut rpc_addr: Option<SocketAddr> = None;
+    let mut rpc_addr_set = false;
     let mut rpc_user: Option<String> = None;
+    let mut rpc_user_set = false;
     let mut rpc_pass: Option<String> = None;
+    let mut rpc_pass_set = false;
     let mut network = Network::Mainnet;
     let mut getdata_batch: usize = DEFAULT_GETDATA_BATCH;
     let mut block_peers: usize = DEFAULT_BLOCK_PEERS;
     let mut header_peers: usize = DEFAULT_HEADER_PEERS;
     let mut header_lead: i32 = DEFAULT_HEADER_LEAD;
     let mut header_peer_addrs: Vec<String> = Vec::new();
+    let mut addnode_addrs: Vec<SocketAddr> = Vec::new();
     let mut tx_peers: usize = DEFAULT_TX_PEERS;
     let mut inflight_per_peer: usize = DEFAULT_INFLIGHT_PER_PEER;
     let mut require_standard: Option<bool> = None;
@@ -5960,6 +6028,12 @@ fn parse_args() -> Result<Config, String> {
                     .next()
                     .ok_or_else(|| format!("missing value for --data-dir\n{}", usage()))?;
                 data_dir = Some(PathBuf::from(value));
+            }
+            "--conf" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --conf\n{}", usage()))?;
+                conf_path = Some(PathBuf::from(value));
             }
             "--params-dir" => {
                 let value = args
@@ -6044,18 +6118,21 @@ fn parse_args() -> Result<Config, String> {
                         .parse::<SocketAddr>()
                         .map_err(|_| format!("invalid rpc addr '{value}'\n{}", usage()))?,
                 );
+                rpc_addr_set = true;
             }
             "--rpc-user" => {
                 let value = args
                     .next()
                     .ok_or_else(|| format!("missing value for --rpc-user\n{}", usage()))?;
                 rpc_user = Some(value);
+                rpc_user_set = true;
             }
             "--rpc-pass" => {
                 let value = args
                     .next()
                     .ok_or_else(|| format!("missing value for --rpc-pass\n{}", usage()))?;
                 rpc_pass = Some(value);
+                rpc_pass_set = true;
             }
             "--network" => {
                 let value = args
@@ -6324,6 +6401,82 @@ fn parse_args() -> Result<Config, String> {
         }
     }
 
+    let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+    let conf_file = conf_path.unwrap_or_else(|| data_dir.join("flux.conf"));
+    if let Some(conf) = load_flux_conf(&conf_file)? {
+        let params = chain_params(network);
+        let default_port = params.default_port;
+
+        if !rpc_user_set {
+            if let Some(values) = conf.get("rpcuser") {
+                if let Some(value) = values.last() {
+                    rpc_user = Some(value.clone());
+                }
+            }
+        }
+        if !rpc_pass_set {
+            if let Some(values) = conf.get("rpcpassword") {
+                if let Some(value) = values.last() {
+                    rpc_pass = Some(value.clone());
+                }
+            }
+        }
+
+        if !rpc_addr_set {
+            let mut bind_socket: Option<SocketAddr> = None;
+            let mut bind_ip: Option<IpAddr> = None;
+            if let Some(values) = conf.get("rpcbind") {
+                if let Some(raw) = values.last() {
+                    if let Ok(addr) = raw.parse::<SocketAddr>() {
+                        bind_socket = Some(addr);
+                    } else if let Ok(ip) = raw.parse::<IpAddr>() {
+                        bind_ip = Some(ip);
+                    } else {
+                        return Err(format!(
+                            "invalid rpcbind '{raw}' in {}",
+                            conf_file.display()
+                        ));
+                    }
+                }
+            }
+
+            let mut port: Option<u16> = None;
+            if let Some(values) = conf.get("rpcport") {
+                if let Some(raw) = values.last() {
+                    port = Some(raw.parse::<u16>().map_err(|_| {
+                        format!("invalid rpcport '{raw}' in {}", conf_file.display())
+                    })?);
+                }
+            }
+
+            if let Some(addr) = bind_socket {
+                rpc_addr = Some(addr);
+            } else if bind_ip.is_some() || port.is_some() {
+                let ip = bind_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                let default_port = default_rpc_addr(network).port();
+                rpc_addr = Some(SocketAddr::new(ip, port.unwrap_or(default_port)));
+            }
+        }
+
+        if let Some(values) = conf.get("addnode") {
+            let mut seen = HashSet::new();
+            for raw in values {
+                let addr = parse_socket_addr_with_default_port(raw, default_port)
+                    .ok_or_else(|| format!("invalid addnode '{raw}' in {}", conf_file.display()))?;
+                if seen.insert(addr) {
+                    addnode_addrs.push(addr);
+                }
+            }
+        }
+    }
+
+    if rpc_user.is_some() ^ rpc_pass.is_some() {
+        return Err(format!(
+            "rpcuser and rpcpassword must both be set (via CLI or flux.conf)\n{}",
+            usage()
+        ));
+    }
+
     let require_standard = require_standard.unwrap_or(network != Network::Regtest);
     let partition_count = fluxd_storage::Column::ALL.len() as u64;
     if !db_memtable_set && db_memtable_mb == 0 {
@@ -6378,7 +6531,7 @@ fn parse_args() -> Result<Config, String> {
 
     Ok(Config {
         backend,
-        data_dir: data_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
+        data_dir,
         network,
         params_dir: params_dir.unwrap_or_else(default_params_dir),
         fetch_params,
@@ -6397,6 +6550,7 @@ fn parse_args() -> Result<Config, String> {
         header_peers,
         header_lead,
         header_peer_addrs,
+        addnode_addrs,
         tx_peers,
         inflight_per_peer,
         require_standard,
@@ -6419,6 +6573,57 @@ fn parse_args() -> Result<Config, String> {
         verify_queue,
         shielded_workers,
     })
+}
+
+fn load_flux_conf(path: &Path) -> Result<Option<HashMap<String, Vec<String>>>, String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for raw_line in contents.lines() {
+        let mut line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(idx) = line.find('#') {
+            line = &line[..idx];
+        }
+        if let Some(idx) = line.find(';') {
+            line = &line[..idx];
+        }
+        line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((key, value)) => (key.trim(), value.trim()),
+            None => (line, "1"),
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let key = key.to_ascii_lowercase();
+        out.entry(key)
+            .or_insert_with(Vec::new)
+            .push(value.to_string());
+    }
+    Ok(Some(out))
+}
+
+fn parse_socket_addr_with_default_port(value: &str, default_port: u16) -> Option<SocketAddr> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, default_port));
+    }
+    None
 }
 
 fn mb_to_bytes(mb: u64) -> u64 {
@@ -6589,11 +6794,12 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
         "  --data-dir  Base data directory (default: ./data)",
+        "  --conf  Config file path (default: <data-dir>/flux.conf)",
         "  --params-dir    Shielded params directory (default: ~/.zcash-params)",
         "  --fetch-params  Download shielded params into --params-dir",
         "  --scan-flatfiles  Scan flatfiles for block index mismatches, then exit",

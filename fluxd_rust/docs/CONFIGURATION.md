@@ -18,6 +18,22 @@ and how they affect behavior.
     - `mempool.dat` - persisted mempool transactions (when enabled).
     - `fee_estimates.dat` - persisted fee estimator samples (when enabled).
     - `rpc.cookie` - RPC auth cookie when not using `--rpc-user`/`--rpc-pass`.
+- `--conf PATH`
+  - Config file path (default: `<data-dir>/flux.conf`).
+
+## flux.conf
+
+The daemon optionally reads a `flux.conf` config file.
+
+- Default path: `<data-dir>/flux.conf`
+- Override path: `--conf PATH`
+- Format: `key=value` (repeatable keys are allowed; `#` and `;` start comments)
+- Precedence: CLI flags override config file values
+
+Currently supported keys:
+- `rpcuser`, `rpcpassword`
+- `rpcbind`, `rpcport`
+- `addnode` (repeatable)
 
 ### Fjall tuning
 

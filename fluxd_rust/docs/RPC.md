@@ -81,6 +81,11 @@ Type notes:
 - `getnettotals`
 - `getconnectioncount`
 - `listbanned`
+- `clearbanned`
+- `setban <ip|ip:port> <add|remove> [bantime] [absolute]`
+- `addnode <node> <add|remove|onetry>`
+- `getaddednodeinfo [dns] [node]`
+- `disconnectnode <node>`
 - `getdeprecationinfo`
 
 ### Chain and blocks
@@ -485,6 +490,48 @@ Returns per-peer details:
 Returns banned header peers (if any):
 - `address`
 - `banned_until`
+
+### clearbanned
+
+Clears the in-memory/persisted banlist.
+
+- Result: `null`
+
+### setban
+
+Adds or removes a ban for a peer address.
+
+- Params:
+  - `ip|ip:port` (string)
+  - `add|remove` (string)
+  - `bantime` (optional integer; seconds unless `absolute=true`)
+  - `absolute` (optional boolean; treat `bantime` as a unix timestamp)
+- Notes:
+  - If you pass an IP with no port, the network default P2P port is assumed.
+  - `add` also requests an immediate disconnect if currently connected.
+
+### addnode
+
+Adds/removes a manual peer address, similar to the C++ daemon.
+
+- Params: `<node> <add|remove|onetry>`
+- Notes:
+  - Only numeric IPs are supported right now (no DNS resolution).
+  - `add` updates an in-memory added-node list (used by `getaddednodeinfo`) and seeds the address manager.
+  - `onetry` seeds the address manager but does not add to the persistent added-node list.
+
+### getaddednodeinfo
+
+Returns the current added-node list and whether each node is currently connected.
+
+- Params: `[dns] [node]` (`dns` is accepted for parity but currently ignored)
+
+### disconnectnode
+
+Requests disconnect of an active peer connection.
+
+- Params: `<node>`
+- Result: `null`
 
 ### getfluxnodecount
 

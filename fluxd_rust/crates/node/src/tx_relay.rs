@@ -133,6 +133,11 @@ async fn tx_relay_peer<S: KeyValueStore>(
     let _ = peer.send_mempool().await;
 
     loop {
+        if peer.take_disconnect_request() {
+            let addr = peer.addr();
+            println!("Disconnect requested for tx relay peer {addr}");
+            return Ok(());
+        }
         tokio::select! {
             msg = peer.read_message() => {
                 let (command, payload) = msg?;

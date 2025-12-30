@@ -1,7 +1,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +48,7 @@ use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind, MempoolPoli
 use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::peer_book::HeaderPeerBook;
 use crate::stats::{hash256_to_hex, MempoolMetrics};
+use crate::AddrBook;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const RPC_REALM: &str = "fluxd";
@@ -122,6 +123,11 @@ const RPC_METHODS: &[&str] = &[
     "getfluxnodestatus",
     "getdoslist",
     "getstartlist",
+    "addnode",
+    "disconnectnode",
+    "getaddednodeinfo",
+    "setban",
+    "clearbanned",
 ];
 pub struct RpcAuth {
     user: String,
@@ -177,6 +183,8 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     net_totals: Arc<NetTotals>,
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
+    addr_book: Arc<AddrBook>,
+    added_nodes: Arc<Mutex<HashSet<SocketAddr>>>,
     tx_announce: broadcast::Sender<Hash256>,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), String> {
@@ -204,6 +212,8 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
+        let addr_book = Arc::clone(&addr_book);
+        let added_nodes = Arc::clone(&added_nodes);
         let tx_announce = tx_announce.clone();
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
@@ -222,6 +232,8 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 net_totals,
                 peer_registry,
                 header_peer_book,
+                addr_book,
+                added_nodes,
                 tx_announce,
                 shutdown_tx,
             )
@@ -249,6 +261,8 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     net_totals: Arc<NetTotals>,
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
+    addr_book: Arc<AddrBook>,
+    added_nodes: Arc<Mutex<HashSet<SocketAddr>>>,
     tx_announce: broadcast::Sender<Hash256>,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), String> {
@@ -305,6 +319,8 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
             &net_totals,
             &peer_registry,
             &header_peer_book,
+            addr_book.as_ref(),
+            added_nodes.as_ref(),
             &tx_announce,
             &shutdown_tx,
         ) {
@@ -334,6 +350,8 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         &net_totals,
         &peer_registry,
         &header_peer_book,
+        addr_book.as_ref(),
+        added_nodes.as_ref(),
         &tx_announce,
         &shutdown_tx,
     ) {
@@ -365,6 +383,8 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
+    addr_book: &AddrBook,
+    added_nodes: &Mutex<HashSet<SocketAddr>>,
     tx_announce: &broadcast::Sender<Hash256>,
     shutdown_tx: &watch::Sender<bool>,
 ) -> Result<Value, RpcError> {
@@ -390,6 +410,8 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
         net_totals,
         peer_registry,
         header_peer_book,
+        addr_book,
+        added_nodes,
         tx_announce,
         shutdown_tx,
     )
@@ -409,6 +431,8 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
+    addr_book: &AddrBook,
+    added_nodes: &Mutex<HashSet<SocketAddr>>,
     tx_announce: &broadcast::Sender<Hash256>,
     shutdown_tx: &watch::Sender<bool>,
 ) -> Result<Value, Value> {
@@ -459,6 +483,8 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         net_totals,
         peer_registry,
         header_peer_book,
+        addr_book,
+        added_nodes,
         tx_announce,
         shutdown_tx,
     );
@@ -607,6 +633,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
+    addr_book: &AddrBook,
+    added_nodes: &Mutex<HashSet<SocketAddr>>,
     tx_announce: &broadcast::Sender<Hash256>,
     shutdown_tx: &watch::Sender<bool>,
 ) -> Result<Value, RpcError> {
@@ -677,6 +705,13 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getpeerinfo" => rpc_getpeerinfo(params, peer_registry),
         "getdeprecationinfo" => rpc_getdeprecationinfo(params),
         "listbanned" => rpc_listbanned(params, header_peer_book),
+        "clearbanned" => rpc_clearbanned(params, header_peer_book),
+        "setban" => rpc_setban(params, chain_params, peer_registry, header_peer_book),
+        "disconnectnode" => rpc_disconnectnode(params, chain_params, peer_registry),
+        "addnode" => rpc_addnode(params, chain_params, addr_book, added_nodes),
+        "getaddednodeinfo" => {
+            rpc_getaddednodeinfo(params, chain_params, peer_registry, added_nodes)
+        }
         "getfluxnodecount" => rpc_getfluxnodecount(chainstate, params),
         "listfluxnodes" => rpc_viewdeterministicfluxnodelist(chainstate, params),
         "viewdeterministicfluxnodelist" => rpc_viewdeterministicfluxnodelist(chainstate, params),
@@ -3762,6 +3797,247 @@ fn rpc_listbanned(
         out.push(json!({
             "address": entry.addr.to_string(),
             "banned_until": system_time_to_unix(entry.banned_until),
+        }));
+    }
+    Ok(Value::Array(out))
+}
+
+fn parse_socket_addr_with_default(value: &str, default_port: u16) -> Result<SocketAddr, RpcError> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+    Err(RpcError::new(
+        RPC_INVALID_PARAMETER,
+        "invalid address (expected ip or ip:port)",
+    ))
+}
+
+fn rpc_clearbanned(
+    params: Vec<Value>,
+    header_peer_book: &HeaderPeerBook,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    header_peer_book.clear_banned();
+    Ok(Value::Null)
+}
+
+fn rpc_setban(
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    peer_registry: &PeerRegistry,
+    header_peer_book: &HeaderPeerBook,
+) -> Result<Value, RpcError> {
+    if params.len() < 2 || params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "setban expects 2 to 4 parameters",
+        ));
+    }
+    let addr_raw = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
+    let addr = parse_socket_addr_with_default(addr_raw, chain_params.default_port)?;
+    let command = params[1]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "command must be a string"))?;
+
+    match command {
+        "add" => {
+            const DEFAULT_BAN_SECS: u64 = 24 * 60 * 60;
+
+            let mut bantime: u64 = DEFAULT_BAN_SECS;
+            let mut absolute = false;
+            if params.len() >= 3 && !params[2].is_null() {
+                let value = params[2].as_i64().ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "bantime must be an integer")
+                })?;
+                bantime = value.max(0) as u64;
+            }
+            if params.len() == 4 && !params[3].is_null() {
+                absolute = params[3].as_bool().ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "absolute must be a boolean")
+                })?;
+            }
+            if bantime == 0 {
+                bantime = DEFAULT_BAN_SECS;
+            }
+            if absolute {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if bantime <= now {
+                    header_peer_book.unban(addr);
+                    return Ok(Value::Null);
+                }
+                bantime = bantime.saturating_sub(now);
+            }
+
+            header_peer_book.ban_for(addr, bantime);
+            peer_registry.request_disconnect(addr);
+        }
+        "remove" => {
+            header_peer_book.unban(addr);
+        }
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "command must be 'add' or 'remove'",
+            ))
+        }
+    }
+
+    Ok(Value::Null)
+}
+
+fn rpc_disconnectnode(
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    peer_registry: &PeerRegistry,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "disconnectnode expects 1 parameter",
+        ));
+    }
+    let addr_raw = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
+    let addr = parse_socket_addr_with_default(addr_raw, chain_params.default_port)?;
+    peer_registry.request_disconnect(addr);
+    Ok(Value::Null)
+}
+
+fn rpc_addnode(
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    addr_book: &AddrBook,
+    added_nodes: &Mutex<HashSet<SocketAddr>>,
+) -> Result<Value, RpcError> {
+    if params.len() != 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "addnode expects 2 parameters",
+        ));
+    }
+    let addr_raw = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "node must be a string"))?;
+    let addr = parse_socket_addr_with_default(addr_raw, chain_params.default_port)?;
+    let command = params[1]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "command must be a string"))?;
+
+    match command {
+        "add" => {
+            let Ok(mut guard) = added_nodes.lock() else {
+                return Err(RpcError::new(
+                    RPC_INTERNAL_ERROR,
+                    "added nodes lock poisoned",
+                ));
+            };
+            guard.insert(addr);
+            let _ = addr_book.insert_many(vec![addr]);
+        }
+        "remove" => {
+            if let Ok(mut guard) = added_nodes.lock() {
+                guard.remove(&addr);
+            }
+        }
+        "onetry" => {
+            addr_book.record_attempt(addr);
+            let _ = addr_book.insert_many(vec![addr]);
+        }
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "command must be 'add', 'remove', or 'onetry'",
+            ))
+        }
+    }
+
+    Ok(Value::Null)
+}
+
+fn rpc_getaddednodeinfo(
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    peer_registry: &PeerRegistry,
+    added_nodes: &Mutex<HashSet<SocketAddr>>,
+) -> Result<Value, RpcError> {
+    let (node_filter, _dns) = match params.len() {
+        0 => (None, false),
+        1 => {
+            if let Some(value) = params[0].as_bool() {
+                (None, value)
+            } else if let Some(value) = params[0].as_str() {
+                (Some(value.to_string()), false)
+            } else {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "getaddednodeinfo expects a boolean or node string",
+                ));
+            }
+        }
+        2 => {
+            let dns = params[0]
+                .as_bool()
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "dns must be a boolean"))?;
+            let node = params[1]
+                .as_str()
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "node must be a string"))?;
+            (Some(node.to_string()), dns)
+        }
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "getaddednodeinfo expects 0 to 2 parameters",
+            ))
+        }
+    };
+
+    let mut nodes = {
+        let Ok(guard) = added_nodes.lock() else {
+            return Err(RpcError::new(
+                RPC_INTERNAL_ERROR,
+                "added nodes lock poisoned",
+            ));
+        };
+        guard.iter().copied().collect::<Vec<_>>()
+    };
+    nodes.sort_by_key(|addr| addr.to_string());
+
+    if let Some(filter) = node_filter.as_deref() {
+        let addr = parse_socket_addr_with_default(filter, chain_params.default_port)?;
+        if !nodes.contains(&addr) {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "node is not in added node list",
+            ));
+        }
+        nodes = vec![addr];
+    }
+
+    let connected: HashSet<SocketAddr> = peer_registry
+        .snapshot()
+        .into_iter()
+        .map(|entry| entry.addr)
+        .collect();
+
+    let mut out = Vec::with_capacity(nodes.len());
+    for addr in nodes {
+        let is_connected = connected.contains(&addr);
+        out.push(json!({
+            "addednode": addr.to_string(),
+            "connected": is_connected,
+            "addresses": [{
+                "address": addr.to_string(),
+                "connected": is_connected,
+            }]
         }));
     }
     Ok(Value::Array(out))
