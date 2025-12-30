@@ -79,6 +79,7 @@ Type notes:
 - `restart`
 - `reindex`
 - `rescanblockchain [start_height] [stop_height]` (stub; wallet not implemented)
+- `getdbinfo`
 - `getnetworkinfo`
 - `getpeerinfo`
 - `getnettotals`
@@ -202,6 +203,10 @@ Fields:
 
 - Params: optional `start_height`, `stop_height`.
 - Result: error `-4` (`wallet not implemented`).
+
+### getdbinfo
+
+- Result: object containing a disk usage breakdown (`db/`, `blocks/`, per-partition sizes), flatfile meta vs filesystem cross-check, and (when using Fjall) current Fjall telemetry.
 
 ### getdeprecationinfo
 

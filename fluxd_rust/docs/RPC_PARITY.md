@@ -172,3 +172,9 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zcbenchmark - Missing
 - startbenchmark - Missing
 - stopbenchmark - Missing
+
+## fluxd-rust extensions
+
+These methods are not part of the legacy C++ `fluxd` RPC surface, but are useful for ops/debugging.
+
+- getdbinfo - Implemented (disk usage breakdown + fjall telemetry)

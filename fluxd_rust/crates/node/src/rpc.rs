@@ -57,10 +57,11 @@ use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::peer_book::HeaderPeerBook;
 use crate::stats::{hash256_to_hex, MempoolMetrics};
 use crate::AddrBook;
+use crate::{db_info, Backend, Store};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const RPC_REALM: &str = "fluxd";
-const RPC_COOKIE_FILE: &str = "rpc.cookie";
+pub(crate) const RPC_COOKIE_FILE: &str = "rpc.cookie";
 
 const RPC_INVALID_PARAMETER: i64 = -8;
 const RPC_TYPE_ERROR: i64 = -3;
@@ -83,6 +84,7 @@ const RPC_METHODS: &[&str] = &[
     "restart",
     "reindex",
     "rescanblockchain",
+    "getdbinfo",
     "getblockcount",
     "getbestblockhash",
     "getblockhash",
@@ -194,6 +196,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     addr: SocketAddr,
     auth: RpcAuth,
     chainstate: Arc<ChainState<S>>,
+    store: Arc<Store>,
     write_lock: Arc<Mutex<()>>,
     mempool: Arc<Mutex<Mempool>>,
     mempool_policy: Arc<MempoolPolicy>,
@@ -224,6 +227,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
             .map_err(|err| format!("rpc accept failed: {err}"))?;
         let auth = Arc::clone(&auth);
         let chainstate = Arc::clone(&chainstate);
+        let store = Arc::clone(&store);
         let write_lock = Arc::clone(&write_lock);
         let mempool = Arc::clone(&mempool);
         let mempool_policy = Arc::clone(&mempool_policy);
@@ -245,6 +249,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 stream,
                 auth,
                 chainstate,
+                store,
                 write_lock,
                 mempool,
                 mempool_policy,
@@ -275,6 +280,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     mut stream: tokio::net::TcpStream,
     auth: Arc<RpcAuth>,
     chainstate: Arc<ChainState<S>>,
+    store: Arc<Store>,
     write_lock: Arc<Mutex<()>>,
     mempool: Arc<Mutex<Mempool>>,
     mempool_policy: Arc<MempoolPolicy>,
@@ -383,6 +389,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
                             &chain_params,
                             miner_address.as_deref(),
                             &data_dir,
+                            store.as_ref(),
                             &net_totals,
                             &peer_registry,
                             &header_peer_book,
@@ -411,6 +418,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
                 &chain_params,
                 miner_address.as_deref(),
                 &data_dir,
+                store.as_ref(),
                 &net_totals,
                 &peer_registry,
                 &header_peer_book,
@@ -444,6 +452,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         &chain_params,
         miner_address.as_deref(),
         &data_dir,
+        store.as_ref(),
         &net_totals,
         &peer_registry,
         &header_peer_book,
@@ -475,6 +484,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         &chain_params,
         miner_address.as_deref(),
         &data_dir,
+        store.as_ref(),
         &net_totals,
         &peer_registry,
         &header_peer_book,
@@ -555,6 +565,7 @@ async fn handle_json_rpc_getblocktemplate_longpoll<S: fluxd_storage::KeyValueSto
     chain_params: &ChainParams,
     miner_address: Option<&str>,
     data_dir: &Path,
+    store: &Store,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
@@ -624,6 +635,7 @@ async fn handle_json_rpc_getblocktemplate_longpoll<S: fluxd_storage::KeyValueSto
         chain_params,
         miner_address,
         data_dir,
+        store,
         net_totals,
         peer_registry,
         header_peer_book,
@@ -652,6 +664,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     chain_params: &ChainParams,
     miner_address: Option<&str>,
     data_dir: &Path,
+    store: &Store,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
@@ -680,6 +693,7 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
         chain_params,
         miner_address,
         data_dir,
+        store,
         net_totals,
         peer_registry,
         header_peer_book,
@@ -702,6 +716,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
     chain_params: &ChainParams,
     miner_address: Option<&str>,
     data_dir: &Path,
+    store: &Store,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
@@ -755,6 +770,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         chain_params,
         miner_address,
         data_dir,
+        store,
         net_totals,
         peer_registry,
         header_peer_book,
@@ -906,6 +922,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
     chain_params: &ChainParams,
     miner_address: Option<&str>,
     data_dir: &Path,
+    store: &Store,
     net_totals: &NetTotals,
     peer_registry: &PeerRegistry,
     header_peer_book: &HeaderPeerBook,
@@ -930,6 +947,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "restart" => rpc_restart(params, shutdown_tx),
         "reindex" => rpc_reindex(params, data_dir, shutdown_tx),
         "rescanblockchain" => rpc_rescanblockchain(params),
+        "getdbinfo" => rpc_getdbinfo(chainstate, store, params, data_dir),
         "getblockcount" => rpc_getblockcount(chainstate, params),
         "getbestblockhash" => rpc_getbestblockhash(chainstate, params),
         "getblockhash" => rpc_getblockhash(chainstate, params),
@@ -1097,6 +1115,21 @@ fn rpc_rescanblockchain(params: Vec<Value>) -> Result<Value, RpcError> {
         ));
     }
     Err(RpcError::new(RPC_WALLET_ERROR, "wallet not implemented"))
+}
+
+fn rpc_getdbinfo<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    store: &Store,
+    params: Vec<Value>,
+    data_dir: &Path,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    let backend = match store {
+        Store::Fjall(_) => Backend::Fjall,
+        Store::Memory(_) => Backend::Memory,
+    };
+    db_info::collect_db_info(chainstate, store, data_dir, backend, false)
+        .map_err(|err| RpcError::new(RPC_INTERNAL_ERROR, err))
 }
 
 fn rpc_getdeprecationinfo(params: Vec<Value>) -> Result<Value, RpcError> {
@@ -1411,7 +1444,7 @@ fn rpc_getblockchaininfo<S: fluxd_storage::KeyValueStore>(
         .as_ref()
         .map(|tip| hex_bytes(&tip.chainwork))
         .unwrap_or_else(|| "00".to_string());
-    let size_on_disk = dir_size(data_dir).unwrap_or(0);
+    let size_on_disk = db_info::dir_size_cached(data_dir, Duration::from_secs(30)).unwrap_or(0);
     let verificationprogress = if best_header_height > 0 && best_block_height >= 0 {
         (best_block_height as f64 / best_header_height as f64).min(1.0)
     } else {
@@ -2415,7 +2448,8 @@ fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(
         .total_amount
         .checked_add(shielded_total)
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "total supply overflow"))?;
-    let disk_size = dir_size(&data_dir.join("db")).unwrap_or(0);
+    let disk_size =
+        db_info::dir_size_cached(&data_dir.join("db"), Duration::from_secs(30)).unwrap_or(0);
     Ok(json!({
         "height": height.max(0),
         "bestblock": hash256_to_hex(&best_hash),
@@ -6867,21 +6901,6 @@ fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 fn map_internal(err: impl ToString) -> RpcError {
     RpcError::new(RPC_INTERNAL_ERROR, err.to_string())
-}
-
-fn dir_size(path: &Path) -> Result<u64, String> {
-    let mut total = 0u64;
-    let entries = fs::read_dir(path).map_err(|err| err.to_string())?;
-    for entry in entries {
-        let entry = entry.map_err(|err| err.to_string())?;
-        let metadata = entry.metadata().map_err(|err| err.to_string())?;
-        if metadata.is_dir() {
-            total = total.saturating_add(dir_size(&entry.path())?);
-        } else {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    Ok(total)
 }
 
 fn write_cookie(path: &Path, user: &str, pass: &str) -> Result<(), String> {

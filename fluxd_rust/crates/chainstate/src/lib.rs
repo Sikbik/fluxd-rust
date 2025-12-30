@@ -4,7 +4,7 @@ pub mod address_deltas;
 pub mod address_index;
 pub mod anchors;
 pub mod blockindex;
-mod filemeta;
+pub mod filemeta;
 pub mod flatfiles;
 pub mod index;
 pub mod metrics;

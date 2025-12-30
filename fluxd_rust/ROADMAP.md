@@ -32,7 +32,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] Reorg handling (disconnect to common ancestor)
 - [x] RPC framework (JSON-RPC + `/daemon` endpoints)
 - [x] Dashboard + status metrics
-- [x] CLI scan tools (`--scan-supply`, `--scan-flatfiles`, `--scan-fluxnodes`)
+- [x] CLI scan tools (`--scan-supply`, `--scan-flatfiles`, `--scan-fluxnodes`, `--db-info`)
 - [x] Documentation set (README + docs/)
 - [x] Binary name `fluxd`
 
@@ -112,6 +112,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [ ] Reindex from existing flatfiles (no network)
   - [ ] Selective index rebuild (txindex/address/spent only)
 - [ ] [P2] DB inspection tools (index stats, supply, integrity) (owner: TBD)
+  - [x] `getdbinfo` RPC (disk usage breakdown + fjall telemetry + flatfiles meta/fs cross-check)
+  - [x] `--db-info` CLI (same JSON as `getdbinfo`, then exit)
+  - [ ] Optional: key count sampling per partition (slow)
+  - [ ] Optional: integrity summary mode (runs `verifychain` + flatfile/meta sanity)
 
 ## Networking state and P2P parity
 
@@ -172,6 +176,9 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [ ] Remaining `flux.conf` keys parity
 - [ ] [P2] Structured CLI help output and subcommands (owner: TBD)
 - [ ] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
+  - [x] `--db-info`
+  - [x] `--scan-flatfiles`
+  - [x] `--scan-supply`
 - [ ] [P2] Metrics export (Prometheus or similar) (owner: TBD)
 - [ ] [P2] Log levels and structured logging parity (owner: TBD)
 - [ ] [P2] Database migrations and upgrade path (owner: TBD)

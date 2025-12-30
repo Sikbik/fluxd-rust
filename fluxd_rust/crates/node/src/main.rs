@@ -1,4 +1,5 @@
 mod dashboard;
+mod db_info;
 mod fee_estimator;
 mod mempool;
 mod p2p;
@@ -172,6 +173,7 @@ struct Config {
     params_dir: PathBuf,
     fetch_params: bool,
     reindex: bool,
+    db_info: bool,
     miner_address: Option<String>,
     scan_flatfiles: bool,
     scan_supply: bool,
@@ -791,6 +793,14 @@ async fn run() -> Result<(), String> {
         undo,
         config.utxo_cache_entries,
     ));
+
+    if config.db_info {
+        let info =
+            db_info::collect_db_info(chainstate.as_ref(), store.as_ref(), data_dir, backend, true)?;
+        let json = serde_json::to_string_pretty(&info).map_err(|err| err.to_string())?;
+        println!("{json}");
+        return Ok(());
+    }
     let net_totals = Arc::new(NetTotals::default());
     let peer_registry = Arc::new(PeerRegistry::default());
     let header_peer_book = Arc::new(HeaderPeerBook::default());
@@ -924,6 +934,7 @@ async fn run() -> Result<(), String> {
     let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
     {
         let chainstate = Arc::clone(&chainstate);
+        let store = Arc::clone(&store);
         let write_lock = Arc::clone(&write_lock);
         let mempool = Arc::clone(&mempool);
         let mempool_policy = Arc::clone(&mempool_policy);
@@ -950,6 +961,7 @@ async fn run() -> Result<(), String> {
                     rpc_addr,
                     rpc_auth,
                     chainstate,
+                    store,
                     write_lock,
                     mempool,
                     mempool_policy,
@@ -5994,6 +6006,7 @@ fn parse_args() -> Result<Config, String> {
     let mut params_dir: Option<PathBuf> = None;
     let mut fetch_params = false;
     let mut reindex = false;
+    let mut db_info = false;
     let mut scan_flatfiles = false;
     let mut scan_supply = false;
     let mut scan_fluxnodes = false;
@@ -6073,6 +6086,9 @@ fn parse_args() -> Result<Config, String> {
             }
             "--reindex" => {
                 reindex = true;
+            }
+            "--db-info" => {
+                db_info = true;
             }
             "--scan-flatfiles" => {
                 scan_flatfiles = true;
@@ -6591,6 +6607,7 @@ fn parse_args() -> Result<Config, String> {
         params_dir: params_dir.unwrap_or_else(default_params_dir),
         fetch_params,
         reindex,
+        db_info,
         miner_address,
         scan_flatfiles,
         scan_supply,
@@ -6851,7 +6868,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--fetch-params] [--reindex] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -6860,6 +6877,7 @@ fn usage() -> String {
         "  --params-dir    Shielded params directory (default: ~/.zcash-params)",
         "  --fetch-params  Download shielded params into --params-dir",
         "  --reindex  Wipe db/blocks for --data-dir and restart from genesis",
+        "  --db-info  Print DB/flatfile size breakdown and fjall telemetry, then exit",
         "  --scan-flatfiles  Scan flatfiles for block index mismatches, then exit",
         "  --scan-supply  Scan blocks in the local DB and print coinbase totals, then exit",
         "  --scan-fluxnodes  Scan fluxnode records in the local DB and print summary stats, then exit",
