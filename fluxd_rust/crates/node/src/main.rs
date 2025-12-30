@@ -28,11 +28,12 @@ use fluxd_chainstate::validation::{
 };
 use fluxd_consensus::money::{money_range, COIN, MAX_MONEY};
 use fluxd_consensus::params::{chain_params, hash256_from_hex, ChainParams, Network};
-use fluxd_consensus::upgrades::current_epoch_branch_id;
+use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
 use fluxd_consensus::Hash256;
 use fluxd_consensus::{
     block_subsidy, exchange_fund_amount, foundation_fund_amount, swap_pool_amount,
 };
+use fluxd_fluxnode::storage::FluxnodeRecord;
 use fluxd_pow::validation as pow_validation;
 use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
 use fluxd_primitives::encoding::{Decoder, Encoder};
@@ -171,6 +172,9 @@ struct Config {
     scan_flatfiles: bool,
     scan_supply: bool,
     scan_fluxnodes: bool,
+    debug_fluxnode_payee_script: Option<Vec<u8>>,
+    debug_fluxnode_payout_height: Option<i32>,
+    debug_fluxnode_payee_candidates: Option<DebugFluxnodePayeeCandidates>,
     check_script: bool,
     rpc_addr: Option<SocketAddr>,
     rpc_user: Option<String>,
@@ -201,6 +205,13 @@ struct Config {
     verify_workers: usize,
     verify_queue: usize,
     shielded_workers: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DebugFluxnodePayeeCandidates {
+    tier: u8,
+    height: i32,
+    limit: usize,
 }
 
 #[derive(Clone)]
@@ -801,6 +812,27 @@ async fn run() -> Result<(), String> {
 
     if config.scan_fluxnodes {
         scan_fluxnodes(chainstate.as_ref())?;
+        return Ok(());
+    }
+
+    if let Some(script) = config.debug_fluxnode_payee_script.as_deref() {
+        debug_find_fluxnode_payee_script(chainstate.as_ref(), script)?;
+        return Ok(());
+    }
+
+    if let Some(height) = config.debug_fluxnode_payout_height {
+        debug_print_expected_fluxnode_payouts(chainstate.as_ref(), params.as_ref(), height)?;
+        return Ok(());
+    }
+
+    if let Some(args) = config.debug_fluxnode_payee_candidates {
+        debug_print_fluxnode_payee_candidates(
+            chainstate.as_ref(),
+            params.as_ref(),
+            args.tier,
+            args.height,
+            args.limit,
+        )?;
         return Ok(());
     }
 
@@ -1502,6 +1534,473 @@ fn scan_fluxnodes<S: KeyValueStore>(chainstate: &ChainState<S>) -> Result<(), St
     if let (Some(min), Some(max)) = (min_last_paid, max_last_paid) {
         println!("last_paid_height range: {min}..{max}");
     }
+    Ok(())
+}
+
+fn debug_find_fluxnode_payee_script<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    target_script: &[u8],
+) -> Result<(), String> {
+    let records = chainstate
+        .fluxnode_records()
+        .map_err(|err| err.to_string())?;
+    if records.is_empty() {
+        println!("No fluxnode records found in the local database.");
+        return Ok(());
+    }
+
+    let mut matches = 0usize;
+    for record in &records {
+        let utxo = chainstate
+            .utxo_entry(&record.collateral)
+            .map_err(|err| err.to_string())?;
+
+        let operator_pubkey = chainstate
+            .fluxnode_key(record.operator_pubkey)
+            .map_err(|err| err.to_string())?
+            .unwrap_or_default();
+
+        let mut candidate_scripts = Vec::new();
+        if let Some(key) = record.p2sh_script {
+            if let Some(redeem_script) = chainstate
+                .fluxnode_key(key)
+                .map_err(|err| err.to_string())?
+            {
+                let script_hash = fluxd_primitives::hash::hash160(&redeem_script);
+                let mut script = Vec::with_capacity(23);
+                script.extend_from_slice(&[0xa9, 0x14]);
+                script.extend_from_slice(&script_hash);
+                script.push(0x87);
+                candidate_scripts.push(("p2sh(redeem_script)", script));
+            }
+        }
+        if let Some(key) = record.collateral_pubkey {
+            if let Some(collateral_pubkey) = chainstate
+                .fluxnode_key(key)
+                .map_err(|err| err.to_string())?
+            {
+                let pubkey_hash = fluxd_primitives::hash::hash160(&collateral_pubkey);
+                let mut script = Vec::with_capacity(25);
+                script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+                script.extend_from_slice(&pubkey_hash);
+                script.extend_from_slice(&[0x88, 0xac]);
+                candidate_scripts.push(("p2pkh(collateral_pubkey)", script));
+            }
+        }
+        if let Some(utxo) = utxo.as_ref() {
+            candidate_scripts.push(("collateral_utxo_script", utxo.script_pubkey.clone()));
+        }
+
+        let found = candidate_scripts
+            .iter()
+            .any(|(_, script)| script.as_slice() == target_script);
+        if !found {
+            continue;
+        }
+
+        matches += 1;
+        println!(
+            "Match {matches}: {}",
+            outpoint_to_string(&record.collateral)
+        );
+        println!(
+            "  tier={} confirmed_height={} last_confirmed_height={} last_paid_height={} collateral_value={}",
+            record.tier,
+            record.confirmed_height,
+            record.last_confirmed_height,
+            record.last_paid_height,
+            record.collateral_value,
+        );
+        println!(
+            "  operator_pubkey_hash160={}",
+            hex_encode(&fluxd_primitives::hash::hash160(&operator_pubkey))
+        );
+        if let Some(utxo) = utxo {
+            println!(
+                "  utxo: value={} script={}",
+                utxo.value,
+                hex_encode(&utxo.script_pubkey)
+            );
+        } else {
+            println!("  utxo: missing");
+        }
+        for (label, script) in candidate_scripts {
+            let is_match = script.as_slice() == target_script;
+            if is_match {
+                println!("  script[{label}]=MATCH {}", hex_encode(&script));
+            } else {
+                println!("  script[{label}]={}", hex_encode(&script));
+            }
+        }
+    }
+
+    if matches == 0 {
+        println!(
+            "No fluxnode records matched script {}",
+            hex_encode(target_script)
+        );
+    } else {
+        println!("Total matches: {matches}");
+    }
+
+    Ok(())
+}
+
+fn debug_print_expected_fluxnode_payouts<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: &ChainParams,
+    height: i32,
+) -> Result<(), String> {
+    let payouts = chainstate
+        .deterministic_fluxnode_payouts(height, params)
+        .map_err(|err| err.to_string())?;
+    if payouts.is_empty() {
+        println!("No deterministic fluxnode payouts at height {height}");
+        return Ok(());
+    }
+
+    let records = chainstate
+        .fluxnode_records()
+        .map_err(|err| err.to_string())?;
+    let mut record_by_outpoint = HashMap::new();
+    for record in records {
+        record_by_outpoint.insert(outpoint_to_string(&record.collateral), record);
+    }
+
+    let block_value = fluxd_consensus::block_subsidy(height, &params.consensus);
+    println!("Expected fluxnode payouts at height {height} (block_value={block_value})");
+    for (outpoint, script_pubkey, amount) in payouts {
+        let inferred_tier = (1u8..=3u8)
+            .find(|tier| {
+                fluxd_consensus::fluxnode_subsidy(
+                    height,
+                    block_value,
+                    *tier as i32,
+                    &params.consensus,
+                ) == amount
+            })
+            .unwrap_or(0);
+        let key = outpoint_to_string(&outpoint);
+        println!(
+            "- tier={} outpoint={} amount={} script={}",
+            inferred_tier,
+            key,
+            amount,
+            hex_encode(&script_pubkey)
+        );
+        if let Some(record) = record_by_outpoint.get(&key) {
+            println!(
+                "  record: tier={} confirmed_height={} last_confirmed_height={} last_paid_height={} p2sh_script={} collateral_pubkey={}",
+                record.tier,
+                record.confirmed_height,
+                record.last_confirmed_height,
+                record.last_paid_height,
+                record.p2sh_script.is_some(),
+                record.collateral_pubkey.is_some()
+            );
+        } else {
+            println!("  record: missing");
+        }
+    }
+
+    Ok(())
+}
+
+fn debug_print_fluxnode_payee_candidates<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: &ChainParams,
+    tier: u8,
+    height: i32,
+    limit: usize,
+) -> Result<(), String> {
+    if !(1..=3).contains(&tier) {
+        return Err(format!("invalid tier {tier} (expected 1..=3)"));
+    }
+    if height <= 0 {
+        return Err(format!("invalid height {height} (expected > 0)"));
+    }
+    if limit == 0 {
+        return Err("limit must be > 0".to_string());
+    }
+
+    let pay_height = height.saturating_sub(1);
+    let pay_height_u32 =
+        u32::try_from(pay_height).map_err(|_| "height out of range".to_string())?;
+    let expiration = {
+        use fluxd_consensus::constants::{
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V1,
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V2,
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V3,
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V4,
+        };
+
+        let upgrades = &params.consensus.upgrades;
+        let count = if network_upgrade_active(pay_height, upgrades, UpgradeIndex::Pon) {
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V4
+        } else if network_upgrade_active(pay_height, upgrades, UpgradeIndex::Halving) {
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V3
+        } else if network_upgrade_active(pay_height, upgrades, UpgradeIndex::Flux) {
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V2
+        } else {
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V1
+        };
+        u32::try_from(count).unwrap_or_default()
+    };
+    let expire_height_for_last_confirmed = |last_confirmed_height: u32| -> u32 {
+        use fluxd_consensus::constants::{
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V1,
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V2,
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V3,
+            FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V4,
+        };
+
+        let expiration_for_height = |height: u32| -> u32 {
+            let height_i32 = i32::try_from(height).unwrap_or(i32::MAX);
+            let upgrades = &params.consensus.upgrades;
+            let count = if network_upgrade_active(height_i32, upgrades, UpgradeIndex::Pon) {
+                FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V4
+            } else if network_upgrade_active(height_i32, upgrades, UpgradeIndex::Halving) {
+                FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V3
+            } else if network_upgrade_active(height_i32, upgrades, UpgradeIndex::Flux) {
+                FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V2
+            } else {
+                FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V1
+            };
+            u32::try_from(count).unwrap_or_default()
+        };
+
+        let mut expiration = expiration_for_height(last_confirmed_height);
+        let mut expire_height = last_confirmed_height
+            .saturating_add(expiration)
+            .saturating_add(1);
+        loop {
+            let next_expiration = expiration_for_height(expire_height);
+            if next_expiration == expiration {
+                break;
+            }
+            expiration = next_expiration;
+            expire_height = last_confirmed_height
+                .saturating_add(expiration)
+                .saturating_add(1);
+        }
+        expire_height
+    };
+
+    let mut candidates: Vec<FluxnodeRecord> = chainstate
+        .fluxnode_records()
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter(|record| record.tier == tier && record.confirmed_height > 0)
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        let a_has_last_paid = a.last_paid_height > 0;
+        let b_has_last_paid = b.last_paid_height > 0;
+        let a_comparator_height = if a_has_last_paid {
+            a.last_paid_height
+        } else {
+            a.confirmed_height
+        };
+        let b_comparator_height = if b_has_last_paid {
+            b.last_paid_height
+        } else {
+            b.confirmed_height
+        };
+        a_comparator_height
+            .cmp(&b_comparator_height)
+            .then_with(|| a_has_last_paid.cmp(&b_has_last_paid))
+            .then_with(|| a.collateral.hash.cmp(&b.collateral.hash))
+            .then_with(|| a.collateral.index.cmp(&b.collateral.index))
+    });
+
+    println!(
+        "Fluxnode payee candidates tier={tier} height={height} (pay_height={pay_height} expiration={expiration})",
+    );
+    println!("Candidates scanned: {}", candidates.len());
+
+    #[derive(Clone)]
+    struct EligibleCandidate {
+        idx: usize,
+        outpoint: OutPoint,
+        comparator_height: u32,
+        has_last_paid: bool,
+        confirmed_height: u32,
+        last_confirmed_height: u32,
+        last_paid_height: u32,
+        collateral_value: i64,
+        script: Vec<u8>,
+        utxo_value: i64,
+        utxo_script: Vec<u8>,
+        is_p2sh: bool,
+    }
+
+    let mut eligible: Vec<EligibleCandidate> = Vec::new();
+    for (idx, record) in candidates.iter().enumerate() {
+        let expired =
+            pay_height_u32 >= expire_height_for_last_confirmed(record.last_confirmed_height);
+        if expired {
+            continue;
+        }
+        let Some(utxo) = chainstate
+            .utxo_entry(&record.collateral)
+            .map_err(|err| err.to_string())?
+        else {
+            continue;
+        };
+        if !fluxd_consensus::fluxnode_collateral_matches_tier(
+            pay_height,
+            utxo.value,
+            tier,
+            &params.fluxnode,
+        ) {
+            continue;
+        }
+
+        let (script, is_p2sh) = if let Some(key) = record.p2sh_script {
+            let redeem_script = chainstate
+                .fluxnode_key(key)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "missing fluxnode redeem script".to_string())?;
+            let script_hash = fluxd_primitives::hash::hash160(&redeem_script);
+            let mut script = Vec::with_capacity(23);
+            script.extend_from_slice(&[0xa9, 0x14]);
+            script.extend_from_slice(&script_hash);
+            script.push(0x87);
+            (script, true)
+        } else {
+            let collateral_key = record
+                .collateral_pubkey
+                .ok_or_else(|| "missing fluxnode collateral pubkey key".to_string())?;
+            let pubkey_bytes = chainstate
+                .fluxnode_key(collateral_key)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "missing fluxnode collateral pubkey bytes".to_string())?;
+            let is_p2sh_signing_key = params.fluxnode.p2sh_public_keys.iter().any(|key| {
+                parse_hex_bytes(key.key)
+                    .as_ref()
+                    .is_some_and(|expected| expected.as_slice() == pubkey_bytes.as_slice())
+            });
+            if is_p2sh_signing_key {
+                (utxo.script_pubkey.clone(), true)
+            } else {
+                let pubkey_hash = fluxd_primitives::hash::hash160(&pubkey_bytes);
+                let mut script = Vec::with_capacity(25);
+                script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+                script.extend_from_slice(&pubkey_hash);
+                script.extend_from_slice(&[0x88, 0xac]);
+                (script, false)
+            }
+        };
+
+        let has_last_paid = record.last_paid_height > 0;
+        let comparator_height = if has_last_paid {
+            record.last_paid_height
+        } else {
+            record.confirmed_height
+        };
+        eligible.push(EligibleCandidate {
+            idx,
+            outpoint: record.collateral.clone(),
+            comparator_height,
+            has_last_paid,
+            confirmed_height: record.confirmed_height,
+            last_confirmed_height: record.last_confirmed_height,
+            last_paid_height: record.last_paid_height,
+            collateral_value: record.collateral_value,
+            script,
+            utxo_value: utxo.value,
+            utxo_script: utxo.script_pubkey.clone(),
+            is_p2sh,
+        });
+        if eligible.len() >= 10 {
+            break;
+        }
+    }
+
+    for (idx, record) in candidates.iter().enumerate().take(limit) {
+        let has_last_paid = record.last_paid_height > 0;
+        let comparator_height = if has_last_paid {
+            record.last_paid_height
+        } else {
+            record.confirmed_height
+        };
+        let outpoint_str = outpoint_to_string(&record.collateral);
+
+        let expired =
+            pay_height_u32 >= expire_height_for_last_confirmed(record.last_confirmed_height);
+        let utxo = chainstate
+            .utxo_entry(&record.collateral)
+            .map_err(|err| err.to_string())?;
+        let collateral_matches = utxo.as_ref().is_some_and(|utxo| {
+            fluxd_consensus::fluxnode_collateral_matches_tier(
+                pay_height,
+                utxo.value,
+                tier,
+                &params.fluxnode,
+            )
+        });
+
+        let mut status = Vec::new();
+        if eligible.first().map(|entry| entry.idx) == Some(idx) {
+            status.push("WINNER");
+        }
+        if expired {
+            status.push("expired");
+        }
+        if utxo.is_none() {
+            status.push("missing_utxo");
+        }
+        if !collateral_matches {
+            status.push("collateral_mismatch");
+        }
+        let status = if status.is_empty() {
+            "ok".to_string()
+        } else {
+            status.join(",")
+        };
+
+        println!(
+            "#{idx:>5} outpoint={outpoint_str} comparator_height={comparator_height} has_last_paid={has_last_paid} confirmed_height={} last_confirmed_height={} last_paid_height={} collateral_value={} [{status}]",
+            record.confirmed_height,
+            record.last_confirmed_height,
+            record.last_paid_height,
+            record.collateral_value,
+        );
+
+        if let Some(utxo) = utxo {
+            println!(
+                "      utxo: value={} script={}",
+                utxo.value,
+                hex_encode(&utxo.script_pubkey)
+            );
+        } else {
+            println!("      utxo: missing");
+        }
+    }
+
+    if eligible.is_empty() {
+        println!("Selected payee: none (no eligible candidates)");
+        return Ok(());
+    }
+    println!("Eligible candidates (first {}):", eligible.len());
+    for entry in &eligible {
+        println!(
+            "- idx={} outpoint={} comparator_height={} has_last_paid={} confirmed_height={} last_confirmed_height={} last_paid_height={} collateral_value={} script={} utxo_value={} utxo_script={} p2sh={}",
+            entry.idx,
+            outpoint_to_string(&entry.outpoint),
+            entry.comparator_height,
+            entry.has_last_paid,
+            entry.confirmed_height,
+            entry.last_confirmed_height,
+            entry.last_paid_height,
+            entry.collateral_value,
+            hex_encode(&entry.script),
+            entry.utxo_value,
+            hex_encode(&entry.utxo_script),
+            entry.is_p2sh,
+        );
+    }
+
     Ok(())
 }
 
@@ -5394,6 +5893,9 @@ fn parse_args() -> Result<Config, String> {
     let mut scan_flatfiles = false;
     let mut scan_supply = false;
     let mut scan_fluxnodes = false;
+    let mut debug_fluxnode_payee_script: Option<Vec<u8>> = None;
+    let mut debug_fluxnode_payout_height: Option<i32> = None;
+    let mut debug_fluxnode_payee_candidates: Option<DebugFluxnodePayeeCandidates> = None;
     let mut check_script = true;
     let mut rpc_addr: Option<SocketAddr> = None;
     let mut rpc_user: Option<String> = None;
@@ -5461,6 +5963,59 @@ fn parse_args() -> Result<Config, String> {
             }
             "--scan-fluxnodes" => {
                 scan_fluxnodes = true;
+            }
+            "--debug-fluxnode-payee-script" => {
+                let value = args.next().ok_or_else(|| {
+                    format!(
+                        "missing value for --debug-fluxnode-payee-script\n{}",
+                        usage()
+                    )
+                })?;
+                debug_fluxnode_payee_script = Some(parse_hex_bytes(&value).ok_or_else(|| {
+                    format!(
+                        "invalid script hex for --debug-fluxnode-payee-script\n{}",
+                        usage()
+                    )
+                })?);
+            }
+            "--debug-fluxnode-payouts" => {
+                let value = args.next().ok_or_else(|| {
+                    format!("missing value for --debug-fluxnode-payouts\n{}", usage())
+                })?;
+                debug_fluxnode_payout_height = Some(value.parse::<i32>().map_err(|_| {
+                    format!("invalid height for --debug-fluxnode-payouts\n{}", usage())
+                })?);
+            }
+            "--debug-fluxnode-payee-candidates" => {
+                let tier = args.next().ok_or_else(|| {
+                    format!(
+                        "missing tier for --debug-fluxnode-payee-candidates\n{}",
+                        usage()
+                    )
+                })?;
+                let height = args.next().ok_or_else(|| {
+                    format!(
+                        "missing height for --debug-fluxnode-payee-candidates\n{}",
+                        usage()
+                    )
+                })?;
+                let tier = tier.parse::<u8>().map_err(|_| {
+                    format!(
+                        "invalid tier for --debug-fluxnode-payee-candidates\n{}",
+                        usage()
+                    )
+                })?;
+                let height = height.parse::<i32>().map_err(|_| {
+                    format!(
+                        "invalid height for --debug-fluxnode-payee-candidates\n{}",
+                        usage()
+                    )
+                })?;
+                debug_fluxnode_payee_candidates = Some(DebugFluxnodePayeeCandidates {
+                    tier,
+                    height,
+                    limit: 50,
+                });
             }
             "--skip-script" => {
                 check_script = false;
@@ -5815,6 +6370,9 @@ fn parse_args() -> Result<Config, String> {
         scan_flatfiles,
         scan_supply,
         scan_fluxnodes,
+        debug_fluxnode_payee_script,
+        debug_fluxnode_payout_height,
+        debug_fluxnode_payee_candidates,
         check_script,
         rpc_addr,
         rpc_user,
@@ -5850,6 +6408,42 @@ fn parse_args() -> Result<Config, String> {
 
 fn mb_to_bytes(mb: u64) -> u64 {
     mb.saturating_mul(1024 * 1024)
+}
+
+fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    let mut hex = value.trim();
+    if let Some(stripped) = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")) {
+        hex = stripped;
+    }
+    if hex.len() % 2 == 1 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut iter = hex.as_bytes().iter().copied();
+    while let (Some(high), Some(low)) = (iter.next(), iter.next()) {
+        let high = (high as char).to_digit(16)? as u8;
+        let low = (low as char).to_digit(16)? as u8;
+        bytes.push(high << 4 | low);
+    }
+    Some(bytes)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+fn outpoint_to_string(outpoint: &OutPoint) -> String {
+    format!(
+        "{}:{}",
+        stats::hash256_to_hex(&outpoint.hash),
+        outpoint.index
+    )
 }
 
 fn parse_fee_rate_per_kb(value: &str) -> Result<i64, String> {
@@ -5980,7 +6574,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--params-dir PATH] [--fetch-params] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -5990,6 +6584,9 @@ fn usage() -> String {
         "  --scan-flatfiles  Scan flatfiles for block index mismatches, then exit",
         "  --scan-supply  Scan blocks in the local DB and print coinbase totals, then exit",
         "  --scan-fluxnodes  Scan fluxnode records in the local DB and print summary stats, then exit",
+        "  --debug-fluxnode-payee-script  Scan fluxnode records for a matching payee script, then exit",
+        "  --debug-fluxnode-payouts  Print expected deterministic fluxnode payouts at a height, then exit",
+        "  --debug-fluxnode-payee-candidates  Print ordered deterministic payee candidates for a tier+height, then exit",
         "  --skip-script  Disable script validation (testing only)",
         "  --network   Network selection (default: mainnet)",
         "  --rpc-addr  Bind JSON-RPC server (default: 127.0.0.1:16124 mainnet, 26124 testnet)",

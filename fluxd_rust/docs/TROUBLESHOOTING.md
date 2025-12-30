@@ -74,6 +74,9 @@ coinbase outputs.
 Likely causes:
 - You are running an older `fluxd-rust` build with a deterministic fluxnode payee ordering mismatch
   (older builds could disagree on which fluxnode should be paid when heights tie).
+- You are running an older `fluxd-rust` build with incorrect fluxnode confirm expiration handling
+  across upgrade boundaries (nodes that expired pre-PoN could be incorrectly treated as eligible
+  post-PoN, leading to a deterministic payee mismatch near PoN-era blocks).
 - You are reusing a database created by an older `fluxd-rust` build that did not yet track
   fluxnode tier metadata and/or deterministic `last_paid_height` state.
 
@@ -81,6 +84,19 @@ Quick diagnosis:
 
 ```bash
 ./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --scan-fluxnodes
+```
+
+If you have the failing height from logs, you can print the expected deterministic fluxnode payouts
+at that height:
+
+```bash
+./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --debug-fluxnode-payouts <height>
+```
+
+For deeper diagnostics on payee selection for a specific tier:
+
+```bash
+./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --debug-fluxnode-payee-candidates <tier 1..3> <height>
 ```
 
 If you see `Tier totals: cumulus=0 nimbus=0 stratus=0` or `last_paid_height range: 0..0` at high

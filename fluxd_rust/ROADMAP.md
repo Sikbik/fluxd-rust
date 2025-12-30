@@ -80,6 +80,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Regression tests for PoN tier distribution + dev-fund remainder
 - [x] [P0] Coinbase rules parity (funding outputs + maturity) (owner: TBD)
   - [x] Regression tests for exchange/foundation/swap-pool coinbase enforcement (mainnet)
+  - [x] Fluxnode confirm expiration parity across upgrades (avoid resurrecting expired nodes after PoN)
   - [x] Deterministic fluxnode payout ordering parity (never-paid tie-break on equal height)
   - [x] Regression test for coinbase maturity (premature spend rejection)
 - [x] [P0] Chainwork parity for PoN/PoW edge cases and existing headers (owner: TBD)

@@ -1721,27 +1721,8 @@ impl<S: KeyValueStore> ChainState<S> {
             return Ok(height_u32 > removal_height);
         }
 
-        let mut expiration = fluxnode_confirm_expiration_count(
-            i32::try_from(record.last_confirmed_height).unwrap_or(i32::MAX),
-            &params.consensus,
-        );
-        let mut expire_height = record
-            .last_confirmed_height
-            .saturating_add(expiration)
-            .saturating_add(1);
-        loop {
-            let candidate_height = i32::try_from(expire_height).unwrap_or(i32::MAX);
-            let next_expiration =
-                fluxnode_confirm_expiration_count(candidate_height, &params.consensus);
-            if next_expiration == expiration {
-                break;
-            }
-            expiration = next_expiration;
-            expire_height = record
-                .last_confirmed_height
-                .saturating_add(expiration)
-                .saturating_add(1);
-        }
+        let expire_height =
+            fluxnode_confirm_expire_height(record.last_confirmed_height, &params.consensus);
         Ok(height_u32 > expire_height)
     }
 
@@ -1833,7 +1814,6 @@ impl<S: KeyValueStore> ChainState<S> {
         let tier_index = (tier - 1) as usize;
         let pay_height_u32 =
             u32::try_from(pay_height).map_err(|_| ChainStateError::ValueOutOfRange)?;
-        let expiration = fluxnode_confirm_expiration_count(pay_height, &params.consensus);
         let mut removed = 0usize;
         let mut last_reason = "none";
 
@@ -1871,11 +1851,11 @@ impl<S: KeyValueStore> ChainState<S> {
                 continue;
             }
 
-            let expired = if pay_height_u32 <= meta.last_confirmed_height {
-                false
-            } else {
-                (pay_height_u32 - meta.last_confirmed_height) > expiration
-            };
+            let expired = fluxnode_confirm_expired_for_pay_height(
+                pay_height_u32,
+                meta.last_confirmed_height,
+                &params.consensus,
+            );
             if expired {
                 let mut cache = self.fluxnode_payments.lock().map_err(|_| {
                     ChainStateError::CorruptIndex("fluxnode payments cache lock poisoned")
@@ -4443,6 +4423,39 @@ fn fluxnode_confirm_expiration_count(height: i32, consensus: &ConsensusParams) -
     u32::try_from(count).unwrap_or_default()
 }
 
+fn fluxnode_confirm_expire_height(last_confirmed_height: u32, consensus: &ConsensusParams) -> u32 {
+    let mut expiration = fluxnode_confirm_expiration_count(
+        i32::try_from(last_confirmed_height).unwrap_or(i32::MAX),
+        consensus,
+    );
+    let mut expire_height = last_confirmed_height
+        .saturating_add(expiration)
+        .saturating_add(1);
+    loop {
+        let candidate_height = i32::try_from(expire_height).unwrap_or(i32::MAX);
+        let next_expiration = fluxnode_confirm_expiration_count(candidate_height, consensus);
+        if next_expiration == expiration {
+            break;
+        }
+        expiration = next_expiration;
+        expire_height = last_confirmed_height
+            .saturating_add(expiration)
+            .saturating_add(1);
+    }
+    expire_height
+}
+
+fn fluxnode_confirm_expired_for_pay_height(
+    pay_height: u32,
+    last_confirmed_height: u32,
+    consensus: &ConsensusParams,
+) -> bool {
+    if pay_height <= last_confirmed_height {
+        return false;
+    }
+    pay_height >= fluxnode_confirm_expire_height(last_confirmed_height, consensus)
+}
+
 fn validate_fluxnode_collateral_script(
     script_pubkey: &[u8],
     _height: i32,
@@ -4732,7 +4745,7 @@ mod tests {
     }
 
     #[test]
-    fn fluxnode_payee_ordering_matches_cpp_unpaid_first_on_equal_height() {
+    fn fluxnode_payee_ordering_matches_cpp_unpaid_before_paid_on_equal_height() {
         fn record(
             hash_byte: u8,
             index: u32,
@@ -4767,6 +4780,33 @@ mod tests {
         let unpaid_a_key = FluxnodePayeeKey::from_record(&unpaid_a).expect("unpaid a key");
         let unpaid_b_key = FluxnodePayeeKey::from_record(&unpaid_b).expect("unpaid b key");
         assert!(unpaid_a_key < unpaid_b_key);
+    }
+
+    #[test]
+    fn fluxnode_confirm_expiration_respects_upgrade_changes() {
+        let params = chain_params(Network::Mainnet);
+        let pon_height =
+            params.consensus.upgrades[UpgradeIndex::Pon.as_usize()].activation_height as u32;
+
+        let pre_pon_old = pon_height.saturating_sub(344);
+        let pre_pon_recent = pon_height.saturating_sub(10);
+        let pay_height = pon_height.saturating_add(264);
+
+        let expire_old = fluxnode_confirm_expire_height(pre_pon_old, &params.consensus);
+        assert!(expire_old < pon_height);
+        assert!(fluxnode_confirm_expired_for_pay_height(
+            pay_height,
+            pre_pon_old,
+            &params.consensus
+        ));
+
+        let expire_recent = fluxnode_confirm_expire_height(pre_pon_recent, &params.consensus);
+        assert!(expire_recent > pon_height);
+        assert!(!fluxnode_confirm_expired_for_pay_height(
+            pay_height,
+            pre_pon_recent,
+            &params.consensus
+        ));
     }
 
     #[test]
