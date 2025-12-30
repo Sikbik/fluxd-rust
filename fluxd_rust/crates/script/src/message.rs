@@ -66,6 +66,24 @@ pub fn verify_signed_message(
     Ok(())
 }
 
+pub fn recover_signed_message_pubkey(
+    signature: &[u8],
+    message: &[u8],
+) -> Result<Vec<u8>, SignedMessageError> {
+    let (recoverable, compressed) = decode_compact_signature(signature)?;
+    let digest = signed_message_hash(message);
+    let msg =
+        Message::from_digest_slice(&digest).map_err(|_| SignedMessageError::InvalidMessage)?;
+    let pubkey = secp256k1_verify()
+        .recover_ecdsa(&msg, &recoverable)
+        .map_err(|_| SignedMessageError::RecoverFailed)?;
+    if compressed {
+        Ok(pubkey.serialize().to_vec())
+    } else {
+        Ok(pubkey.serialize_uncompressed().to_vec())
+    }
+}
+
 fn decode_compact_signature(
     signature: &[u8],
 ) -> Result<(RecoverableSignature, bool), SignedMessageError> {
@@ -117,5 +135,25 @@ mod tests {
         let err = verify_signed_message(&pubkey.serialize_uncompressed(), &sig_bytes, message)
             .unwrap_err();
         assert!(matches!(err, SignedMessageError::PubkeyMismatch));
+    }
+
+    #[test]
+    fn recover_signed_message_pubkey_matches_compact_header() {
+        let secp = Secp256k1::signing_only();
+        let secret = SecretKey::from_slice(&[1u8; 32]).expect("secret");
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+
+        let message = b"hello";
+        let digest = signed_message_hash(message);
+        let msg = Message::from_digest_slice(&digest).expect("msg");
+        let sig = secp.sign_ecdsa_recoverable(&msg, &secret);
+
+        let sig_compact = encode_compact(&sig, true);
+        let recovered = recover_signed_message_pubkey(&sig_compact, message).expect("recover");
+        assert_eq!(recovered, pubkey.serialize().to_vec());
+
+        let sig_uncompressed = encode_compact(&sig, false);
+        let recovered = recover_signed_message_pubkey(&sig_uncompressed, message).expect("recover");
+        assert_eq!(recovered, pubkey.serialize_uncompressed().to_vec());
     }
 }

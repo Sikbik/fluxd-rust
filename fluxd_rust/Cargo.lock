@@ -643,6 +643,7 @@ dependencies = [
  "fluxd-storage",
  "primitive-types",
  "rand",
+ "secp256k1",
  "serde",
  "serde_json",
  "tokio",

@@ -101,11 +101,13 @@ Type notes:
 - `createrawtransaction <transactions> <addresses> [locktime] [expiryheight]`
 - `decoderawtransaction <hexstring>`
 - `decodescript <hex>`
+- `createmultisig <nrequired> <keys>`
 - `getrawtransaction <txid> [verbose]`
 - `sendrawtransaction <hexstring> [allowhighfees]`
 - `gettxout <txid> <vout> [include_mempool]`
 - `gettxoutsetinfo`
 - `validateaddress <fluxaddress>`
+- `verifymessage <fluxaddress> <signature> <message>`
 
 ### Mining and mempool
 
@@ -304,6 +306,25 @@ Notes:
 - Result:
   - If invalid: `{ "isvalid": false }`
   - If valid: `{ "isvalid": true, "address": "...", "scriptPubKey": "..." }`
+
+### createmultisig
+
+- Params:
+  - `nrequired` (number) - required signatures
+  - `keys` (array) - hex-encoded public keys
+- Result: `{ "address": "<p2sh>", "redeemScript": "<hex>" }`
+
+Notes:
+- Wallet-backed address lookup is not available yet, so keys must be hex public keys (not t-addrs).
+
+### verifymessage
+
+- Params: `<fluxaddress> <signature> <message>`
+  - `signature` is base64-encoded (as produced by `signmessage` in the C++ daemon).
+- Result: boolean.
+
+Notes:
+- Only supports P2PKH (key) addresses; P2SH addresses return an error (matches C++).
 
 ### getrawtransaction
 

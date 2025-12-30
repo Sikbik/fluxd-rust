@@ -37,8 +37,10 @@ use fluxd_primitives::hash::hash160;
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{Transaction, TxIn, TxOut, SAPLING_VERSION_GROUP_ID};
 use fluxd_primitives::{address_to_script_pubkey, script_pubkey_to_address, AddressError};
+use fluxd_script::message::recover_signed_message_pubkey;
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
+use secp256k1::PublicKey;
 
 use crate::fee_estimator::FeeEstimator;
 use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind, MempoolPolicy};
@@ -51,6 +53,7 @@ const RPC_REALM: &str = "fluxd";
 const RPC_COOKIE_FILE: &str = "rpc.cookie";
 
 const RPC_INVALID_PARAMETER: i64 = -8;
+const RPC_TYPE_ERROR: i64 = -3;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 const RPC_DESERIALIZATION_ERROR: i64 = -22;
 const RPC_TRANSACTION_ERROR: i64 = -25;
@@ -81,6 +84,8 @@ const RPC_METHODS: &[&str] = &[
     "decoderawtransaction",
     "decodescript",
     "validateaddress",
+    "verifymessage",
+    "createmultisig",
     "getrawtransaction",
     "sendrawtransaction",
     "getmempoolinfo",
@@ -679,6 +684,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getdoslist" => rpc_getdoslist(chainstate, params, chain_params),
         "getstartlist" => rpc_getstartlist(chainstate, params, chain_params),
         "validateaddress" => rpc_validateaddress(params, chain_params),
+        "verifymessage" => rpc_verifymessage(params, chain_params),
+        "createmultisig" => rpc_createmultisig(params, chain_params),
         _ => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "method not found")),
     }
 }
@@ -1389,6 +1396,129 @@ fn rpc_validateaddress(params: Vec<Value>, chain_params: &ChainParams) -> Result
         "isvalid": true,
         "address": address,
         "scriptPubKey": hex_bytes(&script_pubkey),
+    }))
+}
+
+fn rpc_verifymessage(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
+    if params.len() != 3 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "verifymessage expects 3 parameters",
+        ));
+    }
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
+    let signature = params[1]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "signature must be a string"))?;
+    let message = params[2]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "message must be a string"))?;
+
+    let script_pubkey = address_to_script_pubkey(address, chain_params.network)
+        .map_err(|_| RpcError::new(RPC_TYPE_ERROR, "Invalid address"))?;
+    if classify_script_pubkey(&script_pubkey) != ScriptType::P2Pkh {
+        return Err(RpcError::new(
+            RPC_TYPE_ERROR,
+            "Address does not refer to key",
+        ));
+    }
+    if script_pubkey.len() < 23 {
+        return Err(RpcError::new(RPC_INTERNAL_ERROR, "invalid scriptPubKey"));
+    }
+    let expected_key_hash: [u8; 20] = script_pubkey[3..23]
+        .try_into()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid scriptPubKey"))?;
+
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature.as_bytes())
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Malformed base64 encoding"))?;
+
+    let recovered_pubkey = match recover_signed_message_pubkey(&sig_bytes, message.as_bytes()) {
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(Value::Bool(false)),
+    };
+    let recovered_hash = hash160(&recovered_pubkey);
+    Ok(Value::Bool(recovered_hash == expected_key_hash))
+}
+
+fn rpc_createmultisig(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
+    const MAX_PUBKEYS: usize = 16;
+    const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+
+    if params.len() != 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "createmultisig expects 2 parameters",
+        ));
+    }
+    let required = parse_u32(&params[0], "nrequired")? as usize;
+    if required < 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "a multisignature address must require at least one key to redeem",
+        ));
+    }
+    let keys = params[1].as_array().ok_or_else(|| {
+        RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "keys must be a json array of strings",
+        )
+    })?;
+    if keys.len() < required {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            format!(
+                "not enough keys supplied (got {} keys, but need at least {required} to redeem)",
+                keys.len()
+            ),
+        ));
+    }
+    if keys.len() > MAX_PUBKEYS {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "Number of addresses involved in the multisignature address creation > 16\nReduce the number",
+        ));
+    }
+
+    let mut pubkeys = Vec::with_capacity(keys.len());
+    for key in keys {
+        let key = key
+            .as_str()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "keys must be strings"))?;
+        let bytes = bytes_from_hex(key).ok_or_else(|| {
+            RpcError::new(RPC_INVALID_PARAMETER, format!(" Invalid public key: {key}"))
+        })?;
+        PublicKey::from_slice(&bytes).map_err(|_| {
+            RpcError::new(RPC_INVALID_PARAMETER, format!(" Invalid public key: {key}"))
+        })?;
+        pubkeys.push(bytes);
+    }
+
+    let mut redeem_script = Vec::new();
+    redeem_script.push(multisig_small_int_opcode(required)?);
+    for pubkey in &pubkeys {
+        redeem_script.push(pubkey.len() as u8);
+        redeem_script.extend_from_slice(pubkey);
+    }
+    redeem_script.push(multisig_small_int_opcode(pubkeys.len())?);
+    redeem_script.push(0xae);
+
+    if redeem_script.len() > MAX_SCRIPT_ELEMENT_SIZE {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            format!(
+                "redeemScript exceeds size limit: {} > {}",
+                redeem_script.len(),
+                MAX_SCRIPT_ELEMENT_SIZE
+            ),
+        ));
+    }
+
+    Ok(json!({
+        "address": script_p2sh_address(&redeem_script, chain_params.network),
+        "redeemScript": hex_bytes(&redeem_script),
     }))
 }
 
@@ -3456,6 +3586,16 @@ fn script_p2sh_address(script: &[u8], network: Network) -> String {
     script_pubkey.extend_from_slice(&hash);
     script_pubkey.push(0x87);
     script_pubkey_to_address(&script_pubkey, network).unwrap_or_default()
+}
+
+fn multisig_small_int_opcode(value: usize) -> Result<u8, RpcError> {
+    match value {
+        1..=16 => Ok(0x50u8 + value as u8),
+        _ => Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "multisig param out of range",
+        )),
+    }
 }
 
 fn script_req_sigs(script_type: &str) -> Option<i64> {
