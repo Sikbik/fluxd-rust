@@ -129,6 +129,8 @@ const RPC_METHODS: &[&str] = &[
     "createzelnodekey",
     "listfluxnodeconf",
     "listzelnodeconf",
+    "getfluxnodeoutputs",
+    "getzelnodeoutputs",
     "addnode",
     "disconnectnode",
     "getaddednodeinfo",
@@ -989,6 +991,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "createfluxnodekey" | "createzelnodekey" => rpc_createfluxnodekey(params, chain_params),
         "listfluxnodeconf" | "listzelnodeconf" => {
             rpc_listfluxnodeconf(chainstate, params, chain_params, data_dir)
+        }
+        "getfluxnodeoutputs" | "getzelnodeoutputs" => {
+            rpc_getfluxnodeoutputs(chainstate, params, chain_params, data_dir)
         }
         "validateaddress" => rpc_validateaddress(params, chain_params),
         "verifymessage" => rpc_verifymessage(params, chain_params),
@@ -4021,6 +4026,58 @@ fn rpc_listfluxnodeconf<S: fluxd_storage::KeyValueStore>(
         }
 
         out.push(Value::Object(obj));
+    }
+
+    Ok(Value::Array(out))
+}
+
+fn rpc_getfluxnodeoutputs<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    data_dir: &Path,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+
+    let conf_entries = read_fluxnode_conf(data_dir)?;
+    if conf_entries.is_empty() {
+        return Err(RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "This is not a Flux Node (no fluxnode.conf entry found)",
+        ));
+    }
+
+    let best_height = best_block_height(chainstate)?;
+    let best_u32 = u32::try_from(best_height).unwrap_or(0);
+
+    let mut out = Vec::new();
+    for entry in conf_entries {
+        let utxo = chainstate
+            .utxo_entry(&entry.collateral)
+            .map_err(map_internal)?;
+        let Some(utxo) = utxo else {
+            continue;
+        };
+        if utxo.is_coinbase {
+            continue;
+        }
+        if fluxd_consensus::fluxnode_tier_from_collateral(
+            best_height,
+            utxo.value,
+            &chain_params.fluxnode,
+        )
+        .is_none()
+        {
+            continue;
+        }
+
+        let confirmations = best_u32.saturating_sub(utxo.height).saturating_add(1);
+        out.push(json!({
+            "txhash": hash256_to_hex(&entry.collateral.hash),
+            "outputidx": entry.collateral.index,
+            "Flux Amount": amount_to_value(utxo.value),
+            "Confirmations": confirmations,
+        }));
     }
 
     Ok(Value::Array(out))

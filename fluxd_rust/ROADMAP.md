@@ -219,7 +219,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getfluxnodecount`<br>`listfluxnodes`<br>`viewdeterministicfluxnodelist`<br>`getdoslist`<br>`getstartlist`<br>`createfluxnodekey`<br>`listfluxnodeconf` | `fluxnodecurrentwinner`<br>`getfluxnodestatus` | `getfluxnodeoutputs`<br>`startfluxnode`<br>`startdeterministicfluxnode` |
+| `getfluxnodecount`<br>`listfluxnodes`<br>`viewdeterministicfluxnodelist`<br>`getdoslist`<br>`getstartlist`<br>`createfluxnodekey`<br>`listfluxnodeconf`<br>`getfluxnodeoutputs` | `fluxnodecurrentwinner`<br>`getfluxnodestatus` | `startfluxnode`<br>`startdeterministicfluxnode` |
 
 ### Address and insight-style indexes
 

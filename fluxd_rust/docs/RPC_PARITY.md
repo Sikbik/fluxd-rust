@@ -103,7 +103,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - createzelnodekey - Implemented (alias of createfluxnodekey)
 - listfluxnodeconf - Implemented (alias: listzelnodeconf)
 - listzelnodeconf - Implemented (alias of listfluxnodeconf)
-- getfluxnodeoutputs - Missing
+- getfluxnodeoutputs - Implemented (wallet-less; uses fluxnode.conf + UTXO lookups)
 - startfluxnode - Missing
 - startdeterministicfluxnode - Missing
 - verifychain - Missing

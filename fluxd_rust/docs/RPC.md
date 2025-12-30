@@ -130,6 +130,7 @@ Type notes:
 
 - `createfluxnodekey` / `createzelnodekey`
 - `listfluxnodeconf [filter]` / `listzelnodeconf [filter]`
+- `getfluxnodeoutputs` / `getzelnodeoutputs`
 - `getfluxnodecount`
 - `listfluxnodes`
 - `viewdeterministicfluxnodelist [filter]`
@@ -580,6 +581,14 @@ Returns `fluxnode.conf` entries in a JSON array, augmented with best-effort on-c
 - Params: optional `filter` string (case-insensitive substring match on alias/address/txhash/status)
 - Notes:
   - Fields follow the C++ daemon shape (`alias`, `status`, `privateKey`, `address`, etc.).
+
+### getfluxnodeoutputs / getzelnodeoutputs
+
+Returns candidate fluxnode collateral outputs.
+
+- Params: none
+- Notes:
+  - Wallet support is not implemented yet. This method currently reads `fluxnode.conf` and returns entries whose collateral outpoint is present in the current UTXO set and matches a valid tier amount.
 
 ### getfluxnodecount
 
