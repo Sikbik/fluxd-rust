@@ -104,8 +104,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listfluxnodeconf - Implemented (alias: listzelnodeconf)
 - listzelnodeconf - Implemented (alias of listfluxnodeconf)
 - getfluxnodeoutputs - Implemented (wallet-less; uses fluxnode.conf + UTXO lookups)
-- startfluxnode - Missing
-- startdeterministicfluxnode - Missing
+- startfluxnode - Partial (wallet-less; uses fluxnode.conf; requires a collateral WIF key)
+- startdeterministicfluxnode - Partial (wallet-less; requires a collateral WIF key; P2SH collateral also requires redeem script)
 - verifychain - Missing
 - addnode - Implemented (IP/IP:PORT only; no DNS resolution yet)
 - clearbanned - Implemented

@@ -36,14 +36,20 @@ use fluxd_primitives::block::{Block, CURRENT_VERSION, PON_VERSION};
 use fluxd_primitives::hash::hash160;
 use fluxd_primitives::merkleblock::{MerkleBlock, PartialMerkleTree};
 use fluxd_primitives::outpoint::OutPoint;
-use fluxd_primitives::transaction::{Transaction, TxIn, TxOut, SAPLING_VERSION_GROUP_ID};
-use fluxd_primitives::{
-    address_to_script_pubkey, script_pubkey_to_address, secret_key_to_wif, AddressError,
+use fluxd_primitives::transaction::{
+    FluxnodeStartV5, FluxnodeStartV6, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5,
+    FluxnodeTxV6, Transaction, TxIn, TxOut, FLUXNODE_INTERNAL_NORMAL_TX_VERSION,
+    FLUXNODE_INTERNAL_P2SH_TX_VERSION, FLUXNODE_TX_UPGRADEABLE_VERSION, FLUXNODE_TX_VERSION,
+    SAPLING_VERSION_GROUP_ID,
 };
-use fluxd_script::message::recover_signed_message_pubkey;
+use fluxd_primitives::{
+    address_to_script_pubkey, script_pubkey_to_address, secret_key_to_wif, wif_to_secret_key,
+    AddressError,
+};
+use fluxd_script::message::{recover_signed_message_pubkey, signed_message_hash};
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
-use secp256k1::{PublicKey, SecretKey};
+use secp256k1::{ecdsa::RecoverableSignature, Message, PublicKey, Secp256k1, SecretKey};
 
 use crate::fee_estimator::FeeEstimator;
 use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind, MempoolPolicy};
@@ -131,6 +137,10 @@ const RPC_METHODS: &[&str] = &[
     "listzelnodeconf",
     "getfluxnodeoutputs",
     "getzelnodeoutputs",
+    "startfluxnode",
+    "startzelnode",
+    "startdeterministicfluxnode",
+    "startdeterministiczelnode",
     "addnode",
     "disconnectnode",
     "getaddednodeinfo",
@@ -994,6 +1004,32 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         }
         "getfluxnodeoutputs" | "getzelnodeoutputs" => {
             rpc_getfluxnodeoutputs(chainstate, params, chain_params, data_dir)
+        }
+        "startfluxnode" | "startzelnode" => rpc_startfluxnode(
+            chainstate,
+            mempool,
+            mempool_policy,
+            mempool_metrics,
+            fee_estimator,
+            mempool_flags,
+            params,
+            chain_params,
+            tx_announce,
+            data_dir,
+        ),
+        "startdeterministicfluxnode" | "startdeterministiczelnode" => {
+            rpc_startdeterministicfluxnode(
+                chainstate,
+                mempool,
+                mempool_policy,
+                mempool_metrics,
+                fee_estimator,
+                mempool_flags,
+                params,
+                chain_params,
+                tx_announce,
+                data_dir,
+            )
         }
         "validateaddress" => rpc_validateaddress(params, chain_params),
         "verifymessage" => rpc_verifymessage(params, chain_params),
@@ -4083,6 +4119,704 @@ fn rpc_getfluxnodeoutputs<S: fluxd_storage::KeyValueStore>(
     Ok(Value::Array(out))
 }
 
+fn mempool_contains_fluxnode_outpoint(mempool: &Mempool, outpoint: &OutPoint) -> bool {
+    mempool.entries().any(|entry| {
+        let Some(fluxnode) = entry.tx.fluxnode.as_ref() else {
+            return false;
+        };
+        match fluxnode {
+            FluxnodeTx::V5(FluxnodeTxV5::Start(start)) => &start.collateral == outpoint,
+            FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => match &start.variant {
+                FluxnodeStartVariantV6::Normal { collateral, .. } => collateral == outpoint,
+                FluxnodeStartVariantV6::P2sh { collateral, .. } => collateral == outpoint,
+            },
+            FluxnodeTx::V5(FluxnodeTxV5::Confirm(confirm))
+            | FluxnodeTx::V6(FluxnodeTxV6::Confirm(confirm)) => &confirm.collateral == outpoint,
+        }
+    })
+}
+
+fn fluxnode_start_blocked_reason(
+    best_height: i32,
+    record: &FluxnodeRecord,
+    expiration: i32,
+    dos_remove: i32,
+) -> Option<&'static str> {
+    if record.confirmed_height != 0 {
+        return Some("Fluxnode already confirmed and in fluxnode list");
+    }
+    if best_height < record.start_height as i32 {
+        return Some("Fluxnode already started, waiting to be confirmed");
+    }
+    let age = best_height.saturating_sub(record.start_height as i32);
+    if age <= expiration {
+        return Some("Fluxnode already started, waiting to be confirmed");
+    }
+    if age <= dos_remove {
+        return Some("Fluxnode already started then not confirmed, in DoS tracker. Must wait until out of DoS tracker to start");
+    }
+    None
+}
+
+fn extract_p2pkh_hash(script_pubkey: &[u8]) -> Option<[u8; 20]> {
+    if script_pubkey.len() != 25 {
+        return None;
+    }
+    if script_pubkey[0] != 0x76
+        || script_pubkey[1] != 0xa9
+        || script_pubkey[2] != 0x14
+        || script_pubkey[23] != 0x88
+        || script_pubkey[24] != 0xac
+    {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&script_pubkey[3..23]);
+    Some(out)
+}
+
+fn extract_p2sh_hash(script_pubkey: &[u8]) -> Option<[u8; 20]> {
+    if script_pubkey.len() != 23 {
+        return None;
+    }
+    if script_pubkey[0] != 0xa9 || script_pubkey[1] != 0x14 || script_pubkey[22] != 0x87 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&script_pubkey[2..22]);
+    Some(out)
+}
+
+fn parse_multisig_redeem_script(script: &[u8]) -> Option<Vec<Vec<u8>>> {
+    const OP_1: u8 = 0x51;
+    const OP_16: u8 = 0x60;
+    const OP_CHECKMULTISIG: u8 = 0xae;
+    const OP_PUSHDATA1: u8 = 0x4c;
+    const OP_PUSHDATA2: u8 = 0x4d;
+
+    if script.len() < 3 {
+        return None;
+    }
+    let mut cursor = 0usize;
+    let required_opcode = *script.get(cursor)?;
+    cursor += 1;
+    if !(OP_1..=OP_16).contains(&required_opcode) {
+        return None;
+    }
+    let required = required_opcode - OP_1 + 1;
+
+    let mut pubkeys: Vec<Vec<u8>> = Vec::new();
+    while cursor < script.len() {
+        let op = *script.get(cursor)?;
+        if (OP_1..=OP_16).contains(&op) {
+            break;
+        }
+        cursor += 1;
+        let len = if op <= 75 {
+            op as usize
+        } else if op == OP_PUSHDATA1 {
+            let len = *script.get(cursor)? as usize;
+            cursor += 1;
+            len
+        } else if op == OP_PUSHDATA2 {
+            let lo = *script.get(cursor)? as u16;
+            let hi = *script.get(cursor + 1)? as u16;
+            cursor += 2;
+            u16::from_le_bytes([lo as u8, hi as u8]) as usize
+        } else {
+            return None;
+        };
+        if cursor + len > script.len() {
+            return None;
+        }
+        let data = &script[cursor..cursor + len];
+        cursor += len;
+        if matches!(data.len(), 33 | 65) {
+            pubkeys.push(data.to_vec());
+        }
+    }
+
+    let total_opcode = *script.get(cursor)?;
+    cursor += 1;
+    if !(OP_1..=OP_16).contains(&total_opcode) {
+        return None;
+    }
+    let total = total_opcode - OP_1 + 1;
+
+    if cursor >= script.len() || script[cursor] != OP_CHECKMULTISIG {
+        return None;
+    }
+    cursor += 1;
+    if cursor != script.len() {
+        return None;
+    }
+    if total as usize != pubkeys.len() || required > total {
+        return None;
+    }
+    Some(pubkeys)
+}
+
+fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    entry: &FluxnodeConfEntry,
+    chain_params: &ChainParams,
+    collateral_wif: &str,
+    redeem_script_hex: Option<&str>,
+) -> Result<Transaction, RpcError> {
+    let best_height = best_block_height(chainstate)?;
+    let next_height = best_height.saturating_add(1);
+
+    if !network_upgrade_active(
+        next_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Kamata,
+    ) {
+        return Err(RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "deterministic fluxnodes transactions is not active yet",
+        ));
+    }
+
+    let p2sh_active = network_upgrade_active(
+        next_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::P2ShNodes,
+    );
+
+    let (operator_secret, operator_compressed) =
+        parse_wif_secret_key(&entry.privkey, chain_params.network)?;
+    let operator_pubkey = secret_key_pubkey_bytes(&operator_secret, operator_compressed);
+
+    let (collateral_secret, _collateral_wif_compressed) =
+        parse_wif_secret_key(collateral_wif, chain_params.network)?;
+
+    let utxo = chainstate
+        .utxo_entry(&entry.collateral)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "collateral output not found"))?;
+
+    let sig_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .try_into()
+        .unwrap_or(u32::MAX);
+
+    match classify_script_pubkey(&utxo.script_pubkey) {
+        ScriptType::P2Pkh => {
+            let pubkey_hash = extract_p2pkh_hash(&utxo.script_pubkey)
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid p2pkh script"))?;
+
+            let compressed_pubkey = secret_key_pubkey_bytes(&collateral_secret, true);
+            let uncompressed_pubkey = secret_key_pubkey_bytes(&collateral_secret, false);
+
+            let (collateral_pubkey, collateral_compressed) =
+                if hash160(&compressed_pubkey) == pubkey_hash {
+                    (compressed_pubkey, true)
+                } else if hash160(&uncompressed_pubkey) == pubkey_hash {
+                    (uncompressed_pubkey, false)
+                } else {
+                    return Err(RpcError::new(
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "collateral private key does not match collateral output",
+                    ));
+                };
+
+            let mut tx = if p2sh_active {
+                Transaction {
+                    f_overwintered: false,
+                    version: FLUXNODE_TX_UPGRADEABLE_VERSION,
+                    version_group_id: 0,
+                    vin: Vec::new(),
+                    vout: Vec::new(),
+                    lock_time: 0,
+                    expiry_height: 0,
+                    value_balance: 0,
+                    shielded_spends: Vec::new(),
+                    shielded_outputs: Vec::new(),
+                    join_splits: Vec::new(),
+                    join_split_pub_key: [0u8; 32],
+                    join_split_sig: [0u8; 64],
+                    binding_sig: [0u8; 64],
+                    fluxnode: Some(FluxnodeTx::V6(FluxnodeTxV6::Start(FluxnodeStartV6 {
+                        flux_tx_version: FLUXNODE_INTERNAL_NORMAL_TX_VERSION,
+                        variant: FluxnodeStartVariantV6::Normal {
+                            collateral: entry.collateral.clone(),
+                            collateral_pubkey: collateral_pubkey.clone(),
+                            pubkey: operator_pubkey,
+                            sig_time,
+                            sig: Vec::new(),
+                        },
+                        using_delegates: false,
+                        delegates: None,
+                    }))),
+                }
+            } else {
+                Transaction {
+                    f_overwintered: false,
+                    version: FLUXNODE_TX_VERSION,
+                    version_group_id: 0,
+                    vin: Vec::new(),
+                    vout: Vec::new(),
+                    lock_time: 0,
+                    expiry_height: 0,
+                    value_balance: 0,
+                    shielded_spends: Vec::new(),
+                    shielded_outputs: Vec::new(),
+                    join_splits: Vec::new(),
+                    join_split_pub_key: [0u8; 32],
+                    join_split_sig: [0u8; 64],
+                    binding_sig: [0u8; 64],
+                    fluxnode: Some(FluxnodeTx::V5(FluxnodeTxV5::Start(FluxnodeStartV5 {
+                        collateral: entry.collateral.clone(),
+                        collateral_pubkey: collateral_pubkey.clone(),
+                        pubkey: operator_pubkey,
+                        sig_time,
+                        sig: Vec::new(),
+                    }))),
+                }
+            };
+
+            let txid = tx.txid().map_err(map_internal)?;
+            let message = hash256_to_hex(&txid).into_bytes();
+            let sig_bytes =
+                sign_compact_message(&collateral_secret, collateral_compressed, &message)?;
+
+            match tx.fluxnode.as_mut() {
+                Some(FluxnodeTx::V5(FluxnodeTxV5::Start(start))) => {
+                    start.sig = sig_bytes.to_vec();
+                }
+                Some(FluxnodeTx::V6(FluxnodeTxV6::Start(start))) => {
+                    if let FluxnodeStartVariantV6::Normal { sig: sig_field, .. } =
+                        &mut start.variant
+                    {
+                        *sig_field = sig_bytes.to_vec();
+                    }
+                }
+                _ => {}
+            }
+
+            Ok(tx)
+        }
+        ScriptType::P2Sh => {
+            if !p2sh_active {
+                return Err(RpcError::new(
+                    RPC_INTERNAL_ERROR,
+                    "p2sh collateral requires P2SH nodes activation",
+                ));
+            }
+
+            let redeem_script_hex = redeem_script_hex.ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "missing redeem script for p2sh collateral",
+                )
+            })?;
+            let redeem_script = bytes_from_hex(redeem_script_hex).ok_or_else(|| {
+                RpcError::new(RPC_DESERIALIZATION_ERROR, "redeem script decode failed")
+            })?;
+
+            let script_hash = extract_p2sh_hash(&utxo.script_pubkey)
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid p2sh script"))?;
+            if hash160(&redeem_script) != script_hash {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "redeem script hash mismatch",
+                ));
+            }
+
+            let pubkeys = parse_multisig_redeem_script(&redeem_script).ok_or_else(|| {
+                RpcError::new(RPC_INVALID_PARAMETER, "redeem script not multisig")
+            })?;
+
+            let compressed_pubkey = secret_key_pubkey_bytes(&collateral_secret, true);
+            let uncompressed_pubkey = secret_key_pubkey_bytes(&collateral_secret, false);
+
+            let collateral_compressed = if pubkeys.iter().any(|pk| pk == &compressed_pubkey) {
+                true
+            } else if pubkeys.iter().any(|pk| pk == &uncompressed_pubkey) {
+                false
+            } else {
+                return Err(RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "collateral private key not present in redeem script",
+                ));
+            };
+
+            let mut tx = Transaction {
+                f_overwintered: false,
+                version: FLUXNODE_TX_UPGRADEABLE_VERSION,
+                version_group_id: 0,
+                vin: Vec::new(),
+                vout: Vec::new(),
+                lock_time: 0,
+                expiry_height: 0,
+                value_balance: 0,
+                shielded_spends: Vec::new(),
+                shielded_outputs: Vec::new(),
+                join_splits: Vec::new(),
+                join_split_pub_key: [0u8; 32],
+                join_split_sig: [0u8; 64],
+                binding_sig: [0u8; 64],
+                fluxnode: Some(FluxnodeTx::V6(FluxnodeTxV6::Start(FluxnodeStartV6 {
+                    flux_tx_version: FLUXNODE_INTERNAL_P2SH_TX_VERSION,
+                    variant: FluxnodeStartVariantV6::P2sh {
+                        collateral: entry.collateral.clone(),
+                        pubkey: operator_pubkey,
+                        redeem_script,
+                        sig_time,
+                        sig: Vec::new(),
+                    },
+                    using_delegates: false,
+                    delegates: None,
+                }))),
+            };
+
+            let txid = tx.txid().map_err(map_internal)?;
+            let message = hash256_to_hex(&txid).into_bytes();
+            let sig = sign_compact_message(&collateral_secret, collateral_compressed, &message)?;
+
+            if let Some(FluxnodeTx::V6(FluxnodeTxV6::Start(start))) = tx.fluxnode.as_mut() {
+                if let FluxnodeStartVariantV6::P2sh { sig: sig_field, .. } = &mut start.variant {
+                    *sig_field = sig.to_vec();
+                }
+            }
+
+            Ok(tx)
+        }
+        _ => Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "collateral output script unsupported",
+        )),
+    }
+}
+
+fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    tx_announce: &broadcast::Sender<Hash256>,
+    data_dir: &Path,
+) -> Result<Value, RpcError> {
+    if params.len() < 2 || params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "startdeterministicfluxnode expects 2 to 4 parameters",
+        ));
+    }
+
+    let alias = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "alias must be a string"))?
+        .to_string();
+    let _lockwallet = parse_bool(&params[1])?;
+    let collateral_wif_override = params.get(2).and_then(|value| value.as_str());
+    let redeem_script_override = params.get(3).and_then(|value| value.as_str());
+
+    let conf_entries = read_fluxnode_conf(data_dir)?;
+    let selected = conf_entries.iter().find(|entry| entry.alias == alias);
+
+    let mut detail = serde_json::Map::new();
+    detail.insert("alias".to_string(), Value::String(alias.clone()));
+
+    let mut successful = 0;
+    let mut failed = 0;
+
+    let Some(entry) = selected else {
+        failed = 1;
+        detail.insert("result".to_string(), Value::String("failed".to_string()));
+        detail.insert(
+            "error".to_string(),
+            Value::String(
+                "could not find alias in config. Verify with listfluxnodeconf.".to_string(),
+            ),
+        );
+        return Ok(json!({
+            "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
+            "detail": [Value::Object(detail)],
+        }));
+    };
+
+    let best_height = best_block_height(chainstate)?;
+    let pon_active = network_upgrade_active(
+        best_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Pon,
+    );
+    let expiration = if pon_active {
+        FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2
+    } else {
+        FLUXNODE_START_TX_EXPIRATION_HEIGHT
+    };
+    let dos_remove = if pon_active {
+        FLUXNODE_DOS_REMOVE_AMOUNT_V2
+    } else {
+        FLUXNODE_DOS_REMOVE_AMOUNT
+    };
+
+    let record = chainstate
+        .fluxnode_records()
+        .map_err(map_internal)?
+        .into_iter()
+        .find(|record| record.collateral == entry.collateral);
+    if let Some(record) = record {
+        if let Some(reason) =
+            fluxnode_start_blocked_reason(best_height, &record, expiration, dos_remove)
+        {
+            failed = 1;
+            detail.insert("result".to_string(), Value::String("failed".to_string()));
+            detail.insert("reason".to_string(), Value::String(reason.to_string()));
+            return Ok(json!({
+                "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
+                "detail": [Value::Object(detail)],
+            }));
+        }
+    }
+
+    {
+        let guard = mempool
+            .lock()
+            .map_err(|_| map_internal("mempool lock poisoned"))?;
+        if mempool_contains_fluxnode_outpoint(&guard, &entry.collateral) {
+            failed = 1;
+            detail.insert("result".to_string(), Value::String("failed".to_string()));
+            detail.insert(
+                "reason".to_string(),
+                Value::String(
+                    "Mempool already has a fluxnode transaction using this outpoint".to_string(),
+                ),
+            );
+            return Ok(json!({
+                "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
+                "detail": [Value::Object(detail)],
+            }));
+        }
+    }
+
+    let collateral_wif = collateral_wif_override
+        .or(entry.collateral_privkey.as_deref())
+        .ok_or_else(|| {
+            RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "missing collateral private key (provide as 3rd parameter or in fluxnode.conf)",
+            )
+        })?;
+    let redeem_script_hex = redeem_script_override.or(entry.redeem_script.as_deref());
+
+    let tx = match build_fluxnode_start_tx(
+        chainstate,
+        entry,
+        chain_params,
+        collateral_wif,
+        redeem_script_hex,
+    ) {
+        Ok(tx) => tx,
+        Err(err) => {
+            failed = 1;
+            detail.insert("result".to_string(), Value::String("failed".to_string()));
+            detail.insert("errorMessage".to_string(), Value::String(err.message));
+            return Ok(json!({
+                "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
+                "detail": [Value::Object(detail)],
+            }));
+        }
+    };
+
+    let raw = tx.consensus_encode().map_err(map_internal)?;
+    let raw_hex = hex_bytes(&raw);
+
+    match rpc_sendrawtransaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        mempool_metrics,
+        fee_estimator,
+        mempool_flags,
+        vec![Value::String(raw_hex)],
+        chain_params,
+        tx_announce,
+    ) {
+        Ok(txid) => {
+            successful = 1;
+            detail.insert(
+                "result".to_string(),
+                Value::String("successful".to_string()),
+            );
+            detail.insert("txid".to_string(), txid);
+        }
+        Err(err) => {
+            failed = 1;
+            detail.insert("result".to_string(), Value::String("failed".to_string()));
+            detail.insert("errorMessage".to_string(), Value::String(err.message));
+        }
+    }
+
+    Ok(json!({
+        "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
+        "detail": [Value::Object(detail)],
+    }))
+}
+
+fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    tx_announce: &broadcast::Sender<Hash256>,
+    data_dir: &Path,
+) -> Result<Value, RpcError> {
+    if params.len() < 2 || params.len() > 3 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "startfluxnode expects 2 or 3 parameters",
+        ));
+    }
+    let set = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "set must be a string"))?;
+    let _lockwallet = parse_bool(&params[1])?;
+
+    let conf_entries = read_fluxnode_conf(data_dir)?;
+    if conf_entries.is_empty() {
+        return Err(RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "This is not a Flux Node (no fluxnode.conf entry found)",
+        ));
+    }
+
+    let targets: Vec<&FluxnodeConfEntry> = match set {
+        "all" => conf_entries.iter().collect(),
+        "alias" => {
+            let alias = params
+                .get(2)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "alias required for set=alias")
+                })?;
+            let filtered: Vec<_> = conf_entries.iter().filter(|e| e.alias == alias).collect();
+            if filtered.is_empty() {
+                return Ok(json!({
+                    "overall": "Successfully started 0 fluxnodes, failed to start 1, total 1",
+                    "detail": [{
+                        "alias": alias,
+                        "result": "failed",
+                        "error": "could not find alias in config. Verify with listfluxnodeconf.",
+                    }],
+                }));
+            }
+            filtered
+        }
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "set must be \"all\" or \"alias\"",
+            ))
+        }
+    };
+
+    let mut successful = 0;
+    let mut failed = 0;
+    let mut detail = Vec::new();
+
+    for entry in targets {
+        let mut obj = serde_json::Map::new();
+        obj.insert("alias".to_string(), Value::String(entry.alias.clone()));
+        obj.insert(
+            "outpoint".to_string(),
+            Value::String(format_outpoint(&entry.collateral)),
+        );
+
+        let collateral_wif = match entry.collateral_privkey.as_deref() {
+            Some(wif) => wif,
+            None => {
+                failed += 1;
+                obj.insert("result".to_string(), Value::String("failed".to_string()));
+                obj.insert(
+                    "errorMessage".to_string(),
+                    Value::String(
+                        "missing collateral private key in fluxnode.conf (wallet not implemented)"
+                            .to_string(),
+                    ),
+                );
+                detail.push(Value::Object(obj));
+                continue;
+            }
+        };
+        let redeem_script_hex = entry.redeem_script.as_deref();
+
+        let tx = match build_fluxnode_start_tx(
+            chainstate,
+            entry,
+            chain_params,
+            collateral_wif,
+            redeem_script_hex,
+        ) {
+            Ok(tx) => tx,
+            Err(err) => {
+                failed += 1;
+                obj.insert("result".to_string(), Value::String("failed".to_string()));
+                obj.insert("errorMessage".to_string(), Value::String(err.message));
+                detail.push(Value::Object(obj));
+                continue;
+            }
+        };
+
+        let raw = match tx.consensus_encode() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                failed += 1;
+                obj.insert("result".to_string(), Value::String("failed".to_string()));
+                obj.insert("errorMessage".to_string(), Value::String(err.to_string()));
+                detail.push(Value::Object(obj));
+                continue;
+            }
+        };
+
+        let raw_hex = hex_bytes(&raw);
+        match rpc_sendrawtransaction(
+            chainstate,
+            mempool,
+            mempool_policy,
+            mempool_metrics,
+            fee_estimator,
+            mempool_flags,
+            vec![Value::String(raw_hex)],
+            chain_params,
+            tx_announce,
+        ) {
+            Ok(txid) => {
+                successful += 1;
+                obj.insert(
+                    "result".to_string(),
+                    Value::String("successful".to_string()),
+                );
+                obj.insert("txid".to_string(), txid);
+            }
+            Err(err) => {
+                failed += 1;
+                obj.insert("result".to_string(), Value::String("failed".to_string()));
+                obj.insert("errorMessage".to_string(), Value::String(err.message));
+            }
+        }
+
+        detail.push(Value::Object(obj));
+    }
+
+    Ok(json!({
+        "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
+        "detail": detail,
+    }))
+}
+
 fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
@@ -5730,6 +6464,8 @@ struct FluxnodeConfEntry {
     address: String,
     privkey: String,
     collateral: OutPoint,
+    collateral_privkey: Option<String>,
+    redeem_script: Option<String>,
 }
 
 fn read_fluxnode_conf(data_dir: &Path) -> Result<Vec<FluxnodeConfEntry>, RpcError> {
@@ -5768,6 +6504,8 @@ fn read_fluxnode_conf(data_dir: &Path) -> Result<Vec<FluxnodeConfEntry>, RpcErro
             address,
             privkey,
             collateral: OutPoint { hash, index },
+            collateral_privkey: parts.get(5).map(|value| (*value).to_string()),
+            redeem_script: parts.get(6).map(|value| (*value).to_string()),
         });
     }
     if entries.is_empty() && invalid > 0 {
@@ -5777,6 +6515,44 @@ fn read_fluxnode_conf(data_dir: &Path) -> Result<Vec<FluxnodeConfEntry>, RpcErro
         ));
     }
     Ok(entries)
+}
+
+fn parse_wif_secret_key(wif: &str, network: Network) -> Result<(SecretKey, bool), RpcError> {
+    let (secret, compressed) = wif_to_secret_key(wif, network)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key encoding"))?;
+    let secret = SecretKey::from_slice(&secret)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key"))?;
+    Ok((secret, compressed))
+}
+
+fn secret_key_pubkey_bytes(secret: &SecretKey, compressed: bool) -> Vec<u8> {
+    let secp = Secp256k1::signing_only();
+    let pubkey = PublicKey::from_secret_key(&secp, secret);
+    if compressed {
+        pubkey.serialize().to_vec()
+    } else {
+        pubkey.serialize_uncompressed().to_vec()
+    }
+}
+
+fn sign_compact_message(
+    secret: &SecretKey,
+    compressed: bool,
+    message: &[u8],
+) -> Result<[u8; 65], RpcError> {
+    let digest = signed_message_hash(message);
+    let msg = Message::from_digest_slice(&digest)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "Invalid message digest"))?;
+    let secp = Secp256k1::signing_only();
+    let sig: RecoverableSignature = secp.sign_ecdsa_recoverable(&msg, secret);
+    let (rec_id, sig_bytes) = sig.serialize_compact();
+    let header = 27u8
+        .saturating_add(rec_id.to_i32().try_into().unwrap_or(0))
+        .saturating_add(if compressed { 4 } else { 0 });
+    let mut out = [0u8; 65];
+    out[0] = header;
+    out[1..].copy_from_slice(&sig_bytes);
+    Ok(out)
 }
 
 fn fluxnode_payment_address<S: fluxd_storage::KeyValueStore>(

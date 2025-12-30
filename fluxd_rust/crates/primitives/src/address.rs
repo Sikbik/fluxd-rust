@@ -67,6 +67,35 @@ pub fn secret_key_to_wif(secret: &[u8; 32], network: Network, compressed: bool) 
     base58check_encode(&payload)
 }
 
+pub fn wif_to_secret_key(wif: &str, network: Network) -> Result<([u8; 32], bool), AddressError> {
+    let payload = base58check_decode(wif)?;
+    if payload.is_empty() {
+        return Err(AddressError::InvalidLength);
+    }
+
+    let expected_prefix = match network {
+        Network::Mainnet => 0x80,
+        Network::Testnet | Network::Regtest => 0xEF,
+    };
+    if payload[0] != expected_prefix {
+        return Err(AddressError::UnknownPrefix);
+    }
+
+    if payload.len() == 33 {
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&payload[1..33]);
+        return Ok((secret, false));
+    }
+
+    if payload.len() == 34 && payload[33] == 0x01 {
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&payload[1..33]);
+        return Ok((secret, true));
+    }
+
+    Err(AddressError::InvalidLength)
+}
+
 fn network_prefixes(network: Network) -> (&'static [u8], &'static [u8]) {
     match network {
         Network::Mainnet => (&[0x1C, 0xB8], &[0x1C, 0xBD]),

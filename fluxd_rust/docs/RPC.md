@@ -131,6 +131,8 @@ Type notes:
 - `createfluxnodekey` / `createzelnodekey`
 - `listfluxnodeconf [filter]` / `listzelnodeconf [filter]`
 - `getfluxnodeoutputs` / `getzelnodeoutputs`
+- `startfluxnode <all|alias> <lockwallet> [alias]` / `startzelnode ...` (partial; wallet-less)
+- `startdeterministicfluxnode <alias> <lockwallet> [collateral_privkey_wif] [redeem_script_hex]` / `startdeterministiczelnode ...` (partial; wallet-less)
 - `getfluxnodecount`
 - `listfluxnodes`
 - `viewdeterministicfluxnodelist [filter]`
@@ -590,6 +592,32 @@ Returns candidate fluxnode collateral outputs.
 - Notes:
   - Wallet support is not implemented yet. This method currently reads `fluxnode.conf` and returns entries whose collateral outpoint is present in the current UTXO set and matches a valid tier amount.
 
+### startdeterministicfluxnode / startdeterministiczelnode
+
+Attempts to create, sign, and broadcast a deterministic fluxnode START transaction.
+
+- Params:
+  - `alias` (string)
+  - `lockwallet` (boolean; accepted for parity but currently ignored)
+  - `collateral_privkey_wif` (optional string; WIF private key controlling the collateral UTXO)
+  - `redeem_script_hex` (optional string; required for P2SH collateral; multisig redeem script hex)
+- Notes:
+  - Wallet support is not implemented yet. You must provide the collateral private key either as the 3rd parameter or via an optional extra column in `fluxnode.conf` (see below).
+  - P2PKH collateral: pubkey compression is inferred by matching the collateral output script hash.
+  - P2SH collateral: the redeem script must hash to the collateral output script hash, and the provided key must correspond to a pubkey in the redeem script.
+- Result:
+  - Object with `overall` and `detail`, plus `txid` on success.
+
+### startfluxnode / startzelnode
+
+Starts fluxnodes from `fluxnode.conf`.
+
+- Params: `set` (string) `lockwallet` (boolean) `[alias]` (string)
+  - `set` must be `"all"` or `"alias"`. When `"alias"`, the 3rd param is required.
+  - `lockwallet` is accepted for parity but currently ignored.
+- Notes:
+  - Wallet support is not implemented yet. This method requires the collateral private key to be present in `fluxnode.conf` (see below). For one-off starts without modifying config, use `startdeterministicfluxnode` and pass the collateral key as the 3rd param.
+
 ### getfluxnodecount
 
 Returns basic counts of entries in the fluxnode index.
@@ -639,3 +667,6 @@ Partial parity implementation.
   - `ip` / `network` are currently empty (not yet stored in the DB)
 
 `fluxnode.conf` parsing uses the standard C++ layout: `<alias> <ip:port> <privkey> <txid> <vout>`.
+
+For wallet-less start RPCs, `fluxd-rust` also supports optional extra columns:
+`<collateral_privkey_wif> [redeem_script_hex]`.
