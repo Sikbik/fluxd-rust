@@ -451,9 +451,12 @@ These currently return `0.0` and are placeholders for mining metrics.
 
 Returns a block template suitable for pools/miners, modeled after the C++ daemon output.
 
-- Params: optional request object (currently required to include a miner address):
-  - `{"mineraddress":"t1..."}`
-  - `{"address":"t1..."}` (alias)
+- Params: optional request object.
+  - Template mode (default; currently requires a miner address):
+    - `{"mineraddress":"t1..."}`
+    - `{"address":"t1..."}` (alias)
+  - Longpoll: include `longpollid` from a previous response to wait for a template update.
+  - Proposal mode: `{"mode":"proposal","data":"<blockhex>"}`
 - Result: object including standard BIP22-style fields:
   - `version`, `previousblockhash`, `finalsaplingroothash`
   - `transactions` (array of hex txs + fee/depends/sigops)
@@ -468,8 +471,9 @@ Returns a block template suitable for pools/miners, modeled after the C++ daemon
   - Funding events: `flux_creation_address` / `flux_creation_amount` at exchange/foundation/swap heights.
 
 Notes:
-- Longpoll wait behavior and proposal mode are not implemented yet (only `longpollid` is returned).
-- Until wallet/`flux.conf` miner address parity is implemented, `mineraddress`/`address` is required.
+- Longpoll waits until either the best block changes or the mempool revision changes.
+- Proposal mode returns `null` when the block would be accepted, otherwise a string reason (BIP22-style).
+- Until wallet/`flux.conf` miner address parity is implemented, template mode requires `mineraddress`/`address`.
 
 ### estimatefee
 

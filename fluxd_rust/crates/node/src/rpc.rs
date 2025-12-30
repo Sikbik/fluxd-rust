@@ -4,7 +4,7 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use rand::RngCore;
@@ -304,29 +304,127 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
                 .map_err(|err| err.to_string())?;
             return Ok(());
         }
-        let rpc_response = match handle_daemon_request(
-            method,
-            &request,
-            chainstate.as_ref(),
-            write_lock.as_ref(),
-            mempool.as_ref(),
-            mempool_policy.as_ref(),
-            mempool_metrics.as_ref(),
-            fee_estimator.as_ref(),
-            &mempool_flags,
-            &chain_params,
-            &data_dir,
-            &net_totals,
-            &peer_registry,
-            &header_peer_book,
-            addr_book.as_ref(),
-            added_nodes.as_ref(),
-            &tx_announce,
-            &shutdown_tx,
-        ) {
-            Ok(value) => rpc_ok(Value::Null, value),
-            Err(err) => rpc_error(Value::Null, err.code, err.message),
+        let rpc_response = if method == "getblocktemplate" {
+            let params = if request.method == "GET" {
+                parse_query_params(request.query.as_deref().unwrap_or(""))
+            } else if request.method == "POST" {
+                parse_body_params(&request.body)
+            } else {
+                Err(RpcError::new(RPC_INVALID_REQUEST, "method not allowed"))
+            };
+
+            match params {
+                Err(err) => rpc_error(Value::Null, err.code, err.message),
+                Ok(params) => {
+                    let mut longpoll_error: Option<RpcError> = None;
+                    if let Some((watched_hash, watched_revision)) =
+                        longpoll_state_from_params(&params)
+                    {
+                        match current_longpoll_state(chainstate.as_ref(), mempool.as_ref()) {
+                            Ok((current_hash, current_revision))
+                                if current_hash == watched_hash
+                                    && current_revision == watched_revision =>
+                            {
+                                if let Err(err) = wait_longpoll(
+                                    chainstate.as_ref(),
+                                    mempool.as_ref(),
+                                    watched_hash,
+                                    watched_revision,
+                                )
+                                .await
+                                {
+                                    longpoll_error = Some(err);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => longpoll_error = Some(err),
+                        }
+                    }
+
+                    if let Some(err) = longpoll_error {
+                        rpc_error(Value::Null, err.code, err.message)
+                    } else {
+                        match dispatch_method(
+                            method,
+                            params,
+                            chainstate.as_ref(),
+                            write_lock.as_ref(),
+                            mempool.as_ref(),
+                            mempool_policy.as_ref(),
+                            mempool_metrics.as_ref(),
+                            fee_estimator.as_ref(),
+                            &mempool_flags,
+                            &chain_params,
+                            &data_dir,
+                            &net_totals,
+                            &peer_registry,
+                            &header_peer_book,
+                            addr_book.as_ref(),
+                            added_nodes.as_ref(),
+                            &tx_announce,
+                            &shutdown_tx,
+                        ) {
+                            Ok(value) => rpc_ok(Value::Null, value),
+                            Err(err) => rpc_error(Value::Null, err.code, err.message),
+                        }
+                    }
+                }
+            }
+        } else {
+            match handle_daemon_request(
+                method,
+                &request,
+                chainstate.as_ref(),
+                write_lock.as_ref(),
+                mempool.as_ref(),
+                mempool_policy.as_ref(),
+                mempool_metrics.as_ref(),
+                fee_estimator.as_ref(),
+                &mempool_flags,
+                &chain_params,
+                &data_dir,
+                &net_totals,
+                &peer_registry,
+                &header_peer_book,
+                addr_book.as_ref(),
+                added_nodes.as_ref(),
+                &tx_announce,
+                &shutdown_tx,
+            ) {
+                Ok(value) => rpc_ok(Value::Null, value),
+                Err(err) => rpc_error(Value::Null, err.code, err.message),
+            }
         };
+        let body = rpc_response.to_string();
+        let response = build_response("200 OK", "application/json", &body);
+        stream
+            .write_all(&response)
+            .await
+            .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+
+    if let Some(rpc_response) = handle_json_rpc_getblocktemplate_longpoll(
+        &request.body,
+        chainstate.as_ref(),
+        write_lock.as_ref(),
+        mempool.as_ref(),
+        mempool_policy.as_ref(),
+        mempool_metrics.as_ref(),
+        fee_estimator.as_ref(),
+        &mempool_flags,
+        &chain_params,
+        &data_dir,
+        &net_totals,
+        &peer_registry,
+        &header_peer_book,
+        addr_book.as_ref(),
+        added_nodes.as_ref(),
+        &tx_announce,
+        &shutdown_tx,
+    )
+    .await?
+    {
         let body = rpc_response.to_string();
         let response = build_response("200 OK", "application/json", &body);
         stream
@@ -365,6 +463,147 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         .await
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn parse_longpollid(value: &str) -> Option<(Hash256, u64)> {
+    if value.len() < 64 {
+        return None;
+    }
+    let (hash_hex, rest) = value.split_at(64);
+    let hash = hash256_from_hex(hash_hex).ok()?;
+    let revision = rest.parse::<u64>().ok()?;
+    Some((hash, revision))
+}
+
+fn longpoll_state_from_params(params: &[Value]) -> Option<(Hash256, u64)> {
+    let obj = params.get(0)?.as_object()?;
+    let value = obj.get("longpollid")?.as_str()?;
+    parse_longpollid(value)
+}
+
+fn current_longpoll_state<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+) -> Result<(Hash256, u64), RpcError> {
+    let tip_hash = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.hash)
+        .unwrap_or([0u8; 32]);
+    let revision = mempool
+        .lock()
+        .map_err(|_| map_internal("mempool lock poisoned"))?
+        .revision();
+    Ok((tip_hash, revision))
+}
+
+async fn wait_longpoll<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    watched_hash: Hash256,
+    watched_revision: u64,
+) -> Result<(), RpcError> {
+    loop {
+        let (current_hash, current_revision) = current_longpoll_state(chainstate, mempool)?;
+        if current_hash != watched_hash || current_revision != watched_revision {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_json_rpc_getblocktemplate_longpoll<S: fluxd_storage::KeyValueStore>(
+    body: &[u8],
+    chainstate: &ChainState<S>,
+    write_lock: &Mutex<()>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    chain_params: &ChainParams,
+    data_dir: &Path,
+    net_totals: &NetTotals,
+    peer_registry: &PeerRegistry,
+    header_peer_book: &HeaderPeerBook,
+    addr_book: &AddrBook,
+    added_nodes: &Mutex<HashSet<SocketAddr>>,
+    tx_announce: &broadcast::Sender<Hash256>,
+    shutdown_tx: &watch::Sender<bool>,
+) -> Result<Option<Value>, String> {
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    if value.is_array() {
+        return Ok(None);
+    }
+
+    let id = value.get("id").cloned().unwrap_or(Value::Null);
+    let method = match value.get("method").and_then(|value| value.as_str()) {
+        Some(method) => method,
+        None => return Ok(None),
+    };
+    if method != "getblocktemplate" {
+        return Ok(None);
+    }
+
+    let params_value = value
+        .get("params")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let params = match params_value {
+        Value::Array(values) => values,
+        Value::Null => Vec::new(),
+        _ => {
+            return Ok(Some(rpc_error(
+                id,
+                RPC_INVALID_REQUEST,
+                "params must be an array",
+            )))
+        }
+    };
+
+    if let Some((watched_hash, watched_revision)) = longpoll_state_from_params(&params) {
+        let (current_hash, current_revision) = match current_longpoll_state(chainstate, mempool) {
+            Ok(state) => state,
+            Err(err) => return Ok(Some(rpc_error(id, err.code, err.message))),
+        };
+        if current_hash == watched_hash && current_revision == watched_revision {
+            if let Err(err) =
+                wait_longpoll(chainstate, mempool, watched_hash, watched_revision).await
+            {
+                return Ok(Some(rpc_error(id, err.code, err.message)));
+            }
+        }
+    }
+
+    let rpc_response = match dispatch_method(
+        method,
+        params,
+        chainstate,
+        write_lock,
+        mempool,
+        mempool_policy,
+        mempool_metrics,
+        fee_estimator,
+        mempool_flags,
+        chain_params,
+        data_dir,
+        net_totals,
+        peer_registry,
+        header_peer_book,
+        addr_book,
+        added_nodes,
+        tx_announce,
+        shutdown_tx,
+    ) {
+        Ok(value) => rpc_ok(id, value),
+        Err(err) => rpc_error(id, err.code, err.message),
+    };
+    Ok(Some(rpc_response))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -691,7 +930,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getaddresstxids" => rpc_getaddresstxids(chainstate, params, chain_params),
         "getaddressmempool" => rpc_getaddressmempool(chainstate, mempool, params, chain_params),
         "getmininginfo" => rpc_getmininginfo(chainstate, mempool, params, chain_params),
-        "getblocktemplate" => rpc_getblocktemplate(chainstate, mempool, params, chain_params),
+        "getblocktemplate" => {
+            rpc_getblocktemplate(chainstate, mempool, params, chain_params, mempool_flags)
+        }
         "submitblock" => {
             rpc_submitblock(chainstate, write_lock, params, chain_params, mempool_flags)
         }
@@ -2626,6 +2867,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     mempool: &Mutex<Mempool>,
     params: Vec<Value>,
     chain_params: &ChainParams,
+    flags: &ValidationFlags,
 ) -> Result<Value, RpcError> {
     if params.len() > 1 {
         return Err(RpcError::new(
@@ -2634,17 +2876,102 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         ));
     }
 
-    let miner_address = params
-        .get(0)
-        .map(|value| {
-            value.as_object().ok_or_else(|| {
-                RpcError::new(
-                    RPC_INVALID_PARAMETER,
-                    "getblocktemplate param must be an object",
-                )
-            })
-        })
-        .transpose()?
+    let request = match params.get(0) {
+        None => None,
+        Some(value) => Some(value.as_object().ok_or_else(|| {
+            RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "getblocktemplate param must be an object",
+            )
+        })?),
+    };
+    let mode = request
+        .and_then(|obj| obj.get("mode"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("template");
+
+    if mode == "proposal" {
+        let Some(obj) = request else {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "getblocktemplate param must be an object",
+            ));
+        };
+        let hex = obj
+            .get("data")
+            .and_then(|val| val.as_str())
+            .ok_or_else(|| RpcError::new(RPC_TYPE_ERROR, "Missing data String key for proposal"))?;
+        let bytes = bytes_from_hex(hex)
+            .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "Block decode failed"))?;
+        let block = Block::consensus_decode(&bytes)
+            .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "Block decode failed"))?;
+        let hash = block.header.hash();
+
+        if let Some(entry) = chainstate.header_entry(&hash).map_err(map_internal)? {
+            if entry.has_block() {
+                return Ok(Value::String("duplicate".to_string()));
+            }
+            return Ok(Value::String("duplicate-inconclusive".to_string()));
+        }
+
+        let best = chainstate.best_block().map_err(map_internal)?;
+        if let Some(tip) = best {
+            if block.header.prev_block != tip.hash {
+                return Ok(Value::String("inconclusive-not-best-prevblk".to_string()));
+            }
+
+            let height = tip.height + 1;
+            return match chainstate.connect_block(
+                &block,
+                height,
+                chain_params,
+                flags,
+                false,
+                None,
+                None,
+                Some(bytes.as_slice()),
+            ) {
+                Ok(_) => Ok(Value::Null),
+                Err(fluxd_chainstate::state::ChainStateError::Validation(err)) => {
+                    Ok(Value::String(err.to_string()))
+                }
+                Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(msg)) => {
+                    Ok(Value::String(msg.to_string()))
+                }
+                Err(err) => Err(map_internal(err.to_string())),
+            };
+        } else {
+            if block.header.prev_block != [0u8; 32] {
+                return Ok(Value::String("inconclusive-not-best-prevblk".to_string()));
+            }
+
+            return match chainstate.connect_block(
+                &block,
+                0,
+                chain_params,
+                flags,
+                false,
+                None,
+                None,
+                Some(bytes.as_slice()),
+            ) {
+                Ok(_) => Ok(Value::Null),
+                Err(fluxd_chainstate::state::ChainStateError::Validation(err)) => {
+                    Ok(Value::String(err.to_string()))
+                }
+                Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(msg)) => {
+                    Ok(Value::String(msg.to_string()))
+                }
+                Err(err) => Err(map_internal(err.to_string())),
+            };
+        }
+    }
+
+    if mode != "template" {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "Invalid mode"));
+    }
+
+    let miner_address = request
         .and_then(|obj| {
             obj.get("mineraddress")
                 .or_else(|| obj.get("address"))
