@@ -10,6 +10,7 @@ use fluxd_primitives::encoding::{Decoder, Encoder};
 use fluxd_primitives::hash::sha256d;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
 
 const MAX_PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 const MAX_HEADERS_RESULTS: usize = 160;
@@ -18,6 +19,8 @@ const MAX_INV_RESULTS: usize = 50_000;
 const NODE_NETWORK: u64 = 1;
 pub const MSG_TX: u32 = 1;
 pub const MSG_BLOCK: u32 = 2;
+const SEND_TIMEOUT_SECS: u64 = 10;
+const HANDSHAKE_READ_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerKind {
@@ -245,10 +248,13 @@ impl Peer {
         let checksum = sha256d(payload);
         header.extend_from_slice(&checksum[..4]);
         header.extend_from_slice(payload);
-        self.stream
-            .write_all(&header)
-            .await
-            .map_err(|err| err.to_string())?;
+        timeout(
+            Duration::from_secs(SEND_TIMEOUT_SECS),
+            self.stream.write_all(&header),
+        )
+        .await
+        .map_err(|_| "peer write timed out".to_string())?
+        .map_err(|err| err.to_string())?;
         self.net_totals.add_sent(header.len());
         self.registry.note_send(self.addr, header.len());
         Ok(())
@@ -297,7 +303,12 @@ impl Peer {
         let mut got_verack = false;
         let mut got_version = false;
         while !(got_verack && got_version) {
-            let (command, payload) = self.read_message().await?;
+            let (command, payload) = timeout(
+                Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
+                self.read_message(),
+            )
+            .await
+            .map_err(|_| "peer handshake timed out".to_string())??;
             match command.as_str() {
                 "version" => {
                     got_version = true;

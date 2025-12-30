@@ -79,6 +79,7 @@ const READ_TIMEOUT_RETRIES: usize = 3;
 const BLOCK_READ_TIMEOUT_SECS: u64 = 30;
 const BLOCK_READ_TIMEOUT_RETRIES: usize = 2;
 const BLOCK_IDLE_SECS: u64 = 45;
+const CONNECT_PIPELINE_IDLE_SECS: u64 = 120;
 const HEADERS_TIMEOUT_SECS_PROBE: u64 = 12;
 const HEADERS_TIMEOUT_SECS_BEHIND: u64 = 20;
 const HEADERS_TIMEOUT_SECS_IDLE: u64 = 8;
@@ -3850,6 +3851,7 @@ fn is_transient_block_error(err: &str) -> bool {
     let err = err.to_lowercase();
     [
         "peer",
+        "stalled",
         "timeout",
         "timed out",
         "notfound",
@@ -5238,9 +5240,23 @@ fn connect_pending<S: KeyValueStore>(
             break;
         }
 
-        let event = match event_rx.recv() {
+        let event = match event_rx.recv_timeout(Duration::from_secs(CONNECT_PIPELINE_IDLE_SECS)) {
             Ok(event) => event,
-            Err(_) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                let height = received_heights.get(&hash).copied().unwrap_or(-1);
+                return Err(format!(
+                        "block verify pipeline stalled for {}s (height {} hash {} pending_verify {} pending_shielded {} verified {} waiting_shielded {} shielded_ready {})",
+                        CONNECT_PIPELINE_IDLE_SECS,
+                        height,
+                        hash256_to_hex(&hash),
+                        pending_verify,
+                        pending_shielded,
+                        verified.len(),
+                        waiting_shielded.len(),
+                        shielded_ready.len(),
+                    ));
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
         match event {
             PipelineEvent::Verify(result) => {

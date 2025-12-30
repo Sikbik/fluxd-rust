@@ -141,6 +141,26 @@ A known-good mainnet sync configuration is:
   --db-flush-workers 4 --db-compaction-workers 6
 ```
 
+## Sync stalls with peers connected (no network progress)
+
+Symptoms:
+- `headers`/`blocks` stop increasing and `h/s` + `b/s` stay at `0.00`.
+- `getnettotals` stops changing (no bytes in/out).
+- `getpeerinfo` shows block/header peers with stale `lastrecv`/`lastsend` while relay peers may remain active.
+
+Checks:
+- Confirm peers are still connected (`getconnectioncount`, `getpeerinfo`).
+- If you have shell access, inspect socket state (Linux):
+
+```bash
+ss -tnp | grep fluxd
+```
+
+Mitigations:
+- Restart the daemon (it will reconnect peers and resume sync).
+- Ensure you are running a recent build: newer versions include bounded P2P send/handshake timeouts and a
+  block verify/connect pipeline watchdog to prevent indefinite wedges.
+
 ## Memory pressure or OOM
 
 Symptoms:

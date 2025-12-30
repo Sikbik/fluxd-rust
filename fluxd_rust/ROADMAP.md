@@ -113,6 +113,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] `peers.dat` persistence (owner: TBD)
 - [x] [P1] `banlist.dat` persistence (owner: TBD)
 - [x] [P1] Header peer probing (probe more candidates before selecting best height peer) (owner: TBD)
+- [x] [P1] Sync liveness hardening (timeouts + watchdogs, prevent dead-hangs) (owner: TBD)
+  - [x] P2P send timeout (prevents stalled writes / CLOSE-WAIT wedges)
+  - [x] Handshake read timeout (prevents stuck initial connects)
+  - [x] Block verify/connect pipeline idle timeout (prevents fetch/connect wedging indefinitely)
+  - [x] Treat `stalled` errors as transient and reconnect
 - [x] [P1] Peer scoring and eviction parity (owner: TBD)
   - [x] Persist peer health stats in `peers.dat` (success/fail, last-seen, last-height, last-version)
   - [x] Prefer recently-good peers and apply exponential backoff after failures
@@ -187,7 +192,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`getrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage` | `sendrawtransaction` (relays; confirmed inputs only) | `fundrawtransaction`<br>`signrawtransaction`<br>`signmessage`<br>`estimatepriority`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`prioritisetransaction` |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage` | `sendrawtransaction` (relays; confirmed inputs only) | `fundrawtransaction`<br>`signrawtransaction`<br>`signmessage`<br>`estimatepriority`<br>`prioritisetransaction` |
 
 ### Mempool and relay
 

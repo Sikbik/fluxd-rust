@@ -204,9 +204,12 @@ impl FjallStore {
         if now.saturating_sub(last) < WRITE_BUFFER_RELIEF_COOLDOWN_SECS {
             return;
         }
-        let _ = self
-            .last_pressure_relief_secs
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = self.last_pressure_relief_secs.compare_exchange(
+            last,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
 
         let mut did_rotate = false;
 
