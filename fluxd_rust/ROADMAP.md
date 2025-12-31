@@ -200,6 +200,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Schema parity: `getdifficulty`/`getchaintips` required keys
   - [x] Schema parity: `getblockheader`/`getblock` required keys
   - [x] Schema parity: `getblocksubsidy`/`getblockhashes`/`getblockdeltas` required keys
+  - [x] Schema parity: raw tx/script RPCs (`createrawtransaction`, `decoderawtransaction`, `decodescript`, `validateaddress`, `verifymessage`, `createmultisig`, `getrawtransaction`)
   - [x] Schema parity: `getmempoolinfo`/`getrawmempool` required keys
   - [x] Schema parity: `gettxout` required keys (chain + mempool)
   - [x] Schema parity: `getspentinfo` required keys

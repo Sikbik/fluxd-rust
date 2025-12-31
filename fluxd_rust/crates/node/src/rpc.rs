@@ -7183,6 +7183,215 @@ mod tests {
     }
 
     #[test]
+    fn validateaddress_has_cpp_schema() {
+        let (_chainstate, params, _data_dir, address, _txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+
+        let ok = rpc_validateaddress(vec![Value::String(address.clone())], &params).expect("rpc");
+        let obj = ok.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        for key in ["address", "scriptPubKey"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        let bad = rpc_validateaddress(vec![Value::String("notanaddress".to_string())], &params)
+            .expect("rpc");
+        let obj = bad.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn decodescript_has_cpp_schema_keys() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let script = p2pkh_script([0x55u8; 20]);
+        let hex = hex_bytes(&script);
+        let value = rpc_decodescript(vec![Value::String(hex)], &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in ["asm", "hex", "type", "p2sh"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn createrawtransaction_and_decoderawtransaction_have_cpp_schema() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let address =
+            script_pubkey_to_address(&p2pkh_script([0x44u8; 20]), params.network).expect("address");
+
+        let mut outputs = serde_json::Map::new();
+        outputs.insert(address, json!("1.0"));
+
+        let raw_hex = rpc_createrawtransaction(
+            &chainstate,
+            vec![Value::Array(Vec::new()), Value::Object(outputs)],
+            &params,
+        )
+        .expect("rpc")
+        .as_str()
+        .expect("hex string")
+        .to_string();
+        assert!(bytes_from_hex(&raw_hex).is_some(), "invalid hex");
+
+        let decoded = rpc_decoderawtransaction(vec![Value::String(raw_hex)], &params).expect("rpc");
+        let obj = decoded.as_object().expect("object");
+        for key in [
+            "txid",
+            "version",
+            "size",
+            "overwintered",
+            "locktime",
+            "vin",
+            "vout",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        let txid = obj.get("txid").and_then(Value::as_str).unwrap_or("");
+        assert!(is_hex_64(txid));
+    }
+
+    #[test]
+    fn getrawtransaction_mempool_verbose_has_cpp_schema() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+
+        let script_pubkey = p2pkh_script([0x22u8; 20]);
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x33u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: 123,
+                script_pubkey,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let txid = tx.txid().expect("txid");
+        let raw = tx.consensus_encode().expect("encode tx");
+
+        let entry = MempoolEntry {
+            txid,
+            tx,
+            raw: raw.clone(),
+            time: 0,
+            height: 0,
+            fee: 0,
+            spent_outpoints: Vec::new(),
+            parents: Vec::new(),
+        };
+        let mut inner = Mempool::new(0);
+        inner.insert(entry).expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let raw_value = rpc_getrawtransaction(
+            &chainstate,
+            &mempool,
+            vec![Value::String(hash256_to_hex(&txid))],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(raw_value.as_str(), Some(hex_bytes(&raw).as_str()));
+
+        let verbose_value = rpc_getrawtransaction(
+            &chainstate,
+            &mempool,
+            vec![Value::String(hash256_to_hex(&txid)), json!(1)],
+            &params,
+        )
+        .expect("rpc");
+        let obj = verbose_value.as_object().expect("object");
+        for key in [
+            "txid",
+            "version",
+            "size",
+            "overwintered",
+            "locktime",
+            "vin",
+            "vout",
+            "hex",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn verifymessage_accepts_valid_signature() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+
+        let secret = SecretKey::from_slice(&[1u8; 32]).expect("secret key");
+        let pubkey = secret_key_pubkey_bytes(&secret, true);
+        let key_hash = hash160(&pubkey);
+        let script = p2pkh_script(key_hash);
+        let address = script_pubkey_to_address(&script, params.network).expect("address");
+
+        let message = "hello";
+        let sig = sign_compact_message(&secret, true, message.as_bytes()).expect("sig");
+        let signature = base64::engine::general_purpose::STANDARD.encode(sig);
+
+        let ok = rpc_verifymessage(
+            vec![
+                Value::String(address.clone()),
+                Value::String(signature.clone()),
+                Value::String(message.to_string()),
+            ],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(ok, Value::Bool(true));
+
+        let bad = rpc_verifymessage(
+            vec![
+                Value::String(address),
+                Value::String(signature),
+                Value::String("not-hello".to_string()),
+            ],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(bad, Value::Bool(false));
+    }
+
+    #[test]
+    fn createmultisig_has_cpp_schema_keys() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let secret_a = SecretKey::from_slice(&[2u8; 32]).expect("secret key");
+        let secret_b = SecretKey::from_slice(&[3u8; 32]).expect("secret key");
+        let pub_a = secret_key_pubkey_bytes(&secret_a, true);
+        let pub_b = secret_key_pubkey_bytes(&secret_b, true);
+
+        let value = rpc_createmultisig(
+            vec![
+                json!(1),
+                Value::Array(vec![
+                    Value::String(hex_bytes(&pub_a)),
+                    Value::String(hex_bytes(&pub_b)),
+                ]),
+            ],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in ["address", "redeemScript"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
     fn fluxnode_rpcs_have_cpp_schema_keys() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         extend_regtest_chain_to_height(&chainstate, &params, 69);
