@@ -192,7 +192,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P1] RPC golden tests against C++ behavior (owner: TBD)
   - [x] Schema parity: `getblockchaininfo` required keys
   - [x] Schema parity: `gettxoutsetinfo` required keys
-  - [ ] Expand schema checks across remaining RPCs
+  - [x] Schema parity: `getinfo` required keys
+  - [x] Schema parity: `getnetworkinfo` required keys
+  - [x] Schema parity: `getnettotals` required keys
+  - [x] Schema parity: `getpeerinfo` required keys
+  - [ ] Expand schema checks across remaining RPCs (blocks/mempool/fluxnode/etc)
 - [ ] [P1] Long-run sync tests with regression gates (owner: TBD)
   - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity (supports seeding peers.dat and progress thresholds)
   - [x] VPS progress gate (`scripts/progress_gate.sh`) to detect stalls/regressions during sync

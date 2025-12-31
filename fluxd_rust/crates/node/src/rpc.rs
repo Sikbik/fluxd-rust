@@ -6349,6 +6349,122 @@ mod tests {
         let hash_serialized = obj.get("hash_serialized").and_then(Value::as_str).unwrap();
         assert!(is_hex_64(hash_serialized));
     }
+
+    #[test]
+    fn getinfo_has_cpp_schema_keys() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let net_totals = NetTotals::default();
+        let peer_registry = PeerRegistry::default();
+        let mempool_policy = MempoolPolicy::standard(0, false);
+
+        let value = rpc_getinfo(
+            &chainstate,
+            Vec::new(),
+            &params,
+            &data_dir,
+            &net_totals,
+            &peer_registry,
+            &mempool_policy,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+
+        for key in [
+            "version",
+            "protocolversion",
+            "blocks",
+            "timeoffset",
+            "connections",
+            "proxy",
+            "difficulty",
+            "testnet",
+            "relayfee",
+            "errors",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        assert!(obj.get("version").and_then(Value::as_i64).is_some());
+        assert!(obj.get("protocolversion").and_then(Value::as_i64).is_some());
+        assert!(obj.get("blocks").and_then(Value::as_i64).is_some());
+        assert!(obj.get("connections").and_then(Value::as_i64).is_some());
+    }
+
+    #[test]
+    fn getnetworkinfo_has_cpp_schema_keys() {
+        let net_totals = NetTotals::default();
+        let peer_registry = PeerRegistry::default();
+        let mempool_policy = MempoolPolicy::standard(0, false);
+
+        let value = rpc_getnetworkinfo(Vec::new(), &peer_registry, &net_totals, &mempool_policy)
+            .expect("rpc");
+        let obj = value.as_object().expect("object");
+
+        for key in [
+            "version",
+            "subversion",
+            "protocolversion",
+            "localservices",
+            "timeoffset",
+            "connections",
+            "networks",
+            "relayfee",
+            "localaddresses",
+            "warnings",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        let networks = obj
+            .get("networks")
+            .and_then(Value::as_array)
+            .expect("networks array");
+        assert!(!networks.is_empty(), "networks should not be empty");
+        let network = networks[0].as_object().expect("network object");
+        for key in ["name", "limited", "reachable", "proxy"] {
+            assert!(network.contains_key(key), "missing networks key {key}");
+        }
+    }
+
+    #[test]
+    fn getnettotals_has_cpp_schema_keys() {
+        let net_totals = NetTotals::default();
+        let value = rpc_getnettotals(Vec::new(), &net_totals).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in ["totalbytesrecv", "totalbytessent", "timemillis"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn getpeerinfo_has_cpp_schema_keys() {
+        let peer_registry = PeerRegistry::default();
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().expect("addr");
+        peer_registry.register(addr, PeerKind::Header);
+        peer_registry.update_version(addr, 170020, 0x5, "/MagicBean:9.0.6/".to_string(), 123);
+
+        let value = rpc_getpeerinfo(Vec::new(), &peer_registry).expect("rpc");
+        let peers = value.as_array().expect("array");
+        assert_eq!(peers.len(), 1);
+        let obj = peers[0].as_object().expect("object");
+        for key in [
+            "addr",
+            "subver",
+            "version",
+            "services",
+            "servicesnames",
+            "startingheight",
+            "conntime",
+            "lastsend",
+            "lastrecv",
+            "bytessent",
+            "bytesrecv",
+            "inbound",
+            "kind",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
 }
 
 fn system_time_to_unix(time: SystemTime) -> i64 {
