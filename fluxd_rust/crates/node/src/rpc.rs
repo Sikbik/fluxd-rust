@@ -7480,6 +7480,188 @@ mod tests {
     }
 
     #[test]
+    fn sendrawtransaction_rejects_invalid_hex() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let err = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String("zz".to_string())],
+            &params,
+            &tx_announce,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_DESERIALIZATION_ERROR);
+    }
+
+    #[test]
+    fn sendrawtransaction_rejects_missing_inputs() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x33u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let err = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex)],
+            &params,
+            &tx_announce,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_TRANSACTION_ERROR);
+    }
+
+    #[test]
+    fn sendrawtransaction_accepts_tx_with_injected_utxo() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let prevout = OutPoint {
+            hash: [0x55u8; 32],
+            index: 0,
+        };
+        let prev_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 10_000,
+            script_pubkey: vec![0x51],
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&prevout);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), prev_entry.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout,
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: 10_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let value = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex)],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+
+        let txid = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid));
+    }
+
+    #[test]
+    fn sendrawtransaction_reports_already_in_chain() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let genesis_hash = params.consensus.hash_genesis_block;
+        let location = chainstate
+            .block_location(&genesis_hash)
+            .expect("block location")
+            .expect("genesis location");
+        let bytes = chainstate.read_block(location).expect("read block");
+        let block = Block::consensus_decode(&bytes).expect("decode block");
+        let coinbase = block.transactions.first().expect("coinbase tx");
+        let raw_hex = hex_bytes(&coinbase.consensus_encode().expect("encode tx"));
+
+        let err = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex)],
+            &params,
+            &tx_announce,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_TRANSACTION_ALREADY_IN_CHAIN);
+    }
+
+    #[test]
     fn getrawtransaction_mempool_verbose_has_cpp_schema() {
         let (chainstate, params, _data_dir) = setup_regtest_chainstate();
 
