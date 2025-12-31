@@ -7767,6 +7767,177 @@ mod tests {
     }
 
     #[test]
+    fn createfluxnodekey_returns_string() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_createfluxnodekey(Vec::new(), &params).expect("rpc");
+        let key = value.as_str().expect("string");
+        assert!(!key.is_empty());
+    }
+
+    #[test]
+    fn listfluxnodeconf_has_cpp_schema_keys() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+
+        let collateral_hash = [0x42u8; 32];
+        let txhash_hex = hash256_to_hex(&collateral_hash);
+        std::fs::write(
+            data_dir.join("fluxnode.conf"),
+            format!("fn1 127.0.0.1:16125 operatorkey {txhash_hex} 0\n"),
+        )
+        .expect("write fluxnode.conf");
+
+        let value = rpc_listfluxnodeconf(&chainstate, Vec::new(), &params, &data_dir).expect("rpc");
+        let list = value.as_array().expect("array");
+        assert_eq!(list.len(), 1);
+
+        let obj = list[0].as_object().expect("object");
+        for key in [
+            "alias",
+            "status",
+            "collateral",
+            "txHash",
+            "outputIndex",
+            "privateKey",
+            "address",
+            "ip",
+            "network",
+            "added_height",
+            "confirmed_height",
+            "last_confirmed_height",
+            "last_paid_height",
+            "tier",
+            "payment_address",
+            "activesince",
+            "lastpaid",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        let txhash = obj.get("txHash").and_then(Value::as_str).unwrap();
+        assert!(is_hex_64(txhash));
+    }
+
+    #[test]
+    fn getfluxnodeoutputs_has_cpp_schema_keys() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+
+        let collateral = OutPoint {
+            hash: [0x43u8; 32],
+            index: 0,
+        };
+        let txhash_hex = hash256_to_hex(&collateral.hash);
+        std::fs::write(
+            data_dir.join("fluxnode.conf"),
+            format!("fn1 127.0.0.1:16125 operatorkey {txhash_hex} 0\n"),
+        )
+        .expect("write fluxnode.conf");
+
+        let utxo = fluxd_chainstate::utxo::UtxoEntry {
+            value: 1_000 * COIN,
+            script_pubkey: vec![0x51],
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&collateral);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), utxo.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let value =
+            rpc_getfluxnodeoutputs(&chainstate, Vec::new(), &params, &data_dir).expect("rpc");
+        let list = value.as_array().expect("array");
+        assert_eq!(list.len(), 1);
+        let obj = list[0].as_object().expect("object");
+        for key in ["txhash", "outputidx", "Flux Amount", "Confirmations"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        let txhash = obj.get("txhash").and_then(Value::as_str).unwrap();
+        assert!(is_hex_64(txhash));
+    }
+
+    #[test]
+    fn startfluxnode_has_cpp_schema_keys() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let txhash_hex = hash256_to_hex(&[0x44u8; 32]);
+        std::fs::write(
+            data_dir.join("fluxnode.conf"),
+            format!("fn1 127.0.0.1:16125 operatorkey {txhash_hex} 0\n"),
+        )
+        .expect("write fluxnode.conf");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let value = rpc_startfluxnode(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![json!("all"), json!(false)],
+            &params,
+            &tx_announce,
+            &data_dir,
+        )
+        .expect("rpc");
+
+        let obj = value.as_object().expect("object");
+        assert!(obj.contains_key("overall"));
+        let detail = obj
+            .get("detail")
+            .and_then(Value::as_array)
+            .expect("detail array");
+        assert_eq!(detail.len(), 1);
+        let entry = detail[0].as_object().expect("detail entry");
+        for key in ["alias", "outpoint", "result", "errorMessage"] {
+            assert!(entry.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn startdeterministicfluxnode_has_cpp_schema_keys() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let value = rpc_startdeterministicfluxnode(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![json!("missing-alias"), json!(false)],
+            &params,
+            &tx_announce,
+            &data_dir,
+        )
+        .expect("rpc");
+
+        let obj = value.as_object().expect("object");
+        assert!(obj.contains_key("overall"));
+        let detail = obj
+            .get("detail")
+            .and_then(Value::as_array)
+            .expect("detail array");
+        assert_eq!(detail.len(), 1);
+        let entry = detail[0].as_object().expect("detail entry");
+        for key in ["alias", "result", "error"] {
+            assert!(entry.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
     fn getblockhash_rejects_wrong_param_count() {
         let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
         let err = rpc_getblockhash(&chainstate, Vec::new()).unwrap_err();
