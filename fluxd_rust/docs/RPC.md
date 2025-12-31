@@ -134,6 +134,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `signmessage <address> <message>`
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
 - `getunconfirmedbalance`
+- `getreceivedbyaddress <address> [minconf]` (partial)
 - `listunspent [minconf] [maxconf] [addresses]` (partial)
 - `sendtoaddress <address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
 - `sendmany <fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]` (partial)
@@ -273,6 +274,14 @@ Notes:
 ### getunconfirmedbalance
 
 - Result: sum of spendable mempool outputs paying to the wallet.
+
+### getreceivedbyaddress
+
+- Params: `<address> [minconf]` (partial; P2PKH wallet addresses only).
+- Result: total amount received by the address with at least `minconf` confirmations.
+
+Notes:
+- If `minconf=0`, includes mempool outputs paying to the address.
 
 ### listunspent
 

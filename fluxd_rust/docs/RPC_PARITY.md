@@ -122,7 +122,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getbalance - Partial (minconf supported; `minconf=0` includes spendable mempool outputs; accounts/watchonly are placeholders)
 - getnewaddress - Implemented (P2PKH only; random keys; label ignored)
 - getrawchangeaddress - Partial (P2PKH only; address_type param ignored)
-- getreceivedbyaddress - Missing
+- getreceivedbyaddress - Partial (P2PKH only; uses address deltas for confirmed receives, plus mempool outputs when `minconf=0`)
 - getunconfirmedbalance - Partial (derived from spendable mempool outputs paying to the wallet; no tx history yet)
 - getwalletinfo - Partial (balance + unconfirmed fields are real; txcount/keypool fields are placeholders)
 - importaddress - Missing

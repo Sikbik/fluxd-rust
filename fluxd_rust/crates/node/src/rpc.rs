@@ -96,6 +96,7 @@ const RPC_METHODS: &[&str] = &[
     "dumpprivkey",
     "getbalance",
     "getunconfirmedbalance",
+    "getreceivedbyaddress",
     "listunspent",
     "getwalletinfo",
     "signmessage",
@@ -991,6 +992,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "backupwallet" => rpc_backupwallet(wallet, params),
         "getbalance" => rpc_getbalance(chainstate, mempool, wallet, params),
         "getunconfirmedbalance" => rpc_getunconfirmedbalance(chainstate, mempool, wallet, params),
+        "getreceivedbyaddress" => {
+            rpc_getreceivedbyaddress(chainstate, mempool, wallet, params, chain_params)
+        }
         "listunspent" => rpc_listunspent(chainstate, mempool, wallet, params, chain_params),
         "getdbinfo" => rpc_getdbinfo(chainstate, store, params, data_dir),
         "getblockcount" => rpc_getblockcount(chainstate, params),
@@ -1569,6 +1573,98 @@ fn rpc_getunconfirmedbalance<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
     }
     Ok(amount_to_value(total))
+}
+
+fn rpc_getreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getreceivedbyaddress expects 1 to 2 parameters",
+        ));
+    }
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?
+        .trim();
+    if address.is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "address is empty"));
+    }
+    let minconf = match params.get(1) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
+        _ => 1,
+    };
+
+    let script_pubkey = address_to_script_pubkey(address, chain_params.network)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+    {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let scripts = guard
+            .scripts_for_filter(&[address.to_string()])
+            .map_err(map_wallet_error)?;
+        if scripts.is_empty() {
+            return Err(RpcError::new(
+                RPC_WALLET_ERROR,
+                "Address not found in wallet",
+            ));
+        }
+    }
+
+    let best_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+    let best_height_u32 = u32::try_from(best_height).unwrap_or(0);
+
+    let mut received = 0i64;
+    let mut visitor = |delta: fluxd_chainstate::address_deltas::AddressDeltaEntry| {
+        if delta.satoshis <= 0 {
+            return Ok(());
+        }
+        let confirmations = if best_height_u32 >= delta.height {
+            best_height_u32
+                .saturating_sub(delta.height)
+                .saturating_add(1) as i32
+        } else {
+            0
+        };
+        if confirmations < minconf {
+            return Ok(());
+        }
+        received = received.checked_add(delta.satoshis).ok_or_else(|| {
+            fluxd_storage::StoreError::Backend("getreceivedbyaddress overflow".to_string())
+        })?;
+        Ok(())
+    };
+    chainstate
+        .for_each_address_delta(&script_pubkey, &mut visitor)
+        .map_err(map_internal)?;
+
+    if minconf == 0 {
+        let mempool_guard = mempool
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
+        for entry in mempool_guard.entries() {
+            for output in &entry.tx.vout {
+                if output.script_pubkey.as_slice() != script_pubkey.as_slice() {
+                    continue;
+                }
+                received = received
+                    .checked_add(output.value)
+                    .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+            }
+        }
+    }
+
+    Ok(amount_to_value(received))
 }
 
 fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
@@ -10142,6 +10238,127 @@ mod tests {
         let utxos =
             rpc_listunspent(&chainstate, &mempool, &wallet, vec![json!(0)], &params).expect("rpc");
         assert_eq!(utxos.as_array().expect("array").len(), 0);
+    }
+
+    #[test]
+    fn getreceivedbyaddress_counts_confirmed_and_mempool_outputs() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let (_txid, _vout, height, miner_value) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        assert_eq!(height, 1);
+
+        let mempool = Mutex::new(Mempool::new(0));
+
+        let received = rpc_getreceivedbyaddress(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(address.clone())],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(parse_amount(&received).expect("amount"), miner_value);
+
+        let received = rpc_getreceivedbyaddress(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(address.clone()), json!(2)],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(parse_amount(&received).expect("amount"), 0);
+
+        mine_regtest_block_to_script(&chainstate, &params, p2pkh_script([0x22u8; 20]));
+        let received = rpc_getreceivedbyaddress(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(address.clone()), json!(2)],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(parse_amount(&received).expect("amount"), miner_value);
+
+        let incoming_value = 1 * COIN;
+        let incoming_prevout = OutPoint {
+            hash: [0x55u8; 32],
+            index: 0,
+        };
+        let incoming_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: incoming_prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: incoming_value,
+                script_pubkey,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let txid = incoming_tx.txid().expect("txid");
+        let raw = incoming_tx.consensus_encode().expect("encode tx");
+        mempool
+            .lock()
+            .expect("mempool lock")
+            .insert(MempoolEntry {
+                txid,
+                tx: incoming_tx,
+                raw,
+                time: 0,
+                height: 0,
+                fee: 0,
+                spent_outpoints: vec![incoming_prevout],
+                parents: Vec::new(),
+            })
+            .expect("insert mempool tx");
+
+        let received = rpc_getreceivedbyaddress(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(address.clone()), json!(0)],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(
+            parse_amount(&received).expect("amount"),
+            miner_value + incoming_value
+        );
+
+        let other_address =
+            script_pubkey_to_address(&p2pkh_script([0x66u8; 20]), params.network).expect("address");
+        let err = rpc_getreceivedbyaddress(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(other_address)],
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_ERROR);
     }
 
     #[test]
