@@ -120,6 +120,7 @@ const RPC_METHODS: &[&str] = &[
     "createmultisig",
     "getrawtransaction",
     "gettransaction",
+    "listtransactions",
     "fundrawtransaction",
     "signrawtransaction",
     "sendrawtransaction",
@@ -1013,6 +1014,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "decodescript" => rpc_decodescript(params, chain_params),
         "getrawtransaction" => rpc_getrawtransaction(chainstate, mempool, params, chain_params),
         "gettransaction" => rpc_gettransaction(chainstate, mempool, wallet, params, chain_params),
+        "listtransactions" => {
+            rpc_listtransactions(chainstate, mempool, wallet, params, chain_params)
+        }
         "fundrawtransaction" => rpc_fundrawtransaction(
             chainstate,
             mempool,
@@ -1885,6 +1889,220 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
     }
 
     Ok(obj)
+}
+
+fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "listtransactions expects 0 to 4 parameters",
+        ));
+    }
+    if let Some(value) = params.first() {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "account must be a string",
+            ));
+        }
+    }
+    let count = match params.get(1) {
+        Some(value) if !value.is_null() => parse_u32(value, "count")?,
+        _ => 10,
+    };
+    let skip = match params.get(2) {
+        Some(value) if !value.is_null() => parse_u32(value, "skip")?,
+        _ => 0,
+    };
+    if let Some(value) = params.get(3) {
+        if !value.is_null() {
+            let _ = parse_bool(value)?;
+        }
+    }
+
+    let wallet_scripts = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard.all_script_pubkeys().map_err(map_wallet_error)?
+    };
+    if wallet_scripts.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let wallet_contains_script =
+        |script_pubkey: &[u8]| wallet_scripts.iter().any(|s| s.as_slice() == script_pubkey);
+
+    #[derive(Clone, Copy)]
+    enum CandidateOrder {
+        Mempool { time: u64 },
+        Chain { height: u32, tx_index: u32 },
+    }
+
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        txid: Hash256,
+        order: CandidateOrder,
+    }
+
+    let mut mempool_candidates = Vec::new();
+    if let Ok(mempool_guard) = mempool.lock() {
+        for entry in mempool_guard.entries() {
+            let mut touches_wallet = entry
+                .tx
+                .vout
+                .iter()
+                .any(|out| wallet_contains_script(&out.script_pubkey));
+            if !touches_wallet {
+                let prevouts = mempool_guard.prevouts_for_tx(&entry.tx);
+                for input in &entry.tx.vin {
+                    let script_pubkey = match chainstate
+                        .utxo_entry(&input.prevout)
+                        .map_err(map_internal)?
+                    {
+                        Some(utxo) => utxo.script_pubkey,
+                        None => match prevouts.get(&input.prevout) {
+                            Some(prev) => prev.script_pubkey.clone(),
+                            None => continue,
+                        },
+                    };
+                    if wallet_contains_script(&script_pubkey) {
+                        touches_wallet = true;
+                        break;
+                    }
+                }
+            }
+            if touches_wallet {
+                mempool_candidates.push(Candidate {
+                    txid: entry.txid,
+                    order: CandidateOrder::Mempool { time: entry.time },
+                });
+            }
+        }
+    }
+    mempool_candidates.sort_by(|a, b| match (a.order, b.order) {
+        (CandidateOrder::Mempool { time: a_time }, CandidateOrder::Mempool { time: b_time }) => {
+            b_time.cmp(&a_time).then_with(|| b.txid.cmp(&a.txid))
+        }
+        _ => std::cmp::Ordering::Equal,
+    });
+
+    let mut seen_chain: HashMap<Hash256, (u32, u32)> = HashMap::new();
+    for script_pubkey in &wallet_scripts {
+        let deltas = chainstate
+            .address_deltas(script_pubkey)
+            .map_err(map_internal)?;
+        for delta in deltas {
+            seen_chain
+                .entry(delta.txid)
+                .and_modify(|entry| {
+                    entry.0 = entry.0.max(delta.height);
+                    entry.1 = entry.1.max(delta.tx_index);
+                })
+                .or_insert((delta.height, delta.tx_index));
+        }
+    }
+    let mut chain_candidates = seen_chain
+        .into_iter()
+        .map(|(txid, (height, tx_index))| Candidate {
+            txid,
+            order: CandidateOrder::Chain { height, tx_index },
+        })
+        .collect::<Vec<_>>();
+    chain_candidates.sort_by(|a, b| match (a.order, b.order) {
+        (
+            CandidateOrder::Chain {
+                height: a_height,
+                tx_index: a_index,
+            },
+            CandidateOrder::Chain {
+                height: b_height,
+                tx_index: b_index,
+            },
+        ) => b_height
+            .cmp(&a_height)
+            .then_with(|| b_index.cmp(&a_index))
+            .then_with(|| b.txid.cmp(&a.txid)),
+        _ => std::cmp::Ordering::Equal,
+    });
+
+    let mut candidates = Vec::with_capacity(mempool_candidates.len() + chain_candidates.len());
+    candidates.extend(mempool_candidates);
+    candidates.extend(chain_candidates);
+
+    let skip = usize::try_from(skip).unwrap_or(usize::MAX);
+    let count = usize::try_from(count).unwrap_or(0);
+    let mut out = Vec::new();
+    for cand in candidates.into_iter().skip(skip).take(count) {
+        let view = rpc_gettransaction(
+            chainstate,
+            mempool,
+            wallet,
+            vec![Value::String(hash256_to_hex(&cand.txid))],
+            chain_params,
+        )?;
+        let obj = view
+            .as_object()
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid gettransaction result"))?;
+
+        let amount_zat = obj.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
+        let category = if amount_zat >= 0 { "receive" } else { "send" };
+
+        let address = obj
+            .get("details")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(Value::as_object)
+            .and_then(|row| row.get("address"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
+
+        let mut row = serde_json::Map::new();
+        row.insert("account".to_string(), Value::String(String::new()));
+        if let Some(address) = address {
+            row.insert("address".to_string(), Value::String(address));
+        }
+        row.insert("category".to_string(), Value::String(category.to_string()));
+        row.insert(
+            "amount".to_string(),
+            obj.get("amount")
+                .cloned()
+                .unwrap_or_else(|| amount_to_value(amount_zat)),
+        );
+        row.insert(
+            "confirmations".to_string(),
+            obj.get("confirmations").cloned().unwrap_or(0.into()),
+        );
+        row.insert(
+            "txid".to_string(),
+            obj.get("txid")
+                .cloned()
+                .unwrap_or(Value::String(hash256_to_hex(&cand.txid))),
+        );
+        if let Some(value) = obj.get("blockhash") {
+            row.insert("blockhash".to_string(), value.clone());
+        }
+        if let Some(value) = obj.get("blocktime") {
+            row.insert("blocktime".to_string(), value.clone());
+        }
+        if let Some(value) = obj.get("time") {
+            row.insert("time".to_string(), value.clone());
+        }
+        if let Some(value) = obj.get("timereceived") {
+            row.insert("timereceived".to_string(), value.clone());
+        }
+        row.insert("amount_zat".to_string(), Value::Number(amount_zat.into()));
+
+        out.push(Value::Object(row));
+    }
+
+    Ok(Value::Array(out))
 }
 
 fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
@@ -10711,6 +10929,108 @@ mod tests {
             Some(incoming_value)
         );
         assert_eq!(obj.get("time").and_then(Value::as_u64), Some(123));
+    }
+
+    #[test]
+    fn listtransactions_includes_mempool_before_confirmed() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let (txid_a, _vout, height_a, miner_value_a) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        assert_eq!(height_a, 1);
+        let (txid_b, _vout, height_b, miner_value_b) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        assert_eq!(height_b, 2);
+
+        let mempool_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x77u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let mempool_txid = mempool_tx.txid().expect("txid");
+        let mempool_raw = mempool_tx.consensus_encode().expect("encode tx");
+        let entry = MempoolEntry {
+            txid: mempool_txid,
+            tx: mempool_tx,
+            raw: mempool_raw,
+            time: 200,
+            height: 0,
+            fee: 0,
+            spent_outpoints: Vec::new(),
+            parents: Vec::new(),
+        };
+        let mut inner = Mempool::new(0);
+        inner.insert(entry).expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let value =
+            rpc_listtransactions(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 3);
+
+        let mem_txid_hex = hash256_to_hex(&mempool_txid);
+        let txid_b_hex = hash256_to_hex(&txid_b);
+        let txid_a_hex = hash256_to_hex(&txid_a);
+
+        let row0 = arr[0].as_object().expect("object");
+        assert_eq!(
+            row0.get("txid").and_then(Value::as_str),
+            Some(mem_txid_hex.as_str())
+        );
+        assert_eq!(row0.get("confirmations").and_then(Value::as_i64), Some(0));
+        assert_eq!(row0.get("amount_zat").and_then(Value::as_i64), Some(COIN));
+
+        let row1 = arr[1].as_object().expect("object");
+        assert_eq!(
+            row1.get("txid").and_then(Value::as_str),
+            Some(txid_b_hex.as_str())
+        );
+        assert_eq!(row1.get("confirmations").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            row1.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value_b)
+        );
+
+        let row2 = arr[2].as_object().expect("object");
+        assert_eq!(
+            row2.get("txid").and_then(Value::as_str),
+            Some(txid_a_hex.as_str())
+        );
+        assert_eq!(row2.get("confirmations").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            row2.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value_a)
+        );
     }
 
     #[test]
