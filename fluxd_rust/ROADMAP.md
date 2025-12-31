@@ -199,6 +199,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Schema parity: `getblockcount`/`getbestblockhash`/`getblockhash` required keys
   - [x] Schema parity: `getdifficulty`/`getchaintips` required keys
   - [x] Schema parity: `getblockheader`/`getblock` required keys
+  - [x] Schema parity: `getblocksubsidy`/`getblockhashes`/`getblockdeltas` required keys
   - [x] Schema parity: `getmempoolinfo`/`getrawmempool` required keys
   - [x] Schema parity: `gettxout` required keys (chain + mempool)
   - [x] Schema parity: `getspentinfo` required keys

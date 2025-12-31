@@ -7139,6 +7139,50 @@ mod tests {
     }
 
     #[test]
+    fn getblocksubsidy_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_getblocksubsidy(&chainstate, Vec::new(), &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert!(obj.contains_key("miner"));
+    }
+
+    #[test]
+    fn getblockhashes_has_cpp_schema() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_getblockhashes(&chainstate, vec![json!(u32::MAX), json!(0)]).expect("rpc");
+        let hashes = value.as_array().expect("array");
+        assert!(!hashes.is_empty());
+        let first = hashes[0].as_str().expect("string");
+        assert!(is_hex_64(first));
+    }
+
+    #[test]
+    fn getblockdeltas_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir, _address, _txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        let value = rpc_getblockdeltas(&chainstate, vec![json!(1)], &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "hash",
+            "confirmations",
+            "size",
+            "height",
+            "version",
+            "merkleroot",
+            "deltas",
+            "time",
+            "mediantime",
+            "nonce",
+            "bits",
+            "difficulty",
+            "chainwork",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        assert!(obj.get("deltas").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
     fn fluxnode_rpcs_have_cpp_schema_keys() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         extend_regtest_chain_to_height(&chainstate, &params, 69);
