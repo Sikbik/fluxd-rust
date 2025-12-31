@@ -403,7 +403,10 @@ Returns a summary of the current transparent UTXO set.
 
 Fields:
 - `height`, `bestblock`
+- `transactions` - number of transactions with at least one unspent output
 - `txouts` - number of unspent outputs
+- `bytes_serialized` - serialized size of the canonical UTXO stream (see notes)
+- `hash_serialized` - serialized UTXO set hash (fluxd parity; see notes)
 - `total_amount` - sum of all unspent output values (transparent only)
 - `sprout_pool`, `sapling_pool` - shielded pool totals
 - `shielded_amount` - `sprout_pool + sapling_pool`
@@ -411,7 +414,9 @@ Fields:
 - `disk_size` - byte size of the `db/` directory
 
 Notes:
-- `transactions`, `bogosize`, and `hash_serialized_2` are currently placeholders.
+- This call scans the full UTXO set and may take time (like the C++ daemon).
+- `bytes_serialized` is computed from the canonical UTXO stream and may differ from the
+  legacy C++ `coins` LevelDB value sizes.
 - UTXO stats are maintained incrementally in the chainstate `Meta` column under `utxo_stats_v1`.
 - Shielded value pools are maintained incrementally in the chainstate `Meta` column under `value_pools_v1`.
 - `*_zat` fields are provided for exact integer values.

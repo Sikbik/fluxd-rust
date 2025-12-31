@@ -29,6 +29,8 @@ use fluxd_primitives::transaction::{
 };
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
 use rayon::prelude::*;
+use sha2::Digest as _;
+use sha2::Sha256;
 
 use crate::address_deltas::AddressDeltaIndex;
 use crate::address_index::AddressIndex;
@@ -3644,6 +3646,116 @@ impl<S: KeyValueStore> ChainState<S> {
         self.compute_utxo_stats()
     }
 
+    pub fn utxo_set_info(&self) -> Result<UtxoSetInfo, ChainStateError> {
+        let best_hash = self.best_block()?.map(|tip| tip.hash).unwrap_or([0u8; 32]);
+        let mut hasher = Sha256::new();
+        hasher.update(best_hash);
+
+        #[derive(Clone)]
+        struct UtxoOutput {
+            vout: u32,
+            value: i64,
+            script_pubkey: Vec<u8>,
+        }
+
+        fn finalize_tx_group(
+            hasher: &mut Sha256,
+            outputs: &mut Vec<UtxoOutput>,
+            info: &mut UtxoSetInfo,
+        ) -> Result<(), StoreError> {
+            if outputs.is_empty() {
+                return Ok(());
+            }
+
+            outputs.sort_by_key(|output| output.vout);
+
+            info.transactions = info
+                .transactions
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Backend("utxo transactions overflow".to_string()))?;
+            info.bytes_serialized = info
+                .bytes_serialized
+                .checked_add(32)
+                .ok_or_else(|| StoreError::Backend("utxo bytes overflow".to_string()))?;
+
+            for output in outputs.iter() {
+                let index = output.vout as u64 + 1;
+                let index_bytes = update_hash_with_varint(hasher, index);
+                info.bytes_serialized = info
+                    .bytes_serialized
+                    .checked_add(index_bytes)
+                    .ok_or_else(|| StoreError::Backend("utxo bytes overflow".to_string()))?;
+
+                hasher.update(output.value.to_le_bytes());
+                let script_len = output.script_pubkey.len() as u64;
+                let script_len_bytes = update_hash_with_compact_size(hasher, script_len);
+                hasher.update(&output.script_pubkey);
+
+                info.bytes_serialized = info
+                    .bytes_serialized
+                    .checked_add(8)
+                    .and_then(|bytes| bytes.checked_add(script_len_bytes))
+                    .and_then(|bytes| bytes.checked_add(script_len))
+                    .ok_or_else(|| StoreError::Backend("utxo bytes overflow".to_string()))?;
+            }
+
+            let end_bytes = update_hash_with_varint(hasher, 0);
+            info.bytes_serialized = info
+                .bytes_serialized
+                .checked_add(end_bytes)
+                .ok_or_else(|| StoreError::Backend("utxo bytes overflow".to_string()))?;
+
+            outputs.clear();
+            Ok(())
+        }
+
+        let mut info = UtxoSetInfo::default();
+        let mut current_txid: Option<[u8; 32]> = None;
+        let mut current_outputs: Vec<UtxoOutput> = Vec::new();
+
+        let mut visitor = |key: &[u8], value: &[u8]| -> Result<(), StoreError> {
+            if key.len() != crate::utxo::OUTPOINT_KEY_LEN {
+                return Err(StoreError::Backend("invalid utxo key length".to_string()));
+            }
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&key[..32]);
+            if current_txid.map(|current| current != txid).unwrap_or(true) {
+                finalize_tx_group(&mut hasher, &mut current_outputs, &mut info)?;
+                current_txid = Some(txid);
+            }
+
+            let vout = u32::from_le_bytes([key[32], key[33], key[34], key[35]]);
+            let entry =
+                UtxoEntry::decode(value).map_err(|err| StoreError::Backend(err.to_string()))?;
+            info.txouts = info
+                .txouts
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Backend("utxo txouts overflow".to_string()))?;
+            info.total_amount = info
+                .total_amount
+                .checked_add(entry.value)
+                .ok_or_else(|| StoreError::Backend("utxo total overflow".to_string()))?;
+
+            current_outputs.push(UtxoOutput {
+                vout,
+                value: entry.value,
+                script_pubkey: entry.script_pubkey,
+            });
+            Ok(())
+        };
+
+        self.store
+            .for_each_prefix(Column::Utxo, &[], &mut visitor)?;
+        finalize_tx_group(&mut hasher, &mut current_outputs, &mut info)
+            .map_err(ChainStateError::Store)?;
+
+        let first = hasher.finalize();
+        let second = Sha256::digest(first);
+        info.hash_serialized.copy_from_slice(&second);
+
+        Ok(info)
+    }
+
     pub fn value_pools(&self) -> Result<Option<ValuePools>, ChainStateError> {
         let bytes = match self.store.get(Column::Meta, VALUE_POOLS_KEY)? {
             Some(bytes) => bytes,
@@ -3862,10 +3974,65 @@ impl UtxoStats {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UtxoSetInfo {
+    pub transactions: u64,
+    pub txouts: u64,
+    pub bytes_serialized: u64,
+    pub hash_serialized: Hash256,
+    pub total_amount: i64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ValuePools {
     pub sprout: i64,
     pub sapling: i64,
+}
+
+fn encode_varint(mut value: u64) -> ([u8; 10], usize) {
+    let mut tmp = [0u8; 10];
+    let mut len = 0usize;
+    loop {
+        tmp[len] = ((value & 0x7f) as u8) | if len == 0 { 0x00 } else { 0x80 };
+        if value <= 0x7f {
+            break;
+        }
+        value = (value >> 7).saturating_sub(1);
+        len = len.saturating_add(1);
+    }
+    let mut out = [0u8; 10];
+    let mut out_len = 0usize;
+    for byte in tmp[..=len].iter().rev() {
+        out[out_len] = *byte;
+        out_len += 1;
+    }
+    (out, out_len)
+}
+
+fn update_hash_with_varint(hasher: &mut Sha256, value: u64) -> u64 {
+    let (encoded, len) = encode_varint(value);
+    hasher.update(&encoded[..len]);
+    len as u64
+}
+
+fn update_hash_with_compact_size(hasher: &mut Sha256, value: u64) -> u64 {
+    if value < 0xfd {
+        hasher.update([value as u8]);
+        return 1;
+    }
+    if value <= 0xffff {
+        hasher.update([0xfd]);
+        hasher.update((value as u16).to_le_bytes());
+        return 3;
+    }
+    if value <= 0xffff_ffff {
+        hasher.update([0xfe]);
+        hasher.update((value as u32).to_le_bytes());
+        return 5;
+    }
+    hasher.update([0xff]);
+    hasher.update(value.to_le_bytes());
+    9
 }
 
 impl ValuePools {
@@ -4754,6 +4921,28 @@ mod tests {
     use secp256k1::ecdsa::RecoverableSignature;
     use secp256k1::{Message, Secp256k1, SecretKey};
     use std::sync::Arc;
+
+    #[test]
+    fn serialize_varint_matches_fluxd() {
+        let cases: &[(u64, &[u8])] = &[
+            (0, &[0x00]),
+            (1, &[0x01]),
+            (127, &[0x7f]),
+            (128, &[0x80, 0x00]),
+            (255, &[0x80, 0x7f]),
+            (16_383, &[0xfe, 0x7f]),
+            (16_384, &[0xff, 0x00]),
+            (16_511, &[0xff, 0x7f]),
+            (16_512, &[0x80, 0x80, 0x00]),
+            (65_535, &[0x82, 0xfe, 0x7f]),
+            (4_294_967_296, &[0x8e, 0xfe, 0xfe, 0xff, 0x00]),
+        ];
+
+        for (value, expected) in cases {
+            let (encoded, len) = encode_varint(*value);
+            assert_eq!(&encoded[..len], *expected);
+        }
+    }
 
     fn make_tx(vin: Vec<TxIn>, vout: Vec<TxOut>) -> Transaction {
         Transaction {

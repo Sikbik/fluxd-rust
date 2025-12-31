@@ -210,7 +210,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getblockcount`<br>`getbestblockhash`<br>`getblockhash`<br>`getblockheader`<br>`getblock`<br>`getblockchaininfo`<br>`getdifficulty`<br>`getchaintips`<br>`getblocksubsidy`<br>`getblockhashes`<br>`getblockdeltas` | `gettxoutsetinfo` | - |
+| `getblockcount`<br>`getbestblockhash`<br>`getblockhash`<br>`getblockheader`<br>`getblock`<br>`getblockchaininfo`<br>`getdifficulty`<br>`getchaintips`<br>`getblocksubsidy`<br>`getblockhashes`<br>`getblockdeltas`<br>`gettxoutsetinfo` | - | - |
 
 ### Transactions and scripts
 

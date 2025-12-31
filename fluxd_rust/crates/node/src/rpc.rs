@@ -2438,13 +2438,13 @@ fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(
         Some(tip) => (tip.height, tip.hash),
         None => (0, [0u8; 32]),
     };
-    let stats = chainstate.utxo_stats_or_compute().map_err(map_internal)?;
+    let utxo_info = chainstate.utxo_set_info().map_err(map_internal)?;
     let value_pools = chainstate.value_pools_or_compute().map_err(map_internal)?;
     let shielded_total = value_pools
         .sprout
         .checked_add(value_pools.sapling)
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "shielded value pool overflow"))?;
-    let total_supply = stats
+    let total_supply = utxo_info
         .total_amount
         .checked_add(shielded_total)
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "total supply overflow"))?;
@@ -2453,13 +2453,13 @@ fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(
     Ok(json!({
         "height": height.max(0),
         "bestblock": hash256_to_hex(&best_hash),
-        "transactions": 0,
-        "txouts": stats.txouts,
-        "bogosize": 0,
-        "hash_serialized_2": "0000000000000000000000000000000000000000000000000000000000000000",
+        "transactions": utxo_info.transactions,
+        "txouts": utxo_info.txouts,
+        "bytes_serialized": utxo_info.bytes_serialized,
+        "hash_serialized": hash256_to_hex(&utxo_info.hash_serialized),
         "disk_size": disk_size,
-        "total_amount": amount_to_value(stats.total_amount),
-        "total_amount_zat": stats.total_amount,
+        "total_amount": amount_to_value(utxo_info.total_amount),
+        "total_amount_zat": utxo_info.total_amount,
         "sprout_pool": amount_to_value(value_pools.sprout),
         "sprout_pool_zat": value_pools.sprout,
         "sapling_pool": amount_to_value(value_pools.sapling),

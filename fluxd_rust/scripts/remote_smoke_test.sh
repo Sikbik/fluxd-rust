@@ -204,6 +204,9 @@ fi
 
 rpc_get "getinfo" >/dev/null
 
+echo "Checking gettxoutsetinfo ..."
+rpc_get "gettxoutsetinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("transactions","txouts","bytes_serialized","hash_serialized","total_amount"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"'
+
 start_ts=$(date +%s)
 peers=0
 headers=0
