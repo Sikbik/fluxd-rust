@@ -113,6 +113,8 @@ Type notes:
 - `decodescript <hex>`
 - `createmultisig <nrequired> <keys>`
 - `getrawtransaction <txid> [verbose]`
+- `fundrawtransaction <hexstring> [options]` (partial)
+- `signrawtransaction <hexstring> [prevtxs] [privkeys] [sighashtype]` (partial)
 - `sendrawtransaction <hexstring> [allowhighfees]`
 - `gettxout <txid> <vout> [include_mempool]`
 - `gettxoutsetinfo`
@@ -130,6 +132,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `signmessage <address> <message>`
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
 - `listunspent [minconf] [maxconf] [addresses]` (partial)
+- `sendtoaddress <address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
 
 ### Mining and mempool
 
@@ -248,6 +251,15 @@ Fields:
 
 - Params: `[minconf] [maxconf] [addresses]` (partial).
 - Result: array of unspent outputs owned by the wallet.
+
+### sendtoaddress
+
+- Params: `<address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
+- Result: transaction id hex string.
+
+Notes:
+- Builds a transparent transaction, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
+- Currently only supports P2PKH wallet UTXOs and does not support `subtractfeefromamount`.
 
 ### getdbinfo
 
@@ -419,6 +431,30 @@ Notes:
 Notes:
 - Mempool lookup is supported; confirmed transactions include `blockhash`/`confirmations` fields.
 
+### fundrawtransaction
+
+- Params:
+  - `hexstring` (string)
+  - optional `options` object (currently ignored)
+- Result: `{ "hex": "<funded_tx_hex>", "fee": <amount>, "changepos": <n> }`
+
+Notes:
+- Selects spendable wallet UTXOs via the address index and adds inputs + a change output when needed.
+- Only supports funding with P2PKH wallet UTXOs.
+
+### signrawtransaction
+
+- Params:
+  - `hexstring` (string)
+  - optional `prevtxs` (array) - `[{"txid":"...","vout":n,"scriptPubKey":"...","amount":<amount>}, ...]`
+  - optional `privkeys` (array) - `["<wif>", ...]`
+  - optional `sighashtype` (string, default `ALL`)
+- Result: `{ "hex": "<signed_tx_hex>", "complete": <bool>, "errors": [...]? }`
+
+Notes:
+- Only supports signing P2PKH inputs.
+- Uses wallet keys by default; `privkeys` can be provided to sign without importing into the wallet.
+
 ### sendrawtransaction
 
 - Params:
@@ -429,7 +465,7 @@ Notes:
 Notes:
 - Inserts into the local in-memory mempool.
 - If `--tx-peers > 0`, announces the txid to relay peers via P2P (`inv` + `getdata`/`tx`).
-- Only accepts transactions spending confirmed UTXOs (no unconfirmed parent/ancestor tracking yet).
+- Supports spending mempool parents (parents must already be present in the local mempool).
 
 ### gettxout
 

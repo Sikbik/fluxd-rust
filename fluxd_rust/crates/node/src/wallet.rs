@@ -206,6 +206,21 @@ impl Wallet {
         Ok(out)
     }
 
+    pub fn signing_key_for_script_pubkey(
+        &self,
+        script_pubkey: &[u8],
+    ) -> Result<Option<(SecretKey, Vec<u8>)>, WalletError> {
+        for key in &self.keys {
+            if key.p2pkh_script_pubkey()?.as_slice() != script_pubkey {
+                continue;
+            }
+            let secret = key.secret_key()?;
+            let pubkey = key.pubkey_bytes()?;
+            return Ok(Some((secret, pubkey)));
+        }
+        Ok(None)
+    }
+
     pub fn sign_message(
         &self,
         address: &str,

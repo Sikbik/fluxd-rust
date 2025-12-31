@@ -65,7 +65,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - decoderawtransaction - Implemented
 - decodescript - Implemented
 - getrawtransaction - Implemented (chain + mempool)
-- fundrawtransaction - Missing
+- fundrawtransaction - Partial (P2PKH wallet UTXOs only; options object ignored)
 - sendrawtransaction - Partial (supports spending mempool parents; orphan pool + full policy parity WIP)
 - createmultisig - Partial (hex pubkeys only; wallet address lookup not available)
 - estimatefee - Implemented
@@ -115,7 +115,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Wallet
 
-- signrawtransaction - Missing
+- signrawtransaction - Partial (P2PKH only; supports wallet keys and optional WIF override list)
 - addmultisigaddress - Missing
 - backupwallet - Missing
 - dumpprivkey - Implemented (P2PKH only)
@@ -139,7 +139,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - rescanblockchain - Stub (wallet rescan not implemented)
 
 - sendmany - Missing
-- sendtoaddress - Missing
+- sendtoaddress - Partial (P2PKH only; `subtractfeefromamount` not supported)
 - settxfee - Missing
 - signmessage - Implemented (P2PKH only; compatible with verifymessage)
 

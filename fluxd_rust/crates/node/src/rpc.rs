@@ -47,7 +47,11 @@ use fluxd_primitives::{
     address_to_script_pubkey, script_pubkey_to_address, secret_key_to_wif, wif_to_secret_key,
     AddressError,
 };
+use fluxd_script::interpreter::{verify_script, STANDARD_SCRIPT_VERIFY_FLAGS};
 use fluxd_script::message::{recover_signed_message_pubkey, signed_message_hash};
+use fluxd_script::sighash::{
+    signature_hash, SighashType, SIGHASH_ALL, SIGHASH_ANYONECANPAY, SIGHASH_NONE, SIGHASH_SINGLE,
+};
 use fluxd_script::standard::{classify_script_pubkey, ScriptType};
 use primitive_types::U256;
 use secp256k1::{ecdsa::RecoverableSignature, Message, PublicKey, Secp256k1, SecretKey};
@@ -111,7 +115,10 @@ const RPC_METHODS: &[&str] = &[
     "verifymessage",
     "createmultisig",
     "getrawtransaction",
+    "fundrawtransaction",
+    "signrawtransaction",
     "sendrawtransaction",
+    "sendtoaddress",
     "getmempoolinfo",
     "getrawmempool",
     "gettxout",
@@ -993,6 +1000,17 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "decoderawtransaction" => rpc_decoderawtransaction(params, chain_params),
         "decodescript" => rpc_decodescript(params, chain_params),
         "getrawtransaction" => rpc_getrawtransaction(chainstate, mempool, params, chain_params),
+        "fundrawtransaction" => rpc_fundrawtransaction(
+            chainstate,
+            mempool,
+            mempool_policy,
+            wallet,
+            params,
+            chain_params,
+        ),
+        "signrawtransaction" => {
+            rpc_signrawtransaction(chainstate, mempool, wallet, params, chain_params)
+        }
         "sendrawtransaction" => rpc_sendrawtransaction(
             chainstate,
             mempool,
@@ -1000,6 +1018,18 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             mempool_metrics,
             fee_estimator,
             mempool_flags,
+            params,
+            chain_params,
+            tx_announce,
+        ),
+        "sendtoaddress" => rpc_sendtoaddress(
+            chainstate,
+            mempool,
+            mempool_policy,
+            mempool_metrics,
+            fee_estimator,
+            mempool_flags,
+            wallet,
             params,
             chain_params,
             tx_announce,
@@ -2474,6 +2504,748 @@ fn rpc_getrawtransaction<S: fluxd_storage::KeyValueStore>(
         obj.insert("height".to_string(), Value::Number(entry.height.into()));
     }
     Ok(Value::Object(obj))
+}
+
+#[derive(Clone, Debug)]
+struct PrevoutInfo {
+    value: i64,
+    script_pubkey: Vec<u8>,
+}
+
+fn p2pkh_script_pubkey(key_hash: &[u8; 20]) -> Vec<u8> {
+    let mut script = Vec::with_capacity(25);
+    script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+    script.extend_from_slice(key_hash);
+    script.extend_from_slice(&[0x88, 0xac]);
+    script
+}
+
+fn push_script_bytes(script: &mut Vec<u8>, data: &[u8]) -> Result<(), RpcError> {
+    const OP_PUSHDATA1: u8 = 0x4c;
+    const OP_PUSHDATA2: u8 = 0x4d;
+    const OP_PUSHDATA4: u8 = 0x4e;
+
+    if data.len() < OP_PUSHDATA1 as usize {
+        script.push(data.len() as u8);
+        script.extend_from_slice(data);
+        return Ok(());
+    }
+    if data.len() <= u8::MAX as usize {
+        script.extend_from_slice(&[OP_PUSHDATA1, data.len() as u8]);
+        script.extend_from_slice(data);
+        return Ok(());
+    }
+    if data.len() <= u16::MAX as usize {
+        script.push(OP_PUSHDATA2);
+        script.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        script.extend_from_slice(data);
+        return Ok(());
+    }
+    let len = u32::try_from(data.len())
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "pushdata too large"))?;
+    script.push(OP_PUSHDATA4);
+    script.extend_from_slice(&len.to_le_bytes());
+    script.extend_from_slice(data);
+    Ok(())
+}
+
+fn parse_sighash_type(value: Option<&Value>) -> Result<SighashType, RpcError> {
+    let Some(value) = value else {
+        return Ok(SighashType(SIGHASH_ALL));
+    };
+    if value.is_null() {
+        return Ok(SighashType(SIGHASH_ALL));
+    }
+    let text = value.as_str().ok_or_else(|| {
+        RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "sighashtype must be a string (e.g. ALL)",
+        )
+    })?;
+    let normalized = text.trim().to_ascii_uppercase();
+    let (base, anyone_can_pay) = match normalized.as_str() {
+        "ALL" => (SIGHASH_ALL, false),
+        "NONE" => (SIGHASH_NONE, false),
+        "SINGLE" => (SIGHASH_SINGLE, false),
+        "ALL|ANYONECANPAY" => (SIGHASH_ALL, true),
+        "NONE|ANYONECANPAY" => (SIGHASH_NONE, true),
+        "SINGLE|ANYONECANPAY" => (SIGHASH_SINGLE, true),
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                format!("unsupported sighashtype {text}"),
+            ))
+        }
+    };
+    Ok(SighashType(
+        base | if anyone_can_pay {
+            SIGHASH_ANYONECANPAY
+        } else {
+            0
+        },
+    ))
+}
+
+fn parse_prevtxs_map(value: &Value) -> Result<HashMap<OutPoint, PrevoutInfo>, RpcError> {
+    let entries = value.as_array().ok_or_else(|| {
+        RpcError::new(RPC_INVALID_PARAMETER, "prevtxs must be an array of objects")
+    })?;
+    let mut out = HashMap::new();
+    for entry in entries {
+        let obj = entry.as_object().ok_or_else(|| {
+            RpcError::new(RPC_INVALID_PARAMETER, "prevtxs entries must be objects")
+        })?;
+        let txid_value = obj
+            .get("txid")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing txid"))?;
+        let vout_value = obj
+            .get("vout")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing vout"))?;
+        let script_value = obj
+            .get("scriptPubKey")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing scriptPubKey"))?;
+        let amount_value = obj
+            .get("amount")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing amount"))?;
+
+        let txid = parse_hash(txid_value)?;
+        let vout = parse_u32(vout_value, "vout")?;
+        let script_hex = script_value
+            .as_str()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "scriptPubKey must be a string"))?;
+        let script_pubkey = bytes_from_hex(script_hex)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "scriptPubKey must be hex"))?;
+        let value = parse_amount(amount_value)?;
+
+        out.insert(
+            OutPoint {
+                hash: txid,
+                index: vout,
+            },
+            PrevoutInfo {
+                value,
+                script_pubkey,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn resolve_prevout_info<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    outpoint: &OutPoint,
+    overrides: &HashMap<OutPoint, PrevoutInfo>,
+) -> Result<Option<PrevoutInfo>, RpcError> {
+    if let Some(prevout) = overrides.get(outpoint) {
+        return Ok(Some(prevout.clone()));
+    }
+    if let Some(entry) = chainstate.utxo_entry(outpoint).map_err(map_internal)? {
+        return Ok(Some(PrevoutInfo {
+            value: entry.value,
+            script_pubkey: entry.script_pubkey,
+        }));
+    }
+    let guard = mempool
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
+    Ok(guard.prevout(outpoint).map(|prev| PrevoutInfo {
+        value: prev.value,
+        script_pubkey: prev.script_pubkey,
+    }))
+}
+
+fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "signrawtransaction expects 1 to 4 parameters",
+        ));
+    }
+    let hex = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
+    let raw = bytes_from_hex(hex)
+        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    let mut tx = Transaction::consensus_decode(&raw)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    if tx.fluxnode.is_some() {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "signrawtransaction does not support fluxnode transactions",
+        ));
+    }
+    if tx.version == FLUXNODE_TX_VERSION || tx.version == FLUXNODE_TX_UPGRADEABLE_VERSION {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "signrawtransaction does not support fluxnode transactions",
+        ));
+    }
+
+    let prevtxs = match params.get(1) {
+        Some(value) if !value.is_null() => parse_prevtxs_map(value)?,
+        _ => HashMap::new(),
+    };
+
+    let mut key_overrides: HashMap<Vec<u8>, (SecretKey, Vec<u8>)> = HashMap::new();
+    if let Some(value) = params.get(2) {
+        if !value.is_null() {
+            let keys = value.as_array().ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "privkeys must be an array of strings",
+                )
+            })?;
+            for entry in keys {
+                let wif = entry.as_str().ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "privkeys must be strings")
+                })?;
+                let (secret, compressed) = parse_wif_secret_key(wif, chain_params.network)?;
+                let pubkey_bytes = secret_key_pubkey_bytes(&secret, compressed);
+                let key_hash = hash160(&pubkey_bytes);
+                let script_pubkey = p2pkh_script_pubkey(&key_hash);
+                key_overrides.insert(script_pubkey, (secret, pubkey_bytes));
+            }
+        }
+    }
+
+    let sighash_type = parse_sighash_type(params.get(3))?;
+    if sighash_type.0 > 0xff {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "sighashtype must fit in one byte",
+        ));
+    }
+
+    let best_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+    let next_height = best_height.saturating_add(1);
+    let branch_id = current_epoch_branch_id(next_height, &chain_params.consensus.upgrades);
+
+    let mut errors: Vec<Value> = Vec::new();
+
+    let wallet_guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+
+    let secp = Secp256k1::signing_only();
+    for input_index in 0..tx.vin.len() {
+        let outpoint = tx
+            .vin
+            .get(input_index)
+            .map(|input| input.prevout.clone())
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "input index out of range"))?;
+        let prevout = match resolve_prevout_info(chainstate, mempool, &outpoint, &prevtxs)? {
+            Some(prevout) => prevout,
+            None => {
+                errors.push(json!({
+                    "txid": hash256_to_hex(&outpoint.hash),
+                    "vout": outpoint.index,
+                    "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                    "sequence": tx.vin[input_index].sequence,
+                    "error": "Missing inputs",
+                }));
+                continue;
+            }
+        };
+
+        if classify_script_pubkey(&prevout.script_pubkey) != ScriptType::P2Pkh {
+            errors.push(json!({
+                "txid": hash256_to_hex(&outpoint.hash),
+                "vout": outpoint.index,
+                "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                "sequence": tx.vin[input_index].sequence,
+                "error": "Unsupported scriptPubKey type (only P2PKH is supported)",
+            }));
+            continue;
+        }
+
+        let (secret, pubkey_bytes) = match key_overrides.get(&prevout.script_pubkey) {
+            Some((secret, pubkey)) => (secret.clone(), pubkey.clone()),
+            None => match wallet_guard
+                .signing_key_for_script_pubkey(&prevout.script_pubkey)
+                .map_err(map_wallet_error)?
+            {
+                Some((secret, pubkey)) => (secret, pubkey),
+                None => {
+                    errors.push(json!({
+                        "txid": hash256_to_hex(&outpoint.hash),
+                        "vout": outpoint.index,
+                        "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                        "sequence": tx.vin[input_index].sequence,
+                        "error": "Private key not available for this input",
+                    }));
+                    continue;
+                }
+            },
+        };
+
+        let sighash = match signature_hash(
+            &tx,
+            Some(input_index),
+            &prevout.script_pubkey,
+            prevout.value,
+            sighash_type,
+            branch_id,
+        ) {
+            Ok(hash) => hash,
+            Err(err) => {
+                errors.push(json!({
+                    "txid": hash256_to_hex(&outpoint.hash),
+                    "vout": outpoint.index,
+                    "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                    "sequence": tx.vin[input_index].sequence,
+                    "error": format!("sighash failed: {err}"),
+                }));
+                continue;
+            }
+        };
+
+        let msg = Message::from_digest_slice(&sighash)
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "Invalid sighash digest"))?;
+        let mut sig = secp.sign_ecdsa(&msg, &secret);
+        sig.normalize_s();
+        let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
+        sig_bytes.push(sighash_type.0 as u8);
+
+        let mut script_sig = Vec::new();
+        push_script_bytes(&mut script_sig, &sig_bytes)?;
+        push_script_bytes(&mut script_sig, &pubkey_bytes)?;
+        if let Some(input) = tx.vin.get_mut(input_index) {
+            input.script_sig = script_sig;
+        }
+
+        if let Err(err) = verify_script(
+            &tx.vin[input_index].script_sig,
+            &prevout.script_pubkey,
+            &tx,
+            input_index,
+            prevout.value,
+            STANDARD_SCRIPT_VERIFY_FLAGS,
+            branch_id,
+        ) {
+            errors.push(json!({
+                "txid": hash256_to_hex(&outpoint.hash),
+                "vout": outpoint.index,
+                "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                "sequence": tx.vin[input_index].sequence,
+                "error": format!("script verification failed: {err}"),
+            }));
+        }
+    }
+
+    let encoded = tx.consensus_encode().map_err(map_internal)?;
+    let mut out = serde_json::Map::new();
+    out.insert("hex".to_string(), Value::String(hex_bytes(&encoded)));
+    out.insert("complete".to_string(), Value::Bool(errors.is_empty()));
+    if !errors.is_empty() {
+        out.insert("errors".to_string(), Value::Array(errors));
+    }
+    Ok(Value::Object(out))
+}
+
+fn compact_size_len(value: usize) -> usize {
+    if value < 0xfd {
+        1
+    } else if value <= 0xffff {
+        3
+    } else if value <= 0xffff_ffff {
+        5
+    } else {
+        9
+    }
+}
+
+fn is_unspendable(script_pubkey: &[u8]) -> bool {
+    const OP_RETURN: u8 = 0x6a;
+    script_pubkey.first().copied() == Some(OP_RETURN)
+}
+
+fn is_dust(value: i64, script_pubkey: &[u8], min_fee_per_kb: i64) -> bool {
+    if min_fee_per_kb <= 0 {
+        return false;
+    }
+    if is_unspendable(script_pubkey) {
+        return false;
+    }
+    if value < 0 {
+        return true;
+    }
+    let out_size = 8usize
+        .saturating_add(compact_size_len(script_pubkey.len()))
+        .saturating_add(script_pubkey.len());
+    let spend_size = out_size.saturating_add(148);
+    let fee = MempoolPolicy::standard(min_fee_per_kb, false).min_relay_fee_for_size(spend_size);
+    let dust_threshold = fee.saturating_mul(3);
+    value < dust_threshold
+}
+
+fn estimate_signed_tx_size(tx: &Transaction, scriptsig_len: usize) -> Result<usize, RpcError> {
+    let mut tmp = tx.clone();
+    for input in &mut tmp.vin {
+        input.script_sig = vec![0u8; scriptsig_len];
+    }
+    Ok(tmp.consensus_encode().map_err(map_internal)?.len())
+}
+
+fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    _chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "fundrawtransaction expects 1 or 2 parameters",
+        ));
+    }
+    let hex = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
+    let raw = bytes_from_hex(hex)
+        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    let mut tx = Transaction::consensus_decode(&raw)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    if tx.fluxnode.is_some()
+        || tx.version == FLUXNODE_TX_VERSION
+        || tx.version == FLUXNODE_TX_UPGRADEABLE_VERSION
+    {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "fundrawtransaction does not support fluxnode transactions",
+        ));
+    }
+
+    if let Some(value) = params.get(1) {
+        if !value.is_null() && !value.is_object() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "options must be an object",
+            ));
+        }
+    }
+
+    let recipient_vout_len = tx.vout.len();
+    let recipient_value = tx.vout.iter().try_fold(0i64, |total, output| {
+        total
+            .checked_add(output.value)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))
+    })?;
+
+    let mut used_outpoints: HashSet<OutPoint> = HashSet::new();
+    let mut base_inputs_value: i64 = 0;
+    let base_prevtxs = HashMap::new();
+    for input in &tx.vin {
+        if !used_outpoints.insert(input.prevout.clone()) {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "transaction has duplicate inputs",
+            ));
+        }
+        let prevout = resolve_prevout_info(chainstate, mempool, &input.prevout, &base_prevtxs)?
+            .ok_or_else(|| RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs"))?;
+        if classify_script_pubkey(&prevout.script_pubkey) != ScriptType::P2Pkh {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "fundrawtransaction only supports P2PKH inputs",
+            ));
+        }
+        base_inputs_value = base_inputs_value
+            .checked_add(prevout.value)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+    }
+
+    let (wallet_scripts, change_script_pubkey) = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        if guard.key_count() == 0 {
+            let _ = guard.generate_new_address(true).map_err(map_wallet_error)?;
+        }
+        let scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
+        let change_script = scripts
+            .first()
+            .cloned()
+            .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "wallet has no keys"))?;
+        (scripts, change_script)
+    };
+
+    let mut candidates = collect_wallet_utxos(chainstate, mempool, &wallet_scripts)?;
+    candidates.retain(|utxo| {
+        if used_outpoints.contains(&utxo.outpoint) {
+            return false;
+        }
+        if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
+            return false;
+        }
+        utxo.value > 0
+    });
+    candidates.sort_by(|a, b| {
+        a.value
+            .cmp(&b.value)
+            .then_with(|| a.confirmations.cmp(&b.confirmations))
+            .then_with(|| a.outpoint.hash.cmp(&b.outpoint.hash))
+            .then_with(|| a.outpoint.index.cmp(&b.outpoint.index))
+    });
+
+    let mut selected_value: i64 = 0;
+    let mut change_pos: i32 = -1;
+
+    const P2PKH_SCRIPTSIG_ESTIMATE: usize = 141;
+    let mut fee = 0i64;
+
+    for _ in 0..512 {
+        let estimated_size = estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?;
+        let min_fee = mempool_policy.min_relay_fee_for_size(estimated_size);
+
+        if min_fee != fee && fee == 0 {
+            fee = min_fee;
+        }
+
+        let required = recipient_value
+            .checked_add(fee)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+        let total_inputs = base_inputs_value
+            .checked_add(selected_value)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+
+        if total_inputs < required {
+            let next = candidates
+                .pop()
+                .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "insufficient funds"))?;
+            used_outpoints.insert(next.outpoint.clone());
+            selected_value = selected_value
+                .checked_add(next.value)
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+            tx.vin.push(TxIn {
+                prevout: next.outpoint,
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            });
+            fee = mempool_policy
+                .min_relay_fee_for_size(estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?);
+            continue;
+        }
+
+        let mut change = total_inputs
+            .checked_sub(required)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+        let include_change = change > 0
+            && !is_dust(
+                change,
+                &change_script_pubkey,
+                mempool_policy.min_relay_fee_per_kb,
+            );
+        if change > 0 && !include_change && tx.vout.len() == recipient_vout_len + 1 {
+            tx.vout.pop();
+        }
+        if change > 0 && !include_change {
+            fee = fee
+                .checked_add(change)
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+            change = 0;
+        }
+
+        if change == 0 {
+            if tx.vout.len() == recipient_vout_len + 1 {
+                tx.vout.pop();
+            }
+            change_pos = -1;
+        } else if include_change {
+            if tx.vout.len() == recipient_vout_len {
+                tx.vout.push(TxOut {
+                    value: change,
+                    script_pubkey: change_script_pubkey.clone(),
+                });
+                change_pos = recipient_vout_len as i32;
+            } else if tx.vout.len() == recipient_vout_len + 1 {
+                if let Some(out) = tx.vout.get_mut(recipient_vout_len) {
+                    out.value = change;
+                }
+            }
+        }
+
+        let new_fee = mempool_policy
+            .min_relay_fee_for_size(estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?);
+        if new_fee > fee {
+            fee = new_fee;
+            continue;
+        }
+        break;
+    }
+
+    let final_outputs_value = tx.vout.iter().try_fold(0i64, |total, output| {
+        total
+            .checked_add(output.value)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))
+    })?;
+    let total_inputs = base_inputs_value
+        .checked_add(selected_value)
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+    let final_fee = total_inputs
+        .checked_sub(final_outputs_value)
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+    if final_fee < 0 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "outputs exceed inputs",
+        ));
+    }
+
+    let encoded = tx.consensus_encode().map_err(map_internal)?;
+    Ok(json!({
+        "hex": hex_bytes(&encoded),
+        "fee": amount_to_value(final_fee),
+        "fee_zat": final_fee,
+        "changepos": change_pos,
+    }))
+}
+
+fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    tx_announce: &broadcast::Sender<Hash256>,
+) -> Result<Value, RpcError> {
+    const DEFAULT_TX_EXPIRY_DELTA: u32 = 20;
+
+    if params.len() < 2 || params.len() > 9 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "sendtoaddress expects 2 to 9 parameters",
+        ));
+    }
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
+    let amount = parse_amount(&params[1])?;
+
+    if let Some(value) = params.get(4) {
+        if !value.is_null() {
+            let subtract_fee = parse_bool(value)?;
+            if subtract_fee {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "subtractfeefromamount not supported yet",
+                ));
+            }
+        }
+    }
+
+    let script_pubkey = address_to_script_pubkey(address, chain_params.network)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+
+    let next_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height.saturating_add(1))
+        .unwrap_or(1);
+    let sapling_active = network_upgrade_active(
+        next_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Acadia,
+    );
+
+    let tx = Transaction {
+        f_overwintered: sapling_active,
+        version: if sapling_active { 4 } else { 1 },
+        version_group_id: if sapling_active {
+            SAPLING_VERSION_GROUP_ID
+        } else {
+            0
+        },
+        vin: Vec::new(),
+        vout: vec![TxOut {
+            value: amount,
+            script_pubkey,
+        }],
+        lock_time: 0,
+        expiry_height: if sapling_active {
+            (next_height as u32).saturating_add(DEFAULT_TX_EXPIRY_DELTA)
+        } else {
+            0
+        },
+        value_balance: 0,
+        shielded_spends: Vec::new(),
+        shielded_outputs: Vec::new(),
+        join_splits: Vec::new(),
+        join_split_pub_key: [0u8; 32],
+        join_split_sig: [0u8; 64],
+        binding_sig: [0u8; 64],
+        fluxnode: None,
+    };
+
+    let unsigned_hex = hex_bytes(&tx.consensus_encode().map_err(map_internal)?);
+
+    let funded = rpc_fundrawtransaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        wallet,
+        vec![Value::String(unsigned_hex)],
+        chain_params,
+    )?;
+    let funded_hex = funded
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "fundrawtransaction returned no hex"))?
+        .to_string();
+
+    let signed = rpc_signrawtransaction(
+        chainstate,
+        mempool,
+        wallet,
+        vec![Value::String(funded_hex)],
+        chain_params,
+    )?;
+    let signed_obj = signed.as_object().ok_or_else(|| {
+        RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no object")
+    })?;
+    let complete = signed_obj
+        .get("complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !complete {
+        return Err(RpcError::new(
+            RPC_WALLET_ERROR,
+            "transaction could not be fully signed",
+        ));
+    }
+    let signed_hex = signed_obj
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no hex"))?
+        .to_string();
+
+    rpc_sendrawtransaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        mempool_metrics,
+        fee_estimator,
+        mempool_flags,
+        vec![Value::String(signed_hex)],
+        chain_params,
+        tx_announce,
+    )
 }
 
 fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
@@ -8866,6 +9638,74 @@ mod tests {
             row.get("confirmations").and_then(Value::as_i64),
             Some(i64::from(COINBASE_MATURITY))
         );
+    }
+
+    #[test]
+    fn sendtoaddress_funds_signs_and_broadcasts_sapling_tx_when_upgrade_active() {
+        let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x11u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("address");
+
+        let value = rpc_sendtoaddress(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![json!(to_address), json!("1.0")],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("parse txid");
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("mempool entry");
+        assert!(entry.tx.f_overwintered);
+        assert_eq!(entry.tx.version, 4);
+        assert_eq!(entry.tx.version_group_id, SAPLING_VERSION_GROUP_ID);
+        assert!(entry.tx.expiry_height > 0);
     }
 
     #[test]

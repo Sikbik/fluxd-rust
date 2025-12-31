@@ -164,7 +164,19 @@ Owner format: `owner: <name>` or `owner: TBD`.
 ## Wallet
 
 - [ ] [P1] Wallet database (keys, keypool, metadata) (owner: TBD)
+  - [x] `wallet.dat` key store (P2PKH keys + network tag)
+  - [x] Atomic wallet writes + deterministic key order
+  - [ ] Keypool/change-address management parity
+  - [ ] Wallet tx history / persistence (for `gettransaction`, etc.)
 - [ ] [P1] Transparent wallet RPCs (owner: TBD)
+  - [x] `getnewaddress`, `importprivkey`, `dumpprivkey`
+  - [x] `getbalance`, `listunspent`, `getwalletinfo` (partial fields)
+  - [x] `signmessage`
+  - [x] `fundrawtransaction` (P2PKH only)
+  - [x] `signrawtransaction` (P2PKH only)
+  - [x] `sendtoaddress` (P2PKH only; no `subtractfeefromamount`)
+  - [ ] `sendmany`/`sendfrom` parity
+  - [ ] `rescanblockchain`
 - [ ] [P1] Shielded wallet RPCs (owner: TBD)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)
 - [ ] [P2] Wallet encryption and key management parity (owner: TBD)
