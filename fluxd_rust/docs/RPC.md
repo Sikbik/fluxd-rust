@@ -78,7 +78,7 @@ Type notes:
 - `stop`
 - `restart`
 - `reindex`
-- `rescanblockchain [start_height] [stop_height]` (stub; wallet rescan not implemented)
+- `rescanblockchain [start_height] [stop_height]` (populates wallet tx history via the address delta index)
 - `getdbinfo`
 - `getnetworkinfo`
 - `getpeerinfo`
@@ -227,14 +227,18 @@ Fields:
 ### rescanblockchain
 
 - Params: optional `start_height`, `stop_height`.
-- Result: error `-4` (`wallet rescan not implemented`).
+- Result: object `{ "start_height": number, "stop_height": number }`.
+
+Notes:
+- This scans the address delta index for wallet scripts and stores discovered txids in `wallet.dat` (used by `getwalletinfo.txcount`).
 
 ### getwalletinfo
 
-- Result: basic wallet summary (balances are computed from the address index; txcount/keypool fields are placeholders).
+- Result: basic wallet summary (balances are computed from the address index; keypool fields are placeholders).
 
 Notes:
 - `unconfirmed_balance` is derived from spendable mempool outputs paying to the wallet.
+- `txcount` is backed by persisted wallet txids (populated by `rescanblockchain` and wallet send RPCs).
 
 ### getnewaddress
 

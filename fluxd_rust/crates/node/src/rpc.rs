@@ -993,7 +993,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "stop" => rpc_stop(params, shutdown_tx),
         "restart" => rpc_restart(params, shutdown_tx),
         "reindex" => rpc_reindex(params, data_dir, shutdown_tx),
-        "rescanblockchain" => rpc_rescanblockchain(params),
+        "rescanblockchain" => rpc_rescanblockchain(chainstate, wallet, params),
         "importaddress" => rpc_importaddress(wallet, params, chain_params),
         "importwallet" => rpc_importwallet(wallet, params),
         "getwalletinfo" => rpc_getwalletinfo(chainstate, mempool, wallet, params),
@@ -1237,17 +1237,85 @@ fn rpc_reindex(
     ))
 }
 
-fn rpc_rescanblockchain(params: Vec<Value>) -> Result<Value, RpcError> {
+fn rpc_rescanblockchain<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
     if params.len() > 2 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
             "rescanblockchain expects 0 to 2 parameters",
         ));
     }
-    Err(RpcError::new(
-        RPC_WALLET_ERROR,
-        "wallet rescan not implemented",
-    ))
+    let tip_height = best_block_height(chainstate)?;
+    let start_height = match params.get(0) {
+        Some(value) if !value.is_null() => parse_u32(value, "start_height")? as i32,
+        _ => 0,
+    };
+    let stop_height = match params.get(1) {
+        Some(value) if !value.is_null() => parse_u32(value, "stop_height")? as i32,
+        _ => tip_height,
+    };
+    if start_height < 0 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "start_height out of range",
+        ));
+    }
+    if stop_height < 0 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "stop_height out of range",
+        ));
+    }
+    let stop_height = stop_height.min(tip_height);
+    if stop_height < start_height {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "stop_height must be >= start_height",
+        ));
+    }
+
+    let scripts = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard
+            .all_script_pubkeys_including_watchonly()
+            .map_err(map_wallet_error)?
+    };
+    if scripts.is_empty() {
+        return Ok(json!({
+            "start_height": start_height,
+            "stop_height": stop_height,
+        }));
+    }
+
+    let mut txids = std::collections::BTreeSet::<Hash256>::new();
+    for script_pubkey in &scripts {
+        let mut visitor = |delta: fluxd_chainstate::address_deltas::AddressDeltaEntry| {
+            if delta.height < start_height as u32 || delta.height > stop_height as u32 {
+                return Ok(());
+            }
+            txids.insert(delta.txid);
+            Ok(())
+        };
+        chainstate
+            .for_each_address_delta(script_pubkey, &mut visitor)
+            .map_err(map_internal)?;
+    }
+
+    let _added = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .record_txids(txids.into_iter())
+        .map_err(map_wallet_error)?;
+
+    Ok(json!({
+        "start_height": start_height,
+        "stop_height": stop_height,
+    }))
 }
 
 fn rpc_importaddress(
@@ -2807,11 +2875,15 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
     }
 
-    let (key_count, pay_tx_fee_per_kb) = {
+    let (key_count, pay_tx_fee_per_kb, tx_count) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        (guard.key_count(), guard.pay_tx_fee_per_kb())
+        (
+            guard.key_count(),
+            guard.pay_tx_fee_per_kb(),
+            guard.tx_count(),
+        )
     };
 
     Ok(json!({
@@ -2823,7 +2895,7 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
         "unconfirmed_balance_zat": unconfirmed,
         "immature_balance": amount_to_value(immature),
         "immature_balance_zat": immature,
-        "txcount": 0,
+        "txcount": tx_count,
         "keypoololdest": 0,
         "keypoolsize": 0,
         "paytxfee": amount_to_value(pay_tx_fee_per_kb),
@@ -4513,6 +4585,15 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         chain_params,
         tx_announce,
     )
+    .and_then(|txid_value| {
+        let txid = parse_hash(&txid_value)?;
+        wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+            .record_txids(std::iter::once(txid))
+            .map_err(map_wallet_error)?;
+        Ok(txid_value)
+    })
 }
 
 fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
@@ -4648,6 +4729,15 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         chain_params,
         tx_announce,
     )
+    .and_then(|txid_value| {
+        let txid = parse_hash(&txid_value)?;
+        wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+            .record_txids(std::iter::once(txid))
+            .map_err(map_wallet_error)?;
+        Ok(txid_value)
+    })
 }
 
 fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
@@ -4812,6 +4902,15 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         chain_params,
         tx_announce,
     )
+    .and_then(|txid_value| {
+        let txid = parse_hash(&txid_value)?;
+        wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+            .record_txids(std::iter::once(txid))
+            .map_err(map_wallet_error)?;
+        Ok(txid_value)
+    })
 }
 
 fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
@@ -12660,9 +12759,57 @@ mod tests {
     }
 
     #[test]
-    fn rescanblockchain_returns_wallet_error() {
-        let err = rpc_rescanblockchain(Vec::new()).unwrap_err();
-        assert_eq!(err.code, RPC_WALLET_ERROR);
+    fn rescanblockchain_populates_wallet_txcount() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        mine_regtest_block_to_script(&chainstate, &params, script_pubkey);
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let info = rpc_getwalletinfo(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
+        assert_eq!(info.get("txcount").and_then(Value::as_u64), Some(0));
+
+        let value = rpc_rescanblockchain(&chainstate, &wallet, Vec::new()).expect("rpc");
+        assert_eq!(value.get("start_height").and_then(Value::as_i64), Some(0));
+        assert_eq!(value.get("stop_height").and_then(Value::as_i64), Some(2));
+
+        let info = rpc_getwalletinfo(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
+        assert_eq!(info.get("txcount").and_then(Value::as_u64), Some(2));
+    }
+
+    #[test]
+    fn rescanblockchain_accepts_height_range() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        mine_regtest_block_to_script(&chainstate, &params, script_pubkey);
+
+        let value =
+            rpc_rescanblockchain(&chainstate, &wallet, vec![json!(2), json!(2)]).expect("rpc");
+        assert_eq!(value.get("start_height").and_then(Value::as_i64), Some(2));
+        assert_eq!(value.get("stop_height").and_then(Value::as_i64), Some(2));
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let info = rpc_getwalletinfo(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
+        assert_eq!(info.get("txcount").and_then(Value::as_u64), Some(1));
     }
 
     #[test]

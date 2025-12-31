@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -7,6 +7,7 @@ use rand::RngCore;
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 
 use fluxd_consensus::params::Network;
+use fluxd_consensus::Hash256;
 use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
 use fluxd_primitives::hash::hash160;
 use fluxd_primitives::outpoint::OutPoint;
@@ -15,7 +16,7 @@ use fluxd_script::message::signed_message_hash;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 2;
+pub const WALLET_FILE_VERSION: u32 = 3;
 
 #[derive(Debug)]
 pub enum WalletError {
@@ -102,6 +103,7 @@ pub struct Wallet {
     network: Network,
     keys: Vec<WalletKey>,
     watch_scripts: Vec<Vec<u8>>,
+    tx_history: BTreeSet<Hash256>,
     revision: u64,
     locked_outpoints: HashSet<OutPoint>,
     pay_tx_fee_per_kb: i64,
@@ -120,6 +122,7 @@ impl Wallet {
                 network,
                 keys: Vec::new(),
                 watch_scripts: Vec::new(),
+                tx_history: BTreeSet::new(),
                 revision: 0,
                 locked_outpoints: HashSet::new(),
                 pay_tx_fee_per_kb: 0,
@@ -145,6 +148,26 @@ impl Wallet {
 
     pub fn key_count(&self) -> usize {
         self.keys.len()
+    }
+
+    pub fn tx_count(&self) -> usize {
+        self.tx_history.len()
+    }
+
+    pub fn record_txids(
+        &mut self,
+        txids: impl IntoIterator<Item = Hash256>,
+    ) -> Result<usize, WalletError> {
+        let prev_len = self.tx_history.len();
+        for txid in txids {
+            self.tx_history.insert(txid);
+        }
+        let added = self.tx_history.len().saturating_sub(prev_len);
+        if added > 0 {
+            self.save()?;
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(added)
     }
 
     pub fn lock_outpoint(&mut self, outpoint: OutPoint) {
@@ -350,7 +373,7 @@ impl Wallet {
     fn decode(path: &Path, expected_network: Network, bytes: &[u8]) -> Result<Self, WalletError> {
         let mut decoder = Decoder::new(bytes);
         let version = decoder.read_u32_le()?;
-        if version != 1 && version != WALLET_FILE_VERSION {
+        if version != 1 && version != 2 && version != WALLET_FILE_VERSION {
             return Err(WalletError::InvalidData("unsupported wallet file version"));
         }
         let network = decode_network(decoder.read_u8()?)?;
@@ -390,6 +413,17 @@ impl Wallet {
             Vec::new()
         };
 
+        let mut tx_history = BTreeSet::new();
+        if version >= 3 {
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("tx history count too large"))?;
+            for _ in 0..count {
+                let txid = decoder.read_fixed::<32>()?;
+                tx_history.insert(txid);
+            }
+        }
+
         if !decoder.is_empty() {
             return Err(WalletError::InvalidData("wallet file has trailing bytes"));
         }
@@ -398,6 +432,7 @@ impl Wallet {
             network,
             keys,
             watch_scripts,
+            tx_history,
             revision: 0,
             locked_outpoints: HashSet::new(),
             pay_tx_fee_per_kb,
@@ -418,6 +453,11 @@ impl Wallet {
         encoder.write_varint(self.watch_scripts.len() as u64);
         for script in &self.watch_scripts {
             encoder.write_var_bytes(script);
+        }
+
+        encoder.write_varint(self.tx_history.len() as u64);
+        for txid in &self.tx_history {
+            encoder.write_bytes(txid);
         }
         let bytes = encoder.into_inner();
         write_file_atomic(&self.path, &bytes)?;

@@ -169,7 +169,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Persist watch-only scripts in `wallet.dat` (v2; `importaddress`)
   - [x] Persist `paytxfee` in `wallet.dat` (v2; `settxfee`)
   - [ ] Keypool/change-address management parity
-  - [ ] Wallet tx history / persistence (for `gettransaction`, etc.)
+  - [x] Wallet tx history / persistence (txid set in `wallet.dat` v3; updated by `rescanblockchain` + wallet send RPCs)
 - [ ] [P1] Transparent wallet RPCs (owner: TBD)
   - [x] `importaddress` (watch-only; rescan is a no-op due to address index)
   - [x] `importwallet` (best-effort WIF import from dump file)
@@ -197,7 +197,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `sendtoaddress` (P2PKH only; no `subtractfeefromamount`)
   - [x] `sendmany` (P2PKH only; no `subtractfeefromamount`)
   - [x] `sendfrom` (fromaccount ignored; minconf supported)
-  - [ ] `rescanblockchain`
+  - [x] `rescanblockchain` (scans address delta index; populates wallet tx history)
 - [ ] [P1] Shielded wallet RPCs (owner: TBD)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)
 - [ ] [P2] Wallet encryption and key management parity (owner: TBD)
