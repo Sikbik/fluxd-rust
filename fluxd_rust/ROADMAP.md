@@ -181,8 +181,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `getreceivedbyaddress` (P2PKH only)
   - [x] `gettransaction` (partial)
     - [x] `include_watchonly` support
+    - [x] `involvesWatchonly` output flag
   - [x] `listtransactions` (partial)
     - [x] `include_watchonly` support
+    - [x] `involvesWatchonly` output flag
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index

@@ -2029,16 +2029,19 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         Some(value) => parse_bool(value)?,
     };
 
-    let wallet_scripts = {
+    let (wallet_scripts, owned_set) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let owned_scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
         if include_watchonly {
-            guard
+            let scripts = guard
                 .all_script_pubkeys_including_watchonly()
-                .map_err(map_wallet_error)?
+                .map_err(map_wallet_error)?;
+            let owned_set = owned_scripts.into_iter().collect::<HashSet<_>>();
+            (scripts, Some(owned_set))
         } else {
-            guard.all_script_pubkeys().map_err(map_wallet_error)?
+            (owned_scripts, None)
         }
     };
     if wallet_scripts.is_empty() {
@@ -2047,6 +2050,11 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
             "Invalid or non-wallet transaction id",
         ));
     }
+
+    let script_is_watchonly = |script_pubkey: &[u8]| match &owned_set {
+        None => false,
+        Some(set) => !set.contains(script_pubkey),
+    };
 
     let wallet_contains_script = |script_pubkey: &[u8]| {
         wallet_scripts
@@ -2058,10 +2066,14 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         if let Some(entry) = mempool_guard.get(&txid) {
             let mut amount_zat: i64 = 0;
             let mut details = Vec::new();
+            let mut involves_watchonly = false;
 
             for (vout, output) in entry.tx.vout.iter().enumerate() {
                 if !wallet_contains_script(&output.script_pubkey) {
                     continue;
+                }
+                if script_is_watchonly(&output.script_pubkey) {
+                    involves_watchonly = true;
                 }
                 amount_zat = amount_zat
                     .checked_add(output.value)
@@ -2094,6 +2106,9 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 if !wallet_contains_script(&script_pubkey) {
                     continue;
                 }
+                if script_is_watchonly(&script_pubkey) {
+                    involves_watchonly = true;
+                }
                 amount_zat = amount_zat
                     .checked_sub(value)
                     .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
@@ -2121,6 +2136,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 "amount": amount_to_value(amount_zat),
                 "amount_zat": amount_zat,
                 "confirmations": 0,
+                "involvesWatchonly": involves_watchonly,
                 "txid": hash256_to_hex(&txid),
                 "time": entry.time,
                 "timereceived": entry.time,
@@ -2133,6 +2149,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
 
     let mut amount_zat: i64 = 0;
     let mut details = Vec::new();
+    let mut involves_watchonly = false;
     for script_pubkey in &wallet_scripts {
         let Some(address) = script_pubkey_to_address(script_pubkey, chain_params.network) else {
             return Err(RpcError::new(
@@ -2143,6 +2160,9 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         let mut visitor = |delta: fluxd_chainstate::address_deltas::AddressDeltaEntry| {
             if delta.txid != txid {
                 return Ok(());
+            }
+            if script_is_watchonly(script_pubkey) {
+                involves_watchonly = true;
             }
             amount_zat = amount_zat.checked_add(delta.satoshis).ok_or_else(|| {
                 fluxd_storage::StoreError::Backend("gettransaction overflow".to_string())
@@ -2198,6 +2218,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         "amount": amount_to_value(amount_zat),
         "amount_zat": amount_zat,
         "confirmations": -1,
+        "involvesWatchonly": involves_watchonly,
         "txid": hash256_to_hex(&txid),
         "time": block.header.time,
         "timereceived": block.header.time,
@@ -2416,6 +2437,9 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
 
         let mut row = serde_json::Map::new();
         row.insert("account".to_string(), Value::String(String::new()));
+        if let Some(value) = obj.get("involvesWatchonly") {
+            row.insert("involvesWatchonly".to_string(), value.clone());
+        }
         if let Some(address) = address {
             row.insert("address".to_string(), Value::String(address));
         }
@@ -11975,6 +11999,10 @@ mod tests {
             Some(miner_value)
         );
         assert_eq!(obj.get("confirmations").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            obj.get("involvesWatchonly").and_then(Value::as_bool),
+            Some(false)
+        );
         let details = obj
             .get("details")
             .and_then(Value::as_array)
@@ -12125,6 +12153,10 @@ mod tests {
         assert_eq!(
             obj.get("amount_zat").and_then(Value::as_i64),
             Some(miner_value)
+        );
+        assert_eq!(
+            obj.get("involvesWatchonly").and_then(Value::as_bool),
+            Some(true)
         );
     }
 
@@ -12279,6 +12311,10 @@ mod tests {
         assert_eq!(
             row.get("amount_zat").and_then(Value::as_i64),
             Some(miner_value)
+        );
+        assert_eq!(
+            row.get("involvesWatchonly").and_then(Value::as_bool),
+            Some(true)
         );
     }
 

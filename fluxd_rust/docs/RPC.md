@@ -293,10 +293,16 @@ Notes:
 - Params: `<txid> [include_watchonly]` (partial; `include_watchonly=true` includes watch-only scripts imported via `importaddress`).
 - Result: best-effort wallet view of a transaction (confirmed txs via address deltas + tx index; mempool txs via script matching).
 
+Notes:
+- `involvesWatchonly` is set when the transaction touches watch-only scripts.
+
 ### listtransactions
 
 - Params: `[account] [count] [skip] [include_watchonly]` (partial; `account` is ignored, `include_watchonly` is honored).
 - Result: array of wallet transactions (confirmed txs ordered by height; mempool txs ordered by entry time).
+
+Notes:
+- `involvesWatchonly` is set when the transaction touches watch-only scripts.
 
 ### listreceivedbyaddress
 
