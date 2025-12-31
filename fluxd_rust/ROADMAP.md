@@ -170,6 +170,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [ ] Wallet tx history / persistence (for `gettransaction`, etc.)
 - [ ] [P1] Transparent wallet RPCs (owner: TBD)
   - [x] `getnewaddress`, `importprivkey`, `dumpprivkey`
+  - [x] `getrawchangeaddress`
   - [x] `getbalance`, `listunspent`, `getwalletinfo` (partial fields)
   - [x] `signmessage`
   - [x] `fundrawtransaction` (P2PKH only)

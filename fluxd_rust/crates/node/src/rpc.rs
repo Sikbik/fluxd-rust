@@ -91,6 +91,7 @@ const RPC_METHODS: &[&str] = &[
     "reindex",
     "rescanblockchain",
     "getnewaddress",
+    "getrawchangeaddress",
     "importprivkey",
     "dumpprivkey",
     "getbalance",
@@ -980,6 +981,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "rescanblockchain" => rpc_rescanblockchain(params),
         "getwalletinfo" => rpc_getwalletinfo(chainstate, mempool, wallet, params),
         "getnewaddress" => rpc_getnewaddress(wallet, params),
+        "getrawchangeaddress" => rpc_getrawchangeaddress(wallet, params),
         "importprivkey" => rpc_importprivkey(wallet, params),
         "dumpprivkey" => rpc_dumpprivkey(wallet, params, chain_params),
         "signmessage" => rpc_signmessage(wallet, params, chain_params),
@@ -1268,6 +1270,28 @@ fn rpc_getnewaddress(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
                 "label must be a string",
+            ));
+        }
+    }
+    let mut guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    let address = guard.generate_new_address(true).map_err(map_wallet_error)?;
+    Ok(Value::String(address))
+}
+
+fn rpc_getrawchangeaddress(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getrawchangeaddress expects 0 or 1 parameter",
+        ));
+    }
+    if let Some(value) = params.get(0) {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "address_type must be a string",
             ));
         }
     }
@@ -2903,7 +2927,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     mempool_policy: &MempoolPolicy,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
-    _chain_params: &ChainParams,
+    chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
     if params.is_empty() || params.len() > 2 {
         return Err(RpcError::new(
@@ -2975,10 +2999,9 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             let _ = guard.generate_new_address(true).map_err(map_wallet_error)?;
         }
         let scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
-        let change_script = scripts
-            .first()
-            .cloned()
-            .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "wallet has no keys"))?;
+        let change_address = guard.generate_new_address(true).map_err(map_wallet_error)?;
+        let change_script = address_to_script_pubkey(&change_address, chain_params.network)
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid change address"))?;
         (scripts, change_script)
     };
 
@@ -9539,6 +9562,26 @@ mod tests {
 
         let err = rpc_dumpprivkey(&wallet, vec![json!("t1invalidaddress")], &params).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[test]
+    fn wallet_getrawchangeaddress_and_dumpprivkey_roundtrip() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address = rpc_getrawchangeaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let wif = rpc_dumpprivkey(&wallet, vec![json!(address)], &params)
+            .expect("rpc")
+            .as_str()
+            .expect("wif string")
+            .to_string();
+
+        let decoded = wif_to_secret_key(&wif, params.network);
+        assert!(decoded.is_ok(), "wif should decode");
     }
 
     #[test]

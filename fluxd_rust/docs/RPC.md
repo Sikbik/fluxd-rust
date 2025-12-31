@@ -127,6 +127,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 
 - `getwalletinfo` (partial)
 - `getnewaddress [label]` (label ignored)
+- `getrawchangeaddress [address_type]` (partial; address_type ignored)
 - `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
 - `dumpprivkey <address>`
 - `signmessage <address> <message>`
@@ -225,6 +226,11 @@ Fields:
 
 ### getnewaddress
 
+- Result: new transparent P2PKH address (persisted to `wallet.dat`).
+
+### getrawchangeaddress
+
+- Params: optional `address_type` (string; currently ignored).
 - Result: new transparent P2PKH address (persisted to `wallet.dat`).
 
 ### importprivkey

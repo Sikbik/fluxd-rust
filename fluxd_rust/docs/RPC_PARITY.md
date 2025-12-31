@@ -121,7 +121,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - dumpprivkey - Implemented (P2PKH only)
 - getbalance - Partial (minconf supported; accounts/watchonly/unconfirmed are placeholders)
 - getnewaddress - Implemented (P2PKH only; random keys; label ignored)
-- getrawchangeaddress - Missing
+- getrawchangeaddress - Partial (P2PKH only; address_type param ignored)
 - getreceivedbyaddress - Missing
 - getunconfirmedbalance - Missing
 - getwalletinfo - Partial (balance fields are real; txcount/keypool fields are placeholders)
