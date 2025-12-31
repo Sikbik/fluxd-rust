@@ -200,6 +200,7 @@ If you do not specify user/pass, the daemon writes `rpc.cookie` into `--data-dir
 Endpoints:
 - `/` - HTML dashboard.
 - `/stats` - JSON stats.
+- `/metrics` - Prometheus-style plaintext metrics (derived from `/stats`).
 - `/healthz` - simple liveness probe.
 
 ## Maintenance modes

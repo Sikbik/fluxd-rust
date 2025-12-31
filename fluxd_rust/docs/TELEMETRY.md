@@ -3,6 +3,12 @@
 This document describes the runtime counters exposed by the dashboard `/stats` endpoint and how to
 use them to debug sync throughput issues (headers and block indexing).
 
+## `/metrics` (Prometheus)
+
+When the dashboard is enabled, `fluxd` also serves `/metrics` in Prometheus text format.
+It exports the same underlying counters as `/stats` (prefixed with `fluxd_`), which makes it easy
+to build dashboards and alerts (e.g. using `rate(fluxd_commit_blocks_total[5m])`).
+
 ## `/stats` basics
 
 `/stats` returns **cumulative counters** since process start. To get per-second rates or per-block

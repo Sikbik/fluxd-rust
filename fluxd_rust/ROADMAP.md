@@ -181,7 +181,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `--db-info`
   - [x] `--scan-flatfiles`
   - [x] `--scan-supply`
-- [ ] [P2] Metrics export (Prometheus or similar) (owner: TBD)
+- [x] [P2] Metrics export (Prometheus `/metrics`) (owner: TBD)
 - [ ] [P2] Log levels and structured logging parity (owner: TBD)
 - [ ] [P2] Database migrations and upgrade path (owner: TBD)
 

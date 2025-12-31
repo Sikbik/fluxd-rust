@@ -129,6 +129,30 @@ async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
                 format!("stats error: {err}"),
             ),
         },
+        ("GET", "/metrics") => match snapshot_stats(
+            &chainstate,
+            Some(store.as_ref()),
+            network,
+            backend,
+            start_time,
+            Some(&metrics),
+            Some(&header_metrics),
+            Some(&validation_metrics),
+            Some(&connect_metrics),
+            Some(mempool.as_ref()),
+            Some(mempool_metrics.as_ref()),
+        ) {
+            Ok(stats) => (
+                "200 OK",
+                "text/plain; version=0.0.4; charset=utf-8",
+                stats.to_prometheus(),
+            ),
+            Err(err) => (
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                format!("metrics error: {err}"),
+            ),
+        },
         ("GET", "/healthz") => ("200 OK", "text/plain; charset=utf-8", "ok".to_string()),
         _ => (
             "404 Not Found",

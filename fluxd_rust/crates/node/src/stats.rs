@@ -310,6 +310,200 @@ impl StatsSnapshot {
         json.push('}');
         json
     }
+
+    pub fn to_prometheus(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::with_capacity(4096);
+        let labels = format!("network=\"{}\",backend=\"{}\"", self.network, self.backend);
+
+        let _ = writeln!(
+            &mut out,
+            "# HELP fluxd_info Build and network metadata\n# TYPE fluxd_info gauge\nfluxd_info{{{labels},version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        );
+
+        macro_rules! gauge {
+            ($name:expr, $value:expr) => {
+                let _ = writeln!(&mut out, "{}{{{}}} {}", $name, labels, $value);
+            };
+        }
+
+        gauge!("fluxd_best_header_height", self.best_header_height);
+        gauge!("fluxd_best_block_height", self.best_block_height);
+        gauge!("fluxd_header_count", self.header_count);
+        gauge!("fluxd_block_count", self.block_count);
+        gauge!("fluxd_header_gap", self.header_gap);
+        gauge!("fluxd_uptime_secs", self.uptime_secs);
+        gauge!("fluxd_unix_time_secs", self.unix_time_secs);
+
+        gauge!("fluxd_mempool_size", self.mempool_size);
+        gauge!("fluxd_mempool_bytes", self.mempool_bytes);
+        gauge!("fluxd_mempool_max_bytes", self.mempool_max_bytes);
+
+        gauge!("fluxd_mempool_rpc_accept_total", self.mempool_rpc_accept);
+        gauge!("fluxd_mempool_rpc_reject_total", self.mempool_rpc_reject);
+        gauge!(
+            "fluxd_mempool_relay_accept_total",
+            self.mempool_relay_accept
+        );
+        gauge!(
+            "fluxd_mempool_relay_reject_total",
+            self.mempool_relay_reject
+        );
+        gauge!("fluxd_mempool_evicted_total", self.mempool_evicted);
+        gauge!(
+            "fluxd_mempool_evicted_bytes_total",
+            self.mempool_evicted_bytes
+        );
+        gauge!("fluxd_mempool_loaded_total", self.mempool_loaded);
+        gauge!("fluxd_mempool_load_reject_total", self.mempool_load_reject);
+        gauge!(
+            "fluxd_mempool_persisted_writes_total",
+            self.mempool_persisted_writes
+        );
+        gauge!(
+            "fluxd_mempool_persisted_bytes_total",
+            self.mempool_persisted_bytes
+        );
+
+        gauge!("fluxd_download_us_total", self.download_us);
+        gauge!("fluxd_download_blocks_total", self.download_blocks);
+        gauge!("fluxd_verify_us_total", self.verify_us);
+        gauge!("fluxd_verify_blocks_total", self.verify_blocks);
+        gauge!("fluxd_commit_us_total", self.commit_us);
+        gauge!("fluxd_commit_blocks_total", self.commit_blocks);
+
+        gauge!("fluxd_header_request_us_total", self.header_request_us);
+        gauge!(
+            "fluxd_header_request_batches_total",
+            self.header_request_batches
+        );
+        gauge!("fluxd_header_validate_us_total", self.header_validate_us);
+        gauge!(
+            "fluxd_header_validate_headers_total",
+            self.header_validate_headers
+        );
+        gauge!("fluxd_header_commit_us_total", self.header_commit_us);
+        gauge!(
+            "fluxd_header_commit_headers_total",
+            self.header_commit_headers
+        );
+        gauge!("fluxd_header_pow_us_total", self.header_pow_us);
+        gauge!("fluxd_header_pow_headers_total", self.header_pow_headers);
+
+        gauge!("fluxd_validate_us_total", self.validate_us);
+        gauge!("fluxd_validate_blocks_total", self.validate_blocks);
+        gauge!("fluxd_script_us_total", self.script_us);
+        gauge!("fluxd_script_blocks_total", self.script_blocks);
+        gauge!("fluxd_shielded_us_total", self.shielded_us);
+        gauge!("fluxd_shielded_txs_total", self.shielded_txs);
+
+        gauge!("fluxd_utxo_us_total", self.utxo_us);
+        gauge!("fluxd_utxo_blocks_total", self.utxo_blocks);
+        gauge!("fluxd_index_us_total", self.index_us);
+        gauge!("fluxd_index_blocks_total", self.index_blocks);
+        gauge!("fluxd_anchor_us_total", self.anchor_us);
+        gauge!("fluxd_anchor_blocks_total", self.anchor_blocks);
+        gauge!("fluxd_flatfile_us_total", self.flatfile_us);
+        gauge!("fluxd_flatfile_blocks_total", self.flatfile_blocks);
+
+        gauge!("fluxd_utxo_get_us_total", self.utxo_get_us);
+        gauge!("fluxd_utxo_get_ops_total", self.utxo_get_ops);
+        gauge!("fluxd_utxo_cache_hits_total", self.utxo_cache_hits);
+        gauge!("fluxd_utxo_cache_misses_total", self.utxo_cache_misses);
+        gauge!("fluxd_utxo_put_us_total", self.utxo_put_us);
+        gauge!("fluxd_utxo_put_ops_total", self.utxo_put_ops);
+        gauge!("fluxd_utxo_delete_us_total", self.utxo_delete_us);
+        gauge!("fluxd_utxo_delete_ops_total", self.utxo_delete_ops);
+        gauge!("fluxd_spent_index_ops_total", self.spent_index_ops);
+        gauge!(
+            "fluxd_address_index_inserts_total",
+            self.address_index_inserts
+        );
+        gauge!(
+            "fluxd_address_index_deletes_total",
+            self.address_index_deletes
+        );
+        gauge!(
+            "fluxd_address_delta_inserts_total",
+            self.address_delta_inserts
+        );
+        gauge!("fluxd_tx_index_ops_total", self.tx_index_ops);
+        gauge!("fluxd_header_index_ops_total", self.header_index_ops);
+        gauge!("fluxd_timestamp_index_ops_total", self.timestamp_index_ops);
+
+        gauge!("fluxd_undo_encode_us_total", self.undo_encode_us);
+        gauge!("fluxd_undo_bytes_total", self.undo_bytes);
+        gauge!("fluxd_undo_append_us_total", self.undo_append_us);
+
+        if let Some(value) = self.db_write_buffer_bytes {
+            gauge!("fluxd_db_write_buffer_bytes", value);
+        }
+        if let Some(value) = self.db_max_write_buffer_bytes {
+            gauge!("fluxd_db_max_write_buffer_bytes", value);
+        }
+        if let Some(value) = self.db_journal_count {
+            gauge!("fluxd_db_journal_count", value);
+        }
+        if let Some(value) = self.db_journal_disk_space_bytes {
+            gauge!("fluxd_db_journal_disk_space_bytes", value);
+        }
+        if let Some(value) = self.db_max_journal_bytes {
+            gauge!("fluxd_db_max_journal_bytes", value);
+        }
+        if let Some(value) = self.db_flushes_completed {
+            gauge!("fluxd_db_flushes_completed_total", value);
+        }
+        if let Some(value) = self.db_active_compactions {
+            gauge!("fluxd_db_active_compactions", value);
+        }
+        if let Some(value) = self.db_compactions_completed {
+            gauge!("fluxd_db_compactions_completed_total", value);
+        }
+        if let Some(value) = self.db_time_compacting_us {
+            gauge!("fluxd_db_time_compacting_us_total", value);
+        }
+
+        if let Some(value) = self.db_utxo_segments {
+            gauge!("fluxd_db_utxo_segments", value);
+        }
+        if let Some(value) = self.db_utxo_flushes_completed {
+            gauge!("fluxd_db_utxo_flushes_completed_total", value);
+        }
+        if let Some(value) = self.db_tx_index_segments {
+            gauge!("fluxd_db_tx_index_segments", value);
+        }
+        if let Some(value) = self.db_tx_index_flushes_completed {
+            gauge!("fluxd_db_tx_index_flushes_completed_total", value);
+        }
+        if let Some(value) = self.db_spent_index_segments {
+            gauge!("fluxd_db_spent_index_segments", value);
+        }
+        if let Some(value) = self.db_spent_index_flushes_completed {
+            gauge!("fluxd_db_spent_index_flushes_completed_total", value);
+        }
+        if let Some(value) = self.db_address_outpoint_segments {
+            gauge!("fluxd_db_address_outpoint_segments", value);
+        }
+        if let Some(value) = self.db_address_outpoint_flushes_completed {
+            gauge!("fluxd_db_address_outpoint_flushes_completed_total", value);
+        }
+        if let Some(value) = self.db_address_delta_segments {
+            gauge!("fluxd_db_address_delta_segments", value);
+        }
+        if let Some(value) = self.db_address_delta_flushes_completed {
+            gauge!("fluxd_db_address_delta_flushes_completed_total", value);
+        }
+        if let Some(value) = self.db_header_index_segments {
+            gauge!("fluxd_db_header_index_segments", value);
+        }
+        if let Some(value) = self.db_header_index_flushes_completed {
+            gauge!("fluxd_db_header_index_flushes_completed_total", value);
+        }
+
+        out
+    }
 }
 
 fn push_json_u64_opt(json: &mut String, value: Option<u64>) {
