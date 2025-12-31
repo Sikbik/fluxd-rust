@@ -120,6 +120,7 @@ const RPC_METHODS: &[&str] = &[
     "signrawtransaction",
     "sendrawtransaction",
     "sendtoaddress",
+    "sendmany",
     "getmempoolinfo",
     "getrawmempool",
     "gettxout",
@@ -1025,6 +1026,18 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             tx_announce,
         ),
         "sendtoaddress" => rpc_sendtoaddress(
+            chainstate,
+            mempool,
+            mempool_policy,
+            mempool_metrics,
+            fee_estimator,
+            mempool_flags,
+            wallet,
+            params,
+            chain_params,
+            tx_announce,
+        ),
+        "sendmany" => rpc_sendmany(
             chainstate,
             mempool,
             mempool_policy,
@@ -2952,12 +2965,20 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         ));
     }
 
+    let mut minconf = 1i32;
     if let Some(value) = params.get(1) {
         if !value.is_null() && !value.is_object() {
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
                 "options must be an object",
             ));
+        }
+        if let Some(opts) = value.as_object() {
+            if let Some(raw_minconf) = opts.get("minconf") {
+                let parsed = parse_u32(raw_minconf, "minconf")?;
+                minconf = i32::try_from(parsed)
+                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "minconf out of range"))?;
+            }
         }
     }
 
@@ -3011,6 +3032,9 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             return false;
         }
         if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
+            return false;
+        }
+        if utxo.confirmations < minconf {
             return false;
         }
         utxo.value > 0
@@ -3224,6 +3248,170 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         mempool_policy,
         wallet,
         vec![Value::String(unsigned_hex)],
+        chain_params,
+    )?;
+    let funded_hex = funded
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "fundrawtransaction returned no hex"))?
+        .to_string();
+
+    let signed = rpc_signrawtransaction(
+        chainstate,
+        mempool,
+        wallet,
+        vec![Value::String(funded_hex)],
+        chain_params,
+    )?;
+    let signed_obj = signed.as_object().ok_or_else(|| {
+        RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no object")
+    })?;
+    let complete = signed_obj
+        .get("complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !complete {
+        return Err(RpcError::new(
+            RPC_WALLET_ERROR,
+            "transaction could not be fully signed",
+        ));
+    }
+    let signed_hex = signed_obj
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no hex"))?
+        .to_string();
+
+    rpc_sendrawtransaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        mempool_metrics,
+        fee_estimator,
+        mempool_flags,
+        vec![Value::String(signed_hex)],
+        chain_params,
+        tx_announce,
+    )
+}
+
+fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    tx_announce: &broadcast::Sender<Hash256>,
+) -> Result<Value, RpcError> {
+    const DEFAULT_TX_EXPIRY_DELTA: u32 = 20;
+
+    if params.len() < 2 || params.len() > 5 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "sendmany expects 2 to 5 parameters",
+        ));
+    }
+    let _from_account = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "fromaccount must be a string"))?;
+    let outputs = params[1]
+        .as_object()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "amounts must be a json object"))?;
+    if outputs.is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "amounts is empty"));
+    }
+
+    let minconf = match params.get(2) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")?,
+        _ => 1,
+    };
+    if let Some(value) = params.get(3) {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "comment must be a string",
+            ));
+        }
+    }
+    if let Some(value) = params.get(4) {
+        if !value.is_null() {
+            let subtract = value.as_array().ok_or_else(|| {
+                RpcError::new(RPC_INVALID_PARAMETER, "subtractfeefrom must be an array")
+            })?;
+            if !subtract.is_empty() {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "subtractfeefromamount not supported yet",
+                ));
+            }
+        }
+    }
+
+    let next_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height.saturating_add(1))
+        .unwrap_or(1);
+    let sapling_active = network_upgrade_active(
+        next_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Acadia,
+    );
+
+    let mut vout = Vec::with_capacity(outputs.len());
+    for (address, amount) in outputs {
+        let value = parse_amount(amount)?;
+        let script_pubkey = address_to_script_pubkey(address, chain_params.network)
+            .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        if mempool_policy.require_standard
+            && is_dust(value, &script_pubkey, mempool_policy.min_relay_fee_per_kb)
+        {
+            return Err(RpcError::new(RPC_INVALID_PARAMETER, "dust"));
+        }
+        vout.push(TxOut {
+            value,
+            script_pubkey,
+        });
+    }
+
+    let tx = Transaction {
+        f_overwintered: sapling_active,
+        version: if sapling_active { 4 } else { 1 },
+        version_group_id: if sapling_active {
+            SAPLING_VERSION_GROUP_ID
+        } else {
+            0
+        },
+        vin: Vec::new(),
+        vout,
+        lock_time: 0,
+        expiry_height: if sapling_active {
+            (next_height as u32).saturating_add(DEFAULT_TX_EXPIRY_DELTA)
+        } else {
+            0
+        },
+        value_balance: 0,
+        shielded_spends: Vec::new(),
+        shielded_outputs: Vec::new(),
+        join_splits: Vec::new(),
+        join_split_pub_key: [0u8; 32],
+        join_split_sig: [0u8; 64],
+        binding_sig: [0u8; 64],
+        fluxnode: None,
+    };
+
+    let unsigned_hex = hex_bytes(&tx.consensus_encode().map_err(map_internal)?);
+
+    let funded = rpc_fundrawtransaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        wallet,
+        vec![Value::String(unsigned_hex), json!({ "minconf": minconf })],
         chain_params,
     )?;
     let funded_hex = funded
@@ -9749,6 +9937,96 @@ mod tests {
         assert_eq!(entry.tx.version, 4);
         assert_eq!(entry.tx.version_group_id, SAPLING_VERSION_GROUP_ID);
         assert!(entry.tx.expiry_height > 0);
+    }
+
+    #[test]
+    fn sendmany_funds_signs_and_broadcasts_sapling_tx_when_upgrade_active() {
+        let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x12u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 10 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address_a =
+            script_pubkey_to_address(&p2pkh_script([0x21u8; 20]), params.network).expect("address");
+        let to_address_b =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("address");
+        let mut amounts = serde_json::Map::new();
+        amounts.insert(to_address_a.clone(), json!("1.0"));
+        amounts.insert(to_address_b.clone(), json!("2.0"));
+
+        let value = rpc_sendmany(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![json!(""), Value::Object(amounts), json!(1)],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("parse txid");
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("mempool entry");
+
+        assert!(entry.tx.f_overwintered);
+        assert_eq!(entry.tx.version, 4);
+        assert_eq!(entry.tx.version_group_id, SAPLING_VERSION_GROUP_ID);
+        assert!(entry.tx.expiry_height > 0);
+        assert!(entry.tx.vout.len() >= 3);
+
+        let script_a = address_to_script_pubkey(&to_address_a, params.network).expect("script a");
+        let script_b = address_to_script_pubkey(&to_address_b, params.network).expect("script b");
+        let mut found_a = false;
+        let mut found_b = false;
+        for output in &entry.tx.vout {
+            if output.value == COIN && output.script_pubkey == script_a {
+                found_a = true;
+            }
+            if output.value == 2 * COIN && output.script_pubkey == script_b {
+                found_b = true;
+            }
+        }
+        assert!(found_a);
+        assert!(found_b);
     }
 
     #[test]

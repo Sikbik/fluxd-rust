@@ -134,6 +134,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
 - `listunspent [minconf] [maxconf] [addresses]` (partial)
 - `sendtoaddress <address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
+- `sendmany <fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]` (partial)
 
 ### Mining and mempool
 
@@ -265,6 +266,17 @@ Fields:
 
 Notes:
 - Builds a transparent transaction, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
+- Currently only supports P2PKH wallet UTXOs and does not support `subtractfeefromamount`.
+
+### sendmany
+
+- Params: `<fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]` (partial)
+  - `fromaccount` is accepted for legacy compatibility but ignored.
+  - `amounts` is a JSON object mapping `"taddr": amount`.
+- Result: transaction id hex string.
+
+Notes:
+- Builds a transparent transaction with multiple outputs, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
 - Currently only supports P2PKH wallet UTXOs and does not support `subtractfeefromamount`.
 
 ### getdbinfo
@@ -441,7 +453,7 @@ Notes:
 
 - Params:
   - `hexstring` (string)
-  - optional `options` object (currently ignored)
+  - optional `options` object (partial; supports `minconf`)
 - Result: `{ "hex": "<funded_tx_hex>", "fee": <amount>, "changepos": <n> }`
 
 Notes:

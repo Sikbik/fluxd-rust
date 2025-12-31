@@ -176,7 +176,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `fundrawtransaction` (P2PKH only)
   - [x] `signrawtransaction` (P2PKH only)
   - [x] `sendtoaddress` (P2PKH only; no `subtractfeefromamount`)
-  - [ ] `sendmany`/`sendfrom` parity
+  - [x] `sendmany` (P2PKH only; no `subtractfeefromamount`)
+  - [ ] `sendfrom` parity
   - [ ] `rescanblockchain`
 - [ ] [P1] Shielded wallet RPCs (owner: TBD)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)
