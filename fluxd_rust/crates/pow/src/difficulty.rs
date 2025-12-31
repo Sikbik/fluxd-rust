@@ -371,8 +371,8 @@ fn lwma3_next_work_required(
     }
 
     let mut next = sum_target * U256::from(weighted_time as u64);
-    let max_target = previous_diff * U256::from(150u64) / U256::from(100u64);
-    let min_target = previous_diff * U256::from(67u64) / U256::from(100u64);
+    let max_target = previous_diff.saturating_add(previous_diff / U256::from(2u64));
+    let min_target = mul_div_u256(previous_diff, 67, 100);
 
     if next > max_target {
         next = max_target;
@@ -386,6 +386,24 @@ fn lwma3_next_work_required(
     }
 
     Ok(u256_to_compact(next))
+}
+
+fn mul_div_u256(value: U256, mul: u64, div: u64) -> U256 {
+    if div == 0 {
+        return U256::max_value();
+    }
+    let div_u = U256::from(div);
+    let q = value / div_u;
+    let r = value - q * div_u;
+    let (q_mul, overflow_q) = q.overflowing_mul(U256::from(mul));
+    let q_mul = if overflow_q { U256::max_value() } else { q_mul };
+    let r_mul = r * U256::from(mul);
+    let (sum, overflow_sum) = q_mul.overflowing_add(r_mul / div_u);
+    if overflow_sum {
+        U256::max_value()
+    } else {
+        sum
+    }
 }
 
 #[cfg(test)]
