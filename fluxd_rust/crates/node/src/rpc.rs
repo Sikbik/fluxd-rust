@@ -6785,6 +6785,40 @@ mod tests {
     }
 
     #[test]
+    fn getconnectioncount_has_cpp_schema() {
+        let net_totals = NetTotals::default();
+        let peer_registry = PeerRegistry::default();
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().expect("addr");
+        peer_registry.register(addr, PeerKind::Header);
+        let value = rpc_getconnectioncount(Vec::new(), &peer_registry, &net_totals).expect("rpc");
+        assert_eq!(value.as_i64(), Some(1));
+    }
+
+    #[test]
+    fn getdeprecationinfo_has_cpp_schema_keys() {
+        let value = rpc_getdeprecationinfo(Vec::new()).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in ["deprecated", "version", "subversion", "warnings"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn listbanned_has_cpp_schema_keys() {
+        let book = HeaderPeerBook::default();
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().expect("addr");
+        book.ban_for(addr, 60);
+
+        let value = rpc_listbanned(Vec::new(), &book).expect("rpc");
+        let entries = value.as_array().expect("array");
+        assert_eq!(entries.len(), 1);
+        let obj = entries[0].as_object().expect("object");
+        for key in ["address", "banned_until"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
     fn getblockcount_has_cpp_schema() {
         let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
         let value = rpc_getblockcount(&chainstate, Vec::new()).expect("rpc");
