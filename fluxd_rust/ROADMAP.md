@@ -205,6 +205,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Schema parity: raw tx/script RPCs (`createrawtransaction`, `decoderawtransaction`, `decodescript`, `validateaddress`, `verifymessage`, `createmultisig`, `getrawtransaction`)
   - [x] Schema parity: `getmempoolinfo`/`getrawmempool` required keys
   - [x] Schema parity: `gettxout` required keys (chain + mempool)
+  - [x] Schema parity: `gettxoutproof`/`verifytxoutproof` basic behavior
   - [x] Schema parity: `getspentinfo` required keys
   - [x] Schema parity: `getaddress*` required keys (`utxos`/`balance`/`deltas`/`txids`/`mempool`)
   - [x] Error-code parity: `getblockhash`/`getblockheader` invalid params + not-found

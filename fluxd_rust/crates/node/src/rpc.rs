@@ -6669,6 +6669,26 @@ mod tests {
     }
 
     #[test]
+    fn txoutproof_roundtrip_returns_txids() {
+        let (chainstate, _params, _data_dir, _address, txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+
+        let proof = rpc_gettxoutproof(
+            &chainstate,
+            vec![Value::Array(vec![Value::String(hash256_to_hex(&txid))])],
+        )
+        .expect("rpc");
+        let proof_hex = proof.as_str().expect("hex string").to_string();
+        assert!(bytes_from_hex(&proof_hex).is_some(), "proof should be hex");
+
+        let matches =
+            rpc_verifytxoutproof(&chainstate, vec![Value::String(proof_hex)]).expect("rpc");
+        let txids = matches.as_array().expect("array");
+        assert_eq!(txids.len(), 1);
+        assert_eq!(txids[0].as_str(), Some(hash256_to_hex(&txid).as_str()));
+    }
+
+    #[test]
     fn getinfo_has_cpp_schema_keys() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let net_totals = NetTotals::default();
