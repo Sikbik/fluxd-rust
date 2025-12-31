@@ -6819,6 +6819,80 @@ mod tests {
     }
 
     #[test]
+    fn addnode_and_getaddednodeinfo_have_cpp_schema_keys() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+
+        let addr_book = AddrBook::default();
+        let added_nodes = Mutex::new(HashSet::new());
+
+        rpc_addnode(
+            vec![
+                Value::String("127.0.0.1:16125".to_string()),
+                Value::String("add".to_string()),
+            ],
+            &params,
+            &addr_book,
+            &added_nodes,
+        )
+        .expect("addnode");
+
+        let peer_registry = PeerRegistry::default();
+        let addr: std::net::SocketAddr = "127.0.0.1:16125".parse().expect("addr");
+        peer_registry.register(addr, PeerKind::Header);
+
+        let value = rpc_getaddednodeinfo(Vec::new(), &params, &peer_registry, &added_nodes)
+            .expect("getaddednodeinfo");
+        let list = value.as_array().expect("array");
+        assert_eq!(list.len(), 1);
+        let obj = list[0].as_object().expect("object");
+        for key in ["addednode", "connected", "addresses"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        assert_eq!(obj.get("connected").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn disconnectnode_has_cpp_schema() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let peer_registry = PeerRegistry::default();
+        let value = rpc_disconnectnode(
+            vec![Value::String("127.0.0.1".to_string())],
+            &params,
+            &peer_registry,
+        )
+        .expect("disconnectnode");
+        assert!(value.is_null());
+    }
+
+    #[test]
+    fn setban_and_clearbanned_have_cpp_schema() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let peer_registry = PeerRegistry::default();
+        let book = HeaderPeerBook::default();
+
+        rpc_setban(
+            vec![
+                Value::String("127.0.0.1".to_string()),
+                Value::String("add".to_string()),
+                json!(60),
+            ],
+            &params,
+            &peer_registry,
+            &book,
+        )
+        .expect("setban");
+
+        let banned = rpc_listbanned(Vec::new(), &book).expect("listbanned");
+        let banned = banned.as_array().expect("array");
+        assert_eq!(banned.len(), 1);
+
+        rpc_clearbanned(Vec::new(), &book).expect("clearbanned");
+        let banned = rpc_listbanned(Vec::new(), &book).expect("listbanned");
+        let banned = banned.as_array().expect("array");
+        assert!(banned.is_empty());
+    }
+
+    #[test]
     fn getblockcount_has_cpp_schema() {
         let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
         let value = rpc_getblockcount(&chainstate, Vec::new()).expect("rpc");

@@ -197,6 +197,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Schema parity: `getnettotals` required keys
   - [x] Schema parity: `getpeerinfo` required keys
   - [x] Schema parity: `getconnectioncount`/`getdeprecationinfo`/`listbanned` required keys
+  - [x] Schema parity: node control RPCs (`addnode`, `getaddednodeinfo`, `disconnectnode`, `setban`, `clearbanned`)
   - [x] Schema parity: `getblockcount`/`getbestblockhash`/`getblockhash` required keys
   - [x] Schema parity: `getdifficulty`/`getchaintips` required keys
   - [x] Schema parity: `getblockheader`/`getblock` required keys
