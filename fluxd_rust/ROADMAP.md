@@ -212,12 +212,12 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Schema parity: `getaddress*` required keys (`utxos`/`balance`/`deltas`/`txids`/`mempool`)
   - [x] Error-code parity: `getblockhash`/`getblockheader` invalid params + not-found
   - [x] Error-code parity: `getspentinfo` not-found
-  - [ ] Expand schema checks across remaining RPCs (blocks/mempool/fluxnode/etc)
+  - [x] Expand schema checks across remaining RPCs (blocks/mempool/fluxnode/etc)
     - [x] Fluxnode RPC schemas (`getfluxnodecount`, `viewdeterministicfluxnodelist`, `fluxnodecurrentwinner`, `getfluxnodestatus`, `getstartlist`, `getdoslist`)
     - [x] Core daemon/control schemas (`help`, `ping`, `stop`, `restart`, `reindex`, `rescanblockchain`, `verifychain`)
     - [x] Mining metrics/template schemas (`getblocktemplate`, `getnetworkhashps`, `getnetworksolps`, `getlocalsolps`)
     - [x] Fluxnode admin/control schemas (`createfluxnodekey`, `listfluxnodeconf`, `getfluxnodeoutputs`, `startfluxnode`, `startdeterministicfluxnode`)
-- [ ] [P1] Long-run sync tests with regression gates (owner: TBD)
+- [x] [P1] Long-run sync tests with regression gates (owner: TBD)
   - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity (supports seeding peers.dat and progress thresholds)
   - [x] VPS progress gate (`scripts/progress_gate.sh`) to detect stalls/regressions during sync
   - [x] VPS watchdog loop (`scripts/longrun_watchdog.sh`) to combine stall detection + fatal log pattern checks
