@@ -42,6 +42,18 @@ If peer discovery is slow on your VPS, seed the smoke test from an existing data
 ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/remote_smoke_test.sh --profile high --seed-peers-from <remote-data-dir> --min-headers-advance 1\"'"
 ```
 
+## Progress gate (stall detection)
+
+When doing a fresh sync (and expecting steady progress), you can run a simple RPC-based
+progress gate against the long-running instance:
+
+```bash
+ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/progress_gate.sh --data-dir <remote-data-dir> --window-secs 120 --min-blocks-advance 1\"'"
+```
+
+This command exits non-zero if the node is behind the peer best height (or has a headers>blocks gap)
+but fails to advance blocks during the observation window.
+
 ## Run
 
 ```bash
