@@ -6465,6 +6465,108 @@ mod tests {
             assert!(obj.contains_key(key), "missing key {key}");
         }
     }
+
+    #[test]
+    fn getblockcount_has_cpp_schema() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_getblockcount(&chainstate, Vec::new()).expect("rpc");
+        assert!(value.as_i64().is_some());
+    }
+
+    #[test]
+    fn getbestblockhash_has_cpp_schema() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_getbestblockhash(&chainstate, Vec::new()).expect("rpc");
+        let hash = value.as_str().expect("hash string");
+        assert!(is_hex_64(hash));
+    }
+
+    #[test]
+    fn getblockhash_has_cpp_schema() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let best = rpc_getbestblockhash(&chainstate, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("hash")
+            .to_string();
+        let value = rpc_getblockhash(&chainstate, vec![json!(0)]).expect("rpc");
+        assert_eq!(value.as_str().unwrap(), best);
+    }
+
+    #[test]
+    fn getdifficulty_has_cpp_schema() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_getdifficulty(&chainstate, Vec::new(), &params).expect("rpc");
+        assert!(value.as_f64().is_some());
+    }
+
+    #[test]
+    fn getchaintips_has_cpp_schema_keys() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_getchaintips(&chainstate, Vec::new()).expect("rpc");
+        let tips = value.as_array().expect("array");
+        assert!(!tips.is_empty());
+        let tip = tips[0].as_object().expect("object");
+        for key in ["height", "hash", "branchlen", "status"] {
+            assert!(tip.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn getblockheader_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let best = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let hash_hex = hash256_to_hex(&best.hash);
+        let value = rpc_getblockheader(&chainstate, vec![Value::String(hash_hex.clone())], &params)
+            .expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "hash",
+            "confirmations",
+            "height",
+            "version",
+            "merkleroot",
+            "finalsaplingroot",
+            "time",
+            "bits",
+            "difficulty",
+            "chainwork",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        assert_eq!(obj.get("hash").and_then(Value::as_str).unwrap(), hash_hex);
+    }
+
+    #[test]
+    fn getblock_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let best = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let value = rpc_getblock(&chainstate, vec![json!(best.height)], &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "hash",
+            "confirmations",
+            "size",
+            "height",
+            "version",
+            "merkleroot",
+            "finalsaplingroot",
+            "tx",
+            "time",
+            "bits",
+            "difficulty",
+            "chainwork",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        assert!(obj.get("tx").and_then(Value::as_array).is_some());
+    }
 }
 
 fn system_time_to_unix(time: SystemTime) -> i64 {
