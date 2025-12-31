@@ -121,6 +121,7 @@ const RPC_METHODS: &[&str] = &[
     "getrawtransaction",
     "gettransaction",
     "listtransactions",
+    "listreceivedbyaddress",
     "fundrawtransaction",
     "signrawtransaction",
     "sendrawtransaction",
@@ -1016,6 +1017,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "gettransaction" => rpc_gettransaction(chainstate, mempool, wallet, params, chain_params),
         "listtransactions" => {
             rpc_listtransactions(chainstate, mempool, wallet, params, chain_params)
+        }
+        "listreceivedbyaddress" => {
+            rpc_listreceivedbyaddress(chainstate, mempool, wallet, params, chain_params)
         }
         "fundrawtransaction" => rpc_fundrawtransaction(
             chainstate,
@@ -2102,6 +2106,162 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         out.push(Value::Object(row));
     }
 
+    Ok(Value::Array(out))
+}
+
+fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "listreceivedbyaddress expects 0 to 4 parameters",
+        ));
+    }
+    let minconf = match params.get(0) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
+        _ => 1,
+    };
+    let include_empty = match params.get(1) {
+        Some(value) if !value.is_null() => parse_bool(value)?,
+        _ => false,
+    };
+    if let Some(value) = params.get(2) {
+        if !value.is_null() {
+            let _ = parse_bool(value)?;
+        }
+    }
+    let address_filter = match params.get(3) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(addr)) => Some(addr.trim().to_string()),
+        Some(value) if value.as_str().is_some() => value.as_str().map(|s| s.trim().to_string()),
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "address_filter must be a string",
+            ))
+        }
+    }
+    .filter(|s| !s.is_empty());
+
+    let wallet_scripts = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard.all_script_pubkeys().map_err(map_wallet_error)?
+    };
+    if wallet_scripts.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let best_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+    let best_height_u32 = u32::try_from(best_height).unwrap_or(0);
+
+    let mut mempool_received: HashMap<Vec<u8>, i64> = HashMap::new();
+    if minconf == 0 {
+        if let Ok(mempool_guard) = mempool.lock() {
+            for entry in mempool_guard.entries() {
+                for output in &entry.tx.vout {
+                    if !wallet_scripts
+                        .iter()
+                        .any(|script| script.as_slice() == output.script_pubkey.as_slice())
+                    {
+                        continue;
+                    }
+                    mempool_received
+                        .entry(output.script_pubkey.clone())
+                        .and_modify(|sum| *sum = sum.saturating_add(output.value))
+                        .or_insert(output.value);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for script_pubkey in &wallet_scripts {
+        let Some(address) = script_pubkey_to_address(script_pubkey, chain_params.network) else {
+            return Err(RpcError::new(
+                RPC_INTERNAL_ERROR,
+                "invalid wallet script_pubkey",
+            ));
+        };
+        if let Some(filter) = address_filter.as_deref() {
+            if address != filter {
+                continue;
+            }
+        }
+
+        let mut received_zat: i64 = 0;
+        let mut last_height: Option<u32> = None;
+        let mut visitor = |delta: fluxd_chainstate::address_deltas::AddressDeltaEntry| {
+            if delta.satoshis <= 0 {
+                return Ok(());
+            }
+            let confirmations = if best_height_u32 >= delta.height {
+                best_height_u32
+                    .saturating_sub(delta.height)
+                    .saturating_add(1) as i32
+            } else {
+                0
+            };
+            if confirmations < minconf {
+                return Ok(());
+            }
+            received_zat = received_zat.checked_add(delta.satoshis).ok_or_else(|| {
+                fluxd_storage::StoreError::Backend("listreceivedbyaddress overflow".to_string())
+            })?;
+            last_height = Some(last_height.map_or(delta.height, |h| h.max(delta.height)));
+            Ok(())
+        };
+        chainstate
+            .for_each_address_delta(script_pubkey, &mut visitor)
+            .map_err(map_internal)?;
+
+        if minconf == 0 {
+            if let Some(value) = mempool_received.get(script_pubkey) {
+                received_zat = received_zat
+                    .checked_add(*value)
+                    .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+            }
+        }
+
+        if received_zat == 0 && !include_empty {
+            continue;
+        }
+
+        let confirmations = if minconf == 0 {
+            0
+        } else {
+            last_height
+                .and_then(|h| best_height_u32.checked_sub(h).map(|d| d.saturating_add(1)))
+                .unwrap_or(0) as i32
+        };
+
+        out.push(json!({
+            "involvesWatchonly": false,
+            "address": address,
+            "account": "",
+            "amount": amount_to_value(received_zat),
+            "confirmations": confirmations,
+            "label": "",
+            "txids": [],
+            "amount_zat": received_zat,
+        }));
+    }
+
+    out.sort_by(|a, b| {
+        let a_amount = a.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
+        let b_amount = b.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
+        b_amount.cmp(&a_amount)
+    });
     Ok(Value::Array(out))
 }
 
@@ -11031,6 +11191,71 @@ mod tests {
             row2.get("amount_zat").and_then(Value::as_i64),
             Some(miner_value_a)
         );
+    }
+
+    #[test]
+    fn listreceivedbyaddress_reports_wallet_receives() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let (_txid_a, _vout, height_a, miner_value_a) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        assert_eq!(height_a, 1);
+        let (_txid_b, _vout, height_b, miner_value_b) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey);
+        assert_eq!(height_b, 2);
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_listreceivedbyaddress(&chainstate, &mempool, &wallet, Vec::new(), &params)
+            .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("object");
+        assert_eq!(
+            row.get("address").and_then(Value::as_str),
+            Some(address.as_str())
+        );
+        assert_eq!(
+            row.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value_a + miner_value_b)
+        );
+        assert_eq!(row.get("confirmations").and_then(Value::as_i64), Some(1));
+
+        let value =
+            rpc_listreceivedbyaddress(&chainstate, &mempool, &wallet, vec![json!(2)], &params)
+                .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("object");
+        assert_eq!(
+            row.get("address").and_then(Value::as_str),
+            Some(address.as_str())
+        );
+        assert_eq!(
+            row.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value_a)
+        );
+        assert_eq!(row.get("confirmations").and_then(Value::as_i64), Some(2));
+
+        let other_address =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("address");
+        let value = rpc_listreceivedbyaddress(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(1), json!(true), Value::Null, json!(other_address)],
+            &params,
+        )
+        .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 0);
     }
 
     #[test]

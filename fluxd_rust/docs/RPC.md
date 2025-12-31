@@ -128,6 +128,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `getwalletinfo` (partial)
 - `gettransaction <txid> [include_watchonly]` (partial)
 - `listtransactions [account] [count] [skip] [include_watchonly]` (partial)
+- `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` (partial)
 - `getnewaddress [label]` (label ignored)
 - `getrawchangeaddress [address_type]` (partial; address_type ignored)
 - `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
@@ -294,6 +295,11 @@ Notes:
 
 - Params: `[account] [count] [skip] [include_watchonly]` (partial; account/watch-only are ignored).
 - Result: array of wallet transactions (confirmed txs ordered by height; mempool txs ordered by entry time).
+
+### listreceivedbyaddress
+
+- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (partial; account/labels/txids are WIP).
+- Result: array of wallet addresses with received totals.
 
 ### listunspent
 

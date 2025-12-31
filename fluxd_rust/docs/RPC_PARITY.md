@@ -131,7 +131,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - keypoolrefill - Missing
 - listaddressgroupings - Missing
 - listlockunspent - Missing
-- listreceivedbyaddress - Missing
+- listreceivedbyaddress - Partial (wallet keys only; uses address deltas and optional mempool scan; labels/txids fields are placeholders)
 - listsinceblock - Missing
 - listtransactions - Partial (derived from wallet address deltas + mempool scan; schema still evolving)
 - listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; no locked/watchonly outputs)
