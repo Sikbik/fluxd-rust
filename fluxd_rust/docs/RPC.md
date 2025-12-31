@@ -127,6 +127,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `getnewaddress [label]` (label ignored)
 - `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
 - `dumpprivkey <address>`
+- `signmessage <address> <message>`
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
 - `listunspent [minconf] [maxconf] [addresses]` (partial)
 
@@ -232,6 +233,11 @@ Fields:
 
 - Params: `<address>` (P2PKH).
 - Result: WIF private key if present; error `-4` if the address is not in the wallet.
+
+### signmessage
+
+- Params: `<address> <message>` (P2PKH).
+- Result: base64 signature string (compatible with `verifymessage`).
 
 ### getbalance
 

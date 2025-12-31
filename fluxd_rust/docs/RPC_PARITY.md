@@ -141,7 +141,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - sendmany - Missing
 - sendtoaddress - Missing
 - settxfee - Missing
-- signmessage - Missing
+- signmessage - Implemented (P2PKH only; compatible with verifymessage)
 
 ## Shielded
 

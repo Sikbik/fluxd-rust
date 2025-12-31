@@ -92,6 +92,7 @@ const RPC_METHODS: &[&str] = &[
     "getbalance",
     "listunspent",
     "getwalletinfo",
+    "signmessage",
     "getdbinfo",
     "getblockcount",
     "getbestblockhash",
@@ -974,6 +975,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getnewaddress" => rpc_getnewaddress(wallet, params),
         "importprivkey" => rpc_importprivkey(wallet, params),
         "dumpprivkey" => rpc_dumpprivkey(wallet, params, chain_params),
+        "signmessage" => rpc_signmessage(wallet, params, chain_params),
         "getbalance" => rpc_getbalance(chainstate, mempool, wallet, params),
         "listunspent" => rpc_listunspent(chainstate, mempool, wallet, params, chain_params),
         "getdbinfo" => rpc_getdbinfo(chainstate, store, params, data_dir),
@@ -1312,6 +1314,50 @@ fn rpc_dumpprivkey(
         .map_err(map_wallet_error)?
     {
         Some(wif) => Ok(Value::String(wif)),
+        None => Err(RpcError::new(
+            RPC_WALLET_ERROR,
+            "Private key for address is not known",
+        )),
+    }
+}
+
+fn rpc_signmessage(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "signmessage expects 2 parameters",
+        ));
+    }
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
+    let message = params[1]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "message must be a string"))?;
+
+    let script_pubkey = address_to_script_pubkey(address, chain_params.network)
+        .map_err(|_| RpcError::new(RPC_TYPE_ERROR, "Invalid address"))?;
+    if classify_script_pubkey(&script_pubkey) != ScriptType::P2Pkh {
+        return Err(RpcError::new(
+            RPC_TYPE_ERROR,
+            "Address does not refer to key",
+        ));
+    }
+
+    let guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    match guard
+        .sign_message(address, message.as_bytes())
+        .map_err(map_wallet_error)?
+    {
+        Some(sig) => Ok(Value::String(
+            base64::engine::general_purpose::STANDARD.encode(sig),
+        )),
         None => Err(RpcError::new(
             RPC_WALLET_ERROR,
             "Private key for address is not known",
@@ -8752,6 +8798,35 @@ mod tests {
             .expect("wif string")
             .to_string();
         assert_eq!(wif_b, wif);
+    }
+
+    #[test]
+    fn signmessage_roundtrips_with_verifymessage() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let message = "hello world";
+        let signature = rpc_signmessage(
+            &wallet,
+            vec![json!(address.clone()), json!(message)],
+            &params,
+        )
+        .expect("rpc")
+        .as_str()
+        .expect("signature string")
+        .to_string();
+
+        let ok = rpc_verifymessage(
+            vec![json!(address), json!(signature), json!(message)],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(ok, Value::Bool(true));
     }
 
     #[test]

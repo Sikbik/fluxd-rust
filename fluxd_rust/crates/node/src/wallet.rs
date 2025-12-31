@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use rand::RngCore;
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 
 use fluxd_consensus::params::Network;
 use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
 use fluxd_primitives::hash::hash160;
 use fluxd_primitives::{script_pubkey_to_address, secret_key_to_wif, wif_to_secret_key};
+use fluxd_script::message::signed_message_hash;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
@@ -203,6 +204,32 @@ impl Wallet {
             }
         }
         Ok(out)
+    }
+
+    pub fn sign_message(
+        &self,
+        address: &str,
+        message: &[u8],
+    ) -> Result<Option<Vec<u8>>, WalletError> {
+        for key in &self.keys {
+            if key.address(self.network)? != address {
+                continue;
+            }
+            let secret = key.secret_key()?;
+            let digest = signed_message_hash(message);
+            let msg = Message::from_digest_slice(&digest)
+                .map_err(|_| WalletError::InvalidData("invalid message digest"))?;
+            let sig = secp().sign_ecdsa_recoverable(&msg, &secret);
+            let (rec_id, bytes) = sig.serialize_compact();
+            let mut out = [0u8; 65];
+            let header = 27u8
+                .saturating_add(rec_id.to_i32() as u8)
+                .saturating_add(if key.compressed { 4 } else { 0 });
+            out[0] = header;
+            out[1..].copy_from_slice(&bytes);
+            return Ok(Some(out.to_vec()));
+        }
+        Ok(None)
     }
 
     fn decode(path: &Path, expected_network: Network, bytes: &[u8]) -> Result<Self, WalletError> {
