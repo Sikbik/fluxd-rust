@@ -54,6 +54,17 @@ ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./sc
 This command exits non-zero if the node is behind the peer best height (or has a headers>blocks gap)
 but fails to advance blocks during the observation window.
 
+## Watchdog loop (progress + log patterns)
+
+For a long-running sync test, you can loop the progress gate and also fail fast on severe log
+messages:
+
+```bash
+ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/longrun_watchdog.sh --data-dir <remote-data-dir> --log-file <remote-log-dir>/longrun-public.log --window-secs 120\"'"
+```
+
+Use `--fail-pattern` to add additional fatal regexes, and `--loops N` for a finite run.
+
 ## Run
 
 ```bash

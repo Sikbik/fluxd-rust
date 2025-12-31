@@ -193,6 +193,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P1] Long-run sync tests with regression gates (owner: TBD)
   - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity (supports seeding peers.dat and progress thresholds)
   - [x] VPS progress gate (`scripts/progress_gate.sh`) to detect stalls/regressions during sync
+  - [x] VPS watchdog loop (`scripts/longrun_watchdog.sh`) to combine stall detection + fatal log pattern checks
 - [x] [P1] Reorg and fork simulation tests (owner: TBD)
 - [ ] [P2] Snapshot/fast-sync evaluation (optional) (owner: TBD)
 - [ ] [P2] Performance profiling harness (owner: TBD)
