@@ -78,7 +78,7 @@ Type notes:
 - `stop`
 - `restart`
 - `reindex`
-- `rescanblockchain [start_height] [stop_height]` (stub; wallet not implemented)
+- `rescanblockchain [start_height] [stop_height]` (stub; wallet rescan not implemented)
 - `getdbinfo`
 - `getnetworkinfo`
 - `getpeerinfo`
@@ -118,6 +118,17 @@ Type notes:
 - `gettxoutsetinfo`
 - `validateaddress <fluxaddress>`
 - `verifymessage <fluxaddress> <signature> <message>`
+
+### Wallet (transparent)
+
+Wallet state is stored at `--data-dir/wallet.dat`.
+
+- `getwalletinfo` (partial)
+- `getnewaddress [label]` (label ignored)
+- `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
+- `dumpprivkey <address>`
+- `getbalance [account] [minconf] [include_watchonly]` (partial)
+- `listunspent [minconf] [maxconf] [addresses]` (partial)
 
 ### Mining and mempool
 
@@ -202,7 +213,35 @@ Fields:
 ### rescanblockchain
 
 - Params: optional `start_height`, `stop_height`.
-- Result: error `-4` (`wallet not implemented`).
+- Result: error `-4` (`wallet rescan not implemented`).
+
+### getwalletinfo
+
+- Result: basic wallet summary (balances are computed from the address index; txcount/keypool fields are placeholders).
+
+### getnewaddress
+
+- Result: new transparent P2PKH address (persisted to `wallet.dat`).
+
+### importprivkey
+
+- Params: `<wif> [label] [rescan]` (`label` accepted; `rescan` ignored).
+- Result: `null`
+
+### dumpprivkey
+
+- Params: `<address>` (P2PKH).
+- Result: WIF private key if present; error `-4` if the address is not in the wallet.
+
+### getbalance
+
+- Params: `[account] [minconf] [include_watchonly]` (partial; `minconf` is enforced).
+- Result: wallet balance (mature + not spent by mempool).
+
+### listunspent
+
+- Params: `[minconf] [maxconf] [addresses]` (partial).
+- Result: array of unspent outputs owned by the wallet.
 
 ### getdbinfo
 

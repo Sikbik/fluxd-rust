@@ -281,7 +281,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | - | `getnewaddress`<br>`getbalance`<br>`getwalletinfo`<br>`listtransactions`<br>`listunspent`<br>`sendtoaddress`<br>`sendmany`<br>`settxfee`<br>`importaddress`<br>`importprivkey`<br>`importwallet`<br>`backupwallet`<br>`dumpprivkey`<br>`keypoolrefill`<br>`listreceivedbyaddress`<br>`listaddressgroupings`<br>`getreceivedbyaddress`<br>`getunconfirmedbalance`<br>`getrawchangeaddress`<br>`lockunspent`<br>`listlockunspent`<br>`sendfrom` |
+| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey` | `getbalance`<br>`getwalletinfo`<br>`listunspent` | `listtransactions`<br>`sendtoaddress`<br>`sendmany`<br>`settxfee`<br>`importaddress`<br>`importwallet`<br>`backupwallet`<br>`keypoolrefill`<br>`listreceivedbyaddress`<br>`listaddressgroupings`<br>`getreceivedbyaddress`<br>`getunconfirmedbalance`<br>`getrawchangeaddress`<br>`lockunspent`<br>`listlockunspent`<br>`sendfrom` |
 
 ### Wallet (shielded)
 

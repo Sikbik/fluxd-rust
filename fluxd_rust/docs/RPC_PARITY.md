@@ -44,7 +44,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Mining
 
 - getblocksubsidy - Implemented
-- getblocktemplate - Partial (template fields + longpoll + proposal; wallet-backed miner script and capability negotiation still WIP)
+- getblocktemplate - Partial (template fields + longpoll + proposal; falls back to first wallet key if mineraddress is unset; capability negotiation still WIP)
 - getlocalsolps - Stub (returns 0.0)
 - getmininginfo - Partial (rates and mining fields are placeholders)
 - getnetworkhashps - Stub (returns 0.0)
@@ -118,15 +118,15 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - signrawtransaction - Missing
 - addmultisigaddress - Missing
 - backupwallet - Missing
-- dumpprivkey - Missing
-- getbalance - Missing
-- getnewaddress - Missing
+- dumpprivkey - Implemented (P2PKH only)
+- getbalance - Partial (minconf supported; accounts/watchonly/unconfirmed are placeholders)
+- getnewaddress - Implemented (P2PKH only; random keys; label ignored)
 - getrawchangeaddress - Missing
 - getreceivedbyaddress - Missing
 - getunconfirmedbalance - Missing
-- getwalletinfo - Missing
+- getwalletinfo - Partial (balance fields are real; txcount/keypool fields are placeholders)
 - importaddress - Missing
-- importprivkey - Missing
+- importprivkey - Implemented (rescan param accepted but ignored; address index makes it unnecessary)
 - importwallet - Missing
 - keypoolrefill - Missing
 - listaddressgroupings - Missing
@@ -134,9 +134,9 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listreceivedbyaddress - Missing
 - listsinceblock - Missing
 - listtransactions - Missing
-- listunspent - Missing
+- listunspent - Partial (supports minconf/maxconf/address filter; no locked/watchonly outputs)
 - lockunspent - Missing
-- rescanblockchain - Stub (wallet not implemented)
+- rescanblockchain - Stub (wallet rescan not implemented)
 
 - sendmany - Missing
 - sendtoaddress - Missing

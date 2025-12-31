@@ -7,6 +7,7 @@ mod peer_book;
 mod rpc;
 mod stats;
 mod tx_relay;
+mod wallet;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1086,6 +1087,9 @@ async fn run() -> Result<(), String> {
     };
     let fee_estimator = Arc::new(Mutex::new(fee_estimator));
     let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
+    let wallet =
+        wallet::Wallet::load_or_create(data_dir, config.network).map_err(|err| err.to_string())?;
+    let wallet = Arc::new(Mutex::new(wallet));
     {
         let chainstate = Arc::clone(&chainstate);
         let store = Arc::clone(&store);
@@ -1104,6 +1108,7 @@ async fn run() -> Result<(), String> {
         let addr_book = Arc::clone(&addr_book);
         let added_nodes = Arc::clone(&added_nodes);
         let tx_announce = tx_announce.clone();
+        let wallet = Arc::clone(&wallet);
         let shutdown_tx = shutdown_tx.clone();
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1131,6 +1136,7 @@ async fn run() -> Result<(), String> {
                     addr_book,
                     added_nodes,
                     tx_announce,
+                    wallet,
                     shutdown_tx,
                 )
                 .await

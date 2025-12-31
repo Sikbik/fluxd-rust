@@ -1,0 +1,308 @@
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use rand::RngCore;
+use secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+use fluxd_consensus::params::Network;
+use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
+use fluxd_primitives::hash::hash160;
+use fluxd_primitives::{script_pubkey_to_address, secret_key_to_wif, wif_to_secret_key};
+
+pub const WALLET_FILE_NAME: &str = "wallet.dat";
+
+pub const WALLET_FILE_VERSION: u32 = 1;
+
+#[derive(Debug)]
+pub enum WalletError {
+    Io(std::io::Error),
+    Decode(DecodeError),
+    InvalidData(&'static str),
+    NetworkMismatch { expected: Network, found: Network },
+    InvalidSecretKey,
+}
+
+impl std::fmt::Display for WalletError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalletError::Io(err) => write!(f, "{err}"),
+            WalletError::Decode(err) => write!(f, "{err}"),
+            WalletError::InvalidData(msg) => write!(f, "{msg}"),
+            WalletError::NetworkMismatch { expected, found } => write!(
+                f,
+                "wallet network mismatch (expected {expected:?}, found {found:?})"
+            ),
+            WalletError::InvalidSecretKey => write!(f, "invalid secret key"),
+        }
+    }
+}
+
+impl std::error::Error for WalletError {}
+
+impl From<std::io::Error> for WalletError {
+    fn from(err: std::io::Error) -> Self {
+        WalletError::Io(err)
+    }
+}
+
+impl From<DecodeError> for WalletError {
+    fn from(err: DecodeError) -> Self {
+        WalletError::Decode(err)
+    }
+}
+
+#[derive(Clone)]
+struct WalletKey {
+    secret: [u8; 32],
+    compressed: bool,
+}
+
+impl WalletKey {
+    fn secret_key(&self) -> Result<SecretKey, WalletError> {
+        SecretKey::from_slice(&self.secret).map_err(|_| WalletError::InvalidSecretKey)
+    }
+
+    fn pubkey(&self) -> Result<PublicKey, WalletError> {
+        let secret = self.secret_key()?;
+        Ok(PublicKey::from_secret_key(secp(), &secret))
+    }
+
+    fn pubkey_bytes(&self) -> Result<Vec<u8>, WalletError> {
+        let pubkey = self.pubkey()?;
+        if self.compressed {
+            Ok(pubkey.serialize().to_vec())
+        } else {
+            Ok(pubkey.serialize_uncompressed().to_vec())
+        }
+    }
+
+    fn p2pkh_script_pubkey(&self) -> Result<Vec<u8>, WalletError> {
+        let pubkey_bytes = self.pubkey_bytes()?;
+        let key_hash = hash160(&pubkey_bytes);
+        Ok(p2pkh_script(&key_hash))
+    }
+
+    fn address(&self, network: Network) -> Result<String, WalletError> {
+        let script_pubkey = self.p2pkh_script_pubkey()?;
+        script_pubkey_to_address(&script_pubkey, network)
+            .ok_or(WalletError::InvalidData("failed to encode address"))
+    }
+
+    fn wif(&self, network: Network) -> String {
+        secret_key_to_wif(&self.secret, network, self.compressed)
+    }
+}
+
+pub struct Wallet {
+    path: PathBuf,
+    network: Network,
+    keys: Vec<WalletKey>,
+    revision: u64,
+}
+
+impl Wallet {
+    pub fn load_or_create(data_dir: &Path, network: Network) -> Result<Self, WalletError> {
+        let path = data_dir.join(WALLET_FILE_NAME);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let wallet = Self::decode(&path, network, &bytes)?;
+                Ok(wallet)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                path,
+                network,
+                keys: Vec::new(),
+                revision: 0,
+            }),
+            Err(err) => Err(WalletError::Io(err)),
+        }
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn default_address(&self) -> Result<Option<String>, WalletError> {
+        let Some(key) = self.keys.first() else {
+            return Ok(None);
+        };
+        Ok(Some(key.address(self.network)?))
+    }
+
+    pub fn all_script_pubkeys(&self) -> Result<Vec<Vec<u8>>, WalletError> {
+        let mut out = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            out.push(key.p2pkh_script_pubkey()?);
+        }
+        Ok(out)
+    }
+
+    pub fn import_wif(&mut self, wif: &str) -> Result<(), WalletError> {
+        let (secret, compressed) = wif_to_secret_key(wif, self.network)
+            .map_err(|_| WalletError::InvalidData("invalid wif"))?;
+        if self.keys.iter().any(|key| key.secret == secret) {
+            return Ok(());
+        }
+        let key = WalletKey { secret, compressed };
+        self.keys.push(key);
+        if let Err(err) = self.save() {
+            self.keys.retain(|k| k.secret != secret);
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn dump_wif_for_address(&self, address: &str) -> Result<Option<String>, WalletError> {
+        for key in &self.keys {
+            if key.address(self.network)? == address {
+                return Ok(Some(key.wif(self.network)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn generate_new_address(&mut self, compressed: bool) -> Result<String, WalletError> {
+        let mut rng = rand::rngs::OsRng;
+        let mut seed = [0u8; 32];
+        for _ in 0..100 {
+            rng.fill_bytes(&mut seed);
+            if SecretKey::from_slice(&seed).is_ok() {
+                if self.keys.iter().any(|key| key.secret == seed) {
+                    continue;
+                }
+                let key = WalletKey {
+                    secret: seed,
+                    compressed,
+                };
+                let address = key.address(self.network)?;
+                self.keys.push(key);
+                if let Err(err) = self.save() {
+                    self.keys.retain(|k| k.secret != seed);
+                    return Err(err);
+                }
+                self.revision = self.revision.saturating_add(1);
+                return Ok(address);
+            }
+        }
+        Err(WalletError::InvalidData("failed to generate secret key"))
+    }
+
+    pub fn scripts_for_filter(&self, addresses: &[String]) -> Result<Vec<Vec<u8>>, WalletError> {
+        if addresses.is_empty() {
+            return self.all_script_pubkeys();
+        }
+        let allow: HashSet<&str> = addresses.iter().map(|s| s.as_str()).collect();
+        let mut out = Vec::new();
+        for key in &self.keys {
+            let addr = key.address(self.network)?;
+            if allow.contains(addr.as_str()) {
+                out.push(key.p2pkh_script_pubkey()?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn decode(path: &Path, expected_network: Network, bytes: &[u8]) -> Result<Self, WalletError> {
+        let mut decoder = Decoder::new(bytes);
+        let version = decoder.read_u32_le()?;
+        if version != WALLET_FILE_VERSION {
+            return Err(WalletError::InvalidData("unsupported wallet file version"));
+        }
+        let network = decode_network(decoder.read_u8()?)?;
+        if network != expected_network {
+            return Err(WalletError::NetworkMismatch {
+                expected: expected_network,
+                found: network,
+            });
+        }
+        let count = decoder.read_varint()?;
+        let count = usize::try_from(count)
+            .map_err(|_| WalletError::InvalidData("wallet key count too large"))?;
+        let mut keys = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            let secret = decoder.read_fixed::<32>()?;
+            let compressed = decoder.read_bool()?;
+            keys.push(WalletKey { secret, compressed });
+        }
+        if !decoder.is_empty() {
+            return Err(WalletError::InvalidData("wallet file has trailing bytes"));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            network,
+            keys,
+            revision: 0,
+        })
+    }
+
+    fn save(&self) -> Result<(), WalletError> {
+        let mut encoder = Encoder::new();
+        encoder.write_u32_le(WALLET_FILE_VERSION);
+        encoder.write_u8(encode_network(self.network));
+
+        let mut keys = self.keys.clone();
+        keys.sort_by(|a, b| a.secret.cmp(&b.secret));
+        encoder.write_varint(keys.len() as u64);
+        for key in &keys {
+            encoder.write_bytes(&key.secret);
+            encoder.write_u8(if key.compressed { 1 } else { 0 });
+        }
+        let bytes = encoder.into_inner();
+        write_file_atomic(&self.path, &bytes)?;
+        Ok(())
+    }
+}
+
+fn encode_network(network: Network) -> u8 {
+    match network {
+        Network::Mainnet => 0,
+        Network::Testnet => 1,
+        Network::Regtest => 2,
+    }
+}
+
+fn decode_network(value: u8) -> Result<Network, WalletError> {
+    match value {
+        0 => Ok(Network::Mainnet),
+        1 => Ok(Network::Testnet),
+        2 => Ok(Network::Regtest),
+        _ => Err(WalletError::InvalidData("unknown wallet network")),
+    }
+}
+
+fn p2pkh_script(key_hash: &[u8; 20]) -> Vec<u8> {
+    const OP_DUP: u8 = 0x76;
+    const OP_HASH160: u8 = 0xa9;
+    const OP_EQUALVERIFY: u8 = 0x88;
+    const OP_CHECKSIG: u8 = 0xac;
+
+    let mut script = Vec::with_capacity(25);
+    script.push(OP_DUP);
+    script.push(OP_HASH160);
+    script.push(0x14);
+    script.extend_from_slice(key_hash);
+    script.push(OP_EQUALVERIFY);
+    script.push(OP_CHECKSIG);
+    script
+}
+
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), WalletError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
+    if fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(path);
+        fs::rename(&tmp, path)?;
+    }
+    Ok(())
+}
+
+fn secp() -> &'static Secp256k1<secp256k1::All> {
+    static SECP: OnceLock<Secp256k1<secp256k1::All>> = OnceLock::new();
+    SECP.get_or_init(Secp256k1::new)
+}
