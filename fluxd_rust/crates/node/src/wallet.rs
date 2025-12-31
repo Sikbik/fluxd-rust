@@ -101,6 +101,7 @@ pub struct Wallet {
     network: Network,
     keys: Vec<WalletKey>,
     revision: u64,
+    pay_tx_fee_per_kb: i64,
 }
 
 impl Wallet {
@@ -116,9 +117,18 @@ impl Wallet {
                 network,
                 keys: Vec::new(),
                 revision: 0,
+                pay_tx_fee_per_kb: 0,
             }),
             Err(err) => Err(WalletError::Io(err)),
         }
+    }
+
+    pub fn pay_tx_fee_per_kb(&self) -> i64 {
+        self.pay_tx_fee_per_kb
+    }
+
+    pub fn set_pay_tx_fee_per_kb(&mut self, fee: i64) {
+        self.pay_tx_fee_per_kb = fee;
     }
 
     pub fn key_count(&self) -> usize {
@@ -299,6 +309,7 @@ impl Wallet {
             network,
             keys,
             revision: 0,
+            pay_tx_fee_per_kb: 0,
         })
     }
 

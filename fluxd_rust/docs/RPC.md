@@ -130,6 +130,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `listtransactions [account] [count] [skip] [include_watchonly]` (partial)
 - `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` (partial)
 - `keypoolrefill [newsize]` (partial)
+- `settxfee <amount>` (partial)
 - `getnewaddress [label]` (label ignored)
 - `getrawchangeaddress [address_type]` (partial; address_type ignored)
 - `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
@@ -306,6 +307,11 @@ Notes:
 
 - Params: `[newsize]` (partial).
 - Result: `null`
+
+### settxfee
+
+- Params: `<amount>` (fee rate in FLUX/kB).
+- Result: boolean.
 
 ### listunspent
 

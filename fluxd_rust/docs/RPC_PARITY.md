@@ -140,7 +140,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - sendmany - Partial (P2PKH only; `subtractfeefromamount` not supported)
 - sendtoaddress - Partial (P2PKH only; `subtractfeefromamount` not supported)
-- settxfee - Missing
+- settxfee - Partial (sets in-process wallet fee-rate override used by fundrawtransaction/send*)
 - signmessage - Implemented (P2PKH only; compatible with verifymessage)
 
 ## Shielded

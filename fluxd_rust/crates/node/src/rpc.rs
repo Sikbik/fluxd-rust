@@ -123,6 +123,7 @@ const RPC_METHODS: &[&str] = &[
     "listtransactions",
     "listreceivedbyaddress",
     "keypoolrefill",
+    "settxfee",
     "fundrawtransaction",
     "signrawtransaction",
     "sendrawtransaction",
@@ -1023,6 +1024,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             rpc_listreceivedbyaddress(chainstate, mempool, wallet, params, chain_params)
         }
         "keypoolrefill" => rpc_keypoolrefill(wallet, params),
+        "settxfee" => rpc_settxfee(wallet, params),
         "fundrawtransaction" => rpc_fundrawtransaction(
             chainstate,
             mempool,
@@ -1481,6 +1483,24 @@ fn rpc_keypoolrefill(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
         let _ = guard.generate_new_address(true).map_err(map_wallet_error)?;
     }
     Ok(Value::Null)
+}
+
+fn rpc_settxfee(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "settxfee expects 1 parameter",
+        ));
+    }
+    let fee_per_kb = parse_amount(&params[0])?;
+    if fee_per_kb < 0 {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "fee must be >= 0"));
+    }
+    wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .set_pay_tx_fee_per_kb(fee_per_kb);
+    Ok(Value::Bool(true))
 }
 
 fn rpc_signmessage(
@@ -2426,10 +2446,12 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
     }
 
-    let key_count = wallet
-        .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .key_count();
+    let (key_count, pay_tx_fee_per_kb) = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        (guard.key_count(), guard.pay_tx_fee_per_kb())
+    };
 
     Ok(json!({
         "walletname": "wallet.dat",
@@ -2443,7 +2465,8 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
         "txcount": 0,
         "keypoololdest": 0,
         "keypoolsize": 0,
-        "paytxfee": amount_to_value(0),
+        "paytxfee": amount_to_value(pay_tx_fee_per_kb),
+        "paytxfee_zat": pay_tx_fee_per_kb,
         "private_keys_enabled": true,
         "key_count": key_count,
     }))
@@ -3822,18 +3845,30 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
     }
 
-    let (wallet_scripts, change_script_pubkey) = {
+    let (wallet_scripts, change_script_pubkey, pay_tx_fee_per_kb) = {
         let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
         if guard.key_count() == 0 {
             let _ = guard.generate_new_address(true).map_err(map_wallet_error)?;
         }
+        let pay_tx_fee_per_kb = guard.pay_tx_fee_per_kb();
         let scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
         let change_address = guard.generate_new_address(true).map_err(map_wallet_error)?;
         let change_script = address_to_script_pubkey(&change_address, chain_params.network)
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid change address"))?;
-        (scripts, change_script)
+        (scripts, change_script, pay_tx_fee_per_kb)
+    };
+
+    let fee_for_size = |size: usize| -> i64 {
+        let min_fee = mempool_policy.min_relay_fee_for_size(size);
+        if pay_tx_fee_per_kb <= 0 {
+            return min_fee;
+        }
+        let size_i64 = i64::try_from(size).unwrap_or(i64::MAX);
+        let kb = size_i64.saturating_add(999).saturating_div(1000).max(1);
+        let pay_fee = pay_tx_fee_per_kb.saturating_mul(kb);
+        min_fee.max(pay_fee)
     };
 
     let mut candidates = collect_wallet_utxos(chainstate, mempool, &wallet_scripts, false)?;
@@ -3865,10 +3900,9 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
 
     for _ in 0..512 {
         let estimated_size = estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?;
-        let min_fee = mempool_policy.min_relay_fee_for_size(estimated_size);
-
-        if min_fee != fee && fee == 0 {
-            fee = min_fee;
+        let target_fee = fee_for_size(estimated_size);
+        if target_fee > fee {
+            fee = target_fee;
         }
 
         let required = recipient_value
@@ -3891,8 +3925,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
                 script_sig: Vec::new(),
                 sequence: u32::MAX,
             });
-            fee = mempool_policy
-                .min_relay_fee_for_size(estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?);
+            fee = fee_for_size(estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?);
             continue;
         }
 
@@ -3934,8 +3967,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             }
         }
 
-        let new_fee = mempool_policy
-            .min_relay_fee_for_size(estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?);
+        let new_fee = fee_for_size(estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?);
         if new_fee > fee {
             fee = new_fee;
             continue;
@@ -10607,6 +10639,101 @@ mod tests {
 
         rpc_keypoolrefill(&wallet, vec![json!(2)]).expect("rpc");
         assert!(wallet.lock().expect("wallet lock").key_count() >= 2);
+    }
+
+    #[test]
+    fn settxfee_increases_fundrawtransaction_fee() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x11u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+
+        let to_script = p2pkh_script([0x22u8; 20]);
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: vec![TxOut {
+                value: 1 * COIN,
+                script_pubkey: to_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let before = rpc_fundrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &wallet,
+            vec![json!(raw_hex.clone())],
+            &params,
+        )
+        .expect("rpc");
+        let before_fee = before
+            .get("fee_zat")
+            .and_then(Value::as_i64)
+            .expect("fee_zat");
+
+        rpc_settxfee(&wallet, vec![json!("0.01")]).expect("rpc");
+        let info = rpc_getwalletinfo(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
+        assert_eq!(
+            info.get("paytxfee_zat").and_then(Value::as_i64),
+            Some(1_000_000)
+        );
+
+        let after = rpc_fundrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &wallet,
+            vec![json!(raw_hex)],
+            &params,
+        )
+        .expect("rpc");
+        let after_fee = after
+            .get("fee_zat")
+            .and_then(Value::as_i64)
+            .expect("fee_zat");
+        assert!(after_fee > before_fee, "fee should increase after settxfee");
     }
 
     #[test]
