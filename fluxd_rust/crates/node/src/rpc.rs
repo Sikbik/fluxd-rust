@@ -7787,6 +7787,165 @@ mod tests {
         let err = rpc_getblockheader(&chainstate, vec![missing_hash], &params).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
     }
+
+    #[test]
+    fn help_lists_supported_methods() {
+        let value = rpc_help(Vec::new()).expect("rpc");
+        let methods = value.as_array().expect("array");
+        assert!(methods.iter().any(|val| val.as_str() == Some("getinfo")));
+        assert!(methods
+            .iter()
+            .any(|val| val.as_str() == Some("getblockcount")));
+    }
+
+    #[test]
+    fn help_reports_supported_method() {
+        let value = rpc_help(vec![json!("getinfo")]).expect("rpc");
+        assert_eq!(value.as_str(), Some("getinfo is supported"));
+    }
+
+    #[test]
+    fn help_unknown_method_returns_not_found() {
+        let err = rpc_help(vec![json!("notarealmethod")]).unwrap_err();
+        assert_eq!(err.code, RPC_METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn ping_returns_null() {
+        let value = rpc_ping(Vec::new()).expect("rpc");
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn ping_rejects_params() {
+        let err = rpc_ping(vec![json!(1)]).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn stop_requests_shutdown() {
+        let (tx, rx) = watch::channel(false);
+        let value = rpc_stop(Vec::new(), &tx).expect("rpc");
+        assert!(value.as_str().unwrap_or_default().contains("stopping"));
+        assert!(*rx.borrow());
+    }
+
+    #[test]
+    fn restart_requests_shutdown() {
+        let (tx, rx) = watch::channel(false);
+        let value = rpc_restart(Vec::new(), &tx).expect("rpc");
+        assert!(value.as_str().unwrap_or_default().contains("restarting"));
+        assert!(*rx.borrow());
+    }
+
+    #[test]
+    fn reindex_writes_flag_and_requests_shutdown() {
+        let data_dir = temp_data_dir("fluxd-reindex-test");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let (tx, rx) = watch::channel(false);
+
+        let value = rpc_reindex(Vec::new(), &data_dir, &tx).expect("rpc");
+        assert!(value
+            .as_str()
+            .unwrap_or_default()
+            .contains("reindex requested"));
+        assert!(*rx.borrow());
+
+        let flag_path = data_dir.join(crate::REINDEX_REQUEST_FILE_NAME);
+        let contents = std::fs::read_to_string(&flag_path).expect("flag contents");
+        assert_eq!(contents, "reindex\n");
+
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn rescanblockchain_returns_wallet_error() {
+        let err = rpc_rescanblockchain(Vec::new()).unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_ERROR);
+    }
+
+    #[test]
+    fn verifychain_returns_bool() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_verifychain(&chainstate, Vec::new()).expect("rpc");
+        assert_eq!(value.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn network_hashrate_rpcs_return_numbers() {
+        let value = rpc_getnetworkhashps(Vec::new()).expect("rpc");
+        assert!(value.as_f64().is_some());
+        let value = rpc_getnetworksolps(Vec::new()).expect("rpc");
+        assert!(value.as_f64().is_some());
+        let value = rpc_getlocalsolps(Vec::new()).expect("rpc");
+        assert!(value.as_f64().is_some());
+    }
+
+    #[test]
+    fn getblocktemplate_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let flags = ValidationFlags::default();
+
+        let pubkey_hash = [0x11u8; 20];
+        let script_pubkey = p2pkh_script(pubkey_hash);
+        let miner_address =
+            script_pubkey_to_address(&script_pubkey, params.network).expect("p2pkh address");
+
+        let value = rpc_getblocktemplate(
+            &chainstate,
+            &mempool,
+            Vec::new(),
+            &params,
+            &flags,
+            Some(&miner_address),
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+
+        for key in [
+            "capabilities",
+            "version",
+            "previousblockhash",
+            "finalsaplingroothash",
+            "transactions",
+            "coinbasetxn",
+            "longpollid",
+            "target",
+            "mintime",
+            "mutable",
+            "noncerange",
+            "sigoplimit",
+            "sizelimit",
+            "curtime",
+            "bits",
+            "height",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        let prev_hash = obj
+            .get("previousblockhash")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(is_hex_64(prev_hash));
+        let sapling_root = obj
+            .get("finalsaplingroothash")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(is_hex_64(sapling_root));
+        let target = obj.get("target").and_then(Value::as_str).unwrap();
+        assert!(is_hex_64(target));
+
+        let coinbase = obj.get("coinbasetxn").and_then(Value::as_object).unwrap();
+        for key in ["data", "hash", "depends", "fee", "sigops", "required"] {
+            assert!(coinbase.contains_key(key), "missing coinbasetxn key {key}");
+        }
+        let coinbase_hash = coinbase.get("hash").and_then(Value::as_str).unwrap();
+        assert!(is_hex_64(coinbase_hash));
+        assert!(coinbase.get("depends").and_then(Value::as_array).is_some());
+        assert!(coinbase.get("required").and_then(Value::as_bool).is_some());
+    }
 }
 
 fn system_time_to_unix(time: SystemTime) -> i64 {
