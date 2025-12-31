@@ -492,6 +492,18 @@ Returns the transaction ids for one or more transparent addresses.
 
 These currently return `0.0` and are placeholders for mining metrics.
 
+### getmininginfo
+
+Returns a summary of mining state (modeled after the legacy C++ daemon).
+
+- Params: none
+- Result: object with keys including:
+  - `blocks` (best block height)
+  - `difficulty` (derived from best header bits)
+  - `pooledtx` (mempool transaction count)
+  - `testnet`, `chain`
+  - Various rate/size fields (currently placeholders, e.g. `networkhashps`/`networksolps` are `0.0`)
+
 ### getblocktemplate
 
 Returns a block template suitable for pools/miners, modeled after the C++ daemon output.
@@ -520,6 +532,17 @@ Notes:
 - Longpoll waits until either the best block changes or the mempool revision changes.
 - Proposal mode returns `null` when the block would be accepted, otherwise a string reason (BIP22-style).
 - Until wallet integration is implemented, template mode requires a miner address either in the request or via `--miner-address` / `flux.conf`.
+
+### submitblock
+
+Submits a block for validation and (if it extends the current best chain) connects it.
+
+- Params:
+  - `hexdata` (string) - raw block bytes in hex
+  - optional `parameters` (object) - accepted for parity but currently ignored
+- Result:
+  - `null` when accepted and connected
+  - string when rejected (e.g. `"duplicate"`, `"inconclusive"`, or a validation failure reason)
 
 ### estimatefee
 

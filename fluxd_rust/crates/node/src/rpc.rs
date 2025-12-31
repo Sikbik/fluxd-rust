@@ -6307,6 +6307,30 @@ mod tests {
         (chainstate, params, data_dir)
     }
 
+    fn setup_regtest_chainstate_store() -> (
+        ChainState<Store>,
+        fluxd_consensus::params::ChainParams,
+        PathBuf,
+        Arc<Store>,
+    ) {
+        let data_dir = temp_data_dir("fluxd-rpc-test-store");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let blocks_dir = data_dir.join("blocks");
+        let blocks = FlatFileStore::new(&blocks_dir, 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(&blocks_dir, "undo", 10_000_000).expect("flatfiles");
+        let store = Arc::new(Store::Memory(MemoryStore::new()));
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let params = chain_params(Network::Regtest);
+        let flags = ValidationFlags::default();
+        let write_lock = Mutex::new(());
+        crate::ensure_genesis(&chainstate, &params, &flags, None, &write_lock)
+            .expect("insert genesis");
+
+        (chainstate, params, data_dir, store)
+    }
+
     fn extend_regtest_chain_to_height(
         chainstate: &ChainState<MemoryStore>,
         params: &fluxd_consensus::params::ChainParams,
@@ -6799,6 +6823,27 @@ mod tests {
             "bytesrecv",
             "inbound",
             "kind",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn getdbinfo_has_cpp_schema_keys() {
+        let (chainstate, _params, data_dir, store) = setup_regtest_chainstate_store();
+        let value = rpc_getdbinfo(&chainstate, store.as_ref(), Vec::new(), &data_dir).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "backend",
+            "paths",
+            "chain",
+            "supply",
+            "sizes",
+            "flatfiles_meta",
+            "flatfiles_fs",
+            "db_partitions",
+            "files",
+            "fjall",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }
@@ -7308,6 +7353,63 @@ mod tests {
             assert!(obj.contains_key(key), "missing key {key}");
         }
         assert!(obj.get("deltas").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
+    fn estimatefee_has_cpp_schema() {
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let value = rpc_estimatefee(vec![json!(1)], &fee_estimator).expect("rpc");
+        assert!(value.is_number());
+    }
+
+    #[test]
+    fn getmininginfo_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_getmininginfo(&chainstate, &mempool, Vec::new(), &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "blocks",
+            "currentblocksize",
+            "currentblocktx",
+            "difficulty",
+            "errors",
+            "generate",
+            "genproclimit",
+            "localsolps",
+            "networksolps",
+            "networkhashps",
+            "pooledtx",
+            "testnet",
+            "chain",
+            "ponminter",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn submitblock_duplicate_returns_duplicate() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let genesis_hash = params.consensus.hash_genesis_block;
+        let location = chainstate
+            .block_location(&genesis_hash)
+            .expect("block location")
+            .expect("genesis block location");
+        let bytes = chainstate.read_block(location).expect("read block");
+        let block_hex = hex_bytes(&bytes);
+
+        let write_lock = Mutex::new(());
+        let flags = ValidationFlags::default();
+        let value = rpc_submitblock(
+            &chainstate,
+            &write_lock,
+            vec![Value::String(block_hex)],
+            &params,
+            &flags,
+        )
+        .expect("rpc");
+        assert_eq!(value.as_str(), Some("duplicate"));
     }
 
     #[test]
