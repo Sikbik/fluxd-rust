@@ -185,6 +185,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `listtransactions` (partial)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag
+  - [x] `listsinceblock` (partial)
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index
@@ -314,7 +315,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`getreceivedbyaddress`<br>`gettransaction`<br>`listtransactions`<br>`listreceivedbyaddress`<br>`keypoolrefill`<br>`settxfee`<br>`getwalletinfo`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany` | `importaddress`<br>`importwallet`<br>`listaddressgroupings`<br>`lockunspent`<br>`listlockunspent`<br>`sendfrom` |
+| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`getreceivedbyaddress`<br>`gettransaction`<br>`listtransactions`<br>`listsinceblock`<br>`listreceivedbyaddress`<br>`settxfee`<br>`getwalletinfo`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany`<br>`importwallet`<br>`listaddressgroupings`<br>`sendfrom` | `addmultisigaddress` |
 
 ### Wallet (shielded)
 

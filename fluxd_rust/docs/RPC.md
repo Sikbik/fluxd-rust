@@ -128,6 +128,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `getwalletinfo` (partial)
 - `gettransaction <txid> [include_watchonly]` (partial)
 - `listtransactions [account] [count] [skip] [include_watchonly]` (partial)
+- `listsinceblock [blockhash] [target_confirmations] [include_watchonly]` (partial)
 - `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` (partial)
 - `keypoolrefill [newsize]` (partial)
 - `settxfee <amount>` (partial)
@@ -303,10 +304,19 @@ Notes:
 ### listtransactions
 
 - Params: `[account] [count] [skip] [include_watchonly]` (partial; `account` is ignored, `include_watchonly` is honored).
-- Result: array of wallet transactions (confirmed txs ordered by height; mempool txs ordered by entry time).
+- Result: array of wallet transactions (ordered oldest → newest; mempool entries appear last).
 
 Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
+
+### listsinceblock
+
+- Params: `[blockhash] [target_confirmations] [include_watchonly]` (partial; `include_watchonly` is honored).
+- Result: object `{ "transactions": array, "lastblock": string }`.
+
+Notes:
+- If `blockhash` is omitted (or unknown), returns all wallet transactions.
+- `lastblock` is the best block at depth `target_confirmations` (1 = chain tip).
 
 ### listreceivedbyaddress
 
