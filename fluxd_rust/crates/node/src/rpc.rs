@@ -2023,17 +2023,23 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         ));
     }
     let txid = parse_hash(&params[0])?;
-    if let Some(value) = params.get(1) {
-        if !value.is_null() {
-            let _ = parse_bool(value)?;
-        }
-    }
+
+    let include_watchonly = match params.get(1) {
+        None | Some(Value::Null) => false,
+        Some(value) => parse_bool(value)?,
+    };
 
     let wallet_scripts = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        guard.all_script_pubkeys().map_err(map_wallet_error)?
+        if include_watchonly {
+            guard
+                .all_script_pubkeys_including_watchonly()
+                .map_err(map_wallet_error)?
+        } else {
+            guard.all_script_pubkeys().map_err(map_wallet_error)?
+        }
     };
     if wallet_scripts.is_empty() {
         return Err(RpcError::new(
@@ -2256,17 +2262,23 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         Some(value) if !value.is_null() => parse_u32(value, "skip")?,
         _ => 0,
     };
-    if let Some(value) = params.get(3) {
-        if !value.is_null() {
-            let _ = parse_bool(value)?;
-        }
-    }
+
+    let include_watchonly = match params.get(3) {
+        None | Some(Value::Null) => false,
+        Some(value) => parse_bool(value)?,
+    };
 
     let wallet_scripts = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        guard.all_script_pubkeys().map_err(map_wallet_error)?
+        if include_watchonly {
+            guard
+                .all_script_pubkeys_including_watchonly()
+                .map_err(map_wallet_error)?
+        } else {
+            guard.all_script_pubkeys().map_err(map_wallet_error)?
+        }
     };
     if wallet_scripts.is_empty() {
         return Ok(Value::Array(Vec::new()));
@@ -2380,7 +2392,10 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
             chainstate,
             mempool,
             wallet,
-            vec![Value::String(hash256_to_hex(&cand.txid))],
+            vec![
+                Value::String(hash256_to_hex(&cand.txid)),
+                Value::Bool(include_watchonly),
+            ],
             chain_params,
         )?;
         let obj = view
@@ -2462,11 +2477,10 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
         Some(value) if !value.is_null() => parse_bool(value)?,
         _ => false,
     };
-    if let Some(value) = params.get(2) {
-        if !value.is_null() {
-            let _ = parse_bool(value)?;
-        }
-    }
+    let include_watchonly = match params.get(2) {
+        Some(value) if !value.is_null() => parse_bool(value)?,
+        _ => false,
+    };
     let address_filter = match params.get(3) {
         None | Some(Value::Null) => None,
         Some(Value::String(addr)) => Some(addr.trim().to_string()),
@@ -2480,15 +2494,24 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
     }
     .filter(|s| !s.is_empty());
 
-    let wallet_scripts = {
+    let (wallet_scripts, owned_scripts) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        guard.all_script_pubkeys().map_err(map_wallet_error)?
+        let owned_scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
+        let wallet_scripts = if include_watchonly {
+            guard
+                .all_script_pubkeys_including_watchonly()
+                .map_err(map_wallet_error)?
+        } else {
+            owned_scripts.clone()
+        };
+        (wallet_scripts, owned_scripts)
     };
     if wallet_scripts.is_empty() {
         return Ok(Value::Array(Vec::new()));
     }
+    let owned_set: HashSet<Vec<u8>> = owned_scripts.into_iter().collect();
 
     let best_height = chainstate
         .best_block()
@@ -2578,7 +2601,7 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
         };
 
         out.push(json!({
-            "involvesWatchonly": false,
+            "involvesWatchonly": !owned_set.contains(script_pubkey),
             "address": address,
             "account": "",
             "amount": amount_to_value(received_zat),
@@ -12032,6 +12055,62 @@ mod tests {
     }
 
     #[test]
+    fn gettransaction_requires_include_watchonly_for_watchonly_tx() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let _owned_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let watch_script = p2pkh_script([0x33u8; 20]);
+        let watch_address =
+            script_pubkey_to_address(&watch_script, params.network).expect("watch address");
+        rpc_importaddress(
+            &wallet,
+            vec![json!(watch_address.clone()), Value::Null, json!(false)],
+            &params,
+        )
+        .expect("rpc");
+
+        let (txid, _vout, _height, miner_value) =
+            mine_regtest_block_to_script(&chainstate, &params, watch_script);
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let txid_hex = hash256_to_hex(&txid);
+
+        let err = rpc_gettransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(txid_hex.clone())],
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
+
+        let value = rpc_gettransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(txid_hex.clone()), json!(true)],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(
+            obj.get("txid").and_then(Value::as_str),
+            Some(txid_hex.as_str())
+        );
+        assert_eq!(
+            obj.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value)
+        );
+    }
+
+    #[test]
     fn listtransactions_includes_mempool_before_confirmed() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
@@ -12134,6 +12213,58 @@ mod tests {
     }
 
     #[test]
+    fn listtransactions_includes_watchonly_when_requested() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let _owned_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let watch_script = p2pkh_script([0x44u8; 20]);
+        let watch_address =
+            script_pubkey_to_address(&watch_script, params.network).expect("watch address");
+        rpc_importaddress(
+            &wallet,
+            vec![json!(watch_address.clone()), Value::Null, json!(false)],
+            &params,
+        )
+        .expect("rpc");
+
+        let (txid, _vout, _height, miner_value) =
+            mine_regtest_block_to_script(&chainstate, &params, watch_script);
+
+        let mempool = Mutex::new(Mempool::new(0));
+
+        let value =
+            rpc_listtransactions(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        assert_eq!(value.as_array().expect("array").len(), 0);
+
+        let txid_hex = hash256_to_hex(&txid);
+        let value = rpc_listtransactions(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![Value::Null, json!(10), json!(0), json!(true)],
+            &params,
+        )
+        .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("object");
+        assert_eq!(
+            row.get("txid").and_then(Value::as_str),
+            Some(txid_hex.as_str())
+        );
+        assert_eq!(
+            row.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value)
+        );
+    }
+
+    #[test]
     fn listreceivedbyaddress_reports_wallet_receives() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
@@ -12196,6 +12327,61 @@ mod tests {
         .expect("rpc");
         let arr = value.as_array().expect("array");
         assert_eq!(arr.len(), 0);
+    }
+
+    #[test]
+    fn listreceivedbyaddress_sets_involves_watchonly_for_watchonly_receives() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let _owned_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let watch_script = p2pkh_script([0x66u8; 20]);
+        let watch_address =
+            script_pubkey_to_address(&watch_script, params.network).expect("watch address");
+        rpc_importaddress(
+            &wallet,
+            vec![json!(watch_address.clone()), Value::Null, json!(false)],
+            &params,
+        )
+        .expect("rpc");
+
+        let (_txid, _vout, _height, miner_value) =
+            mine_regtest_block_to_script(&chainstate, &params, watch_script);
+
+        let mempool = Mutex::new(Mempool::new(0));
+
+        let value = rpc_listreceivedbyaddress(&chainstate, &mempool, &wallet, Vec::new(), &params)
+            .expect("rpc");
+        assert_eq!(value.as_array().expect("array").len(), 0);
+
+        let value = rpc_listreceivedbyaddress(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(1), json!(false), json!(true)],
+            &params,
+        )
+        .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("object");
+        assert_eq!(
+            row.get("address").and_then(Value::as_str),
+            Some(watch_address.as_str())
+        );
+        assert_eq!(
+            row.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value)
+        );
+        assert_eq!(
+            row.get("involvesWatchonly").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

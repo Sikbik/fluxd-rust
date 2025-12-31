@@ -290,17 +290,17 @@ Notes:
 
 ### gettransaction
 
-- Params: `<txid> [include_watchonly]` (partial; watch-only not supported).
+- Params: `<txid> [include_watchonly]` (partial; `include_watchonly=true` includes watch-only scripts imported via `importaddress`).
 - Result: best-effort wallet view of a transaction (confirmed txs via address deltas + tx index; mempool txs via script matching).
 
 ### listtransactions
 
-- Params: `[account] [count] [skip] [include_watchonly]` (partial; account/watch-only are ignored).
+- Params: `[account] [count] [skip] [include_watchonly]` (partial; `account` is ignored, `include_watchonly` is honored).
 - Result: array of wallet transactions (confirmed txs ordered by height; mempool txs ordered by entry time).
 
 ### listreceivedbyaddress
 
-- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (partial; account/labels/txids are WIP).
+- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (partial; `include_watchonly` is honored; `txids`/labels are WIP).
 - Result: array of wallet addresses with received totals.
 
 ### keypoolrefill

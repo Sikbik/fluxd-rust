@@ -180,8 +180,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `listaddressgroupings` (simplified grouping)
   - [x] `getreceivedbyaddress` (P2PKH only)
   - [x] `gettransaction` (partial)
+    - [x] `include_watchonly` support
   - [x] `listtransactions` (partial)
+    - [x] `include_watchonly` support
   - [x] `listreceivedbyaddress` (partial)
+    - [x] `include_watchonly` support + `involvesWatchonly`
   - [x] `keypoolrefill` (partial)
   - [x] `settxfee` (partial)
   - [x] `signmessage`
