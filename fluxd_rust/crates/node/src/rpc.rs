@@ -6567,6 +6567,31 @@ mod tests {
         }
         assert!(obj.get("tx").and_then(Value::as_array).is_some());
     }
+
+    #[test]
+    fn getmempoolinfo_has_cpp_schema_keys() {
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_getmempoolinfo(Vec::new(), &mempool).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in ["size", "bytes", "usage"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn getrawmempool_has_cpp_schema() {
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_getrawmempool(Vec::new(), &mempool).expect("rpc");
+        let txids = value.as_array().expect("array");
+        assert!(txids.is_empty());
+    }
+
+    #[test]
+    fn getrawmempool_verbose_has_cpp_schema() {
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_getrawmempool(vec![json!(true)], &mempool).expect("rpc");
+        assert!(value.as_object().is_some());
+    }
 }
 
 fn system_time_to_unix(time: SystemTime) -> i64 {
