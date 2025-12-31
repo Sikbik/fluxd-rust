@@ -185,6 +185,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `include_watchonly` support
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`
+    - [x] Populate `txids` via address delta index
   - [x] `keypoolrefill` (partial)
   - [x] `settxfee` (partial)
   - [x] `signmessage`

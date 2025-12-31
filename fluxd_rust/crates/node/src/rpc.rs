@@ -2521,6 +2521,7 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
     let best_height_u32 = u32::try_from(best_height).unwrap_or(0);
 
     let mut mempool_received: HashMap<Vec<u8>, i64> = HashMap::new();
+    let mut mempool_txids: HashMap<Vec<u8>, std::collections::BTreeSet<Hash256>> = HashMap::new();
     if minconf == 0 {
         if let Ok(mempool_guard) = mempool.lock() {
             for entry in mempool_guard.entries() {
@@ -2531,6 +2532,10 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
                     {
                         continue;
                     }
+                    mempool_txids
+                        .entry(output.script_pubkey.clone())
+                        .or_default()
+                        .insert(entry.txid);
                     mempool_received
                         .entry(output.script_pubkey.clone())
                         .and_modify(|sum| *sum = sum.saturating_add(output.value))
@@ -2556,6 +2561,7 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
 
         let mut received_zat: i64 = 0;
         let mut last_height: Option<u32> = None;
+        let mut txids = std::collections::BTreeSet::<(u32, Hash256)>::new();
         let mut visitor = |delta: fluxd_chainstate::address_deltas::AddressDeltaEntry| {
             if delta.satoshis <= 0 {
                 return Ok(());
@@ -2574,17 +2580,29 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
                 fluxd_storage::StoreError::Backend("listreceivedbyaddress overflow".to_string())
             })?;
             last_height = Some(last_height.map_or(delta.height, |h| h.max(delta.height)));
+            txids.insert((delta.height, delta.txid));
             Ok(())
         };
         chainstate
             .for_each_address_delta(script_pubkey, &mut visitor)
             .map_err(map_internal)?;
 
+        let mut txids = txids
+            .into_iter()
+            .map(|(_height, txid)| Value::String(hash256_to_hex(&txid)))
+            .collect::<Vec<_>>();
         if minconf == 0 {
             if let Some(value) = mempool_received.get(script_pubkey) {
                 received_zat = received_zat
                     .checked_add(*value)
                     .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+            }
+            if let Some(entries) = mempool_txids.get(script_pubkey) {
+                txids.extend(
+                    entries
+                        .iter()
+                        .map(|txid| Value::String(hash256_to_hex(txid))),
+                );
             }
         }
 
@@ -2607,7 +2625,7 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
             "amount": amount_to_value(received_zat),
             "confirmations": confirmations,
             "label": "",
-            "txids": [],
+            "txids": txids,
             "amount_zat": received_zat,
         }));
     }
@@ -12276,10 +12294,10 @@ mod tests {
         let script_pubkey =
             address_to_script_pubkey(&address, params.network).expect("address script");
 
-        let (_txid_a, _vout, height_a, miner_value_a) =
+        let (txid_a, _vout, height_a, miner_value_a) =
             mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
         assert_eq!(height_a, 1);
-        let (_txid_b, _vout, height_b, miner_value_b) =
+        let (txid_b, _vout, height_b, miner_value_b) =
             mine_regtest_block_to_script(&chainstate, &params, script_pubkey);
         assert_eq!(height_b, 2);
 
@@ -12298,6 +12316,15 @@ mod tests {
             Some(miner_value_a + miner_value_b)
         );
         assert_eq!(row.get("confirmations").and_then(Value::as_i64), Some(1));
+        let txids = row.get("txids").and_then(Value::as_array).expect("txids");
+        let got = txids
+            .iter()
+            .map(|value| value.as_str().expect("txid string").to_string())
+            .collect::<HashSet<_>>();
+        let expected = [hash256_to_hex(&txid_a), hash256_to_hex(&txid_b)]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(got, expected);
 
         let value =
             rpc_listreceivedbyaddress(&chainstate, &mempool, &wallet, vec![json!(2)], &params)
@@ -12314,6 +12341,9 @@ mod tests {
             Some(miner_value_a)
         );
         assert_eq!(row.get("confirmations").and_then(Value::as_i64), Some(2));
+        let txids = row.get("txids").and_then(Value::as_array).expect("txids");
+        let expected_txid = hash256_to_hex(&txid_a);
+        assert_eq!(txids, &vec![Value::String(expected_txid)]);
 
         let other_address =
             script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("address");
@@ -12350,7 +12380,7 @@ mod tests {
         )
         .expect("rpc");
 
-        let (_txid, _vout, _height, miner_value) =
+        let (txid, _vout, _height, miner_value) =
             mine_regtest_block_to_script(&chainstate, &params, watch_script);
 
         let mempool = Mutex::new(Mempool::new(0));
@@ -12382,6 +12412,9 @@ mod tests {
             row.get("involvesWatchonly").and_then(Value::as_bool),
             Some(true)
         );
+        let txids = row.get("txids").and_then(Value::as_array).expect("txids");
+        let expected_txid = hash256_to_hex(&txid);
+        assert_eq!(txids, &vec![Value::String(expected_txid)]);
     }
 
     #[test]

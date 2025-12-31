@@ -300,8 +300,11 @@ Notes:
 
 ### listreceivedbyaddress
 
-- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (partial; `include_watchonly` is honored; `txids`/labels are WIP).
+- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (partial; `include_watchonly` is honored; labels are WIP).
 - Result: array of wallet addresses with received totals.
+
+Notes:
+- `txids` is derived from the address delta index (and includes mempool txids when `minconf=0`).
 
 ### keypoolrefill
 
