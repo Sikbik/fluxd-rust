@@ -35,6 +35,10 @@ Currently supported keys:
 - `rpcbind`, `rpcport`
 - `addnode` (repeatable)
 - `mineraddress` (default coinbase/miner address for `getblocktemplate`)
+- `testnet=1` / `regtest=1` (network selection; CLI `--network ...` overrides)
+
+Unsupported keys are ignored; `fluxd` prints a warning listing the ignored keys to help catch
+misconfigurations.
 
 ## Run profiles
 

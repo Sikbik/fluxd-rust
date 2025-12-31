@@ -6124,6 +6124,7 @@ fn parse_args() -> Result<Config, String> {
     let mut rpc_pass: Option<String> = None;
     let mut rpc_pass_set = false;
     let mut network = Network::Mainnet;
+    let mut network_set = false;
     let mut getdata_batch: usize = DEFAULT_GETDATA_BATCH;
     let mut getdata_batch_set = false;
     let mut block_peers: usize = DEFAULT_BLOCK_PEERS;
@@ -6330,6 +6331,7 @@ fn parse_args() -> Result<Config, String> {
                     "regtest" => Network::Regtest,
                     _ => return Err(format!("invalid network '{value}'\n{}", usage())),
                 };
+                network_set = true;
             }
             "--getdata-batch" => {
                 let value = args
@@ -6609,6 +6611,39 @@ fn parse_args() -> Result<Config, String> {
     let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
     let conf_file = conf_path.unwrap_or_else(|| data_dir.join("flux.conf"));
     if let Some(conf) = load_flux_conf(&conf_file)? {
+        if !network_set {
+            if let Some(values) = conf.get("regtest") {
+                if let Some(raw) = values.last() {
+                    match parse_conf_bool(raw) {
+                        Some(true) => network = Network::Regtest,
+                        Some(false) => {}
+                        None => {
+                            return Err(format!(
+                                "invalid regtest value '{raw}' in {}",
+                                conf_file.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            if network != Network::Regtest {
+                if let Some(values) = conf.get("testnet") {
+                    if let Some(raw) = values.last() {
+                        match parse_conf_bool(raw) {
+                            Some(true) => network = Network::Testnet,
+                            Some(false) => {}
+                            None => {
+                                return Err(format!(
+                                    "invalid testnet value '{raw}' in {}",
+                                    conf_file.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let params = chain_params(network);
         let default_port = params.default_port;
 
@@ -6680,6 +6715,30 @@ fn parse_args() -> Result<Config, String> {
                     addnode_addrs.push(addr);
                 }
             }
+        }
+
+        let supported_keys = [
+            "addnode",
+            "mineraddress",
+            "rpcbind",
+            "rpcpassword",
+            "rpcport",
+            "rpcuser",
+            "regtest",
+            "testnet",
+        ];
+        let mut unsupported: Vec<String> = conf
+            .keys()
+            .filter(|key| !supported_keys.contains(&key.as_str()))
+            .cloned()
+            .collect();
+        unsupported.sort();
+        if !unsupported.is_empty() {
+            eprintln!(
+                "Warning: ignoring unsupported keys in {}: {}",
+                conf_file.display(),
+                unsupported.join(", ")
+            );
         }
     }
 
@@ -6915,6 +6974,18 @@ fn load_flux_conf(path: &Path) -> Result<Option<HashMap<String, Vec<String>>>, S
     Ok(Some(out))
 }
 
+fn parse_conf_bool(value: &str) -> Option<bool> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(true);
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_socket_addr_with_default_port(value: &str, default_port: u16) -> Option<SocketAddr> {
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return Some(addr);
@@ -7145,4 +7216,19 @@ fn usage() -> String {
         "  --dashboard-addr  Bind dashboard HTTP server (disabled by default)",
     ]
     .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn genesis_pow_validation_is_allowed() {
+        for network in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            let params = chain_params(network);
+            let block = build_genesis_block(&params).expect("genesis block");
+            pow_validation::validate_pow_header(&block.header, 0, &params.consensus)
+                .expect("genesis pow validation");
+        }
+    }
 }

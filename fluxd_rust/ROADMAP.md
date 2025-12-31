@@ -175,6 +175,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P2] Config file support (`flux.conf` parity) (owner: TBD)
   - [x] Basic `flux.conf` parsing (`rpcuser`, `rpcpassword`, `rpcbind`, `rpcport`, `addnode`, `mineraddress`)
   - [ ] Remaining `flux.conf` keys parity
+    - [x] Support `testnet`/`regtest` toggles and warn on unsupported keys
 - [ ] [P2] Structured CLI help output and subcommands (owner: TBD)
 - [ ] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
   - [x] `--db-info`

@@ -59,9 +59,14 @@ pub fn validate_pow_header(
         return Err(PowError::InvalidBits("pow target above limit"));
     }
 
-    let hash_value = U256::from_little_endian(&header.hash());
+    let hash_bytes = header.hash();
+    let hash_value = U256::from_little_endian(&hash_bytes);
     if hash_value > target {
         return Err(PowError::HashMismatch);
+    }
+
+    if height == 0 && header.prev_block == [0u8; 32] && hash_bytes == params.hash_genesis_block {
+        return Ok(());
     }
 
     equihash::validate_equihash_solution(header, height, params)?;
