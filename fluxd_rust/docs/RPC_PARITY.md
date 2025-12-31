@@ -128,7 +128,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - importaddress - Missing
 - importprivkey - Implemented (rescan param accepted but ignored; address index makes it unnecessary)
 - importwallet - Missing
-- keypoolrefill - Missing
+- keypoolrefill - Partial (generates additional wallet keys; does not maintain a real keypool yet)
 - listaddressgroupings - Missing
 - listlockunspent - Missing
 - listreceivedbyaddress - Partial (wallet keys only; uses address deltas and optional mempool scan; labels/txids fields are placeholders)

@@ -122,6 +122,7 @@ const RPC_METHODS: &[&str] = &[
     "gettransaction",
     "listtransactions",
     "listreceivedbyaddress",
+    "keypoolrefill",
     "fundrawtransaction",
     "signrawtransaction",
     "sendrawtransaction",
@@ -1021,6 +1022,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "listreceivedbyaddress" => {
             rpc_listreceivedbyaddress(chainstate, mempool, wallet, params, chain_params)
         }
+        "keypoolrefill" => rpc_keypoolrefill(wallet, params),
         "fundrawtransaction" => rpc_fundrawtransaction(
             chainstate,
             mempool,
@@ -1456,6 +1458,28 @@ fn rpc_backupwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value,
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
     let path = Path::new(destination);
     guard.backup_to(path).map_err(map_wallet_error)?;
+    Ok(Value::Null)
+}
+
+fn rpc_keypoolrefill(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "keypoolrefill expects 0 or 1 parameters",
+        ));
+    }
+    let newsize = match params.first() {
+        Some(value) if !value.is_null() => parse_u32(value, "newsize")?,
+        _ => 100,
+    };
+    let newsize = usize::try_from(newsize).unwrap_or(usize::MAX);
+
+    let mut guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    while guard.key_count() < newsize {
+        let _ = guard.generate_new_address(true).map_err(map_wallet_error)?;
+    }
     Ok(Value::Null)
 }
 
@@ -10573,6 +10597,16 @@ mod tests {
             std::fs::read(data_dir.join(crate::wallet::WALLET_FILE_NAME)).expect("read wallet.dat");
         let backup = std::fs::read(&backup_path).expect("read backup");
         assert_eq!(backup, original);
+    }
+
+    #[test]
+    fn keypoolrefill_generates_keys() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        assert_eq!(wallet.lock().expect("wallet lock").key_count(), 0);
+
+        rpc_keypoolrefill(&wallet, vec![json!(2)]).expect("rpc");
+        assert!(wallet.lock().expect("wallet lock").key_count() >= 2);
     }
 
     #[test]
