@@ -68,8 +68,8 @@ ssh <vps-user>@<vps-host> "nohup stdbuf -oL -eL <remote-repo-path>/target/releas
 ```
 
 Note: do not run multiple `fluxd` instances pointing at the same `--data-dir` at the same time.
-There is no cross-process locking for the database / flatfiles, so concurrent writers can corrupt
-or stall the node.
+`fluxd` takes an exclusive lock on `--data-dir/.lock`; a second process using the same `--data-dir`
+will exit with an error.
 
 If you need a lower-resource run (or are debugging OOM issues), use `--profile low` or override the
 individual `--db-*` / worker flags explicitly.
@@ -78,6 +78,7 @@ individual `--db-*` / worker flags explicitly.
 
 The daemon writes a few non-db helper files into `--data-dir`:
 
+- `.lock` - prevents multiple `fluxd` processes from using the same data dir.
 - `rpc.cookie` - JSON-RPC auth cookie when not using `--rpc-user`/`--rpc-pass`.
 - `peers.dat` - cached peer addresses learned from the network (used to reduce DNS seed reliance).
 - `banlist.dat` - cached peer bans (temporary).

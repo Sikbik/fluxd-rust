@@ -10,8 +10,8 @@ mod tx_relay;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -47,6 +47,7 @@ use fluxd_shielded::{
 use fluxd_storage::fjall::{FjallOptions, FjallStore};
 use fluxd_storage::memory::MemoryStore;
 use fluxd_storage::{KeyValueStore, StoreError, WriteBatch};
+use fs2::FileExt;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -114,6 +115,7 @@ const BANLIST_FILE_NAME: &str = "banlist.dat";
 const MEMPOOL_FILE_NAME: &str = "mempool.dat";
 const FEE_ESTIMATES_FILE_NAME: &str = "fee_estimates.dat";
 const REINDEX_REQUEST_FILE_NAME: &str = "reindex.flag";
+const DATA_DIR_LOCK_FILE_NAME: &str = ".lock";
 const PEERS_FILE_VERSION: u32 = 2;
 const PEERS_FILE_VERSION_V1: u32 = 1;
 const MEMPOOL_FILE_VERSION: u32 = 1;
@@ -834,6 +836,55 @@ async fn main() {
     }
 }
 
+struct DataDirLock {
+    _file: File,
+}
+
+fn lock_data_dir(data_dir: &Path) -> Result<DataDirLock, String> {
+    let lock_path = data_dir.join(DATA_DIR_LOCK_FILE_NAME);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open lock file {}: {err}", lock_path.display()))?;
+
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let pid = std::process::id();
+            let _ = file.set_len(0);
+            let _ = file.seek(SeekFrom::Start(0));
+            let _ = writeln!(file, "pid={pid}");
+            let _ = file.flush();
+            Ok(DataDirLock { _file: file })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            let mut holder = String::new();
+            let _ =
+                File::open(&lock_path).and_then(|mut reader| reader.read_to_string(&mut holder));
+            let holder = holder.trim();
+            if holder.is_empty() {
+                Err(format!(
+                    "data dir {} is already locked (another fluxd instance may be running); lock file {}",
+                    data_dir.display(),
+                    lock_path.display()
+                ))
+            } else {
+                Err(format!(
+                    "data dir {} is already locked (another fluxd instance may be running); lock file {} ({holder})",
+                    data_dir.display(),
+                    lock_path.display()
+                ))
+            }
+        }
+        Err(err) => Err(format!(
+            "failed to lock data dir {} (lock file {}): {err}",
+            data_dir.display(),
+            lock_path.display()
+        )),
+    }
+}
+
 async fn run() -> Result<(), String> {
     let start_time = Instant::now();
     let config = parse_args()?;
@@ -854,6 +905,7 @@ async fn run() -> Result<(), String> {
     let reindex_flag_path = data_dir.join(REINDEX_REQUEST_FILE_NAME);
 
     fs::create_dir_all(data_dir).map_err(|err| err.to_string())?;
+    let _data_dir_lock = lock_data_dir(data_dir)?;
 
     if config.reindex || reindex_flag_path.exists() {
         println!(

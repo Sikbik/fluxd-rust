@@ -9,6 +9,7 @@
 
 # Rust local caches
 /fluxd_rust/.cargo/
+/.cargo_home/
 
 # Chain data and logs
 /fluxd_rust/data*/
