@@ -2243,10 +2243,44 @@ fn rpc_gettxout<S: fluxd_storage::KeyValueStore>(
         if guard.is_spent(&outpoint) {
             return Ok(Value::Null);
         }
+        if let Some(entry) = guard.get(&txid) {
+            let out_index = outpoint.index as usize;
+            let Some(output) = entry.tx.vout.get(out_index) else {
+                return Ok(Value::Null);
+            };
+            let best = chainstate
+                .best_block()
+                .map_err(map_internal)?
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "best block not found"))?;
+            let script = script_pubkey_json(&output.script_pubkey, chain_params.network);
+            return Ok(json!({
+                "bestblock": hash256_to_hex(&best.hash),
+                "confirmations": 0,
+                "value": amount_to_value(output.value),
+                "scriptPubKey": script,
+                "version": entry.tx.version,
+                "coinbase": false,
+            }));
+        }
     }
     let entry = match chainstate.utxo_entry(&outpoint).map_err(map_internal)? {
         Some(entry) => entry,
         None => return Ok(Value::Null),
+    };
+    let tx_version = {
+        let location = chainstate
+            .tx_location(&txid)
+            .map_err(map_internal)?
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "transaction not found"))?;
+        let bytes = chainstate
+            .read_block(location.block)
+            .map_err(map_internal)?;
+        let block = Block::consensus_decode(&bytes).map_err(map_internal)?;
+        block
+            .transactions
+            .get(location.index as usize)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "transaction index out of range"))?
+            .version
     };
     let best = chainstate
         .best_block()
@@ -2263,6 +2297,7 @@ fn rpc_gettxout<S: fluxd_storage::KeyValueStore>(
         "confirmations": confirmations,
         "value": amount_to_value(entry.value),
         "scriptPubKey": script,
+        "version": tx_version,
         "coinbase": entry.is_coinbase,
     }))
 }
@@ -6218,10 +6253,13 @@ fn parse_amount(value: &Value) -> Result<i64, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mempool::MempoolEntry;
     use fluxd_chainstate::flatfiles::FlatFileStore;
     use fluxd_chainstate::validation::ValidationFlags;
     use fluxd_consensus::params::{chain_params, Network};
+    use fluxd_primitives::block::BlockHeader;
     use fluxd_storage::memory::MemoryStore;
+    use fluxd_storage::{Column, WriteBatch};
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -6266,6 +6304,119 @@ mod tests {
             .expect("insert genesis");
 
         (chainstate, params, data_dir)
+    }
+
+    fn p2pkh_script(pubkey_hash: [u8; 20]) -> Vec<u8> {
+        let mut script = Vec::with_capacity(25);
+        script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        script.extend_from_slice(&pubkey_hash);
+        script.extend_from_slice(&[0x88, 0xac]);
+        script
+    }
+
+    fn setup_regtest_chain_with_p2pkh_utxo() -> (
+        ChainState<MemoryStore>,
+        fluxd_consensus::params::ChainParams,
+        PathBuf,
+        String,
+        Hash256,
+        u32,
+    ) {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let time = tip_entry.time.saturating_add(1);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let pubkey_hash = [0x11u8; 20];
+        let script_pubkey = p2pkh_script(pubkey_hash);
+        let address =
+            script_pubkey_to_address(&script_pubkey, params.network).expect("p2pkh address");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: miner_value,
+                script_pubkey: script_pubkey.clone(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root: [0u8; 32],
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase],
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                &params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+
+        (chainstate, params, data_dir, address, coinbase_txid, 0)
     }
 
     #[test]
@@ -6591,6 +6742,233 @@ mod tests {
         let mempool = Mutex::new(Mempool::new(0));
         let value = rpc_getrawmempool(vec![json!(true)], &mempool).expect("rpc");
         assert!(value.as_object().is_some());
+    }
+
+    #[test]
+    fn gettxout_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir, _address, txid, vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_gettxout(
+            &chainstate,
+            &mempool,
+            vec![Value::String(hash256_to_hex(&txid)), json!(vout)],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "bestblock",
+            "confirmations",
+            "value",
+            "scriptPubKey",
+            "version",
+            "coinbase",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        let bestblock = obj.get("bestblock").and_then(Value::as_str).unwrap();
+        assert!(is_hex_64(bestblock));
+    }
+
+    #[test]
+    fn gettxout_can_serve_mempool_outputs() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+
+        let script_pubkey = p2pkh_script([0x22u8; 20]);
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x33u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: 123,
+                script_pubkey,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let txid = tx.txid().expect("txid");
+        let raw = tx.consensus_encode().expect("encode tx");
+
+        let entry = MempoolEntry {
+            txid,
+            tx,
+            raw,
+            time: 0,
+            height: 0,
+            fee: 0,
+            spent_outpoints: Vec::new(),
+            parents: Vec::new(),
+        };
+        let mut inner = Mempool::new(0);
+        inner.insert(entry).expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let value = rpc_gettxout(
+            &chainstate,
+            &mempool,
+            vec![Value::String(hash256_to_hex(&txid)), json!(0)],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("confirmations").and_then(Value::as_i64), Some(0));
+        assert_eq!(obj.get("coinbase").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("version").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn getspentinfo_has_cpp_schema_keys() {
+        let (chainstate, _params, _data_dir, _address, txid, vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+
+        let outpoint = OutPoint {
+            hash: txid,
+            index: vout,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let spent = fluxd_chainstate::spentindex::SpentIndexValue {
+            txid: [0x44u8; 32],
+            input_index: 7,
+            block_height: 123,
+            details: None,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(Column::SpentIndex, key.as_bytes(), spent.encode());
+        chainstate.commit_batch(batch).expect("insert spent index");
+
+        let object_form = rpc_getspentinfo(
+            &chainstate,
+            vec![json!({"txid": hash256_to_hex(&txid), "index": vout })],
+        )
+        .expect("rpc");
+        let obj = object_form.as_object().expect("object");
+        for key in ["txid", "index", "height"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        let positional = rpc_getspentinfo(
+            &chainstate,
+            vec![Value::String(hash256_to_hex(&txid)), json!(vout)],
+        )
+        .expect("rpc");
+        assert_eq!(positional, object_form);
+
+        let not_found =
+            rpc_getspentinfo(&chainstate, vec![Value::String("00".repeat(32)), json!(0)])
+                .unwrap_err();
+        assert_eq!(not_found.code, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[test]
+    fn getaddressutxos_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir, address, _txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        let value = rpc_getaddressutxos(&chainstate, vec![Value::String(address.clone())], &params)
+            .expect("rpc");
+        let utxos = value.as_array().expect("array");
+        assert!(!utxos.is_empty());
+        let first = utxos[0].as_object().expect("object");
+        for key in [
+            "address",
+            "txid",
+            "outputIndex",
+            "script",
+            "satoshis",
+            "height",
+        ] {
+            assert!(first.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn getaddressutxos_chaininfo_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir, address, _txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        let value = rpc_getaddressutxos(
+            &chainstate,
+            vec![json!({"addresses": [address], "chainInfo": true })],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in ["utxos", "hash", "height"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn getaddressbalance_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir, address, _txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        let value =
+            rpc_getaddressbalance(&chainstate, vec![Value::String(address)], &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in ["balance", "received"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn getaddressdeltas_has_cpp_schema_keys() {
+        let (chainstate, params, _data_dir, address, _txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        let value =
+            rpc_getaddressdeltas(&chainstate, vec![Value::String(address)], &params).expect("rpc");
+        let deltas = value.as_array().expect("array");
+        assert!(!deltas.is_empty());
+        let first = deltas[0].as_object().expect("object");
+        for key in [
+            "address",
+            "blockindex",
+            "height",
+            "index",
+            "satoshis",
+            "txid",
+        ] {
+            assert!(first.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn getaddresstxids_has_cpp_schema() {
+        let (chainstate, params, _data_dir, address, txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        let value =
+            rpc_getaddresstxids(&chainstate, vec![Value::String(address)], &params).expect("rpc");
+        let txids = value.as_array().expect("array");
+        let expected = hash256_to_hex(&txid);
+        assert_eq!(
+            txids.get(0).and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn getaddressmempool_has_cpp_schema() {
+        let (chainstate, params, _data_dir, address, _txid, _vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        let mempool = Mutex::new(Mempool::new(0));
+        let value =
+            rpc_getaddressmempool(&chainstate, &mempool, vec![Value::String(address)], &params)
+                .expect("rpc");
+        assert!(value.as_array().expect("array").is_empty());
     }
 
     #[test]

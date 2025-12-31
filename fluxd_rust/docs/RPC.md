@@ -394,10 +394,11 @@ Notes:
   - `include_mempool` (boolean or numeric, default true)
 - Result:
   - `null` if the output is spent.
-  - Otherwise: `bestblock`, `confirmations`, `value`, `scriptPubKey`, `coinbase`.
+  - Otherwise: `bestblock`, `confirmations`, `value`, `scriptPubKey`, `version`, `coinbase`.
 
 Notes:
 - If `include_mempool=true`, returns `null` when the output is spent by a mempool transaction.
+- If `include_mempool=true`, can also return outputs created by a mempool transaction (`confirmations=0`, `coinbase=false`).
 
 ### gettxoutsetinfo
 
