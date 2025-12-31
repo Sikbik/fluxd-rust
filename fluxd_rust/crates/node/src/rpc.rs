@@ -123,6 +123,7 @@ const RPC_METHODS: &[&str] = &[
     "validateaddress",
     "verifymessage",
     "createmultisig",
+    "addmultisigaddress",
     "getrawtransaction",
     "gettransaction",
     "listtransactions",
@@ -1004,6 +1005,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "dumpprivkey" => rpc_dumpprivkey(wallet, params, chain_params),
         "signmessage" => rpc_signmessage(wallet, params, chain_params),
         "backupwallet" => rpc_backupwallet(wallet, params),
+        "addmultisigaddress" => rpc_addmultisigaddress(wallet, params, chain_params),
         "getbalance" => rpc_getbalance(chainstate, mempool, wallet, params),
         "getunconfirmedbalance" => rpc_getunconfirmedbalance(chainstate, mempool, wallet, params),
         "getreceivedbyaddress" => {
@@ -3921,6 +3923,131 @@ fn rpc_verifymessage(params: Vec<Value>, chain_params: &ChainParams) -> Result<V
     };
     let recovered_hash = hash160(&recovered_pubkey);
     Ok(Value::Bool(recovered_hash == expected_key_hash))
+}
+
+fn rpc_addmultisigaddress(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    const MAX_PUBKEYS: usize = 16;
+    const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+
+    if params.len() < 2 || params.len() > 3 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "addmultisigaddress expects 2 or 3 parameters",
+        ));
+    }
+
+    let required = parse_u32(&params[0], "nrequired")? as usize;
+    if required < 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "a multisignature address must require at least one key to redeem",
+        ));
+    }
+    let keys = params[1].as_array().ok_or_else(|| {
+        RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "keys must be a json array of strings",
+        )
+    })?;
+    if keys.len() < required {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            format!(
+                "not enough keys supplied (got {} keys, but need at least {required} to redeem)",
+                keys.len()
+            ),
+        ));
+    }
+    if keys.len() > MAX_PUBKEYS {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "Number of addresses involved in the multisignature address creation > 16\nReduce the number",
+        ));
+    }
+
+    if let Some(value) = params.get(2) {
+        let account = value
+            .as_str()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "account must be a string"))?;
+        if !account.is_empty() {
+            return Err(RpcError::new(RPC_INVALID_PARAMETER, "Invalid parameter"));
+        }
+    }
+
+    let mut wallet_guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+
+    let mut pubkeys = Vec::with_capacity(keys.len());
+    for key in keys {
+        let key = key
+            .as_str()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "keys must be strings"))?;
+        if let Some(bytes) = bytes_from_hex(key) {
+            PublicKey::from_slice(&bytes).map_err(|_| {
+                RpcError::new(RPC_INVALID_PARAMETER, format!(" Invalid public key: {key}"))
+            })?;
+            pubkeys.push(bytes);
+            continue;
+        }
+
+        let script_pubkey = address_to_script_pubkey(key, chain_params.network)
+            .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        if classify_script_pubkey(&script_pubkey) != ScriptType::P2Pkh {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                format!(" Invalid public key: {key}"),
+            ));
+        }
+        let Some((_secret, pubkey_bytes)) = wallet_guard
+            .signing_key_for_script_pubkey(&script_pubkey)
+            .map_err(map_wallet_error)?
+        else {
+            return Err(RpcError::new(
+                RPC_WALLET_ERROR,
+                "Private key for address is not known",
+            ));
+        };
+        pubkeys.push(pubkey_bytes);
+    }
+
+    let mut redeem_script = Vec::new();
+    redeem_script.push(multisig_small_int_opcode(required)?);
+    for pubkey in &pubkeys {
+        redeem_script.push(pubkey.len() as u8);
+        redeem_script.extend_from_slice(pubkey);
+    }
+    redeem_script.push(multisig_small_int_opcode(pubkeys.len())?);
+    redeem_script.push(0xae);
+
+    if redeem_script.len() > MAX_SCRIPT_ELEMENT_SIZE {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            format!(
+                "redeemScript exceeds size limit: {} > {}",
+                redeem_script.len(),
+                MAX_SCRIPT_ELEMENT_SIZE
+            ),
+        ));
+    }
+
+    let address = script_p2sh_address(&redeem_script, chain_params.network);
+
+    let hash = hash160(&redeem_script);
+    let mut script_pubkey = Vec::with_capacity(23);
+    script_pubkey.push(0xa9);
+    script_pubkey.push(0x14);
+    script_pubkey.extend_from_slice(&hash);
+    script_pubkey.push(0x87);
+    wallet_guard
+        .import_watch_script_pubkey(script_pubkey)
+        .map_err(map_wallet_error)?;
+
+    Ok(Value::String(address))
 }
 
 fn rpc_createmultisig(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
@@ -11090,6 +11217,78 @@ mod tests {
         for key in ["address", "redeemScript"] {
             assert!(obj.contains_key(key), "missing key {key}");
         }
+    }
+
+    #[test]
+    fn addmultisigaddress_adds_watchonly_p2sh_script() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let value = rpc_addmultisigaddress(
+            &wallet,
+            vec![
+                json!(2),
+                Value::Array(vec![Value::String(addr_a), Value::String(addr_b)]),
+            ],
+            &params,
+        )
+        .expect("rpc");
+        let p2sh_address = value.as_str().expect("p2sh address").to_string();
+
+        let script_pubkey =
+            address_to_script_pubkey(&p2sh_address, params.network).expect("script_pubkey");
+
+        let outpoint = OutPoint {
+            hash: [0x99u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 2 * COIN,
+            script_pubkey: script_pubkey.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&script_pubkey, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_listunspent(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(1), json!(9_999_999), json!([p2sh_address.clone()])],
+            &params,
+        )
+        .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("object");
+        assert_eq!(
+            row.get("address").and_then(Value::as_str),
+            Some(p2sh_address.as_str())
+        );
+        assert_eq!(
+            row.get("spendable").and_then(Value::as_bool),
+            Some(false),
+            "p2sh multisig output should be watch-only"
+        );
     }
 
     #[test]

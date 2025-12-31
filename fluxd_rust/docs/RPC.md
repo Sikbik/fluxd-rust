@@ -129,6 +129,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `gettransaction <txid> [include_watchonly]` (partial)
 - `listtransactions [account] [count] [skip] [include_watchonly]` (partial)
 - `listsinceblock [blockhash] [target_confirmations] [include_watchonly]` (partial)
+- `addmultisigaddress <nrequired> <keys> [account]` (partial; adds a watch-only P2SH script)
 - `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` (partial)
 - `keypoolrefill [newsize]` (partial)
 - `settxfee <amount>` (partial)
@@ -317,6 +318,15 @@ Notes:
 Notes:
 - If `blockhash` is omitted (or unknown), returns all wallet transactions.
 - `lastblock` is the best block at depth `target_confirmations` (1 = chain tip).
+
+### addmultisigaddress
+
+- Params: `<nrequired> <keys> [account]` (partial; `account` must be `""` if provided).
+- Result: string (P2SH address).
+
+Notes:
+- `keys` entries may be hex public keys or P2PKH wallet addresses (the address must be present in the wallet).
+- Adds the resulting P2SH `scriptPubKey` to the wallet as watch-only (spending multisig outputs is not yet supported).
 
 ### listreceivedbyaddress
 
