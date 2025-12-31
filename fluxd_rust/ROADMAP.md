@@ -200,6 +200,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Schema parity: `getdifficulty`/`getchaintips` required keys
   - [x] Schema parity: `getblockheader`/`getblock` required keys
   - [x] Schema parity: `getmempoolinfo`/`getrawmempool` required keys
+  - [x] Error-code parity: `getblockhash`/`getblockheader` invalid params + not-found
   - [ ] Expand schema checks across remaining RPCs (blocks/mempool/fluxnode/etc)
 - [ ] [P1] Long-run sync tests with regression gates (owner: TBD)
   - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity (supports seeding peers.dat and progress thresholds)

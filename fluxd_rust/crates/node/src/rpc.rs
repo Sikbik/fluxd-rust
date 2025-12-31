@@ -6592,6 +6592,28 @@ mod tests {
         let value = rpc_getrawmempool(vec![json!(true)], &mempool).expect("rpc");
         assert!(value.as_object().is_some());
     }
+
+    #[test]
+    fn getblockhash_rejects_wrong_param_count() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let err = rpc_getblockhash(&chainstate, Vec::new()).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn getblockhash_rejects_out_of_range_height() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let err = rpc_getblockhash(&chainstate, vec![json!(1)]).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn getblockheader_returns_not_found_code() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let missing_hash = Value::String("00".repeat(32));
+        let err = rpc_getblockheader(&chainstate, vec![missing_hash], &params).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
+    }
 }
 
 fn system_time_to_unix(time: SystemTime) -> i64 {
