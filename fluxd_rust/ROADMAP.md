@@ -166,12 +166,18 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P1] Wallet database (keys, keypool, metadata) (owner: TBD)
   - [x] `wallet.dat` key store (P2PKH keys + network tag)
   - [x] Atomic wallet writes + deterministic key order
+  - [x] Persist watch-only scripts in `wallet.dat` (v2; `importaddress`)
+  - [x] Persist `paytxfee` in `wallet.dat` (v2; `settxfee`)
   - [ ] Keypool/change-address management parity
   - [ ] Wallet tx history / persistence (for `gettransaction`, etc.)
 - [ ] [P1] Transparent wallet RPCs (owner: TBD)
+  - [x] `importaddress` (watch-only; rescan is a no-op due to address index)
+  - [x] `importwallet` (best-effort WIF import from dump file)
   - [x] `getnewaddress`, `importprivkey`, `dumpprivkey`
   - [x] `getrawchangeaddress`
   - [x] `getbalance`, `getunconfirmedbalance`, `listunspent`, `getwalletinfo` (partial fields)
+  - [x] `lockunspent`, `listlockunspent`
+  - [x] `listaddressgroupings` (simplified grouping)
   - [x] `getreceivedbyaddress` (P2PKH only)
   - [x] `gettransaction` (partial)
   - [x] `listtransactions` (partial)
@@ -184,7 +190,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `signrawtransaction` (P2PKH only)
   - [x] `sendtoaddress` (P2PKH only; no `subtractfeefromamount`)
   - [x] `sendmany` (P2PKH only; no `subtractfeefromamount`)
-  - [ ] `sendfrom` parity
+  - [x] `sendfrom` (fromaccount ignored; minconf supported)
   - [ ] `rescanblockchain`
 - [ ] [P1] Shielded wallet RPCs (owner: TBD)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)

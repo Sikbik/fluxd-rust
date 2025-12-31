@@ -90,6 +90,8 @@ const RPC_METHODS: &[&str] = &[
     "restart",
     "reindex",
     "rescanblockchain",
+    "importaddress",
+    "importwallet",
     "getnewaddress",
     "getrawchangeaddress",
     "importprivkey",
@@ -98,6 +100,9 @@ const RPC_METHODS: &[&str] = &[
     "getunconfirmedbalance",
     "getreceivedbyaddress",
     "listunspent",
+    "lockunspent",
+    "listlockunspent",
+    "listaddressgroupings",
     "getwalletinfo",
     "signmessage",
     "backupwallet",
@@ -127,6 +132,7 @@ const RPC_METHODS: &[&str] = &[
     "fundrawtransaction",
     "signrawtransaction",
     "sendrawtransaction",
+    "sendfrom",
     "sendtoaddress",
     "sendmany",
     "getmempoolinfo",
@@ -988,6 +994,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "restart" => rpc_restart(params, shutdown_tx),
         "reindex" => rpc_reindex(params, data_dir, shutdown_tx),
         "rescanblockchain" => rpc_rescanblockchain(params),
+        "importaddress" => rpc_importaddress(wallet, params, chain_params),
+        "importwallet" => rpc_importwallet(wallet, params),
         "getwalletinfo" => rpc_getwalletinfo(chainstate, mempool, wallet, params),
         "getnewaddress" => rpc_getnewaddress(wallet, params),
         "getrawchangeaddress" => rpc_getrawchangeaddress(wallet, params),
@@ -1001,6 +1009,11 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             rpc_getreceivedbyaddress(chainstate, mempool, wallet, params, chain_params)
         }
         "listunspent" => rpc_listunspent(chainstate, mempool, wallet, params, chain_params),
+        "lockunspent" => rpc_lockunspent(wallet, params),
+        "listlockunspent" => rpc_listlockunspent(wallet, params),
+        "listaddressgroupings" => {
+            rpc_listaddressgroupings(chainstate, mempool, wallet, params, chain_params)
+        }
         "getdbinfo" => rpc_getdbinfo(chainstate, store, params, data_dir),
         "getblockcount" => rpc_getblockcount(chainstate, params),
         "getbestblockhash" => rpc_getbestblockhash(chainstate, params),
@@ -1043,6 +1056,18 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             mempool_metrics,
             fee_estimator,
             mempool_flags,
+            params,
+            chain_params,
+            tx_announce,
+        ),
+        "sendfrom" => rpc_sendfrom(
+            chainstate,
+            mempool,
+            mempool_policy,
+            mempool_metrics,
+            fee_estimator,
+            mempool_flags,
+            wallet,
             params,
             chain_params,
             tx_announce,
@@ -1222,6 +1247,244 @@ fn rpc_rescanblockchain(params: Vec<Value>) -> Result<Value, RpcError> {
     Err(RpcError::new(
         RPC_WALLET_ERROR,
         "wallet rescan not implemented",
+    ))
+}
+
+fn rpc_importaddress(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "importaddress expects 1 to 4 parameters",
+        ));
+    }
+    let value = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
+    if let Some(label) = params.get(1) {
+        if !label.is_null() && label.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "label must be a string",
+            ));
+        }
+    }
+    if let Some(rescan) = params.get(2) {
+        if !rescan.is_null() && rescan.as_bool().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "rescan must be a boolean",
+            ));
+        }
+    }
+    if let Some(p2sh) = params.get(3) {
+        if !p2sh.is_null() && p2sh.as_bool().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "p2sh must be a boolean",
+            ));
+        }
+    }
+
+    let script_pubkey = match address_to_script_pubkey(value, chain_params.network) {
+        Ok(script) => script,
+        Err(_) => bytes_from_hex(value).ok_or_else(|| {
+            RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address or script")
+        })?,
+    };
+
+    wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .import_watch_script_pubkey(script_pubkey)
+        .map_err(map_wallet_error)?;
+
+    Ok(Value::Null)
+}
+
+fn rpc_importwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "importwallet expects 1 parameter",
+        ));
+    }
+    let filename = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "filename must be a string"))?;
+    if filename.trim().is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "filename is empty"));
+    }
+    let contents = std::fs::read_to_string(filename)
+        .map_err(|err| RpcError::new(RPC_INVALID_PARAMETER, err.to_string()))?;
+
+    let mut imported = 0usize;
+    let mut guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(wif) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+        match guard.import_wif(wif) {
+            Ok(()) => imported += 1,
+            Err(WalletError::InvalidData("invalid wif")) => continue,
+            Err(err) => return Err(map_wallet_error(err)),
+        }
+    }
+
+    if imported == 0 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "no keys found in wallet dump",
+        ));
+    }
+    Ok(Value::Null)
+}
+
+fn parse_outpoint_list(value: &Value) -> Result<Vec<OutPoint>, RpcError> {
+    let outputs = value.as_array().ok_or_else(|| {
+        RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "outputs must be an array of {txid,vout} objects",
+        )
+    })?;
+    let mut out = Vec::with_capacity(outputs.len());
+    for entry in outputs {
+        let obj = entry.as_object().ok_or_else(|| {
+            RpcError::new(RPC_INVALID_PARAMETER, "outputs entries must be objects")
+        })?;
+        let txid_value = obj
+            .get("txid")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing txid"))?;
+        let vout_value = obj
+            .get("vout")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing vout"))?;
+        let txid = parse_hash(txid_value)?;
+        let vout = parse_u32(vout_value, "vout")?;
+        out.push(OutPoint {
+            hash: txid,
+            index: vout,
+        });
+    }
+    Ok(out)
+}
+
+fn rpc_lockunspent(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "lockunspent expects 1 or 2 parameters",
+        ));
+    }
+    let unlock = parse_bool(&params[0])?;
+
+    let outputs = match params.get(1) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => parse_outpoint_list(value)?,
+    };
+
+    let mut guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+
+    if unlock && outputs.is_empty() {
+        guard.unlock_all_outpoints();
+        return Ok(Value::Bool(true));
+    }
+    if !unlock && outputs.is_empty() {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "outputs is required when unlock=false",
+        ));
+    }
+
+    if unlock {
+        for outpoint in outputs {
+            guard.unlock_outpoint(&outpoint);
+        }
+    } else {
+        for outpoint in outputs {
+            guard.lock_outpoint(outpoint);
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn rpc_listlockunspent(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    let mut locked = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .locked_outpoints();
+    locked.sort_by(|a, b| a.hash.cmp(&b.hash).then_with(|| a.index.cmp(&b.index)));
+    Ok(Value::Array(
+        locked
+            .into_iter()
+            .map(|outpoint| {
+                json!({
+                    "txid": hash256_to_hex(&outpoint.hash),
+                    "vout": outpoint.index,
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn rpc_listaddressgroupings<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+
+    let scripts = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .all_script_pubkeys_including_watchonly()
+        .map_err(map_wallet_error)?;
+
+    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, true)?;
+    let mut totals: HashMap<Vec<u8>, i64> = HashMap::new();
+    for row in utxos {
+        let entry = totals.entry(row.script_pubkey).or_insert(0);
+        *entry = entry
+            .checked_add(row.value)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+    }
+
+    let mut entries: Vec<(String, i64)> = Vec::new();
+    for (script_pubkey, value) in totals {
+        if value <= 0 {
+            continue;
+        }
+        if let Some(address) = script_pubkey_to_address(&script_pubkey, chain_params.network) {
+            entries.push((address, value));
+        }
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Value::Array(
+        entries
+            .into_iter()
+            .map(|(address, value)| {
+                Value::Array(vec![Value::Array(vec![
+                    Value::String(address),
+                    amount_to_value(value),
+                    Value::String(String::new()),
+                ])])
+            })
+            .collect(),
     ))
 }
 
@@ -1499,7 +1762,8 @@ fn rpc_settxfee(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, Rpc
     wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .set_pay_tx_fee_per_kb(fee_per_kb);
+        .set_pay_tx_fee_per_kb(fee_per_kb)
+        .map_err(map_wallet_error)?;
     Ok(Value::Bool(true))
 }
 
@@ -1580,12 +1844,26 @@ fn rpc_getbalance<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    let scripts = {
+    let include_watchonly = match params.get(2) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Null) | None => false,
+        Some(_) => false,
+    };
+    let (scripts, locked_outpoints) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        guard.all_script_pubkeys().map_err(map_wallet_error)?
+        let scripts = if include_watchonly {
+            guard
+                .all_script_pubkeys_including_watchonly()
+                .map_err(map_wallet_error)?
+        } else {
+            guard.all_script_pubkeys().map_err(map_wallet_error)?
+        };
+        let locked = guard.locked_outpoints();
+        (scripts, locked)
     };
+    let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
     let include_mempool_outputs = minconf == 0;
     let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, include_mempool_outputs)?;
     let mut total: i64 = 0;
@@ -1594,6 +1872,9 @@ fn rpc_getbalance<S: fluxd_storage::KeyValueStore>(
             continue;
         }
         if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        if locked_set.contains(&utxo.outpoint) {
             continue;
         }
         total = total
@@ -1610,16 +1891,23 @@ fn rpc_getunconfirmedbalance<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
 ) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
-    let scripts = {
+    let (scripts, locked_outpoints) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        guard.all_script_pubkeys().map_err(map_wallet_error)?
+        (
+            guard.all_script_pubkeys().map_err(map_wallet_error)?,
+            guard.locked_outpoints(),
+        )
     };
+    let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
     let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, true)?;
     let mut total: i64 = 0;
     for utxo in utxos {
         if utxo.confirmations != 0 {
+            continue;
+        }
+        if locked_set.contains(&utxo.outpoint) {
             continue;
         }
         total = total
@@ -2360,14 +2648,19 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
             .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
     }
 
-    let scripts = {
+    let (scripts, owned_scripts, locked_outpoints) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        guard
+        let scripts = guard
             .scripts_for_filter(&addresses)
-            .map_err(map_wallet_error)?
+            .map_err(map_wallet_error)?;
+        let owned_scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
+        let locked_outpoints = guard.locked_outpoints();
+        (scripts, owned_scripts, locked_outpoints)
     };
+    let owned_script_set: HashSet<Vec<u8>> = owned_scripts.into_iter().collect();
+    let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
 
     let include_mempool_outputs = minconf == 0;
     let mut utxos = collect_wallet_utxos(chainstate, mempool, &scripts, include_mempool_outputs)?;
@@ -2394,6 +2687,9 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
     for row in utxos {
         let address = script_pubkey_to_address(&row.script_pubkey, chain_params.network)
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid script_pubkey"))?;
+        let owned = owned_script_set.contains(&row.script_pubkey);
+        let locked = locked_set.contains(&row.outpoint);
+        let spendable = owned && !locked;
         out.push(json!({
             "txid": hash256_to_hex(&row.outpoint.hash),
             "vout": row.outpoint.index,
@@ -2402,8 +2698,8 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
             "amount": amount_to_value(row.value),
             "amount_zat": row.value,
             "confirmations": row.confirmations,
-            "spendable": true,
-            "solvable": true,
+            "spendable": spendable,
+            "solvable": spendable,
             "generated": row.is_coinbase,
         }));
     }
@@ -3845,7 +4141,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
     }
 
-    let (wallet_scripts, change_script_pubkey, pay_tx_fee_per_kb) = {
+    let (wallet_scripts, change_script_pubkey, pay_tx_fee_per_kb, locked_outpoints) = {
         let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -3857,8 +4153,10 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         let change_address = guard.generate_new_address(true).map_err(map_wallet_error)?;
         let change_script = address_to_script_pubkey(&change_address, chain_params.network)
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid change address"))?;
-        (scripts, change_script, pay_tx_fee_per_kb)
+        let locked_outpoints = guard.locked_outpoints();
+        (scripts, change_script, pay_tx_fee_per_kb, locked_outpoints)
     };
+    let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
 
     let fee_for_size = |size: usize| -> i64 {
         let min_fee = mempool_policy.min_relay_fee_for_size(size);
@@ -3874,6 +4172,9 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     let mut candidates = collect_wallet_utxos(chainstate, mempool, &wallet_scripts, false)?;
     candidates.retain(|utxo| {
         if used_outpoints.contains(&utxo.outpoint) {
+            return false;
+        }
+        if locked_set.contains(&utxo.outpoint) {
             return false;
         }
         if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
@@ -4000,6 +4301,153 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         "fee_zat": final_fee,
         "changepos": change_pos,
     }))
+}
+
+fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    tx_announce: &broadcast::Sender<Hash256>,
+) -> Result<Value, RpcError> {
+    const DEFAULT_TX_EXPIRY_DELTA: u32 = 20;
+
+    if params.len() < 3 || params.len() > 6 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "sendfrom expects 3 to 6 parameters",
+        ));
+    }
+    let _from_account = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "fromaccount must be a string"))?;
+    let address = params[1]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
+    let amount = parse_amount(&params[2])?;
+
+    let minconf = match params.get(3) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")?,
+        _ => 1,
+    };
+    if let Some(value) = params.get(4) {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "comment must be a string",
+            ));
+        }
+    }
+    if let Some(value) = params.get(5) {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "comment_to must be a string",
+            ));
+        }
+    }
+
+    let script_pubkey = address_to_script_pubkey(address, chain_params.network)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+
+    let next_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height.saturating_add(1))
+        .unwrap_or(1);
+    let sapling_active = network_upgrade_active(
+        next_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Acadia,
+    );
+
+    let tx = Transaction {
+        f_overwintered: sapling_active,
+        version: if sapling_active { 4 } else { 1 },
+        version_group_id: if sapling_active {
+            SAPLING_VERSION_GROUP_ID
+        } else {
+            0
+        },
+        vin: Vec::new(),
+        vout: vec![TxOut {
+            value: amount,
+            script_pubkey,
+        }],
+        lock_time: 0,
+        expiry_height: if sapling_active {
+            (next_height as u32).saturating_add(DEFAULT_TX_EXPIRY_DELTA)
+        } else {
+            0
+        },
+        value_balance: 0,
+        shielded_spends: Vec::new(),
+        shielded_outputs: Vec::new(),
+        join_splits: Vec::new(),
+        join_split_pub_key: [0u8; 32],
+        join_split_sig: [0u8; 64],
+        binding_sig: [0u8; 64],
+        fluxnode: None,
+    };
+
+    let unsigned_hex = hex_bytes(&tx.consensus_encode().map_err(map_internal)?);
+
+    let funded = rpc_fundrawtransaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        wallet,
+        vec![Value::String(unsigned_hex), json!({ "minconf": minconf })],
+        chain_params,
+    )?;
+    let funded_hex = funded
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "fundrawtransaction returned no hex"))?
+        .to_string();
+
+    let signed = rpc_signrawtransaction(
+        chainstate,
+        mempool,
+        wallet,
+        vec![Value::String(funded_hex)],
+        chain_params,
+    )?;
+    let signed_obj = signed.as_object().ok_or_else(|| {
+        RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no object")
+    })?;
+    let complete = signed_obj
+        .get("complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !complete {
+        return Err(RpcError::new(
+            RPC_WALLET_ERROR,
+            "transaction could not be fully signed",
+        ));
+    }
+    let signed_hex = signed_obj
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no hex"))?
+        .to_string();
+
+    rpc_sendrawtransaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        mempool_metrics,
+        fee_estimator,
+        mempool_flags,
+        vec![Value::String(signed_hex)],
+        chain_params,
+        tx_announce,
+    )
 }
 
 fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
@@ -10734,6 +11182,337 @@ mod tests {
             .and_then(Value::as_i64)
             .expect("fee_zat");
         assert!(after_fee > before_fee, "fee should increase after settxfee");
+    }
+
+    #[test]
+    fn lockunspent_excludes_utxo_from_coin_selection() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x44u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 2 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let value =
+            rpc_listunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].get("spendable").and_then(Value::as_bool), Some(true));
+
+        let outputs = json!([{
+            "txid": hash256_to_hex(&outpoint.hash),
+            "vout": outpoint.index,
+        }]);
+        rpc_lockunspent(&wallet, vec![json!(false), outputs]).expect("rpc");
+
+        let value = rpc_listlockunspent(&wallet, Vec::new()).expect("rpc");
+        let locked = value.as_array().expect("array");
+        assert_eq!(locked.len(), 1);
+
+        let value =
+            rpc_listunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("spendable").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let to_script = p2pkh_script([0x22u8; 20]);
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: vec![TxOut {
+                value: 1 * COIN,
+                script_pubkey: to_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let err = rpc_fundrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &wallet,
+            vec![json!(raw_hex.clone())],
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_ERROR);
+
+        rpc_lockunspent(&wallet, vec![json!(true)]).expect("rpc unlockall");
+
+        let value = rpc_fundrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &wallet,
+            vec![json!(raw_hex)],
+            &params,
+        )
+        .expect("rpc");
+        assert!(value.get("hex").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn importaddress_enables_watchonly_listunspent_and_getbalance() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let watch_script = p2pkh_script([0x55u8; 20]);
+        let watch_address =
+            script_pubkey_to_address(&watch_script, params.network).expect("watch address");
+        let outpoint = OutPoint {
+            hash: [0x55u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 3 * COIN,
+            script_pubkey: watch_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&watch_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_listunspent(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(1), json!(9_999_999), json!([watch_address.clone()])],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(value.as_array().expect("array").len(), 0);
+
+        rpc_importaddress(
+            &wallet,
+            vec![json!(watch_address.clone()), Value::Null, json!(false)],
+            &params,
+        )
+        .expect("rpc");
+
+        let value = rpc_listunspent(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(1), json!(9_999_999), json!([watch_address.clone()])],
+            &params,
+        )
+        .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("spendable").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let balance = rpc_getbalance(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![Value::Null, json!(1), json!(true)],
+        )
+        .expect("rpc");
+        assert_eq!(balance, amount_to_value(3 * COIN));
+    }
+
+    #[test]
+    fn listaddressgroupings_reports_wallet_balances() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let script_a = address_to_script_pubkey(&addr_a, params.network).expect("script a");
+        let script_b = address_to_script_pubkey(&addr_b, params.network).expect("script b");
+
+        let outpoint_a = OutPoint {
+            hash: [0xaau8; 32],
+            index: 0,
+        };
+        let outpoint_b = OutPoint {
+            hash: [0xbbu8; 32],
+            index: 0,
+        };
+        let utxo_a = fluxd_chainstate::utxo::UtxoEntry {
+            value: 1 * COIN,
+            script_pubkey: script_a.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_b = fluxd_chainstate::utxo::UtxoEntry {
+            value: 2 * COIN,
+            script_pubkey: script_b.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let mut batch = WriteBatch::new();
+
+        let utxo_key_a = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint_a);
+        let addr_key_a =
+            fluxd_chainstate::address_index::address_outpoint_key(&script_a, &outpoint_a)
+                .expect("addr key a");
+        batch.put(Column::Utxo, utxo_key_a.as_bytes(), utxo_a.encode());
+        batch.put(Column::AddressOutpoint, addr_key_a, []);
+
+        let utxo_key_b = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint_b);
+        let addr_key_b =
+            fluxd_chainstate::address_index::address_outpoint_key(&script_b, &outpoint_b)
+                .expect("addr key b");
+        batch.put(Column::Utxo, utxo_key_b.as_bytes(), utxo_b.encode());
+        batch.put(Column::AddressOutpoint, addr_key_b, []);
+
+        chainstate.commit_batch(batch).expect("commit utxos");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_listaddressgroupings(&chainstate, &mempool, &wallet, Vec::new(), &params)
+            .expect("rpc");
+        let groups = value.as_array().expect("array");
+        assert_eq!(groups.len(), 2);
+
+        let mut totals: HashMap<String, i64> = HashMap::new();
+        for group in groups {
+            let entries = group.as_array().expect("group array");
+            for entry in entries {
+                let arr = entry.as_array().expect("entry array");
+                let address = arr[0].as_str().expect("address").to_string();
+                let amount = parse_amount(&arr[1]).expect("amount");
+                totals.insert(address, amount);
+            }
+        }
+
+        assert_eq!(totals.get(&addr_a).copied(), Some(1 * COIN));
+        assert_eq!(totals.get(&addr_b).copied(), Some(2 * COIN));
+    }
+
+    #[test]
+    fn sendfrom_respects_minconf() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x99u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("to addr");
+
+        let err = rpc_sendfrom(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![json!(""), json!(to_address.clone()), json!("1.0"), json!(2)],
+            &params,
+            &tx_announce,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_ERROR);
+
+        let value = rpc_sendfrom(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![json!(""), json!(to_address), json!("1.0"), json!(1)],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("txid");
+        assert!(mempool.lock().expect("mempool lock").contains(&txid));
     }
 
     #[test]

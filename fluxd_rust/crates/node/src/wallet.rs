@@ -9,12 +9,13 @@ use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 use fluxd_consensus::params::Network;
 use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
 use fluxd_primitives::hash::hash160;
+use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::{script_pubkey_to_address, secret_key_to_wif, wif_to_secret_key};
 use fluxd_script::message::signed_message_hash;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 1;
+pub const WALLET_FILE_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub enum WalletError {
@@ -100,7 +101,9 @@ pub struct Wallet {
     path: PathBuf,
     network: Network,
     keys: Vec<WalletKey>,
+    watch_scripts: Vec<Vec<u8>>,
     revision: u64,
+    locked_outpoints: HashSet<OutPoint>,
     pay_tx_fee_per_kb: i64,
 }
 
@@ -116,7 +119,9 @@ impl Wallet {
                 path,
                 network,
                 keys: Vec::new(),
+                watch_scripts: Vec::new(),
                 revision: 0,
+                locked_outpoints: HashSet::new(),
                 pay_tx_fee_per_kb: 0,
             }),
             Err(err) => Err(WalletError::Io(err)),
@@ -127,12 +132,35 @@ impl Wallet {
         self.pay_tx_fee_per_kb
     }
 
-    pub fn set_pay_tx_fee_per_kb(&mut self, fee: i64) {
+    pub fn set_pay_tx_fee_per_kb(&mut self, fee: i64) -> Result<(), WalletError> {
+        let prev = self.pay_tx_fee_per_kb;
         self.pay_tx_fee_per_kb = fee;
+        if let Err(err) = self.save() {
+            self.pay_tx_fee_per_kb = prev;
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
     }
 
     pub fn key_count(&self) -> usize {
         self.keys.len()
+    }
+
+    pub fn lock_outpoint(&mut self, outpoint: OutPoint) {
+        self.locked_outpoints.insert(outpoint);
+    }
+
+    pub fn unlock_outpoint(&mut self, outpoint: &OutPoint) {
+        self.locked_outpoints.remove(outpoint);
+    }
+
+    pub fn unlock_all_outpoints(&mut self) {
+        self.locked_outpoints.clear();
+    }
+
+    pub fn locked_outpoints(&self) -> Vec<OutPoint> {
+        self.locked_outpoints.iter().cloned().collect()
     }
 
     pub fn default_address(&self) -> Result<Option<String>, WalletError> {
@@ -150,6 +178,12 @@ impl Wallet {
         Ok(out)
     }
 
+    pub fn all_script_pubkeys_including_watchonly(&self) -> Result<Vec<Vec<u8>>, WalletError> {
+        let mut out = self.all_script_pubkeys()?;
+        out.extend(self.watch_scripts.iter().cloned());
+        Ok(out)
+    }
+
     pub fn import_wif(&mut self, wif: &str) -> Result<(), WalletError> {
         let (secret, compressed) = wif_to_secret_key(wif, self.network)
             .map_err(|_| WalletError::InvalidData("invalid wif"))?;
@@ -160,6 +194,33 @@ impl Wallet {
         self.keys.push(key);
         if let Err(err) = self.save() {
             self.keys.retain(|k| k.secret != secret);
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn import_watch_script_pubkey(
+        &mut self,
+        script_pubkey: Vec<u8>,
+    ) -> Result<(), WalletError> {
+        let owned = self
+            .all_script_pubkeys()?
+            .iter()
+            .any(|spk| spk.as_slice() == script_pubkey.as_slice());
+        if owned {
+            return Ok(());
+        }
+        if self
+            .watch_scripts
+            .iter()
+            .any(|spk| spk.as_slice() == script_pubkey.as_slice())
+        {
+            return Ok(());
+        }
+        self.watch_scripts.push(script_pubkey);
+        if let Err(err) = self.save() {
+            self.watch_scripts.pop();
             return Err(err);
         }
         self.revision = self.revision.saturating_add(1);
@@ -211,6 +272,13 @@ impl Wallet {
             let addr = key.address(self.network)?;
             if allow.contains(addr.as_str()) {
                 out.push(key.p2pkh_script_pubkey()?);
+            }
+        }
+        for script_pubkey in &self.watch_scripts {
+            if let Some(addr) = script_pubkey_to_address(script_pubkey, self.network) {
+                if allow.contains(addr.as_str()) {
+                    out.push(script_pubkey.clone());
+                }
             }
         }
         Ok(out)
@@ -282,7 +350,7 @@ impl Wallet {
     fn decode(path: &Path, expected_network: Network, bytes: &[u8]) -> Result<Self, WalletError> {
         let mut decoder = Decoder::new(bytes);
         let version = decoder.read_u32_le()?;
-        if version != WALLET_FILE_VERSION {
+        if version != 1 && version != WALLET_FILE_VERSION {
             return Err(WalletError::InvalidData("unsupported wallet file version"));
         }
         let network = decode_network(decoder.read_u8()?)?;
@@ -292,15 +360,36 @@ impl Wallet {
                 found: network,
             });
         }
-        let count = decoder.read_varint()?;
-        let count = usize::try_from(count)
+        let pay_tx_fee_per_kb = if version >= 2 {
+            decoder.read_i64_le()?
+        } else {
+            0
+        };
+
+        let key_count = decoder.read_varint()?;
+        let key_count = usize::try_from(key_count)
             .map_err(|_| WalletError::InvalidData("wallet key count too large"))?;
-        let mut keys = Vec::with_capacity(count.min(4096));
-        for _ in 0..count {
+        let mut keys = Vec::with_capacity(key_count.min(4096));
+        for _ in 0..key_count {
             let secret = decoder.read_fixed::<32>()?;
             let compressed = decoder.read_bool()?;
             keys.push(WalletKey { secret, compressed });
         }
+
+        let watch_scripts = if version >= 2 {
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("watch script count too large"))?;
+            let mut out = Vec::with_capacity(count.min(4096));
+            for _ in 0..count {
+                let script = decoder.read_var_bytes()?;
+                out.push(script);
+            }
+            out
+        } else {
+            Vec::new()
+        };
+
         if !decoder.is_empty() {
             return Err(WalletError::InvalidData("wallet file has trailing bytes"));
         }
@@ -308,8 +397,10 @@ impl Wallet {
             path: path.to_path_buf(),
             network,
             keys,
+            watch_scripts,
             revision: 0,
-            pay_tx_fee_per_kb: 0,
+            locked_outpoints: HashSet::new(),
+            pay_tx_fee_per_kb,
         })
     }
 
@@ -317,11 +408,16 @@ impl Wallet {
         let mut encoder = Encoder::new();
         encoder.write_u32_le(WALLET_FILE_VERSION);
         encoder.write_u8(encode_network(self.network));
+        encoder.write_i64_le(self.pay_tx_fee_per_kb);
 
         encoder.write_varint(self.keys.len() as u64);
         for key in &self.keys {
             encoder.write_bytes(&key.secret);
             encoder.write_u8(if key.compressed { 1 } else { 0 });
+        }
+        encoder.write_varint(self.watch_scripts.len() as u64);
+        for script in &self.watch_scripts {
+            encoder.write_var_bytes(script);
         }
         let bytes = encoder.into_inner();
         write_file_atomic(&self.path, &bytes)?;
