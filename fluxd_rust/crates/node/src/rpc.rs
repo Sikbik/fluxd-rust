@@ -98,6 +98,7 @@ const RPC_METHODS: &[&str] = &[
     "listunspent",
     "getwalletinfo",
     "signmessage",
+    "backupwallet",
     "getdbinfo",
     "getblockcount",
     "getbestblockhash",
@@ -986,6 +987,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "importprivkey" => rpc_importprivkey(wallet, params),
         "dumpprivkey" => rpc_dumpprivkey(wallet, params, chain_params),
         "signmessage" => rpc_signmessage(wallet, params, chain_params),
+        "backupwallet" => rpc_backupwallet(wallet, params),
         "getbalance" => rpc_getbalance(chainstate, mempool, wallet, params),
         "listunspent" => rpc_listunspent(chainstate, mempool, wallet, params, chain_params),
         "getdbinfo" => rpc_getdbinfo(chainstate, store, params, data_dir),
@@ -1386,6 +1388,27 @@ fn rpc_dumpprivkey(
             "Private key for address is not known",
         )),
     }
+}
+
+fn rpc_backupwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "backupwallet expects 1 parameter",
+        ));
+    }
+    let destination = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "destination must be a string"))?;
+    if destination.trim().is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "destination is empty"));
+    }
+    let guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    let path = Path::new(destination);
+    guard.backup_to(path).map_err(map_wallet_error)?;
+    Ok(Value::Null)
 }
 
 fn rpc_signmessage(
@@ -9770,6 +9793,23 @@ mod tests {
 
         let decoded = wif_to_secret_key(&wif, params.network);
         assert!(decoded.is_ok(), "wif should decode");
+    }
+
+    #[test]
+    fn backupwallet_writes_copy_of_wallet_dat() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let _ = rpc_getnewaddress(&wallet, Vec::new()).expect("rpc");
+
+        let backup_path = temp_data_dir("fluxd-wallet-backup").join("wallet.bak");
+        let backup_string = backup_path.to_string_lossy().to_string();
+        rpc_backupwallet(&wallet, vec![json!(backup_string)]).expect("rpc");
+
+        let original =
+            std::fs::read(data_dir.join(crate::wallet::WALLET_FILE_NAME)).expect("read wallet.dat");
+        let backup = std::fs::read(&backup_path).expect("read backup");
+        assert_eq!(backup, original);
     }
 
     #[test]

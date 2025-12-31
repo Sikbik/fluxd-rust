@@ -117,7 +117,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - signrawtransaction - Partial (P2PKH only; supports wallet keys and optional WIF override list)
 - addmultisigaddress - Missing
-- backupwallet - Missing
+- backupwallet - Implemented
 - dumpprivkey - Implemented (P2PKH only)
 - getbalance - Partial (minconf supported; accounts/watchonly/unconfirmed are placeholders)
 - getnewaddress - Implemented (P2PKH only; random keys; label ignored)

@@ -130,6 +130,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `getrawchangeaddress [address_type]` (partial; address_type ignored)
 - `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
 - `dumpprivkey <address>`
+- `backupwallet <destination>`
 - `signmessage <address> <message>`
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
 - `listunspent [minconf] [maxconf] [addresses]` (partial)
@@ -243,6 +244,14 @@ Fields:
 
 - Params: `<address>` (P2PKH).
 - Result: WIF private key if present; error `-4` if the address is not in the wallet.
+
+### backupwallet
+
+- Params: `<destination>` (string path).
+- Result: `null`
+
+Notes:
+- Writes a copy of `wallet.dat` to the destination path.
 
 ### signmessage
 

@@ -247,6 +247,28 @@ impl Wallet {
         Ok(None)
     }
 
+    pub fn backup_to(&self, destination: &Path) -> Result<(), WalletError> {
+        if destination == self.path.as_path() {
+            return Err(WalletError::InvalidData(
+                "backup destination must differ from wallet.dat",
+            ));
+        }
+        if let Ok(meta) = fs::metadata(destination) {
+            if meta.is_dir() {
+                return Err(WalletError::InvalidData(
+                    "backup destination is a directory",
+                ));
+            }
+        }
+
+        if fs::metadata(&self.path).is_err() {
+            self.save()?;
+        }
+        let bytes = fs::read(&self.path)?;
+        write_file_atomic(destination, &bytes)?;
+        Ok(())
+    }
+
     fn decode(path: &Path, expected_network: Network, bytes: &[u8]) -> Result<Self, WalletError> {
         let mut decoder = Decoder::new(bytes);
         let version = decoder.read_u32_le()?;

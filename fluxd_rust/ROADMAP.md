@@ -173,6 +173,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `getrawchangeaddress`
   - [x] `getbalance`, `listunspent`, `getwalletinfo` (partial fields)
   - [x] `signmessage`
+  - [x] `backupwallet`
   - [x] `fundrawtransaction` (P2PKH only)
   - [x] `signrawtransaction` (P2PKH only)
   - [x] `sendtoaddress` (P2PKH only; no `subtractfeefromamount`)
