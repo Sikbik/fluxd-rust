@@ -1457,6 +1457,8 @@ fn rpc_getblockchaininfo<S: fluxd_storage::KeyValueStore>(
         "nextblock": format!("{:08x}", current_epoch_branch_id(best_block_height + 1, &chain_params.consensus.upgrades)),
     });
 
+    let commitments = chainstate.sprout_commitment_count().map_err(map_internal)?;
+    let softforks = build_softfork_info(chainstate, best_block_hash, &chain_params.consensus)?;
     let value_pools = chainstate.value_pools_or_compute().map_err(map_internal)?;
     let utxo_stats = chainstate.utxo_stats_or_compute().map_err(map_internal)?;
     let shielded_total = value_pools
@@ -1478,6 +1480,7 @@ fn rpc_getblockchaininfo<S: fluxd_storage::KeyValueStore>(
         "chainwork": chainwork,
         "pruned": false,
         "size_on_disk": size_on_disk,
+        "commitments": commitments,
         "valuePools": [
             {
                 "id": "sprout",
@@ -1494,6 +1497,7 @@ fn rpc_getblockchaininfo<S: fluxd_storage::KeyValueStore>(
         ],
         "total_supply": amount_to_value(total_supply),
         "total_supply_zat": total_supply,
+        "softforks": softforks,
         "upgrades": upgrades,
         "consensus": consensus
     }))
@@ -6214,7 +6218,55 @@ fn parse_amount(value: &Value) -> Result<i64, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxd_chainstate::flatfiles::FlatFileStore;
+    use fluxd_chainstate::validation::ValidationFlags;
+    use fluxd_consensus::params::{chain_params, Network};
+    use fluxd_storage::memory::MemoryStore;
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_data_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn is_hex_64(value: &str) -> bool {
+        if value.len() != 64 {
+            return false;
+        }
+        value
+            .as_bytes()
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+    }
+
+    fn setup_regtest_chainstate() -> (
+        ChainState<MemoryStore>,
+        fluxd_consensus::params::ChainParams,
+        PathBuf,
+    ) {
+        let data_dir = temp_data_dir("fluxd-rpc-test");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let blocks_dir = data_dir.join("blocks");
+        let blocks = FlatFileStore::new(&blocks_dir, 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(&blocks_dir, "undo", 10_000_000).expect("flatfiles");
+        let store = Arc::new(MemoryStore::new());
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let params = chain_params(Network::Regtest);
+        let flags = ValidationFlags::default();
+        let write_lock = Mutex::new(());
+        crate::ensure_genesis(&chainstate, &params, &flags, None, &write_lock)
+            .expect("insert genesis");
+
+        (chainstate, params, data_dir)
+    }
 
     #[test]
     fn parse_amount_accepts_basic_inputs() {
@@ -6235,6 +6287,67 @@ mod tests {
         assert!(parse_amount(&json!("foo")).is_err());
         assert!(parse_amount(&json!("1e-8")).is_err());
         assert!(parse_amount(&json!("")).is_err());
+    }
+
+    #[test]
+    fn getblockchaininfo_has_cpp_schema_keys() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let value =
+            rpc_getblockchaininfo(&chainstate, Vec::new(), &params, &data_dir).expect("rpc");
+        let obj = value.as_object().expect("object");
+
+        let chain = obj.get("chain").and_then(Value::as_str).unwrap_or("");
+        assert_eq!(chain, "regtest");
+
+        for key in [
+            "blocks",
+            "headers",
+            "bestblockhash",
+            "difficulty",
+            "verificationprogress",
+            "chainwork",
+            "pruned",
+            "size_on_disk",
+            "commitments",
+            "softforks",
+            "valuePools",
+            "upgrades",
+            "consensus",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        assert!(obj.get("bestblockhash").and_then(Value::as_str).is_some());
+        let best_block = obj.get("bestblockhash").and_then(Value::as_str).unwrap();
+        assert!(is_hex_64(best_block));
+        assert!(obj.get("softforks").and_then(Value::as_array).is_some());
+        assert!(obj.get("commitments").and_then(Value::as_u64).is_some());
+    }
+
+    #[test]
+    fn gettxoutsetinfo_has_cpp_schema_keys() {
+        let (chainstate, _params, data_dir) = setup_regtest_chainstate();
+        let value = rpc_gettxoutsetinfo(&chainstate, Vec::new(), &data_dir).expect("rpc");
+        let obj = value.as_object().expect("object");
+
+        for key in [
+            "height",
+            "bestblock",
+            "transactions",
+            "txouts",
+            "bytes_serialized",
+            "hash_serialized",
+            "total_amount",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        assert!(obj.get("bestblock").and_then(Value::as_str).is_some());
+        let best_block = obj.get("bestblock").and_then(Value::as_str).unwrap();
+        assert!(is_hex_64(best_block));
+
+        let hash_serialized = obj.get("hash_serialized").and_then(Value::as_str).unwrap();
+        assert!(is_hex_64(hash_serialized));
     }
 }
 
@@ -6633,6 +6746,112 @@ fn build_upgrade_info(params: &ChainParams, height: i32) -> Value {
         map.insert(format!("{:08x}", info.branch_id), entry);
     }
     Value::Object(map)
+}
+
+fn block_header_version(bytes: &[u8]) -> Result<i32, RpcError> {
+    if bytes.len() < 4 {
+        return Err(RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "invalid block header bytes",
+        ));
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes[..4]);
+    Ok(i32::from_le_bytes(buf))
+}
+
+fn build_softfork_info<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    tip: Option<Hash256>,
+    consensus: &fluxd_consensus::params::ConsensusParams,
+) -> Result<Value, RpcError> {
+    let window = consensus.majority_window;
+    let mut found_v2 = 0i32;
+    let mut found_v3 = 0i32;
+    let mut found_v4 = 0i32;
+
+    let mut cursor = tip;
+    for _ in 0..window {
+        let Some(hash) = cursor else { break };
+        let entry = chainstate
+            .header_entry(&hash)
+            .map_err(map_internal)?
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing header entry"))?;
+        let bytes = chainstate
+            .block_header_bytes(&hash)
+            .map_err(map_internal)?
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing block header bytes"))?;
+        let version = block_header_version(&bytes)?;
+        if version >= 2 {
+            found_v2 = found_v2.saturating_add(1);
+            if version >= 3 {
+                found_v3 = found_v3.saturating_add(1);
+                if version >= 4 {
+                    found_v4 = found_v4.saturating_add(1);
+                }
+            }
+        }
+        cursor = if entry.height > 0 {
+            Some(entry.prev_hash)
+        } else {
+            None
+        };
+    }
+
+    let enforce_required = consensus.majority_enforce_block_upgrade;
+    let reject_required = consensus.majority_reject_block_outdated;
+
+    fn majority_desc(found: i32, required: i32, window: i32) -> Value {
+        json!({
+            "status": found >= required,
+            "found": found,
+            "required": required,
+            "window": window,
+        })
+    }
+
+    fn softfork_desc(
+        id: &'static str,
+        version: i32,
+        found: i32,
+        enforce_required: i32,
+        reject_required: i32,
+        window: i32,
+    ) -> Value {
+        json!({
+            "id": id,
+            "version": version,
+            "enforce": majority_desc(found, enforce_required, window),
+            "reject": majority_desc(found, reject_required, window),
+        })
+    }
+
+    Ok(Value::Array(vec![
+        softfork_desc(
+            "bip34",
+            2,
+            found_v2,
+            enforce_required,
+            reject_required,
+            window,
+        ),
+        softfork_desc(
+            "bip66",
+            3,
+            found_v3,
+            enforce_required,
+            reject_required,
+            window,
+        ),
+        softfork_desc(
+            "bip65",
+            4,
+            found_v4,
+            enforce_required,
+            reject_required,
+            window,
+        ),
+    ]))
 }
 
 fn network_name(network: Network) -> &'static str {

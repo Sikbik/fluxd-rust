@@ -268,6 +268,8 @@ Returns chain metadata:
 - `chainwork`
 - `pruned` - always false.
 - `size_on_disk` - total size of `--data-dir`.
+- `commitments` - current number of Sprout note commitments in the commitment tree.
+- `softforks` - BIP34/66/65 version-majority status objects (enforce/reject windows).
 - `valuePools` - Sprout/Sapling value pool totals (with `chainValue` and `chainValueZat`).
 - `total_supply` / `total_supply_zat` - transparent UTXOs + shielded value pools.
 - `upgrades` - network upgrades with activation heights and status.

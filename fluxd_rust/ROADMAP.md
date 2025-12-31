@@ -190,6 +190,9 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 - [x] [P0] Automated consensus vector tests vs C++ (embedded sighash vectors) (owner: TBD)
 - [ ] [P1] RPC golden tests against C++ behavior (owner: TBD)
+  - [x] Schema parity: `getblockchaininfo` required keys
+  - [x] Schema parity: `gettxoutsetinfo` required keys
+  - [ ] Expand schema checks across remaining RPCs
 - [ ] [P1] Long-run sync tests with regression gates (owner: TBD)
   - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity (supports seeding peers.dat and progress thresholds)
   - [x] VPS progress gate (`scripts/progress_gate.sh`) to detect stalls/regressions during sync
