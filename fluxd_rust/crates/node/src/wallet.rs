@@ -270,10 +270,8 @@ impl Wallet {
         encoder.write_u32_le(WALLET_FILE_VERSION);
         encoder.write_u8(encode_network(self.network));
 
-        let mut keys = self.keys.clone();
-        keys.sort_by(|a, b| a.secret.cmp(&b.secret));
-        encoder.write_varint(keys.len() as u64);
-        for key in &keys {
+        encoder.write_varint(self.keys.len() as u64);
+        for key in &self.keys {
             encoder.write_bytes(&key.secret);
             encoder.write_u8(if key.compressed { 1 } else { 0 });
         }
@@ -332,4 +330,36 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), WalletError> {
 fn secp() -> &'static Secp256k1<secp256k1::All> {
     static SECP: OnceLock<Secp256k1<secp256k1::All>> = OnceLock::new();
     SECP.get_or_init(Secp256k1::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_data_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn default_address_stable_across_restart() {
+        let data_dir = temp_data_dir("fluxd-wallet-test");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+
+        let mut wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet");
+        let wif_a = secret_key_to_wif(&[2u8; 32], Network::Regtest, true);
+        let wif_b = secret_key_to_wif(&[1u8; 32], Network::Regtest, true);
+        wallet.import_wif(&wif_a).expect("import wif a");
+        wallet.import_wif(&wif_b).expect("import wif b");
+        let before = wallet.default_address().expect("default").expect("address");
+        drop(wallet);
+
+        let wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet reload");
+        let after = wallet.default_address().expect("default").expect("address");
+        assert_eq!(before, after);
+    }
 }
