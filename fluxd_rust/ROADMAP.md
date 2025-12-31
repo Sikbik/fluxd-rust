@@ -173,6 +173,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `getrawchangeaddress`
   - [x] `getbalance`, `getunconfirmedbalance`, `listunspent`, `getwalletinfo` (partial fields)
   - [x] `getreceivedbyaddress` (P2PKH only)
+  - [x] `gettransaction` (partial)
   - [x] `signmessage`
   - [x] `backupwallet`
   - [x] `fundrawtransaction` (P2PKH only)
@@ -297,7 +298,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`getreceivedbyaddress`<br>`getwalletinfo`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany` | `listtransactions`<br>`settxfee`<br>`importaddress`<br>`importwallet`<br>`keypoolrefill`<br>`listreceivedbyaddress`<br>`listaddressgroupings`<br>`lockunspent`<br>`listlockunspent`<br>`sendfrom` |
+| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`getreceivedbyaddress`<br>`gettransaction`<br>`getwalletinfo`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany` | `listtransactions`<br>`settxfee`<br>`importaddress`<br>`importwallet`<br>`keypoolrefill`<br>`listreceivedbyaddress`<br>`listaddressgroupings`<br>`lockunspent`<br>`listlockunspent`<br>`sendfrom` |
 
 ### Wallet (shielded)
 

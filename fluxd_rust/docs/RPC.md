@@ -126,6 +126,7 @@ Type notes:
 Wallet state is stored at `--data-dir/wallet.dat`.
 
 - `getwalletinfo` (partial)
+- `gettransaction <txid> [include_watchonly]` (partial)
 - `getnewaddress [label]` (label ignored)
 - `getrawchangeaddress [address_type]` (partial; address_type ignored)
 - `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
@@ -282,6 +283,11 @@ Notes:
 
 Notes:
 - If `minconf=0`, includes mempool outputs paying to the address.
+
+### gettransaction
+
+- Params: `<txid> [include_watchonly]` (partial; watch-only not supported).
+- Result: best-effort wallet view of a transaction (confirmed txs via address deltas + tx index; mempool txs via script matching).
 
 ### listunspent
 

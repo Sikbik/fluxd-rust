@@ -75,7 +75,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Extra queries
 
-- gettransaction - Missing
+- gettransaction - Partial (wallet-only view based on address deltas + mempool script matching; field parity is WIP)
 - zvalidateaddress - Missing
 - getbenchmarks - Missing
 - getbenchstatus - Missing
