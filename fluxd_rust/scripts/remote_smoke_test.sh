@@ -14,7 +14,11 @@ Options:
   --profile NAME       low|default|high (default: default)
   --rpc-port PORT      RPC port to bind on 127.0.0.1 (default: 16134)
   --params-dir PATH    Shielded params dir (default: ~/.zcash-params)
+  --seed-peers-from DIR  Copy peers.dat/banlist.dat from DIR into the temp data dir
   --timeout-secs N     Max seconds to wait for peers+headers (default: 60)
+  --min-peers N        Fail if fewer than N peers are connected (default: 1)
+  --min-headers-advance N  Require header height to increase by N (default: 0)
+  --min-blocks-advance N   Require block height to increase by N (default: 0)
   --require-headers    Fail if headers do not advance beyond genesis within timeout
   --keep               Do not delete data dir/log on exit (for debugging)
   -h, --help           Show this help
@@ -28,8 +32,12 @@ NETWORK="mainnet"
 PROFILE="default"
 RPC_PORT="16134"
 PARAMS_DIR="${HOME}/.zcash-params"
+SEED_PEERS_FROM=""
 TIMEOUT_SECS="60"
 REQUIRE_HEADERS="0"
+MIN_PEERS="1"
+MIN_HEADERS_ADVANCE="0"
+MIN_BLOCKS_ADVANCE="0"
 KEEP="0"
 
 while [[ $# -gt 0 ]]; do
@@ -54,8 +62,24 @@ while [[ $# -gt 0 ]]; do
       PARAMS_DIR="${2:-}"
       shift 2
       ;;
+    --seed-peers-from)
+      SEED_PEERS_FROM="${2:-}"
+      shift 2
+      ;;
     --timeout-secs)
       TIMEOUT_SECS="${2:-}"
+      shift 2
+      ;;
+    --min-peers)
+      MIN_PEERS="${2:-}"
+      shift 2
+      ;;
+    --min-headers-advance)
+      MIN_HEADERS_ADVANCE="${2:-}"
+      shift 2
+      ;;
+    --min-blocks-advance)
+      MIN_BLOCKS_ADVANCE="${2:-}"
       shift 2
       ;;
     --require-headers)
@@ -86,6 +110,19 @@ fi
 
 DATA_DIR="$(mktemp -d "/tmp/fluxd-smoke.XXXXXX")"
 LOG_PATH="${DATA_DIR}.log"
+
+if [[ -n "$SEED_PEERS_FROM" ]]; then
+  if [[ ! -d "$SEED_PEERS_FROM" ]]; then
+    echo "--seed-peers-from is not a directory: $SEED_PEERS_FROM" >&2
+    exit 2
+  fi
+  if [[ -f "${SEED_PEERS_FROM}/peers.dat" ]]; then
+    cp -f "${SEED_PEERS_FROM}/peers.dat" "${DATA_DIR}/peers.dat"
+  fi
+  if [[ -f "${SEED_PEERS_FROM}/banlist.dat" ]]; then
+    cp -f "${SEED_PEERS_FROM}/banlist.dat" "${DATA_DIR}/banlist.dat"
+  fi
+fi
 
 cleanup() {
   local exit_code=$?
@@ -144,6 +181,10 @@ json_headers() {
   python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; headers=res.get("headers"); headers=res.get("best_header_height", 0) if headers is None else headers; print(int(headers or 0))'
 }
 
+json_blocks() {
+  python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; blocks=res.get("blocks"); blocks=res.get("best_block_height", 0) if blocks is None else blocks; print(int(blocks or 0))'
+}
+
 echo "PID: $PID"
 echo "Data dir: $DATA_DIR"
 echo "RPC: 127.0.0.1:${RPC_PORT}"
@@ -166,25 +207,35 @@ rpc_get "getinfo" >/dev/null
 start_ts=$(date +%s)
 peers=0
 headers=0
+blocks=0
+start_headers="$(rpc_get "getblockchaininfo" | json_headers)"
+start_blocks="$(rpc_get "getblockchaininfo" | json_blocks)"
+if [[ "$REQUIRE_HEADERS" == "1" ]]; then
+  if [[ "$MIN_HEADERS_ADVANCE" -lt 1 ]]; then
+    MIN_HEADERS_ADVANCE="1"
+  fi
+fi
 while true; do
   peers="$(rpc_get "getpeerinfo" | json_len)"
   headers="$(rpc_get "getblockchaininfo" | json_headers)"
-  if [[ "$peers" -ge 1 && ( "$REQUIRE_HEADERS" != "1" || "$headers" -ge 1 ) ]]; then
+  blocks="$(rpc_get "getblockchaininfo" | json_blocks)"
+  headers_advance=$((headers - start_headers))
+  blocks_advance=$((blocks - start_blocks))
+  if [[ "$peers" -ge "$MIN_PEERS" && "$headers_advance" -ge "$MIN_HEADERS_ADVANCE" && "$blocks_advance" -ge "$MIN_BLOCKS_ADVANCE" ]]; then
     break
   fi
   now_ts=$(date +%s)
   if [[ $((now_ts - start_ts)) -ge "$TIMEOUT_SECS" ]]; then
-    echo "Timed out waiting for peers/headers (peers=$peers headers=$headers)" >&2
+    echo "Timed out waiting for smoke test conditions:" >&2
+    echo "  peers=$peers (min $MIN_PEERS)" >&2
+    echo "  headers=$headers (start $start_headers, +$headers_advance, min +$MIN_HEADERS_ADVANCE)" >&2
+    echo "  blocks=$blocks (start $start_blocks, +$blocks_advance, min +$MIN_BLOCKS_ADVANCE)" >&2
     exit 1
   fi
   sleep 1
 done
 
-if [[ "$REQUIRE_HEADERS" != "1" && "$headers" -lt 1 ]]; then
-  echo "OK (partial): peers=$peers headers=$headers (headers not required)"
-else
-  echo "OK: peers=$peers headers=$headers"
-fi
+echo "OK: peers=$peers headers=$headers (start $start_headers, +$headers_advance) blocks=$blocks (start $start_blocks, +$blocks_advance)"
 echo "Sample getnetworkinfo:"
 networkinfo="$(rpc_get "getnetworkinfo")"
 echo "${networkinfo:0:1200}"

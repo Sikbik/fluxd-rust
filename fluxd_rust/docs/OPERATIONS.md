@@ -36,6 +36,11 @@ ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./sc
 ```
 
 Use `--keep` to preserve the temporary data dir/log for debugging.
+If peer discovery is slow on your VPS, seed the smoke test from an existing data dir:
+
+```bash
+ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/remote_smoke_test.sh --profile high --seed-peers-from <remote-data-dir> --min-headers-advance 1\"'"
+```
 
 ## Run
 
