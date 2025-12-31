@@ -6257,6 +6257,7 @@ mod tests {
     use fluxd_chainstate::flatfiles::FlatFileStore;
     use fluxd_chainstate::validation::ValidationFlags;
     use fluxd_consensus::params::{chain_params, Network};
+    use fluxd_fluxnode::storage::dedupe_key;
     use fluxd_primitives::block::BlockHeader;
     use fluxd_storage::memory::MemoryStore;
     use fluxd_storage::{Column, WriteBatch};
@@ -6304,6 +6305,136 @@ mod tests {
             .expect("insert genesis");
 
         (chainstate, params, data_dir)
+    }
+
+    fn extend_regtest_chain_to_height(
+        chainstate: &ChainState<MemoryStore>,
+        params: &fluxd_consensus::params::ChainParams,
+        target_height: i32,
+    ) {
+        let flags = ValidationFlags::default();
+        loop {
+            let tip = chainstate
+                .best_block()
+                .expect("best block")
+                .expect("best block present");
+            if tip.height >= target_height {
+                break;
+            }
+            let tip_entry = chainstate
+                .header_entry(&tip.hash)
+                .expect("header entry")
+                .expect("header entry present");
+            let height = tip.height + 1;
+            let time = tip_entry.time.saturating_add(1);
+            let bits = chainstate
+                .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+                .expect("next bits");
+
+            let miner_value = block_subsidy(height, &params.consensus);
+            let exchange_amount = exchange_fund_amount(height, &params.funding);
+            let foundation_amount = foundation_fund_amount(height, &params.funding);
+            let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+            let mut vout = Vec::new();
+            vout.push(TxOut {
+                value: miner_value,
+                script_pubkey: Vec::new(),
+            });
+            if exchange_amount > 0 {
+                let script =
+                    address_to_script_pubkey(params.funding.exchange_address, params.network)
+                        .expect("exchange address script");
+                vout.push(TxOut {
+                    value: exchange_amount,
+                    script_pubkey: script,
+                });
+            }
+            if foundation_amount > 0 {
+                let script =
+                    address_to_script_pubkey(params.funding.foundation_address, params.network)
+                        .expect("foundation address script");
+                vout.push(TxOut {
+                    value: foundation_amount,
+                    script_pubkey: script,
+                });
+            }
+            if swap_amount > 0 {
+                let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                    .expect("swap pool address script");
+                vout.push(TxOut {
+                    value: swap_amount,
+                    script_pubkey: script,
+                });
+            }
+            let coinbase = Transaction {
+                f_overwintered: false,
+                version: 1,
+                version_group_id: 0,
+                vin: vec![TxIn {
+                    prevout: OutPoint::null(),
+                    script_sig: Vec::new(),
+                    sequence: u32::MAX,
+                }],
+                vout,
+                lock_time: 0,
+                expiry_height: 0,
+                value_balance: 0,
+                shielded_spends: Vec::new(),
+                shielded_outputs: Vec::new(),
+                join_splits: Vec::new(),
+                join_split_pub_key: [0u8; 32],
+                join_split_sig: [0u8; 64],
+                binding_sig: [0u8; 64],
+                fluxnode: None,
+            };
+
+            let coinbase_txid = coinbase.txid().expect("coinbase txid");
+            let header = BlockHeader {
+                version: CURRENT_VERSION,
+                prev_block: tip.hash,
+                merkle_root: coinbase_txid,
+                final_sapling_root: [0u8; 32],
+                time,
+                bits,
+                nonce: [0u8; 32],
+                solution: Vec::new(),
+                nodes_collateral: OutPoint::null(),
+                block_sig: Vec::new(),
+            };
+
+            let mut header_batch = WriteBatch::new();
+            chainstate
+                .insert_headers_batch_with_pow(
+                    &[header.clone()],
+                    &params.consensus,
+                    &mut header_batch,
+                    false,
+                )
+                .expect("insert header");
+            chainstate
+                .commit_batch(header_batch)
+                .expect("commit header");
+
+            let block = Block {
+                header,
+                transactions: vec![coinbase],
+            };
+            let block_bytes = block.consensus_encode().expect("encode block");
+            let batch = chainstate
+                .connect_block(
+                    &block,
+                    height,
+                    params,
+                    &flags,
+                    true,
+                    None,
+                    None,
+                    Some(block_bytes.as_slice()),
+                )
+                .expect("connect block");
+            chainstate.commit_batch(batch).expect("commit block");
+        }
     }
 
     fn p2pkh_script(pubkey_hash: [u8; 20]) -> Vec<u8> {
@@ -6417,6 +6548,42 @@ mod tests {
         chainstate.commit_batch(batch).expect("commit block");
 
         (chainstate, params, data_dir, address, coinbase_txid, 0)
+    }
+
+    fn add_fluxnode_record_to_batch(
+        batch: &mut WriteBatch,
+        outpoint: OutPoint,
+        tier: u8,
+        start_height: u32,
+        operator_pubkey: Vec<u8>,
+        collateral_pubkey: Vec<u8>,
+        collateral_value: i64,
+    ) -> FluxnodeRecord {
+        let operator_pubkey_key = dedupe_key(&operator_pubkey);
+        let collateral_pubkey_key = dedupe_key(&collateral_pubkey);
+
+        batch.put(Column::FluxnodeKey, &operator_pubkey_key.0, operator_pubkey);
+        batch.put(
+            Column::FluxnodeKey,
+            &collateral_pubkey_key.0,
+            collateral_pubkey,
+        );
+
+        let record = FluxnodeRecord {
+            collateral: outpoint.clone(),
+            tier,
+            start_height,
+            confirmed_height: 0,
+            last_confirmed_height: start_height,
+            last_paid_height: 0,
+            collateral_value,
+            operator_pubkey: operator_pubkey_key,
+            collateral_pubkey: Some(collateral_pubkey_key),
+            p2sh_script: None,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        batch.put(Column::Fluxnode, key.as_bytes(), record.encode());
+        record
     }
 
     #[test]
@@ -6969,6 +7136,151 @@ mod tests {
             rpc_getaddressmempool(&chainstate, &mempool, vec![Value::String(address)], &params)
                 .expect("rpc");
         assert!(value.as_array().expect("array").is_empty());
+    }
+
+    #[test]
+    fn fluxnode_rpcs_have_cpp_schema_keys() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        extend_regtest_chain_to_height(&chainstate, &params, 69);
+
+        let mut batch = WriteBatch::new();
+        let record_cumulus = add_fluxnode_record_to_batch(
+            &mut batch,
+            OutPoint {
+                hash: [0x10u8; 32],
+                index: 0,
+            },
+            1,
+            1,
+            vec![0x02u8; 33],
+            vec![0x03u8; 33],
+            100_000,
+        );
+        add_fluxnode_record_to_batch(
+            &mut batch,
+            OutPoint {
+                hash: [0x11u8; 32],
+                index: 1,
+            },
+            2,
+            69,
+            vec![0x02u8; 33],
+            vec![0x03u8; 33],
+            100_000,
+        );
+        add_fluxnode_record_to_batch(
+            &mut batch,
+            OutPoint {
+                hash: [0x12u8; 32],
+                index: 2,
+            },
+            3,
+            69,
+            vec![0x02u8; 33],
+            vec![0x03u8; 33],
+            100_000,
+        );
+        chainstate.commit_batch(batch).expect("insert fluxnodes");
+
+        let value = rpc_getfluxnodecount(&chainstate, Vec::new()).expect("rpc");
+        let obj = value.as_object().expect("object");
+        for key in ["total", "stable", "enabled", "inqueue"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+
+        let value = rpc_viewdeterministicfluxnodelist(&chainstate, Vec::new()).expect("rpc");
+        let list = value.as_array().expect("array");
+        assert!(!list.is_empty());
+        let first = list[0].as_object().expect("object");
+        for key in [
+            "collateral",
+            "txhash",
+            "outidx",
+            "added_height",
+            "confirmed_height",
+            "last_confirmed_height",
+            "last_paid_height",
+            "tier",
+            "pubkey",
+            "collateral_pubkey",
+        ] {
+            assert!(first.contains_key(key), "missing key {key}");
+        }
+
+        let value = rpc_fluxnodecurrentwinner(&chainstate, Vec::new()).expect("rpc");
+        let winners = value.as_object().expect("object");
+        for tier_key in ["CUMULUS Winner", "NIMBUS Winner", "STRATUS Winner"] {
+            assert!(winners.contains_key(tier_key), "missing key {tier_key}");
+            let winner = winners.get(tier_key).expect("winner key present");
+            if winner.is_null() {
+                continue;
+            }
+            let obj = winner.as_object().expect("object");
+            for key in [
+                "collateral",
+                "added_height",
+                "confirmed_height",
+                "last_confirmed_height",
+                "last_paid_height",
+                "tier",
+            ] {
+                assert!(obj.contains_key(key), "missing key {key}");
+            }
+        }
+
+        let value = rpc_getfluxnodestatus(
+            &chainstate,
+            vec![Value::String(format_outpoint(&record_cumulus.collateral))],
+            &params,
+            &data_dir,
+        )
+        .expect("rpc");
+        let status = value.as_object().expect("object");
+        for key in [
+            "status",
+            "collateral",
+            "txhash",
+            "outidx",
+            "ip",
+            "network",
+            "added_height",
+            "confirmed_height",
+            "last_confirmed_height",
+            "last_paid_height",
+            "tier",
+            "payment_address",
+            "pubkey",
+            "activesince",
+            "lastpaid",
+        ] {
+            assert!(status.contains_key(key), "missing key {key}");
+        }
+
+        let starts = rpc_getstartlist(&chainstate, Vec::new(), &params).expect("rpc");
+        let starts = starts.as_array().expect("array");
+        assert_eq!(starts.len(), 2);
+        let first = starts[0].as_object().expect("object");
+        for key in [
+            "collateral",
+            "added_height",
+            "payment_address",
+            "expires_in",
+        ] {
+            assert!(first.contains_key(key), "missing key {key}");
+        }
+
+        let dos = rpc_getdoslist(&chainstate, Vec::new(), &params).expect("rpc");
+        let dos = dos.as_array().expect("array");
+        assert_eq!(dos.len(), 1);
+        let first = dos[0].as_object().expect("object");
+        for key in [
+            "collateral",
+            "added_height",
+            "payment_address",
+            "eligible_in",
+        ] {
+            assert!(first.contains_key(key), "missing key {key}");
+        }
     }
 
     #[test]

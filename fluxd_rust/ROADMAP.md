@@ -206,6 +206,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Error-code parity: `getblockhash`/`getblockheader` invalid params + not-found
   - [x] Error-code parity: `getspentinfo` not-found
   - [ ] Expand schema checks across remaining RPCs (blocks/mempool/fluxnode/etc)
+    - [x] Fluxnode RPC schemas (`getfluxnodecount`, `viewdeterministicfluxnodelist`, `fluxnodecurrentwinner`, `getfluxnodestatus`, `getstartlist`, `getdoslist`)
 - [ ] [P1] Long-run sync tests with regression gates (owner: TBD)
   - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity (supports seeding peers.dat and progress thresholds)
   - [x] VPS progress gate (`scripts/progress_gate.sh`) to detect stalls/regressions during sync
