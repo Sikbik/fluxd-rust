@@ -132,7 +132,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Prefer recently-good peers and apply exponential backoff after failures
   - [x] Prune stale/unreachable addresses and suppress dial spam
 - [x] [P1] Address manager v1 (last-seen timestamps + persistence) (owner: TBD)
-- [ ] [P2] Address manager parity (bucket-based selection like C++) (owner: TBD)
+- [x] [P2] Address manager parity (bucket-based selection like C++) (owner: TBD)
+  - [x] Bucketed sampling by netgroup + tried/new split (reduces peer herding on large address books)
 - [ ] [P2] P2P message coverage parity (addr/getaddr/feefilter/mempool, etc.) (owner: TBD)
   - [x] Address discovery: `getaddr` + `addr` ingest (owner: TBD)
   - [x] Tx relay: `inv`/`getdata`/`tx` + `mempool` (owner: TBD)

@@ -431,24 +431,79 @@ impl AddrBook {
             Ok(book) => book,
             Err(_) => return Vec::new(),
         };
-        let mut scored: Vec<(SocketAddr, i64)> = Vec::with_capacity(book.len());
+        let mut scored: Vec<(SocketAddr, i64, bool)> = Vec::with_capacity(book.len());
         for (addr, entry) in book.iter() {
             if !addr_is_eligible(addr, entry, now, min_height) {
                 continue;
             }
-            scored.push((*addr, addr_score(entry, now, min_height)));
+            let score = addr_score(entry, now, min_height);
+            let tried = entry.last_success > 0;
+            scored.push((*addr, score, tried));
         }
 
         if scored.is_empty() {
             return Vec::new();
         }
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
 
-        let top = scored
-            .len()
-            .min(limit.saturating_mul(8).max(limit).min(512));
-        let mut addrs: Vec<SocketAddr> = scored.iter().take(top).map(|(addr, _)| *addr).collect();
-        addrs.shuffle(&mut rand::thread_rng());
+        const BUCKET_KEEP: usize = 8;
+        let mut tried_buckets: HashMap<u64, Vec<(SocketAddr, i64)>> = HashMap::new();
+        let mut new_buckets: HashMap<u64, Vec<(SocketAddr, i64)>> = HashMap::new();
+        for (addr, score, tried) in scored {
+            let key = addr_bucket_key(&addr);
+            if tried {
+                tried_buckets.entry(key).or_default().push((addr, score));
+            } else {
+                new_buckets.entry(key).or_default().push((addr, score));
+            }
+        }
+
+        let to_bucket_lists = |mut buckets: HashMap<u64, Vec<(SocketAddr, i64)>>| {
+            let mut out = Vec::with_capacity(buckets.len());
+            for entries in buckets.values_mut() {
+                entries.sort_by(|a, b| a.1.cmp(&b.1));
+                if entries.len() > BUCKET_KEEP {
+                    let drop = entries.len() - BUCKET_KEEP;
+                    entries.drain(0..drop);
+                }
+                out.push(entries.iter().map(|(addr, _)| *addr).collect::<Vec<_>>());
+            }
+            out
+        };
+
+        let mut tried_lists = to_bucket_lists(tried_buckets);
+        let mut new_lists = to_bucket_lists(new_buckets);
+
+        fn take_round_robin(
+            buckets: &mut Vec<Vec<SocketAddr>>,
+            count: usize,
+            out: &mut Vec<SocketAddr>,
+        ) {
+            if count == 0 {
+                return;
+            }
+            buckets.shuffle(&mut rand::thread_rng());
+            let target_len = out.len().saturating_add(count);
+            let mut idx = 0usize;
+            while out.len() < target_len && !buckets.is_empty() {
+                if idx >= buckets.len() {
+                    idx = 0;
+                }
+                if let Some(addr) = buckets[idx].pop() {
+                    out.push(addr);
+                    idx = idx.saturating_add(1);
+                } else {
+                    buckets.swap_remove(idx);
+                }
+            }
+        }
+
+        let mut addrs = Vec::with_capacity(limit);
+        let tried_target = limit.saturating_mul(3).saturating_div(4);
+        take_round_robin(&mut tried_lists, tried_target, &mut addrs);
+        let remaining = limit.saturating_sub(addrs.len());
+        take_round_robin(&mut new_lists, remaining, &mut addrs);
+        let remaining = limit.saturating_sub(addrs.len());
+        take_round_robin(&mut tried_lists, remaining, &mut addrs);
         addrs.truncate(limit);
         addrs
     }
@@ -524,6 +579,10 @@ fn addr_score(entry: &AddrBookEntry, now: u64, min_height: i32) -> i64 {
     score += i64::from(entry.successes).saturating_mul(15);
     score -= i64::from(entry.failures).saturating_mul(25);
 
+    if entry.last_height > 0 {
+        score += i64::from(entry.last_height / 1000).min(2500);
+    }
+
     if min_height > 0 && entry.last_height > 0 {
         let delta = entry.last_height.saturating_sub(min_height);
         if delta >= -10 {
@@ -543,6 +602,23 @@ fn addr_score(entry: &AddrBookEntry, now: u64, min_height: i32) -> i64 {
     }
 
     score
+}
+
+fn addr_bucket_key(addr: &SocketAddr) -> u64 {
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            let group = u64::from(octets[0]) << 8 | u64::from(octets[1]);
+            (1u64 << 63) | group
+        }
+        IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            let group = u64::from(u32::from_be_bytes([
+                octets[0], octets[1], octets[2], octets[3],
+            ]));
+            (2u64 << 62) | group
+        }
+    }
 }
 
 fn merge_addr_entry(existing: &mut AddrBookEntry, incoming: &AddrBookEntry) {
