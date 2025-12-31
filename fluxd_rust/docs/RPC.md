@@ -133,6 +133,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `backupwallet <destination>`
 - `signmessage <address> <message>`
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
+- `getunconfirmedbalance`
 - `listunspent [minconf] [maxconf] [addresses]` (partial)
 - `sendtoaddress <address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
 - `sendmany <fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]` (partial)
@@ -226,6 +227,9 @@ Fields:
 
 - Result: basic wallet summary (balances are computed from the address index; txcount/keypool fields are placeholders).
 
+Notes:
+- `unconfirmed_balance` is derived from spendable mempool outputs paying to the wallet.
+
 ### getnewaddress
 
 - Result: new transparent P2PKH address (persisted to `wallet.dat`).
@@ -263,10 +267,20 @@ Notes:
 - Params: `[account] [minconf] [include_watchonly]` (partial; `minconf` is enforced).
 - Result: wallet balance (mature + not spent by mempool).
 
+Notes:
+- If `minconf=0`, includes spendable mempool outputs paying to the wallet.
+
+### getunconfirmedbalance
+
+- Result: sum of spendable mempool outputs paying to the wallet.
+
 ### listunspent
 
 - Params: `[minconf] [maxconf] [addresses]` (partial).
 - Result: array of unspent outputs owned by the wallet.
+
+Notes:
+- If `minconf=0`, includes spendable mempool outputs paying to the wallet (with `confirmations=0`).
 
 ### sendtoaddress
 

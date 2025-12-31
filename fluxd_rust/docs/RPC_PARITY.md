@@ -119,12 +119,12 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - addmultisigaddress - Missing
 - backupwallet - Implemented
 - dumpprivkey - Implemented (P2PKH only)
-- getbalance - Partial (minconf supported; accounts/watchonly/unconfirmed are placeholders)
+- getbalance - Partial (minconf supported; `minconf=0` includes spendable mempool outputs; accounts/watchonly are placeholders)
 - getnewaddress - Implemented (P2PKH only; random keys; label ignored)
 - getrawchangeaddress - Partial (P2PKH only; address_type param ignored)
 - getreceivedbyaddress - Missing
-- getunconfirmedbalance - Missing
-- getwalletinfo - Partial (balance fields are real; txcount/keypool fields are placeholders)
+- getunconfirmedbalance - Partial (derived from spendable mempool outputs paying to the wallet; no tx history yet)
+- getwalletinfo - Partial (balance + unconfirmed fields are real; txcount/keypool fields are placeholders)
 - importaddress - Missing
 - importprivkey - Implemented (rescan param accepted but ignored; address index makes it unnecessary)
 - importwallet - Missing
@@ -134,7 +134,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listreceivedbyaddress - Missing
 - listsinceblock - Missing
 - listtransactions - Missing
-- listunspent - Partial (supports minconf/maxconf/address filter; no locked/watchonly outputs)
+- listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; no locked/watchonly outputs)
 - lockunspent - Missing
 - rescanblockchain - Stub (wallet rescan not implemented)
 

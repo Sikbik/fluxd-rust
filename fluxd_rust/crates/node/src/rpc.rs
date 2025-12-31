@@ -95,6 +95,7 @@ const RPC_METHODS: &[&str] = &[
     "importprivkey",
     "dumpprivkey",
     "getbalance",
+    "getunconfirmedbalance",
     "listunspent",
     "getwalletinfo",
     "signmessage",
@@ -989,6 +990,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "signmessage" => rpc_signmessage(wallet, params, chain_params),
         "backupwallet" => rpc_backupwallet(wallet, params),
         "getbalance" => rpc_getbalance(chainstate, mempool, wallet, params),
+        "getunconfirmedbalance" => rpc_getunconfirmedbalance(chainstate, mempool, wallet, params),
         "listunspent" => rpc_listunspent(chainstate, mempool, wallet, params, chain_params),
         "getdbinfo" => rpc_getdbinfo(chainstate, store, params, data_dir),
         "getblockcount" => rpc_getblockcount(chainstate, params),
@@ -1228,6 +1230,7 @@ fn collect_wallet_utxos<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
     scripts: &[Vec<u8>],
+    include_mempool_outputs: bool,
 ) -> Result<Vec<WalletUtxoRow>, RpcError> {
     let best_height = chainstate
         .best_block()
@@ -1270,6 +1273,37 @@ fn collect_wallet_utxos<S: fluxd_storage::KeyValueStore>(
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
     out.retain(|row| !mempool_guard.is_spent(&row.outpoint));
+
+    if include_mempool_outputs {
+        for entry in mempool_guard.entries() {
+            for (output_index, output) in entry.tx.vout.iter().enumerate() {
+                if !scripts
+                    .iter()
+                    .any(|script| script.as_slice() == output.script_pubkey.as_slice())
+                {
+                    continue;
+                }
+                let outpoint = OutPoint {
+                    hash: entry.txid,
+                    index: output_index as u32,
+                };
+                if mempool_guard.is_spent(&outpoint) {
+                    continue;
+                }
+                if !seen.insert(outpoint.clone()) {
+                    continue;
+                }
+                out.push(WalletUtxoRow {
+                    outpoint,
+                    value: output.value,
+                    script_pubkey: output.script_pubkey.clone(),
+                    height: 0,
+                    is_coinbase: false,
+                    confirmations: 0,
+                });
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -1494,13 +1528,40 @@ fn rpc_getbalance<S: fluxd_storage::KeyValueStore>(
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
         guard.all_script_pubkeys().map_err(map_wallet_error)?
     };
-    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts)?;
+    let include_mempool_outputs = minconf == 0;
+    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, include_mempool_outputs)?;
     let mut total: i64 = 0;
     for utxo in utxos {
         if utxo.confirmations < minconf {
             continue;
         }
         if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        total = total
+            .checked_add(utxo.value)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+    }
+    Ok(amount_to_value(total))
+}
+
+fn rpc_getunconfirmedbalance<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    let scripts = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard.all_script_pubkeys().map_err(map_wallet_error)?
+    };
+    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, true)?;
+    let mut total: i64 = 0;
+    for utxo in utxos {
+        if utxo.confirmations != 0 {
             continue;
         }
         total = total
@@ -1570,7 +1631,8 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
             .map_err(map_wallet_error)?
     };
 
-    let mut utxos = collect_wallet_utxos(chainstate, mempool, &scripts)?;
+    let include_mempool_outputs = minconf == 0;
+    let mut utxos = collect_wallet_utxos(chainstate, mempool, &scripts, include_mempool_outputs)?;
     utxos.retain(|utxo| {
         if utxo.confirmations < minconf {
             return false;
@@ -1624,10 +1686,17 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
         guard.all_script_pubkeys().map_err(map_wallet_error)?
     };
-    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts)?;
+    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, true)?;
     let mut balance: i64 = 0;
     let mut immature: i64 = 0;
+    let mut unconfirmed: i64 = 0;
     for utxo in utxos {
+        if utxo.confirmations == 0 {
+            unconfirmed = unconfirmed
+                .checked_add(utxo.value)
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+            continue;
+        }
         if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
             immature = immature
                 .checked_add(utxo.value)
@@ -1649,8 +1718,8 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
         "walletversion": WALLET_FILE_VERSION,
         "balance": amount_to_value(balance),
         "balance_zat": balance,
-        "unconfirmed_balance": amount_to_value(0),
-        "unconfirmed_balance_zat": 0,
+        "unconfirmed_balance": amount_to_value(unconfirmed),
+        "unconfirmed_balance_zat": unconfirmed,
         "immature_balance": amount_to_value(immature),
         "immature_balance_zat": immature,
         "txcount": 0,
@@ -3049,7 +3118,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         (scripts, change_script)
     };
 
-    let mut candidates = collect_wallet_utxos(chainstate, mempool, &wallet_scripts)?;
+    let mut candidates = collect_wallet_utxos(chainstate, mempool, &wallet_scripts, false)?;
     candidates.retain(|utxo| {
         if used_outpoints.contains(&utxo.outpoint) {
             return false;
@@ -9909,6 +9978,170 @@ mod tests {
             row.get("confirmations").and_then(Value::as_i64),
             Some(i64::from(COINBASE_MATURITY))
         );
+    }
+
+    #[test]
+    fn wallet_unconfirmed_balance_tracks_mempool_outputs() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let incoming_value = 2 * COIN;
+        let incoming_prevout = OutPoint {
+            hash: [0x33u8; 32],
+            index: 0,
+        };
+        let incoming_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: incoming_prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: incoming_value,
+                script_pubkey: script_pubkey.clone(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let incoming_txid = incoming_tx.txid().expect("txid");
+        let incoming_raw = incoming_tx.consensus_encode().expect("encode tx");
+
+        let mut inner = Mempool::new(0);
+        inner
+            .insert(MempoolEntry {
+                txid: incoming_txid,
+                tx: incoming_tx,
+                raw: incoming_raw,
+                time: 0,
+                height: 0,
+                fee: 0,
+                spent_outpoints: vec![incoming_prevout],
+                parents: Vec::new(),
+            })
+            .expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let confirmed_only =
+            rpc_getbalance(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
+        assert_eq!(parse_amount(&confirmed_only).expect("amount"), 0);
+
+        let include_mempool =
+            rpc_getbalance(&chainstate, &mempool, &wallet, vec![Value::Null, json!(0)])
+                .expect("rpc");
+        assert_eq!(
+            parse_amount(&include_mempool).expect("amount"),
+            incoming_value
+        );
+
+        let unconfirmed =
+            rpc_getunconfirmedbalance(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
+        assert_eq!(parse_amount(&unconfirmed).expect("amount"), incoming_value);
+
+        let info = rpc_getwalletinfo(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
+        let obj = info.as_object().expect("object");
+        assert_eq!(
+            obj.get("unconfirmed_balance_zat").and_then(Value::as_i64),
+            Some(incoming_value)
+        );
+        assert_eq!(obj.get("balance_zat").and_then(Value::as_i64), Some(0));
+
+        let utxos_default =
+            rpc_listunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        assert_eq!(utxos_default.as_array().expect("array").len(), 0);
+
+        let utxos =
+            rpc_listunspent(&chainstate, &mempool, &wallet, vec![json!(0)], &params).expect("rpc");
+        let arr = utxos.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("object");
+        let incoming_txid_hex = hash256_to_hex(&incoming_txid);
+        assert_eq!(
+            row.get("txid").and_then(Value::as_str),
+            Some(incoming_txid_hex.as_str())
+        );
+        assert_eq!(row.get("vout").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            row.get("address").and_then(Value::as_str),
+            Some(address.as_str())
+        );
+        assert_eq!(
+            row.get("amount_zat").and_then(Value::as_i64),
+            Some(incoming_value)
+        );
+        assert_eq!(row.get("confirmations").and_then(Value::as_i64), Some(0));
+
+        let spending_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: incoming_txid,
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: incoming_value,
+                script_pubkey: p2pkh_script([0x44u8; 20]),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let spending_txid = spending_tx.txid().expect("txid");
+        let spending_raw = spending_tx.consensus_encode().expect("encode tx");
+        mempool
+            .lock()
+            .expect("mempool lock")
+            .insert(MempoolEntry {
+                txid: spending_txid,
+                tx: spending_tx,
+                raw: spending_raw,
+                time: 0,
+                height: 0,
+                fee: 0,
+                spent_outpoints: vec![OutPoint {
+                    hash: incoming_txid,
+                    index: 0,
+                }],
+                parents: vec![incoming_txid],
+            })
+            .expect("insert spending tx");
+
+        let unconfirmed =
+            rpc_getunconfirmedbalance(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
+        assert_eq!(parse_amount(&unconfirmed).expect("amount"), 0);
+
+        let utxos =
+            rpc_listunspent(&chainstate, &mempool, &wallet, vec![json!(0)], &params).expect("rpc");
+        assert_eq!(utxos.as_array().expect("array").len(), 0);
     }
 
     #[test]
