@@ -1810,9 +1810,7 @@ fn rpc_keypoolrefill(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-    while guard.key_count() < newsize {
-        let _ = guard.generate_new_address(true).map_err(map_wallet_error)?;
-    }
+    guard.refill_keypool(newsize).map_err(map_wallet_error)?;
     Ok(Value::Null)
 }
 
@@ -2875,7 +2873,7 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
     }
 
-    let (key_count, pay_tx_fee_per_kb, tx_count) = {
+    let (key_count, pay_tx_fee_per_kb, tx_count, keypool_oldest, keypool_size) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -2883,6 +2881,8 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
             guard.key_count(),
             guard.pay_tx_fee_per_kb(),
             guard.tx_count(),
+            guard.keypool_oldest(),
+            guard.keypool_size(),
         )
     };
 
@@ -2896,8 +2896,8 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
         "immature_balance": amount_to_value(immature),
         "immature_balance_zat": immature,
         "txcount": tx_count,
-        "keypoololdest": 0,
-        "keypoolsize": 0,
+        "keypoololdest": keypool_oldest,
+        "keypoolsize": keypool_size,
         "paytxfee": amount_to_value(pay_tx_fee_per_kb),
         "paytxfee_zat": pay_tx_fee_per_kb,
         "private_keys_enabled": true,
@@ -11244,13 +11244,16 @@ mod tests {
     }
 
     #[test]
-    fn keypoolrefill_generates_keys() {
+    fn keypoolrefill_fills_keypool() {
         let (_chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
         assert_eq!(wallet.lock().expect("wallet lock").key_count(), 0);
 
         rpc_keypoolrefill(&wallet, vec![json!(2)]).expect("rpc");
-        assert!(wallet.lock().expect("wallet lock").key_count() >= 2);
+        let guard = wallet.lock().expect("wallet lock");
+        assert_eq!(guard.key_count(), 0);
+        assert_eq!(guard.keypool_size(), 2);
+        assert!(guard.keypool_oldest() > 0);
     }
 
     #[test]

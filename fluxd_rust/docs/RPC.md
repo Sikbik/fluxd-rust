@@ -234,7 +234,7 @@ Notes:
 
 ### getwalletinfo
 
-- Result: basic wallet summary (balances are computed from the address index; keypool fields are placeholders).
+- Result: basic wallet summary (balances are computed from the address index; keypool fields reflect the persisted keypool).
 
 Notes:
 - `unconfirmed_balance` is derived from spendable mempool outputs paying to the wallet.
@@ -320,6 +320,10 @@ Notes:
 
 - Params: `[newsize]` (partial).
 - Result: `null`
+
+Notes:
+- Fills the wallet keypool to at least `newsize` keys (persisted in `wallet.dat`).
+- Does not create new addresses; addresses are reserved from the keypool by `getnewaddress` / `getrawchangeaddress`.
 
 ### settxfee
 

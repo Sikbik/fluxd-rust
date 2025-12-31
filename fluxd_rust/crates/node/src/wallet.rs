@@ -1,7 +1,8 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
@@ -16,7 +17,15 @@ use fluxd_script::message::signed_message_hash;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 3;
+pub const WALLET_FILE_VERSION: u32 = 4;
+
+const DEFAULT_KEYPOOL_SIZE: usize = 100;
+
+#[derive(Clone)]
+struct KeyPoolEntry {
+    key: WalletKey,
+    created_at: u64,
+}
 
 #[derive(Debug)]
 pub enum WalletError {
@@ -104,6 +113,7 @@ pub struct Wallet {
     keys: Vec<WalletKey>,
     watch_scripts: Vec<Vec<u8>>,
     tx_history: BTreeSet<Hash256>,
+    keypool: VecDeque<KeyPoolEntry>,
     revision: u64,
     locked_outpoints: HashSet<OutPoint>,
     pay_tx_fee_per_kb: i64,
@@ -123,6 +133,7 @@ impl Wallet {
                 keys: Vec::new(),
                 watch_scripts: Vec::new(),
                 tx_history: BTreeSet::new(),
+                keypool: VecDeque::new(),
                 revision: 0,
                 locked_outpoints: HashSet::new(),
                 pay_tx_fee_per_kb: 0,
@@ -148,6 +159,17 @@ impl Wallet {
 
     pub fn key_count(&self) -> usize {
         self.keys.len()
+    }
+
+    pub fn keypool_size(&self) -> usize {
+        self.keypool.len()
+    }
+
+    pub fn keypool_oldest(&self) -> u64 {
+        self.keypool
+            .front()
+            .map(|entry| entry.created_at)
+            .unwrap_or(0)
     }
 
     pub fn tx_count(&self) -> usize {
@@ -260,27 +282,102 @@ impl Wallet {
     }
 
     pub fn generate_new_address(&mut self, compressed: bool) -> Result<String, WalletError> {
+        self.reserve_from_keypool_or_generate(compressed)
+    }
+
+    pub fn refill_keypool(&mut self, newsize: usize) -> Result<(), WalletError> {
+        if self.keypool.len() >= newsize {
+            return Ok(());
+        }
+        let prev_len = self.keypool.len();
+        while self.keypool.len() < newsize {
+            let key = self.generate_unique_key(true)?;
+            let created_at = current_unix_seconds();
+            self.keypool.push_back(KeyPoolEntry { key, created_at });
+        }
+        if let Err(err) = self.save() {
+            while self.keypool.len() > prev_len {
+                self.keypool.pop_back();
+            }
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    fn reserve_from_keypool_or_generate(
+        &mut self,
+        compressed: bool,
+    ) -> Result<String, WalletError> {
+        let prev_key_len = self.keys.len();
+
+        let popped = if compressed {
+            self.keypool.pop_front()
+        } else {
+            None
+        };
+        let reserved = match popped.as_ref() {
+            Some(entry) => entry.key.clone(),
+            None => self.generate_unique_key(compressed)?,
+        };
+
+        let added_keypool = self.ensure_keypool_minimum(DEFAULT_KEYPOOL_SIZE)?;
+
+        let address = reserved.address(self.network)?;
+        self.keys.push(reserved);
+        if let Err(err) = self.save() {
+            self.keys.truncate(prev_key_len);
+            for _ in 0..added_keypool {
+                self.keypool.pop_back();
+            }
+            if let Some(entry) = popped {
+                self.keypool.push_front(entry);
+            }
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(address)
+    }
+
+    fn ensure_keypool_minimum(&mut self, target: usize) -> Result<usize, WalletError> {
+        let mut added = 0usize;
+        while self.keypool.len() < target {
+            let key = self.generate_unique_key(true)?;
+            self.keypool.push_back(KeyPoolEntry {
+                key,
+                created_at: current_unix_seconds(),
+            });
+            added = added.saturating_add(1);
+        }
+        Ok(added)
+    }
+
+    fn generate_unique_key(&self, compressed: bool) -> Result<WalletKey, WalletError> {
         let mut rng = rand::rngs::OsRng;
         let mut seed = [0u8; 32];
         for _ in 0..100 {
             rng.fill_bytes(&mut seed);
-            if SecretKey::from_slice(&seed).is_ok() {
-                if self.keys.iter().any(|key| key.secret == seed) {
-                    continue;
-                }
-                let key = WalletKey {
-                    secret: seed,
-                    compressed,
-                };
-                let address = key.address(self.network)?;
-                self.keys.push(key);
-                if let Err(err) = self.save() {
-                    self.keys.retain(|k| k.secret != seed);
-                    return Err(err);
-                }
-                self.revision = self.revision.saturating_add(1);
-                return Ok(address);
+            if SecretKey::from_slice(&seed).is_err() {
+                continue;
             }
+            if self
+                .keys
+                .iter()
+                .any(|key| key.secret.as_slice() == seed.as_slice())
+            {
+                continue;
+            }
+            if self
+                .keypool
+                .iter()
+                .any(|entry| entry.key.secret.as_slice() == seed.as_slice())
+            {
+                continue;
+            }
+            return Ok(WalletKey {
+                secret: seed,
+                compressed,
+            });
         }
         Err(WalletError::InvalidData("failed to generate secret key"))
     }
@@ -373,7 +470,7 @@ impl Wallet {
     fn decode(path: &Path, expected_network: Network, bytes: &[u8]) -> Result<Self, WalletError> {
         let mut decoder = Decoder::new(bytes);
         let version = decoder.read_u32_le()?;
-        if version != 1 && version != 2 && version != WALLET_FILE_VERSION {
+        if version != 1 && version != 2 && version != 3 && version != WALLET_FILE_VERSION {
             return Err(WalletError::InvalidData("unsupported wallet file version"));
         }
         let network = decode_network(decoder.read_u8()?)?;
@@ -424,6 +521,22 @@ impl Wallet {
             }
         }
 
+        let mut keypool = VecDeque::new();
+        if version >= 4 {
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("keypool count too large"))?;
+            for _ in 0..count {
+                let secret = decoder.read_fixed::<32>()?;
+                let compressed = decoder.read_bool()?;
+                let created_at = decoder.read_u64_le()?;
+                keypool.push_back(KeyPoolEntry {
+                    key: WalletKey { secret, compressed },
+                    created_at,
+                });
+            }
+        }
+
         if !decoder.is_empty() {
             return Err(WalletError::InvalidData("wallet file has trailing bytes"));
         }
@@ -433,6 +546,7 @@ impl Wallet {
             keys,
             watch_scripts,
             tx_history,
+            keypool,
             revision: 0,
             locked_outpoints: HashSet::new(),
             pay_tx_fee_per_kb,
@@ -459,10 +573,24 @@ impl Wallet {
         for txid in &self.tx_history {
             encoder.write_bytes(txid);
         }
+
+        encoder.write_varint(self.keypool.len() as u64);
+        for entry in &self.keypool {
+            encoder.write_bytes(&entry.key.secret);
+            encoder.write_u8(if entry.key.compressed { 1 } else { 0 });
+            encoder.write_u64_le(entry.created_at);
+        }
         let bytes = encoder.into_inner();
         write_file_atomic(&self.path, &bytes)?;
         Ok(())
     }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn encode_network(network: Network) -> u8 {

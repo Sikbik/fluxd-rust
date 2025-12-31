@@ -163,12 +163,12 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Wallet
 
-- [ ] [P1] Wallet database (keys, keypool, metadata) (owner: TBD)
+- [x] [P1] Wallet database (keys, keypool, metadata) (owner: TBD)
   - [x] `wallet.dat` key store (P2PKH keys + network tag)
   - [x] Atomic wallet writes + deterministic key order
   - [x] Persist watch-only scripts in `wallet.dat` (v2; `importaddress`)
   - [x] Persist `paytxfee` in `wallet.dat` (v2; `settxfee`)
-  - [ ] Keypool/change-address management parity
+  - [x] Keypool/change-address management parity
   - [x] Wallet tx history / persistence (txid set in `wallet.dat` v3; updated by `rescanblockchain` + wallet send RPCs)
 - [ ] [P1] Transparent wallet RPCs (owner: TBD)
   - [x] `importaddress` (watch-only; rescan is a no-op due to address index)
@@ -188,7 +188,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index
-  - [x] `keypoolrefill` (partial)
+  - [x] `keypoolrefill`
   - [x] `settxfee` (partial)
   - [x] `signmessage`
   - [x] `backupwallet`

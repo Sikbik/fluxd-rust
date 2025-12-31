@@ -119,24 +119,24 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - addmultisigaddress - Missing
 - backupwallet - Implemented
 - dumpprivkey - Implemented (P2PKH only)
-- getbalance - Partial (minconf supported; `minconf=0` includes spendable mempool outputs; accounts/watchonly are placeholders)
-- getnewaddress - Implemented (P2PKH only; random keys; label ignored)
+- getbalance - Partial (minconf supported; `minconf=0` includes spendable mempool outputs; `include_watchonly` supported; accounts ignored)
+- getnewaddress - Implemented (P2PKH only; label ignored; keypool-backed)
 - getrawchangeaddress - Partial (P2PKH only; address_type param ignored)
 - getreceivedbyaddress - Partial (P2PKH only; uses address deltas for confirmed receives, plus mempool outputs when `minconf=0`)
-- getunconfirmedbalance - Partial (derived from spendable mempool outputs paying to the wallet; no tx history yet)
-- getwalletinfo - Partial (balance + unconfirmed fields are real; txcount/keypool fields are placeholders)
-- importaddress - Missing
+- getunconfirmedbalance - Partial (derived from spendable mempool outputs paying to the wallet)
+- getwalletinfo - Partial (balances derived from the address index; `txcount` and keypool fields are persisted)
+- importaddress - Implemented (watch-only; rescan ignored due to address index)
 - importprivkey - Implemented (rescan param accepted but ignored; address index makes it unnecessary)
-- importwallet - Missing
-- keypoolrefill - Partial (generates additional wallet keys; does not maintain a real keypool yet)
-- listaddressgroupings - Missing
-- listlockunspent - Missing
-- listreceivedbyaddress - Partial (wallet keys only; uses address deltas and optional mempool scan; labels/txids fields are placeholders)
+- importwallet - Partial (best-effort WIF import from dump file)
+- keypoolrefill - Implemented (fills persisted keypool; does not create addresses)
+- listaddressgroupings - Partial (simplified grouping)
+- listlockunspent - Implemented
+- listreceivedbyaddress - Partial (transparent only; `include_watchonly` supported; `txids` populated; labels are WIP)
 - listsinceblock - Missing
-- listtransactions - Partial (derived from wallet address deltas + mempool scan; schema still evolving)
-- listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; no locked/watchonly outputs)
-- lockunspent - Missing
-- rescanblockchain - Stub (wallet rescan not implemented)
+- listtransactions - Partial (transparent only; confirmed via address deltas; mempool included; `include_watchonly` supported)
+- listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; returns spendable flag and locked state)
+- lockunspent - Implemented
+- rescanblockchain - Implemented (scans address delta index; populates wallet tx history)
 
 - sendmany - Partial (P2PKH only; `subtractfeefromamount` not supported)
 - sendtoaddress - Partial (P2PKH only; `subtractfeefromamount` not supported)
