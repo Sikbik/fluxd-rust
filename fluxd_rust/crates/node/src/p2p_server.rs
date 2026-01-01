@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::ValidationFlags;
@@ -26,6 +26,70 @@ const MAX_INBOUND_ADDR: usize = 1000;
 const TX_GETDATA_BATCH: usize = 128;
 const TX_KNOWN_CAP: usize = 50_000;
 const MAX_INBOUND_TX_REQUEST: usize = 2048;
+const INBOUND_RATE_WINDOW_SECS: u64 = 10;
+const INBOUND_MAX_BYTES_SENT_PER_WINDOW: usize = 32 * 1024 * 1024;
+const INBOUND_MAX_BYTES_RECV_PER_WINDOW: usize = 16 * 1024 * 1024;
+
+struct InboundRateLimiter {
+    window_start: Instant,
+    bytes_sent: usize,
+    bytes_recv: usize,
+}
+
+impl InboundRateLimiter {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            bytes_sent: 0,
+            bytes_recv: 0,
+        }
+    }
+
+    fn reset_if_needed(&mut self) {
+        if self.window_start.elapsed() >= Duration::from_secs(INBOUND_RATE_WINDOW_SECS) {
+            self.window_start = Instant::now();
+            self.bytes_sent = 0;
+            self.bytes_recv = 0;
+        }
+    }
+
+    fn note_recv(&mut self, bytes: usize) -> Result<(), String> {
+        self.reset_if_needed();
+        self.bytes_recv = self.bytes_recv.saturating_add(bytes);
+        if self.bytes_recv > INBOUND_MAX_BYTES_RECV_PER_WINDOW {
+            return Err("inbound peer rate limit exceeded (recv)".to_string());
+        }
+        Ok(())
+    }
+
+    fn note_send(&mut self, bytes: usize) -> Result<(), String> {
+        self.reset_if_needed();
+        self.bytes_sent = self.bytes_sent.saturating_add(bytes);
+        if self.bytes_sent > INBOUND_MAX_BYTES_SENT_PER_WINDOW {
+            return Err("inbound peer rate limit exceeded (send)".to_string());
+        }
+        Ok(())
+    }
+}
+
+async fn send_message_limited(
+    peer: &mut Peer,
+    limiter: &mut InboundRateLimiter,
+    command: &str,
+    payload: &[u8],
+) -> Result<(), String> {
+    limiter.note_send(payload.len().saturating_add(24))?;
+    peer.send_message(command, payload).await
+}
+
+async fn send_inv_tx_limited(
+    peer: &mut Peer,
+    limiter: &mut InboundRateLimiter,
+    hashes: &[Hash256],
+) -> Result<(), String> {
+    let payload = build_inv_payload(hashes, MSG_TX);
+    send_message_limited(peer, limiter, "inv", &payload).await
+}
 
 pub async fn serve_inbound_p2p<S: KeyValueStore + Send + Sync + 'static>(
     listener: TcpListener,
@@ -155,6 +219,7 @@ async fn handle_inbound_peer<S: KeyValueStore + Send + Sync + 'static>(
     let mut known: HashSet<Hash256> = HashSet::new();
     let mut requested: HashSet<Hash256> = HashSet::new();
     let mut peer_fee_filter_per_kb: i64 = 0;
+    let mut limiter = InboundRateLimiter::new();
 
     let _ = peer
         .send_feefilter(mempool_policy.min_relay_fee_per_kb)
@@ -172,9 +237,11 @@ async fn handle_inbound_peer<S: KeyValueStore + Send + Sync + 'static>(
                     Ok(Err(err)) => return Err(err),
                     Err(_) => return Err("peer read timed out".to_string()),
                 };
+                limiter.note_recv(payload.len().saturating_add(24))?;
 
                 handle_inbound_message(
                     &mut peer,
+                    &mut limiter,
                     remote_addr,
                     &command,
                     &payload,
@@ -200,7 +267,7 @@ async fn handle_inbound_peer<S: KeyValueStore + Send + Sync + 'static>(
                         }
                         if should_announce_tx(mempool.as_ref(), &txid, peer_fee_filter_per_kb) {
                             let _ = touch_known(&mut known, txid);
-                            peer.send_inv_tx(&[txid]).await?;
+                            send_inv_tx_limited(&mut peer, &mut limiter, &[txid]).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -215,6 +282,7 @@ async fn handle_inbound_peer<S: KeyValueStore + Send + Sync + 'static>(
 
 async fn handle_inbound_message<S: KeyValueStore>(
     peer: &mut Peer,
+    limiter: &mut InboundRateLimiter,
     remote_addr: SocketAddr,
     command: &str,
     payload: &[u8],
@@ -232,7 +300,7 @@ async fn handle_inbound_message<S: KeyValueStore>(
     peer_fee_filter_per_kb: &mut i64,
 ) -> Result<(), String> {
     match command {
-        "ping" => peer.send_message("pong", payload).await?,
+        "ping" => send_message_limited(peer, limiter, "pong", payload).await?,
         "getaddr" => {
             let mut sample = addr_book.sample(MAX_INBOUND_ADDR);
             if sample.len() > MAX_INBOUND_ADDR {
@@ -243,7 +311,7 @@ async fn handle_inbound_message<S: KeyValueStore>(
                 .map(|value| value.as_secs() as u32)
                 .unwrap_or(0);
             let payload = build_addr_payload(&sample, now);
-            peer.send_message("addr", &payload).await?;
+            send_message_limited(peer, limiter, "addr", &payload).await?;
         }
         "addr" => {
             if let Ok(addrs) = parse_addr(payload) {
@@ -257,7 +325,7 @@ async fn handle_inbound_message<S: KeyValueStore>(
                 }
             }
         }
-        "getheaders" => handle_getheaders(peer, chainstate, params, payload).await?,
+        "getheaders" => handle_getheaders(peer, limiter, chainstate, params, payload).await?,
         "inv" => handle_inv(peer, mempool, payload, known, requested).await?,
         "tx" => {
             handle_tx(
@@ -279,14 +347,14 @@ async fn handle_inbound_message<S: KeyValueStore>(
             for txid in &txids {
                 let _ = touch_known(known, *txid);
             }
-            peer.send_inv_tx(&txids).await?;
+            send_inv_tx_limited(peer, limiter, &txids).await?;
         }
         "feefilter" => {
             if let Ok(filter) = parse_feefilter(payload) {
                 *peer_fee_filter_per_kb = filter;
             }
         }
-        "getdata" => handle_getdata(peer, chainstate, mempool, payload).await?,
+        "getdata" => handle_getdata(peer, limiter, chainstate, mempool, payload).await?,
         "notfound" => {
             if let Ok(vectors) = parse_inv(payload) {
                 for vector in vectors {
@@ -305,7 +373,7 @@ async fn handle_inbound_message<S: KeyValueStore>(
                 }
             }
         }
-        "version" => peer.send_message("verack", &[]).await?,
+        "version" => send_message_limited(peer, limiter, "verack", &[]).await?,
         _ => {}
     }
     Ok(())
@@ -443,6 +511,7 @@ fn handle_tx<S: KeyValueStore>(
 
 async fn handle_getheaders<S: KeyValueStore>(
     peer: &mut Peer,
+    limiter: &mut InboundRateLimiter,
     chainstate: &ChainState<S>,
     params: &ChainParams,
     payload: &[u8],
@@ -478,8 +547,8 @@ async fn handle_getheaders<S: KeyValueStore>(
 
     let start_height = anchor_height.saturating_add(1);
     if start_height > tip_height {
-        peer.send_message("headers", &build_headers_payload(&[]))
-            .await?;
+        let payload = build_headers_payload(&[]);
+        send_message_limited(peer, limiter, "headers", &payload).await?;
         return Ok(());
     }
 
@@ -524,13 +593,14 @@ async fn handle_getheaders<S: KeyValueStore>(
         headers.push(bytes);
     }
 
-    peer.send_message("headers", &build_headers_payload(&headers))
-        .await?;
+    let payload = build_headers_payload(&headers);
+    send_message_limited(peer, limiter, "headers", &payload).await?;
     Ok(())
 }
 
 async fn handle_getdata<S: KeyValueStore>(
     peer: &mut Peer,
+    limiter: &mut InboundRateLimiter,
     chainstate: &ChainState<S>,
     mempool: &Mutex<mempool::Mempool>,
     payload: &[u8],
@@ -555,7 +625,7 @@ async fn handle_getdata<S: KeyValueStore>(
                 let block_bytes = chainstate
                     .read_block(location)
                     .map_err(|err| err.to_string())?;
-                peer.send_message("block", &block_bytes).await?;
+                send_message_limited(peer, limiter, "block", &block_bytes).await?;
             }
             MSG_TX => {
                 let raw = {
@@ -565,7 +635,7 @@ async fn handle_getdata<S: KeyValueStore>(
                     guard.get(&inv.hash).map(|entry| entry.raw.clone())
                 };
                 if let Some(raw) = raw {
-                    peer.send_message("tx", &raw).await?;
+                    send_message_limited(peer, limiter, "tx", &raw).await?;
                 } else {
                     missing_txs.push(inv.hash);
                 }
@@ -575,8 +645,8 @@ async fn handle_getdata<S: KeyValueStore>(
     }
 
     if !missing_txs.is_empty() {
-        peer.send_message("notfound", &build_inv_payload(&missing_txs, MSG_TX))
-            .await?;
+        let payload = build_inv_payload(&missing_txs, MSG_TX);
+        send_message_limited(peer, limiter, "notfound", &payload).await?;
     }
     Ok(())
 }
