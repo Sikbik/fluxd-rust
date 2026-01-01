@@ -148,7 +148,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zexportkey - Partial (Sapling only; exports Sapling extended spending key)
 - zexportviewingkey - Partial (Sapling only; exports Sapling full viewing key)
 - zgetbalance - Partial (Sapling only; scans chain for Sapling notes; spent detection via nullifier set; supports watch-only via includeWatchonly)
-- zgetmigrationstatus - Stub (returns wallet error; shielded wallet WIP)
+- zgetmigrationstatus - Implemented (returns disabled migration status; amount fields are strings for C++ parity; migration not supported)
 - zgetnewaddress - Partial (Sapling only; persists a Sapling key in wallet.dat)
 - zgetoperationresult - Implemented (returns an empty array; async shielded ops not implemented yet)
 - zgetoperationstatus - Implemented (returns an empty array; async shielded ops not implemented yet)
@@ -161,8 +161,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zlistreceivedbyaddress - Partial (Sapling only; lists received Sapling notes for a zaddr; supports watch-only via includeWatchonly; memo is placeholder)
 - zlistunspent - Partial (Sapling only; lists unspent Sapling notes; supports watch-only via includeWatchonly)
 - zsendmany - Stub (returns wallet error; shielded wallet WIP)
-- zsetmigration - Stub (returns wallet error; shielded wallet WIP)
-- zshieldcoinbase - Stub (returns wallet error; shielded wallet WIP)
+- zsetmigration - Implemented (deprecated on Flux fork; returns misc error)
+- zshieldcoinbase - Implemented (deprecated on Flux fork; returns misc error)
 
 ## Admin and benchmarking
 

@@ -264,6 +264,13 @@ rpc_get "zlistoperationids" | python3 -c 'import json,sys; obj=json.load(sys.std
 rpc_get "zgetoperationstatus" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
 rpc_get "zgetoperationresult" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
 
+echo "Checking zgetmigrationstatus schema ..."
+rpc_get "zgetmigrationstatus" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or {}; assert isinstance(res, dict), res; assert isinstance(res.get("enabled"), bool), res; keys=("unmigrated_amount","unfinalized_migrated_amount","finalized_migrated_amount"); assert all(isinstance(res.get(k), str) for k in keys), res; assert isinstance(res.get("finalized_migration_transactions"), int), res; assert isinstance(res.get("migration_txids"), list), res'
+
+echo "Checking deprecated migration/shield RPCs return misc error ..."
+rpc_get "zsetmigration?enabled=true" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-1, obj'
+rpc_get "zshieldcoinbase" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-1, obj'
+
 echo "Restarting node to confirm persistence ..."
 stop_node
 sleep 0.2

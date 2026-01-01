@@ -72,6 +72,7 @@ const RPC_REALM: &str = "fluxd";
 pub(crate) const RPC_COOKIE_FILE: &str = "rpc.cookie";
 
 const RPC_INVALID_PARAMETER: i64 = -8;
+const RPC_MISC_ERROR: i64 = -1;
 const RPC_TYPE_ERROR: i64 = -3;
 const RPC_WALLET_ERROR: i64 = -4;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
@@ -1395,9 +1396,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             rpc_zexportviewingkey(wallet, params, chain_params)
         }
         "zgetbalance" | "z_getbalance" => rpc_zgetbalance(chainstate, wallet, params, chain_params),
-        "zgetmigrationstatus" | "z_getmigrationstatus" => {
-            rpc_shielded_wallet_not_implemented(params, "zgetmigrationstatus")
-        }
+        "zgetmigrationstatus" | "z_getmigrationstatus" => rpc_zgetmigrationstatus(params),
         "zgetnewaddress" | "z_getnewaddress" => {
             rpc_zgetnewaddress(chainstate, wallet, params, chain_params)
         }
@@ -1420,12 +1419,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             rpc_zlistunspent(chainstate, wallet, params, chain_params)
         }
         "zsendmany" | "z_sendmany" => rpc_shielded_wallet_not_implemented(params, "zsendmany"),
-        "zsetmigration" | "z_setmigration" => {
-            rpc_shielded_wallet_not_implemented(params, "zsetmigration")
-        }
-        "zshieldcoinbase" | "z_shieldcoinbase" => {
-            rpc_shielded_wallet_not_implemented(params, "zshieldcoinbase")
-        }
+        "zsetmigration" | "z_setmigration" => rpc_zsetmigration(params),
+        "zshieldcoinbase" | "z_shieldcoinbase" => rpc_zshieldcoinbase(params),
         "zvalidateaddress" | "z_validateaddress" => {
             rpc_zvalidateaddress(wallet, params, chain_params)
         }
@@ -1511,6 +1506,44 @@ fn rpc_zgetoperationresult(params: Vec<Value>) -> Result<Value, RpcError> {
         }
     }
     Ok(Value::Array(Vec::new()))
+}
+
+fn rpc_zgetmigrationstatus(params: Vec<Value>) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    Ok(json!({
+        "enabled": false,
+        "unmigrated_amount": "0.00000000",
+        "unfinalized_migrated_amount": "0.00000000",
+        "finalized_migrated_amount": "0.00000000",
+        "finalized_migration_transactions": 0,
+        "migration_txids": [],
+    }))
+}
+
+fn rpc_zsetmigration(params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zsetmigration expects 1 parameter",
+        ));
+    }
+    if !matches!(params[0], Value::Bool(_)) {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "enabled must be a boolean",
+        ));
+    }
+    Err(RpcError::new(
+        RPC_MISC_ERROR,
+        "Flux fork active: z_setmigration has been deprecated.",
+    ))
+}
+
+fn rpc_zshieldcoinbase(_params: Vec<Value>) -> Result<Value, RpcError> {
+    Err(RpcError::new(
+        RPC_MISC_ERROR,
+        "Flux fork active. z_shieldcoinbase has been deprecated.",
+    ))
 }
 
 fn rpc_shielded_wallet_not_implemented(
@@ -13682,6 +13715,36 @@ mod tests {
 
         let err = rpc_zgetoperationresult(vec![json!("opid")]).expect_err("err");
         assert_eq!(err.code, RPC_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn migration_rpcs_are_structured_and_deprecated() {
+        let status = rpc_zgetmigrationstatus(Vec::new()).expect("rpc");
+        let obj = status.as_object().expect("object");
+        assert_eq!(obj.get("enabled").and_then(Value::as_bool), Some(false));
+        for key in [
+            "unmigrated_amount",
+            "unfinalized_migrated_amount",
+            "finalized_migrated_amount",
+        ] {
+            assert_eq!(obj.get(key).and_then(Value::as_str), Some("0.00000000"));
+        }
+        assert_eq!(
+            obj.get("finalized_migration_transactions")
+                .and_then(Value::as_i64),
+            Some(0)
+        );
+        let txids = obj
+            .get("migration_txids")
+            .and_then(Value::as_array)
+            .expect("migration_txids array");
+        assert!(txids.is_empty());
+
+        let err = rpc_zsetmigration(vec![json!(true)]).expect_err("err");
+        assert_eq!(err.code, RPC_MISC_ERROR);
+
+        let err = rpc_zshieldcoinbase(Vec::new()).expect_err("err");
+        assert_eq!(err.code, RPC_MISC_ERROR);
     }
 
     #[test]

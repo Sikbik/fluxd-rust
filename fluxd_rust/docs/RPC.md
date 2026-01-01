@@ -60,6 +60,7 @@ Type notes:
 
 ## Error codes
 
+- `-1` misc error
 - `-32600` invalid request
 - `-32601` method not found
 - `-32603` internal error
@@ -160,6 +161,9 @@ a full rescan and can be slow on large chains).
 
 Async operation-tracking RPCs currently return empty lists (until shielded send/shield ops are implemented):
 `zlistoperationids`, `zgetoperationstatus`, and `zgetoperationresult`.
+
+Migration/coinbase shielding RPCs are deprecated on the Flux fork:
+`zsetmigration` and `zshieldcoinbase` return a misc error, and `zgetmigrationstatus` reports migration as disabled.
 
 Other shielded wallet RPCs still return a wallet error (`-4`) while shielded wallet support is WIP.
 
