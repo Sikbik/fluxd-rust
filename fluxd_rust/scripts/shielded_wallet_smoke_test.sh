@@ -9,6 +9,7 @@ Starts a short-lived fluxd instance (separate data dir + RPC port) and exercises
 Sapling wallet RPCs:
   - zgetnewaddress (Sapling)
   - zvalidateaddress (ismine=true)
+  - zexportviewingkey / zimportviewingkey (Sapling viewing keys, watch-only)
   - persistence across restart (same data dir)
 
 Options:
@@ -114,7 +115,7 @@ PID=""
 
 rpc_get() {
   local method="$1"
-  curl -sS --fail -u "$COOKIE" "http://127.0.0.1:${RPC_PORT}/daemon/${method}"
+  curl -g -sS --fail -u "$COOKIE" "http://127.0.0.1:${RPC_PORT}/daemon/${method}"
 }
 
 url_encode() {
@@ -175,18 +176,22 @@ stop_node() {
 
 expected_hrp=""
 expected_sk_hrp=""
+expected_vk_hrp=""
 case "$NETWORK" in
   mainnet)
     expected_hrp="za"
     expected_sk_hrp="secret-extended-key-main"
+    expected_vk_hrp="zviewa"
     ;;
   testnet)
     expected_hrp="ztestacadia"
     expected_sk_hrp="secret-extended-key-test"
+    expected_vk_hrp="zviewtestacadia"
     ;;
   regtest)
     expected_hrp="zregtestsapling"
     expected_sk_hrp="secret-extended-key-regtest"
+    expected_vk_hrp="zviewregtestsapling"
     ;;
   *)
     echo "Unknown network: $NETWORK" >&2
@@ -228,6 +233,17 @@ if [[ "$zkey1" != "${expected_sk_hrp}1"* ]]; then
   exit 1
 fi
 
+echo "Checking zexportviewingkey returns a Sapling viewing key ..."
+vkey1="$(rpc_get "zexportviewingkey?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
+if [[ -z "$vkey1" || "$vkey1" == "null" ]]; then
+  echo "zexportviewingkey returned empty result" >&2
+  exit 1
+fi
+if [[ "$vkey1" != "${expected_vk_hrp}1"* ]]; then
+  echo "unexpected viewing key prefix (expected ${expected_vk_hrp}1...)" >&2
+  exit 1
+fi
+
 echo "Checking zlistaddresses contains zaddr1 ..."
 rpc_get "zlistaddresses" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert addr in res, res' "$zaddr1"
 
@@ -256,6 +272,28 @@ fi
 
 echo "Checking zlistaddresses contains both addresses ..."
 rpc_get "zlistaddresses" | python3 -c 'import json,sys; a1=sys.argv[1]; a2=sys.argv[2]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert a1 in res, res; assert a2 in res, res' "$zaddr1" "$zaddr2"
+
+echo "Importing viewing key into a fresh wallet (watch-only) ..."
+stop_node
+if [[ "$KEEP" != "1" ]]; then
+  rm -rf "$DATA_DIR" "$LOG_PATH" || true
+fi
+DATA_DIR="$(mktemp -d "/tmp/fluxd-shielded-wallet-vk-import.XXXXXX")"
+LOG_PATH="${DATA_DIR}.log"
+: >"$LOG_PATH"
+start_node
+
+vkey1_enc="$(url_encode "$vkey1")"
+rpc_get "zimportviewingkey?vkey=${vkey1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
+
+echo "Checking zlistaddresses excludes watch-only by default ..."
+rpc_get "zlistaddresses" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert len(res) == 0, res'
+
+echo "Checking zlistaddresses(includeWatchonly=true) includes zaddr1 ..."
+rpc_get "zlistaddresses?params=[true]" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert addr in res, res' "$zaddr1"
+
+echo "Checking zvalidateaddress ismine=false for watch-only wallet ..."
+rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("ismine") is False, res'
 
 echo "Importing zkey into a fresh wallet (no output) ..."
 stop_node

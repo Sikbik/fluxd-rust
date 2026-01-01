@@ -151,7 +151,8 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 ### Wallet (shielded) (WIP)
 
 Shielded wallet RPCs are registered for parity. The initial Sapling wallet surface is implemented:
-`zgetnewaddress`, `zlistaddresses`, `zexportkey`, `zimportkey`, `zimportwallet`, and Sapling ownership detection in `zvalidateaddress`.
+`zgetnewaddress`, `zlistaddresses` (supports watch-only via `includeWatchonly=true`), `zexportkey`, `zexportviewingkey`,
+`zimportkey`, `zimportviewingkey`, `zimportwallet`, and Sapling ownership detection in `zvalidateaddress`.
 The remaining shielded wallet RPCs return a wallet error (`-4`) while shielded wallet support is
 still WIP.
 

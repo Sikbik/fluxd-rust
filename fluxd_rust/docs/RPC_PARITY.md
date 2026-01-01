@@ -76,7 +76,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Extra queries
 
 - gettransaction - Partial (wallet-only view based on address deltas + mempool script matching; field parity is WIP)
-- zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; `ismine` is always false until shielded wallet support exists)
+- zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; Sapling `ismine` checks wallet Sapling spending keys)
 - getbenchmarks - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
 - getbenchstatus - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
 - getblockhashes - Implemented
@@ -146,7 +146,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Shielded
 
 - zexportkey - Partial (Sapling only; exports Sapling extended spending key)
-- zexportviewingkey - Stub (returns wallet error; shielded wallet WIP)
+- zexportviewingkey - Partial (Sapling only; exports Sapling full viewing key)
 - zgetbalance - Stub (returns wallet error; shielded wallet WIP)
 - zgetmigrationstatus - Stub (returns wallet error; shielded wallet WIP)
 - zgetnewaddress - Partial (Sapling only; persists a Sapling key in wallet.dat)
@@ -154,9 +154,9 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zgetoperationstatus - Stub (returns wallet error; shielded wallet WIP)
 - zgettotalbalance - Stub (returns wallet error; shielded wallet WIP)
 - zimportkey - Partial (Sapling only; rescan ignored)
-- zimportviewingkey - Stub (returns wallet error; shielded wallet WIP)
+- zimportviewingkey - Partial (Sapling only; stores watch-only viewing keys; rescan ignored)
 - zimportwallet - Partial (imports Sapling spending keys and WIFs from file; rescan ignored)
-- zlistaddresses - Partial (Sapling only)
+- zlistaddresses - Partial (Sapling only; `includeWatchonly=true` includes watch-only addresses)
 - zlistoperationids - Stub (returns wallet error; shielded wallet WIP)
 - zlistreceivedbyaddress - Stub (returns wallet error; shielded wallet WIP)
 - zlistunspent - Stub (returns wallet error; shielded wallet WIP)

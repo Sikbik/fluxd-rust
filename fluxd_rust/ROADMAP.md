@@ -202,10 +202,12 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `rescanblockchain` (scans address delta index; populates wallet tx history)
 - [ ] [P1] Shielded wallet RPCs (owner: TBD)
   - [x] `zgetnewaddress` (Sapling only; wallet persistence)
-  - [x] `zlistaddresses` (Sapling only; no watchonly yet)
+  - [x] `zlistaddresses` (Sapling only; supports watch-only via `includeWatchonly`)
   - [x] `zvalidateaddress` `ismine=true` for Sapling addresses owned by wallet
   - [x] `zexportkey` (Sapling only)
+  - [x] `zexportviewingkey` (Sapling only; exports Sapling full viewing key; enables watch-only import)
   - [x] `zimportkey` (Sapling only; rescan ignored)
+  - [x] `zimportviewingkey` (Sapling only; stores watch-only viewing keys; rescan ignored)
   - [x] `zimportwallet` (Sapling only; rescan ignored)
   - [x] Regtest/testnet RPC smoke harness (`scripts/shielded_wallet_smoke_test.sh`)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)

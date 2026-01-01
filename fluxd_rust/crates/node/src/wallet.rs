@@ -19,7 +19,7 @@ use fluxd_script::message::signed_message_hash;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 5;
+pub const WALLET_FILE_VERSION: u32 = 6;
 
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
 
@@ -32,6 +32,12 @@ struct KeyPoolEntry {
 #[derive(Clone)]
 struct SaplingKeyEntry {
     extsk: [u8; 169],
+    next_diversifier_index: [u8; 11],
+}
+
+#[derive(Clone)]
+struct SaplingViewingKeyEntry {
+    extfvk: [u8; 169],
     next_diversifier_index: [u8; 11],
 }
 
@@ -123,6 +129,7 @@ pub struct Wallet {
     tx_history: BTreeSet<Hash256>,
     keypool: VecDeque<KeyPoolEntry>,
     sapling_keys: Vec<SaplingKeyEntry>,
+    sapling_viewing_keys: Vec<SaplingViewingKeyEntry>,
     revision: u64,
     locked_outpoints: HashSet<OutPoint>,
     pay_tx_fee_per_kb: i64,
@@ -144,6 +151,7 @@ impl Wallet {
                 tx_history: BTreeSet::new(),
                 keypool: VecDeque::new(),
                 sapling_keys: Vec::new(),
+                sapling_viewing_keys: Vec::new(),
                 revision: 0,
                 locked_outpoints: HashSet::new(),
                 pay_tx_fee_per_kb: 0,
@@ -177,6 +185,10 @@ impl Wallet {
 
     pub fn sapling_key_count(&self) -> usize {
         self.sapling_keys.len()
+    }
+
+    pub fn sapling_viewing_key_count(&self) -> usize {
+        self.sapling_viewing_keys.len()
     }
 
     pub fn keypool_oldest(&self) -> u64 {
@@ -380,6 +392,40 @@ impl Wallet {
         Ok(out)
     }
 
+    pub fn sapling_viewing_addresses_bytes(&self) -> Result<Vec<[u8; 43]>, WalletError> {
+        let mut out = Vec::new();
+
+        for entry in &self.sapling_viewing_keys {
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let dfvk = extfvk.to_diversifiable_full_viewing_key();
+
+            let mut index = DiversifierIndex::from([0u8; 11]);
+            let stop = DiversifierIndex::from(entry.next_diversifier_index);
+
+            while index < stop {
+                let Some((found_index, address)) = dfvk.find_address(index) else {
+                    return Err(WalletError::InvalidData(
+                        "sapling diversifier space exhausted",
+                    ));
+                };
+                if found_index >= stop {
+                    break;
+                }
+                out.push(address.to_bytes());
+                index = found_index;
+                index
+                    .increment()
+                    .map_err(|_| WalletError::InvalidData("sapling diversifier index overflow"))?;
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn sapling_extsk_for_address(
         &self,
         bytes: &[u8; 43],
@@ -394,6 +440,47 @@ impl Wallet {
             let dfvk = extsk.to_diversifiable_full_viewing_key();
             if dfvk.decrypt_diversifier(&addr).is_some() {
                 return Ok(Some(entry.extsk));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn sapling_extfvk_for_address(
+        &self,
+        bytes: &[u8; 43],
+    ) -> Result<Option<[u8; 169]>, WalletError> {
+        if let Some(extsk_bytes) = self.sapling_extsk_for_address(bytes)? {
+            let extsk = ExtendedSpendingKey::from_bytes(&extsk_bytes)
+                .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
+            #[allow(deprecated)]
+            let extfvk = extsk.to_extended_full_viewing_key();
+
+            let mut buf = Vec::with_capacity(169);
+            extfvk
+                .write(&mut buf)
+                .map_err(|_| WalletError::InvalidData("invalid sapling viewing key encoding"))?;
+
+            let extfvk_bytes: [u8; 169] = buf
+                .as_slice()
+                .try_into()
+                .map_err(|_| WalletError::InvalidData("invalid sapling viewing key encoding"))?;
+            return Ok(Some(extfvk_bytes));
+        }
+
+        let Some(addr) = PaymentAddress::from_bytes(bytes) else {
+            return Ok(None);
+        };
+
+        for entry in &self.sapling_viewing_keys {
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let dfvk = extfvk.to_diversifiable_full_viewing_key();
+            if dfvk.decrypt_diversifier(&addr).is_some() {
+                return Ok(Some(entry.extfvk));
             }
         }
 
@@ -418,6 +505,41 @@ impl Wallet {
             self.sapling_keys.truncate(prev_len);
             return Err(err);
         }
+        self.revision = self.revision.saturating_add(1);
+        Ok(true)
+    }
+
+    pub fn import_sapling_extfvk(&mut self, extfvk: [u8; 169]) -> Result<bool, WalletError> {
+        let extfvk_parsed = sapling_crypto::zip32::ExtendedFullViewingKey::read(extfvk.as_slice())
+            .map_err(|_| WalletError::InvalidData("invalid sapling viewing key encoding"))?;
+
+        if self
+            .sapling_viewing_keys
+            .iter()
+            .any(|entry| entry.extfvk == extfvk)
+        {
+            return Ok(false);
+        }
+
+        let (default_index, _) = extfvk_parsed.default_address();
+        let mut next_index = default_index;
+        next_index
+            .increment()
+            .map_err(|_| WalletError::InvalidData("sapling diversifier index overflow"))?;
+
+        let next_diversifier_index = *next_index.as_bytes();
+
+        let prev_len = self.sapling_viewing_keys.len();
+        self.sapling_viewing_keys.push(SaplingViewingKeyEntry {
+            extfvk,
+            next_diversifier_index,
+        });
+
+        if let Err(err) = self.save() {
+            self.sapling_viewing_keys.truncate(prev_len);
+            return Err(err);
+        }
+
         self.revision = self.revision.saturating_add(1);
         Ok(true)
     }
@@ -627,6 +749,7 @@ impl Wallet {
             && version != 2
             && version != 3
             && version != 4
+            && version != 5
             && version != WALLET_FILE_VERSION
         {
             return Err(WalletError::InvalidData("unsupported wallet file version"));
@@ -711,6 +834,22 @@ impl Wallet {
             }
         }
 
+        let mut sapling_viewing_keys = Vec::new();
+        if version >= 6 {
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("sapling viewing key count too large"))?;
+            sapling_viewing_keys = Vec::with_capacity(count.min(16));
+            for _ in 0..count {
+                let extfvk = decoder.read_fixed::<169>()?;
+                let next_diversifier_index = decoder.read_fixed::<11>()?;
+                sapling_viewing_keys.push(SaplingViewingKeyEntry {
+                    extfvk,
+                    next_diversifier_index,
+                });
+            }
+        }
+
         if !decoder.is_empty() {
             return Err(WalletError::InvalidData("wallet file has trailing bytes"));
         }
@@ -722,6 +861,7 @@ impl Wallet {
             tx_history,
             keypool,
             sapling_keys,
+            sapling_viewing_keys,
             revision: 0,
             locked_outpoints: HashSet::new(),
             pay_tx_fee_per_kb,
@@ -759,6 +899,12 @@ impl Wallet {
         encoder.write_varint(self.sapling_keys.len() as u64);
         for entry in &self.sapling_keys {
             encoder.write_bytes(&entry.extsk);
+            encoder.write_bytes(&entry.next_diversifier_index);
+        }
+
+        encoder.write_varint(self.sapling_viewing_keys.len() as u64);
+        for entry in &self.sapling_viewing_keys {
+            encoder.write_bytes(&entry.extfvk);
             encoder.write_bytes(&entry.next_diversifier_index);
         }
         let bytes = encoder.into_inner();

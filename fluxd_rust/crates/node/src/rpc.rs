@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -1392,7 +1392,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "zcrawreceive" => rpc_shielded_not_implemented(params, "zcrawreceive"),
         "zexportkey" | "z_exportkey" => rpc_zexportkey(wallet, params, chain_params),
         "zexportviewingkey" | "z_exportviewingkey" => {
-            rpc_shielded_wallet_not_implemented(params, "zexportviewingkey")
+            rpc_zexportviewingkey(wallet, params, chain_params)
         }
         "zgetbalance" | "z_getbalance" => {
             rpc_shielded_wallet_not_implemented(params, "zgetbalance")
@@ -1412,7 +1412,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         }
         "zimportkey" | "z_importkey" => rpc_zimportkey(wallet, params, chain_params),
         "zimportviewingkey" | "z_importviewingkey" => {
-            rpc_shielded_wallet_not_implemented(params, "zimportviewingkey")
+            rpc_zimportviewingkey(wallet, params, chain_params)
         }
         "zimportwallet" | "z_importwallet" => rpc_zimportwallet(wallet, params, chain_params),
         "zlistaddresses" | "z_listaddresses" => rpc_zlistaddresses(wallet, params, chain_params),
@@ -4232,20 +4232,31 @@ fn rpc_zlistaddresses(
         ));
     }
 
-    if let Some(value) = params.first() {
-        if value.as_bool().is_none() {
+    let include_watchonly = match params.first() {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
                 "includeWatchonly must be a boolean",
             ));
         }
-    }
+        None => false,
+    };
 
-    let bytes = wallet
+    let guard = wallet
         .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+
+    let mut bytes = guard
         .sapling_addresses_bytes()
         .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "failed to list sapling addresses"))?;
+
+    if include_watchonly {
+        let watch_only = guard
+            .sapling_viewing_addresses_bytes()
+            .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "failed to list sapling addresses"))?;
+        bytes.extend(watch_only);
+    }
 
     let hrp = match chain_params.network {
         Network::Mainnet => "za",
@@ -4254,14 +4265,14 @@ fn rpc_zlistaddresses(
     };
     let hrp = Hrp::parse(hrp).map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid hrp"))?;
 
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = BTreeSet::new();
     for addr_bytes in bytes {
         let encoded = bech32::encode::<Bech32>(hrp, addr_bytes.as_slice())
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling address"))?;
-        out.push(Value::String(encoded));
+        out.insert(encoded);
     }
 
-    Ok(Value::Array(out))
+    Ok(Value::Array(out.into_iter().map(Value::String).collect()))
 }
 
 fn rpc_zexportkey(
@@ -4317,6 +4328,62 @@ fn rpc_zexportkey(
     let hrp = Hrp::parse(hrp).map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid hrp"))?;
     let encoded = bech32::encode::<Bech32>(hrp, extsk_bytes.as_slice())
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling spending key"))?;
+    Ok(Value::String(encoded))
+}
+
+fn rpc_zexportviewingkey(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zexportviewingkey expects 1 parameter",
+        ));
+    }
+
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zaddr must be a string"))?;
+
+    if decode_sprout_payment_address(address, chain_params.network).is_ok() {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Currently, only Sapling zaddrs are supported",
+        ));
+    }
+
+    let Some((diversifier, diversified_transmission_key)) =
+        decode_sapling_payment_address(address, chain_params.network)
+    else {
+        return Err(RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"));
+    };
+
+    let mut addr_bytes = [0u8; 43];
+    addr_bytes[..11].copy_from_slice(&diversifier);
+    addr_bytes[11..].copy_from_slice(&diversified_transmission_key);
+
+    let extfvk_bytes = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .sapling_extfvk_for_address(&addr_bytes)
+        .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "failed to lookup sapling key"))?
+        .ok_or_else(|| {
+            RpcError::new(
+                RPC_WALLET_ERROR,
+                "Wallet does not hold private key or viewing key for this zaddr",
+            )
+        })?;
+
+    let hrp = match chain_params.network {
+        Network::Mainnet => "zviewa",
+        Network::Testnet => "zviewtestacadia",
+        Network::Regtest => "zviewregtestsapling",
+    };
+    let hrp = Hrp::parse(hrp).map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid hrp"))?;
+    let encoded = bech32::encode::<Bech32>(hrp, extfvk_bytes.as_slice())
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling viewing key"))?;
     Ok(Value::String(encoded))
 }
 
@@ -4388,6 +4455,87 @@ fn rpc_zimportkey(
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
         .import_sapling_extsk(extsk)
         .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "Error adding spending key to wallet"))?;
+
+    if !inserted {
+        return Ok(Value::Null);
+    }
+
+    Ok(Value::Null)
+}
+
+fn rpc_zimportviewingkey(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 3 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zimportviewingkey expects 1 to 3 parameters",
+        ));
+    }
+
+    let vkey = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "vkey must be a string"))?;
+
+    if let Some(rescan) = params.get(1) {
+        let ok = match rescan {
+            Value::String(value) => matches!(value.as_str(), "yes" | "no" | "whenkeyisnew"),
+            Value::Bool(_) => true,
+            _ => false,
+        };
+        if !ok {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "rescan must be \"yes\", \"no\" or \"whenkeyisnew\"",
+            ));
+        }
+    }
+
+    if let Some(start_height) = params.get(2) {
+        let height = start_height.as_i64().ok_or_else(|| {
+            RpcError::new(RPC_INVALID_PARAMETER, "startHeight must be an integer")
+        })?;
+        if height < 0 {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "Block height out of range",
+            ));
+        }
+    }
+
+    let expected_hrp = match chain_params.network {
+        Network::Mainnet => "zviewa",
+        Network::Testnet => "zviewtestacadia",
+        Network::Regtest => "zviewregtestsapling",
+    };
+
+    let checked = CheckedHrpstring::new::<Bech32>(vkey)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid viewing key"))?;
+    if checked.hrp().as_str() != expected_hrp {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Invalid viewing key",
+        ));
+    }
+
+    let data: Vec<u8> = checked.byte_iter().collect();
+    let extfvk: [u8; 169] = data
+        .as_slice()
+        .try_into()
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid viewing key"))?;
+
+    let inserted = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .import_sapling_extfvk(extfvk)
+        .map_err(|err| match err {
+            WalletError::InvalidData("invalid sapling viewing key encoding") => {
+                RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid viewing key")
+            }
+            _ => RpcError::new(RPC_WALLET_ERROR, "Error adding viewing key to wallet"),
+        })?;
 
     if !inserted {
         return Ok(Value::Null);
