@@ -1469,6 +1469,12 @@ async fn run() -> Result<(), String> {
         let peer_registry = Arc::clone(&peer_registry);
         let net_totals = Arc::clone(&net_totals);
         let max_connections = config.max_connections;
+        let mempool = Arc::clone(&mempool);
+        let mempool_policy = Arc::clone(&mempool_policy);
+        let mempool_metrics = Arc::clone(&mempool_metrics);
+        let fee_estimator = Arc::clone(&fee_estimator);
+        let flags = flags.clone();
+        let tx_announce = tx_announce.clone();
         tokio::spawn(async move {
             if let Err(err) = p2p_server::serve_inbound_p2p(
                 listener,
@@ -1478,6 +1484,12 @@ async fn run() -> Result<(), String> {
                 peer_registry,
                 net_totals,
                 max_connections,
+                mempool,
+                mempool_policy,
+                mempool_metrics,
+                fee_estimator,
+                flags,
+                tx_announce,
             )
             .await
             {

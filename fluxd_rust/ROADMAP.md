@@ -147,7 +147,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Respond to `getaddr` and ingest `addr` messages
   - [x] Respond to `getheaders` requests (up to 160 headers)
   - [x] Respond to `getdata` block requests (bounded)
-  - [ ] Tx relay to inbound peers (`inv`/`getdata`/`tx`)
+  - [x] Tx relay to inbound peers (`inv`/`getdata`/`tx`)
   - [ ] DoS limits (owner: TBD)
     - [x] Enforce `maxconnections` for inbound accepts
     - [ ] Per-peer rate limits
