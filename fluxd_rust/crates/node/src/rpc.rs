@@ -3014,14 +3014,17 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         let amount_zat = obj.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
         let category = if amount_zat >= 0 { "receive" } else { "send" };
 
-        let address = obj
+        let first_detail = obj
             .get("details")
             .and_then(Value::as_array)
             .and_then(|rows| rows.first())
-            .and_then(Value::as_object)
+            .and_then(Value::as_object);
+
+        let address = first_detail
             .and_then(|row| row.get("address"))
             .and_then(Value::as_str)
             .map(|s| s.to_string());
+        let vout = first_detail.and_then(|row| row.get("vout")).cloned();
 
         let mut row = serde_json::Map::new();
         row.insert("account".to_string(), Value::String(String::new()));
@@ -3030,6 +3033,9 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         }
         if let Some(address) = address {
             row.insert("address".to_string(), Value::String(address));
+        }
+        if let Some(vout) = vout {
+            row.insert("vout".to_string(), vout);
         }
         row.insert("category".to_string(), Value::String(category.to_string()));
         row.insert(
@@ -3272,14 +3278,17 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
         let amount_zat = obj.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
         let category = if amount_zat >= 0 { "receive" } else { "send" };
 
-        let address = obj
+        let first_detail = obj
             .get("details")
             .and_then(Value::as_array)
             .and_then(|rows| rows.first())
-            .and_then(Value::as_object)
+            .and_then(Value::as_object);
+
+        let address = first_detail
             .and_then(|row| row.get("address"))
             .and_then(Value::as_str)
             .map(|s| s.to_string());
+        let vout = first_detail.and_then(|row| row.get("vout")).cloned();
 
         let mut row = serde_json::Map::new();
         row.insert("account".to_string(), Value::String(String::new()));
@@ -3288,6 +3297,9 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
         }
         if let Some(address) = address {
             row.insert("address".to_string(), Value::String(address));
+        }
+        if let Some(vout) = vout {
+            row.insert("vout".to_string(), vout);
         }
         row.insert("category".to_string(), Value::String(category.to_string()));
         row.insert(

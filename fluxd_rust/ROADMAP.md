@@ -189,8 +189,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag
     - [x] `fee` output for `send` entries (via `gettransaction`)
+    - [x] `vout` output (best-effort; derived from `gettransaction.details[0]`)
   - [x] `listsinceblock` (partial)
     - [x] `fee` output for `send` entries (via `gettransaction`)
+    - [x] `vout` output (best-effort; derived from `gettransaction.details[0]`)
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index
