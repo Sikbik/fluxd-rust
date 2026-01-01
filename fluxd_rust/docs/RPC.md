@@ -188,11 +188,11 @@ Joinsplit helper RPCs are also stubbed:
 
 - `getmempoolinfo`
 - `getrawmempool [verbose]`
-- `getmininginfo` (partial; rate fields return 0.0)
+- `getmininginfo` (partial; `localsolps` is 0.0)
 - `getblocktemplate` (partial; includes deterministic fluxnode payouts + basic mempool tx selection)
 - `submitblock <hexdata>` (partial)
-- `getnetworkhashps` (returns 0.0)
-- `getnetworksolps` (returns 0.0)
+- `getnetworkhashps [blocks] [height]` (implemented; chainwork/time estimate)
+- `getnetworksolps [blocks] [height]` (implemented; chainwork/time estimate)
 - `getlocalsolps` (returns 0.0)
 - `prioritisetransaction <txid> <priority_delta> <fee_delta_sat>` (mining selection hint)
 - `estimatefee <nblocks>`
@@ -752,7 +752,10 @@ Returns the transaction ids for one or more transparent addresses.
 
 ### getnetworkhashps / getnetworksolps / getlocalsolps
 
-These currently return `0.0` and are placeholders for mining metrics.
+- `getnetworksolps` and `getnetworkhashps` return a chainwork/time-based estimate, modeled after the legacy C++ daemon.
+  - `blocks` defaults to `120`. If `blocks <= 0`, the Digishield averaging window is used.
+  - `height` defaults to `-1` (current tip).
+- `getlocalsolps` currently returns `0.0` (mining telemetry not yet implemented).
 
 ### getmininginfo
 
@@ -764,7 +767,7 @@ Returns a summary of mining state (modeled after the legacy C++ daemon).
   - `difficulty` (derived from best header bits)
   - `pooledtx` (mempool transaction count)
   - `testnet`, `chain`
-  - Various rate/size fields (currently placeholders, e.g. `networkhashps`/`networksolps` are `0.0`)
+  - Various rate/size fields (`networkhashps`/`networksolps` are chainwork/time estimates; `localsolps` is currently `0.0`)
 
 ### getblocktemplate
 

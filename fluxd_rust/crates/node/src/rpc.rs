@@ -1320,8 +1320,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "submitblock" => {
             rpc_submitblock(chainstate, write_lock, params, chain_params, mempool_flags)
         }
-        "getnetworkhashps" => rpc_getnetworkhashps(params),
-        "getnetworksolps" => rpc_getnetworksolps(params),
+        "getnetworkhashps" => rpc_getnetworkhashps(chainstate, params, chain_params),
+        "getnetworksolps" => rpc_getnetworksolps(chainstate, params, chain_params),
         "getlocalsolps" => rpc_getlocalsolps(params),
         "estimatefee" => rpc_estimatefee(params, fee_estimator),
         "estimatepriority" => rpc_estimatepriority(params),
@@ -8065,6 +8065,8 @@ fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
         .map_err(|_| map_internal("mempool lock poisoned"))?
         .size();
 
+    let network_solps = network_hashps(chainstate, chain_params, 120, -1).unwrap_or(0);
+
     Ok(json!({
         "blocks": best_block,
         "currentblocksize": 0,
@@ -8074,8 +8076,8 @@ fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
         "generate": false,
         "genproclimit": -1,
         "localsolps": 0.0,
-        "networksolps": 0.0,
-        "networkhashps": 0.0,
+        "networksolps": network_solps,
+        "networkhashps": network_solps,
         "pooledtx": pooledtx,
         "testnet": chain_params.network != Network::Mainnet,
         "chain": network_name(chain_params.network),
@@ -9644,24 +9646,134 @@ fn rpc_getblockhashes<S: fluxd_storage::KeyValueStore>(
     Ok(Value::Array(out))
 }
 
-fn rpc_getnetworkhashps(params: Vec<Value>) -> Result<Value, RpcError> {
+fn network_hashps<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    chain_params: &ChainParams,
+    mut lookup: i64,
+    height: i64,
+) -> Result<i64, RpcError> {
+    let best = chainstate.best_block().map_err(map_internal)?;
+    let Some(best) = best else {
+        return Ok(0);
+    };
+
+    let (mut pb_height, mut pb_hash) = (best.height, best.hash);
+    if height >= 0 {
+        let height: i32 = height
+            .try_into()
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "height out of range"))?;
+        if height >= 0 && height < best.height {
+            if let Some(hash) = chainstate.height_hash(height).map_err(map_internal)? {
+                pb_height = height;
+                pb_hash = hash;
+            } else {
+                return Ok(0);
+            }
+        }
+    }
+
+    if pb_height <= 0 {
+        return Ok(0);
+    }
+
+    if lookup <= 0 {
+        lookup = chain_params.consensus.digishield_averaging_window;
+    }
+
+    if lookup <= 0 {
+        return Ok(0);
+    }
+
+    if lookup > pb_height as i64 {
+        lookup = pb_height as i64;
+    }
+
+    let pb_entry = chainstate
+        .header_entry(&pb_hash)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing header entry"))?;
+
+    let mut pb0_entry = pb_entry.clone();
+
+    let mut min_time = pb0_entry.time as i64;
+    let mut max_time = min_time;
+
+    for _ in 0..lookup {
+        let prev_hash = pb0_entry.prev_hash;
+        pb0_entry = chainstate
+            .header_entry(&prev_hash)
+            .map_err(map_internal)?
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing header entry"))?;
+
+        let time = pb0_entry.time as i64;
+        min_time = min_time.min(time);
+        max_time = max_time.max(time);
+    }
+
+    if min_time == max_time {
+        return Ok(0);
+    }
+
+    let time_diff = (max_time - min_time) as u64;
+    if time_diff == 0 {
+        return Ok(0);
+    }
+
+    let work_diff = pb_entry.chainwork_value() - pb0_entry.chainwork_value();
+    let rate = work_diff / U256::from(time_diff);
+
+    let max = U256::from(i64::MAX as u64);
+    if rate > max {
+        return Ok(i64::MAX);
+    }
+
+    Ok(rate.low_u64() as i64)
+}
+
+fn rpc_getnetworkhashps<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
     if params.len() > 2 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
             "getnetworkhashps expects 0, 1, or 2 parameters",
         ));
     }
-    Ok(json!(0.0))
+
+    let lookup = params.get(0).map(|v| parse_i64(v, "blocks")).transpose()?;
+    let height = params.get(1).map(|v| parse_i64(v, "height")).transpose()?;
+    let rate = network_hashps(
+        chainstate,
+        chain_params,
+        lookup.unwrap_or(120),
+        height.unwrap_or(-1),
+    )?;
+    Ok(json!(rate))
 }
 
-fn rpc_getnetworksolps(params: Vec<Value>) -> Result<Value, RpcError> {
+fn rpc_getnetworksolps<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
     if params.len() > 2 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
             "getnetworksolps expects 0, 1, or 2 parameters",
         ));
     }
-    Ok(json!(0.0))
+
+    let lookup = params.get(0).map(|v| parse_i64(v, "blocks")).transpose()?;
+    let height = params.get(1).map(|v| parse_i64(v, "height")).transpose()?;
+    let rate = network_hashps(
+        chainstate,
+        chain_params,
+        lookup.unwrap_or(120),
+        height.unwrap_or(-1),
+    )?;
+    Ok(json!(rate))
 }
 
 fn rpc_getlocalsolps(params: Vec<Value>) -> Result<Value, RpcError> {
@@ -14759,10 +14871,11 @@ mod tests {
 
     #[test]
     fn network_hashrate_rpcs_return_numbers() {
-        let value = rpc_getnetworkhashps(Vec::new()).expect("rpc");
-        assert!(value.as_f64().is_some());
-        let value = rpc_getnetworksolps(Vec::new()).expect("rpc");
-        assert!(value.as_f64().is_some());
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_getnetworkhashps(&chainstate, Vec::new(), &params).expect("rpc");
+        assert!(value.as_i64().is_some());
+        let value = rpc_getnetworksolps(&chainstate, Vec::new(), &params).expect("rpc");
+        assert!(value.as_i64().is_some());
         let value = rpc_getlocalsolps(Vec::new()).expect("rpc");
         assert!(value.as_f64().is_some());
     }

@@ -160,6 +160,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Miner address config (`--miner-address` / `flux.conf` `mineraddress=`) (owner: TBD)
   - [x] Wallet-backed miner script (coinbase script from wallet) (owner: TBD)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
+  - [x] Chainwork/time estimate for `getnetworksolps` and `getnetworkhashps`
+  - [ ] Real `getlocalsolps` (requires mining telemetry; currently returns 0.0)
 
 ## Wallet
 

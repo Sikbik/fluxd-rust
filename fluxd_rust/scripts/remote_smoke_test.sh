@@ -210,6 +210,10 @@ rpc_get "gettxoutsetinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin
 echo "Checking getblocktemplate ..."
 rpc_get "getblocktemplate" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("previousblockhash","coinbasetxn","transactions","height"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"'
 
+echo "Checking getnetworksolps/getnetworkhashps ..."
+rpc_get "getnetworksolps" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, (int,float)), res; assert res >= 0'
+rpc_get "getnetworkhashps" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, (int,float)), res; assert res >= 0'
+
 echo "Checking zvalidateaddress ..."
 rpc_get "zvalidateaddress?zaddr=notanaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is False'
 
