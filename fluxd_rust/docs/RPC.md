@@ -564,7 +564,10 @@ Notes:
 - Params: `fluxaddress` (string)
 - Result:
   - If invalid: `{ "isvalid": false }`
-  - If valid: `{ "isvalid": true, "address": "...", "scriptPubKey": "..." }`
+  - If valid: `{ "isvalid": true, "address": "...", "scriptPubKey": "...", "ismine": <bool>, "iswatchonly": <bool>, "isscript": <bool> }`
+
+Notes:
+- `ismine` is true when the wallet has a private key for the address; `iswatchonly` is true for imported watch-only scripts (e.g., `importaddress` / `addmultisigaddress`).
 
 ### zvalidateaddress
 

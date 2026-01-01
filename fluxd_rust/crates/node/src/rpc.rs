@@ -1387,7 +1387,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             )
         }
         "verifychain" => rpc_verifychain(chainstate, params),
-        "validateaddress" => rpc_validateaddress(params, chain_params),
+        "validateaddress" => rpc_validateaddress(wallet, params, chain_params),
         "zcrawjoinsplit" => rpc_shielded_not_implemented(params, "zcrawjoinsplit"),
         "zcrawreceive" => rpc_shielded_not_implemented(params, "zcrawreceive"),
         "zexportkey" | "z_exportkey" => rpc_zexportkey(wallet, params, chain_params),
@@ -4695,7 +4695,11 @@ fn decode_sapling_payment_address(address: &str, network: Network) -> Option<([u
     Some((diversifier, diversified_transmission_key))
 }
 
-fn rpc_validateaddress(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
+fn rpc_validateaddress(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
     if params.len() != 1 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
@@ -4713,10 +4717,34 @@ fn rpc_validateaddress(params: Vec<Value>, chain_params: &ChainParams) -> Result
             }))
         }
     };
+
+    let (ismine, iswatchonly) = {
+        let wallet_guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let ismine = wallet_guard
+            .signing_key_for_script_pubkey(&script_pubkey)
+            .map_err(map_wallet_error)?
+            .is_some();
+        let iswatchonly = if ismine {
+            false
+        } else {
+            wallet_guard.script_pubkey_is_watchonly(&script_pubkey)
+        };
+        (ismine, iswatchonly)
+    };
+
+    let isscript = matches!(
+        classify_script_pubkey(&script_pubkey),
+        ScriptType::P2Sh | ScriptType::P2Wsh
+    );
     Ok(json!({
         "isvalid": true,
         "address": address,
         "scriptPubKey": hex_bytes(&script_pubkey),
+        "ismine": ismine,
+        "iswatchonly": iswatchonly,
+        "isscript": isscript,
     }))
 }
 
@@ -12094,18 +12122,69 @@ mod tests {
     fn validateaddress_has_cpp_schema() {
         let (_chainstate, params, _data_dir, address, _txid, _vout) =
             setup_regtest_chain_with_p2pkh_utxo();
+        let wallet =
+            Mutex::new(Wallet::load_or_create(&_data_dir, params.network).expect("wallet"));
 
-        let ok = rpc_validateaddress(vec![Value::String(address.clone())], &params).expect("rpc");
+        let ok = rpc_validateaddress(&wallet, vec![Value::String(address.clone())], &params)
+            .expect("rpc");
         let obj = ok.as_object().expect("object");
         assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
-        for key in ["address", "scriptPubKey"] {
+        for key in [
+            "address",
+            "scriptPubKey",
+            "ismine",
+            "iswatchonly",
+            "isscript",
+        ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("isscript").and_then(Value::as_bool), Some(false));
 
-        let bad = rpc_validateaddress(vec![Value::String("notanaddress".to_string())], &params)
-            .expect("rpc");
+        let bad = rpc_validateaddress(
+            &wallet,
+            vec![Value::String("notanaddress".to_string())],
+            &params,
+        )
+        .expect("rpc");
         let obj = bad.as_object().expect("object");
         assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn validateaddress_reports_ismine_for_wallet_address() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr = rpc_getnewaddress(&wallet, Vec::new()).expect("rpc");
+        let addr = addr.as_str().expect("string").to_string();
+
+        let ok = rpc_validateaddress(&wallet, vec![Value::String(addr)], &params).expect("rpc");
+        let obj = ok.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("isscript").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn validateaddress_reports_watchonly_for_imported_script() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let watch_script = p2pkh_script([0x55u8; 20]);
+        let watch_address =
+            script_pubkey_to_address(&watch_script, params.network).expect("watch address");
+        rpc_importaddress(&wallet, vec![json!(watch_address.clone())], &params).expect("rpc");
+
+        let ok =
+            rpc_validateaddress(&wallet, vec![Value::String(watch_address)], &params).expect("rpc");
+        let obj = ok.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("isscript").and_then(Value::as_bool), Some(false));
     }
 
     #[test]

@@ -204,6 +204,15 @@ fi
 
 rpc_get "getinfo" >/dev/null
 
+echo "Checking validateaddress ..."
+taddr="$(rpc_get "getnewaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
+if [[ -z "$taddr" ]]; then
+  echo "getnewaddress returned empty result" >&2
+  exit 1
+fi
+rpc_get "validateaddress?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("isvalid","address","scriptPubKey","ismine","iswatchonly","isscript"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"; assert res.get("isvalid") is True; assert res.get("ismine") is True; assert res.get("iswatchonly") is False'
+rpc_get "validateaddress?address=notanaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is False, res'
+
 echo "Checking gettxoutsetinfo ..."
 rpc_get "gettxoutsetinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("transactions","txouts","bytes_serialized","hash_serialized","total_amount"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"'
 

@@ -255,6 +255,12 @@ impl Wallet {
         Ok(out)
     }
 
+    pub fn script_pubkey_is_watchonly(&self, script_pubkey: &[u8]) -> bool {
+        self.watch_scripts
+            .iter()
+            .any(|spk| spk.as_slice() == script_pubkey)
+    }
+
     pub fn import_wif(&mut self, wif: &str) -> Result<(), WalletError> {
         let (secret, compressed) = wif_to_secret_key(wif, self.network)
             .map_err(|_| WalletError::InvalidData("invalid wif"))?;
