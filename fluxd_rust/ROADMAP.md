@@ -148,7 +148,9 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Respond to `getheaders` requests (up to 160 headers)
   - [x] Respond to `getdata` block requests (bounded)
   - [ ] Tx relay to inbound peers (`inv`/`getdata`/`tx`)
-  - [ ] DoS limits (maxconnections, per-peer rate limits)
+  - [ ] DoS limits (owner: TBD)
+    - [x] Enforce `maxconnections` for inbound accepts
+    - [ ] Per-peer rate limits
 
 ## Mempool and mining
 

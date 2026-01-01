@@ -112,6 +112,7 @@ const DEFAULT_HEADER_PEERS: usize = 4;
 const DEFAULT_HEADER_LEAD: i32 = 20000;
 const DEFAULT_INFLIGHT_PER_PEER: usize = 1;
 const DEFAULT_TX_PEERS: usize = 2;
+const DEFAULT_MAX_CONNECTIONS: usize = 125;
 const DEFAULT_MEMPOOL_MAX_MB: u64 = 300;
 const DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS: u64 = 60;
 const DEFAULT_UTXO_CACHE_ENTRIES: usize = 200_000;
@@ -268,6 +269,7 @@ struct Config {
     header_lead: i32,
     header_peer_addrs: Vec<String>,
     addnode_addrs: Vec<SocketAddr>,
+    max_connections: usize,
     tx_peers: usize,
     inflight_per_peer: usize,
     require_standard: bool,
@@ -1466,6 +1468,7 @@ async fn run() -> Result<(), String> {
         let addr_book = Arc::clone(&addr_book);
         let peer_registry = Arc::clone(&peer_registry);
         let net_totals = Arc::clone(&net_totals);
+        let max_connections = config.max_connections;
         tokio::spawn(async move {
             if let Err(err) = p2p_server::serve_inbound_p2p(
                 listener,
@@ -1474,6 +1477,7 @@ async fn run() -> Result<(), String> {
                 addr_book,
                 peer_registry,
                 net_totals,
+                max_connections,
             )
             .await
             {
@@ -6330,6 +6334,8 @@ fn parse_args() -> Result<Config, String> {
     let mut header_lead_set = false;
     let mut header_peer_addrs: Vec<String> = Vec::new();
     let mut addnode_addrs: Vec<SocketAddr> = Vec::new();
+    let mut max_connections: usize = DEFAULT_MAX_CONNECTIONS;
+    let mut max_connections_set = false;
     let mut tx_peers: usize = DEFAULT_TX_PEERS;
     let mut tx_peers_set = false;
     let mut inflight_per_peer: usize = DEFAULT_INFLIGHT_PER_PEER;
@@ -6593,6 +6599,18 @@ fn parse_args() -> Result<Config, String> {
                     .parse::<usize>()
                     .map_err(|_| format!("invalid block peers '{value}'\n{}", usage()))?;
                 block_peers_set = true;
+            }
+            "--maxconnections" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --maxconnections\n{}", usage()))?;
+                max_connections = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid maxconnections '{value}'\n{}", usage()))?;
+                max_connections_set = true;
+                if max_connections == 0 {
+                    return Err(format!("maxconnections must be > 0\n{}", usage()));
+                }
             }
             "--header-peers" => {
                 let value = args
@@ -7001,6 +7019,22 @@ fn parse_args() -> Result<Config, String> {
             }
         }
 
+        if !max_connections_set {
+            if let Some(values) = conf.get("maxconnections") {
+                if let Some(raw) = values.last() {
+                    max_connections = raw.parse::<usize>().map_err(|_| {
+                        format!("invalid maxconnections '{raw}' in {}", conf_file.display())
+                    })?;
+                    if max_connections == 0 {
+                        return Err(format!(
+                            "invalid maxconnections '{raw}' in {}",
+                            conf_file.display()
+                        ));
+                    }
+                }
+            }
+        }
+
         if !min_relay_fee_per_kb_set {
             if let Some(values) = conf.get("minrelaytxfee") {
                 if let Some(raw) = values.last() {
@@ -7069,6 +7103,7 @@ fn parse_args() -> Result<Config, String> {
             "loglevel",
             "logtimestamps",
             "listen",
+            "maxconnections",
             "maxmempool",
             "mineraddress",
             "minrelaytxfee",
@@ -7275,6 +7310,7 @@ fn parse_args() -> Result<Config, String> {
         header_lead,
         header_peer_addrs,
         addnode_addrs,
+        max_connections,
         tx_peers,
         inflight_per_peer,
         require_standard,
@@ -7538,7 +7574,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--maxconnections N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -7570,6 +7606,7 @@ fn usage() -> String {
         "  --rpc-allow-ip  Allow JSON-RPC requests from IP/CIDR (repeatable; default: localhost only)",
         "  --getdata-batch  Max blocks per getdata request (default: 128)",
         "  --block-peers  Number of parallel peers for block download (default: 3)",
+        "  --maxconnections  Maintain at most N total peer connections (default: 125)",
         "  --header-peers  Number of peers to probe for header sync (default: 4)",
         "  --header-peer  Header peer IP:PORT to pin for header sync (repeatable)",
         "  --header-lead  Target header lead over blocks (default: 20000, 0 disables cap)",

@@ -44,6 +44,7 @@ The daemon optionally reads a `flux.conf` config file.
 
 Currently supported keys:
 - `dbcache` (MiB; maps to `--db-cache-mb`)
+- `maxconnections` (max peer connections; maps to `--maxconnections`)
 - `maxmempool` (MiB; maps to `--mempool-max-mb`)
 - `minrelaytxfee` (FLUX/kB; maps to `--minrelaytxfee`)
 - `listen` (`1|0`; enables/disables inbound P2P listener)
@@ -157,6 +158,7 @@ RPC defaults:
 
 - `--p2p-addr IP:PORT` - bind address for inbound P2P connections (default: `0.0.0.0:<net p2p port>`).
 - `--no-p2p-listen` - disable inbound P2P listener (useful for running multiple local instances).
+- `--maxconnections N` - maximum total peer connections (inbound + outbound) (default: 125).
 - `--getdata-batch N` - max blocks per getdata request (default: 128).
 - `--block-peers N` - parallel peers for block download (default: 3).
 - `--header-peers N` - peers to probe for header sync (default: 4).

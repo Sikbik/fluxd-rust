@@ -24,6 +24,7 @@ pub async fn serve_inbound_p2p<S: KeyValueStore + Send + Sync + 'static>(
     addr_book: Arc<crate::AddrBook>,
     peer_registry: Arc<crate::p2p::PeerRegistry>,
     net_totals: Arc<crate::p2p::NetTotals>,
+    max_connections: usize,
 ) -> Result<(), String> {
     let local_addr = listener.local_addr().ok();
     if let Some(addr) = local_addr {
@@ -40,6 +41,18 @@ pub async fn serve_inbound_p2p<S: KeyValueStore + Send + Sync + 'static>(
                 continue;
             }
         };
+
+        let connections = net_totals.snapshot().connections;
+        if connections >= max_connections {
+            log_debug!(
+                "Refusing inbound peer {}: maxconnections reached ({}/{})",
+                remote_addr,
+                connections,
+                max_connections
+            );
+            drop(stream);
+            continue;
+        }
 
         let magic = params.message_start;
         let chainstate = Arc::clone(&chainstate);
