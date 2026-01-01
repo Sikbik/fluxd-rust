@@ -204,6 +204,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `zgetnewaddress` (Sapling only; wallet persistence)
   - [x] `zlistaddresses` (Sapling only; no watchonly yet)
   - [x] `zvalidateaddress` `ismine=true` for Sapling addresses owned by wallet
+  - [x] `zexportkey` (Sapling only)
   - [x] Regtest/testnet RPC smoke harness (`scripts/shielded_wallet_smoke_test.sh`)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)
 - [ ] [P2] Wallet encryption and key management parity (owner: TBD)
@@ -341,4 +342,4 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | `zvalidateaddress` (partial; `ismine` only for Sapling)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zgetbalance` (stub)<br>`zgettotalbalance` (stub)<br>`zlistunspent` (stub)<br>`zsendmany` (stub)<br>`zshieldcoinbase` (stub)<br>`zexportkey` (stub)<br>`zexportviewingkey` (stub)<br>`zimportkey` (stub)<br>`zimportviewingkey` (stub)<br>`zimportwallet` (stub)<br>`zgetoperationstatus` (stub)<br>`zgetoperationresult` (stub)<br>`zlistoperationids` (stub)<br>`zgetmigrationstatus` (stub)<br>`zsetmigration` (stub)<br>`zcrawjoinsplit` (stub)<br>`zcrawreceive` (stub) | - |
+| - | `zvalidateaddress` (partial; `ismine` only for Sapling)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zexportkey` (partial; Sapling only)<br>`zgetbalance` (stub)<br>`zgettotalbalance` (stub)<br>`zlistunspent` (stub)<br>`zsendmany` (stub)<br>`zshieldcoinbase` (stub)<br>`zexportviewingkey` (stub)<br>`zimportkey` (stub)<br>`zimportviewingkey` (stub)<br>`zimportwallet` (stub)<br>`zgetoperationstatus` (stub)<br>`zgetoperationresult` (stub)<br>`zlistoperationids` (stub)<br>`zgetmigrationstatus` (stub)<br>`zsetmigration` (stub)<br>`zcrawjoinsplit` (stub)<br>`zcrawreceive` (stub) | - |

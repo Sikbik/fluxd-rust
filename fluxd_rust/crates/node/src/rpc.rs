@@ -1390,7 +1390,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "validateaddress" => rpc_validateaddress(params, chain_params),
         "zcrawjoinsplit" => rpc_shielded_not_implemented(params, "zcrawjoinsplit"),
         "zcrawreceive" => rpc_shielded_not_implemented(params, "zcrawreceive"),
-        "zexportkey" | "z_exportkey" => rpc_shielded_wallet_not_implemented(params, "zexportkey"),
+        "zexportkey" | "z_exportkey" => rpc_zexportkey(wallet, params, chain_params),
         "zexportviewingkey" | "z_exportviewingkey" => {
             rpc_shielded_wallet_not_implemented(params, "zexportviewingkey")
         }
@@ -4264,6 +4264,62 @@ fn rpc_zlistaddresses(
     }
 
     Ok(Value::Array(out))
+}
+
+fn rpc_zexportkey(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zexportkey expects 1 parameter",
+        ));
+    }
+
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zaddr must be a string"))?;
+
+    if decode_sprout_payment_address(address, chain_params.network).is_ok() {
+        return Err(RpcError::new(
+            RPC_WALLET_ERROR,
+            "wallet does not hold private zkey for this zaddr",
+        ));
+    }
+
+    let Some((diversifier, diversified_transmission_key)) =
+        decode_sapling_payment_address(address, chain_params.network)
+    else {
+        return Err(RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"));
+    };
+
+    let mut addr_bytes = [0u8; 43];
+    addr_bytes[..11].copy_from_slice(&diversifier);
+    addr_bytes[11..].copy_from_slice(&diversified_transmission_key);
+
+    let extsk_bytes = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .sapling_extsk_for_address(&addr_bytes)
+        .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "failed to lookup sapling key"))?
+        .ok_or_else(|| {
+            RpcError::new(
+                RPC_WALLET_ERROR,
+                "wallet does not hold private zkey for this zaddr",
+            )
+        })?;
+
+    let hrp = match chain_params.network {
+        Network::Mainnet => "secret-extended-key-main",
+        Network::Testnet => "secret-extended-key-test",
+        Network::Regtest => "secret-extended-key-regtest",
+    };
+    let hrp = Hrp::parse(hrp).map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid hrp"))?;
+    let encoded = bech32::encode::<Bech32>(hrp, extsk_bytes.as_slice())
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling spending key"))?;
+    Ok(Value::String(encoded))
 }
 
 fn decode_sprout_payment_address(
@@ -11615,6 +11671,35 @@ mod tests {
         assert!(addrs
             .iter()
             .any(|value| value.as_str() == Some(addr.as_str())));
+    }
+
+    #[test]
+    fn zexportkey_exports_sapling_extsk_for_own_address() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = addr.as_str().expect("string").to_string();
+
+        let key = rpc_zexportkey(&wallet, vec![json!(addr)], &params).expect("rpc");
+        let key = key.as_str().expect("string");
+        assert!(key.starts_with("secret-extended-key-regtest1"));
+    }
+
+    #[test]
+    fn zexportkey_rejects_address_not_in_wallet() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = addr.as_str().expect("string").to_string();
+
+        let other_dir = temp_data_dir("fluxd-rpc-test-zexportkey");
+        std::fs::create_dir_all(&other_dir).expect("create dir");
+        let other_wallet =
+            Mutex::new(Wallet::load_or_create(&other_dir, params.network).expect("wallet"));
+
+        let err = rpc_zexportkey(&other_wallet, vec![json!(addr)], &params).unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_ERROR);
     }
 
     #[test]

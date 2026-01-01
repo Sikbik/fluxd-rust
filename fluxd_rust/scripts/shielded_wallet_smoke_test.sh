@@ -174,10 +174,20 @@ stop_node() {
 }
 
 expected_hrp=""
+expected_sk_hrp=""
 case "$NETWORK" in
-  mainnet) expected_hrp="za" ;;
-  testnet) expected_hrp="ztestacadia" ;;
-  regtest) expected_hrp="zregtestsapling" ;;
+  mainnet)
+    expected_hrp="za"
+    expected_sk_hrp="secret-extended-key-main"
+    ;;
+  testnet)
+    expected_hrp="ztestacadia"
+    expected_sk_hrp="secret-extended-key-test"
+    ;;
+  regtest)
+    expected_hrp="zregtestsapling"
+    expected_sk_hrp="secret-extended-key-regtest"
+    ;;
   *)
     echo "Unknown network: $NETWORK" >&2
     exit 2
@@ -206,6 +216,17 @@ fi
 echo "Checking zvalidateaddress (ismine) ..."
 zaddr1_enc="$(url_encode "$zaddr1")"
 rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("address")==addr, res; assert res.get("ismine") is True, res' "$zaddr1"
+
+echo "Checking zexportkey returns a Sapling spending key (no output) ..."
+zkey1="$(rpc_get "zexportkey?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
+if [[ -z "$zkey1" || "$zkey1" == "null" ]]; then
+  echo "zexportkey returned empty result" >&2
+  exit 1
+fi
+if [[ "$zkey1" != "${expected_sk_hrp}1"* ]]; then
+  echo "unexpected spending key prefix (expected ${expected_sk_hrp}1...)" >&2
+  exit 1
+fi
 
 echo "Checking zlistaddresses contains zaddr1 ..."
 rpc_get "zlistaddresses" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert addr in res, res' "$zaddr1"
