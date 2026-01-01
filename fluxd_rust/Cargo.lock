@@ -646,10 +646,12 @@ dependencies = [
  "fs2",
  "primitive-types",
  "rand",
+ "sapling-crypto",
  "secp256k1",
  "serde",
  "serde_json",
  "tokio",
+ "zip32",
 ]
 
 [[package]]

@@ -1400,9 +1400,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "zgetmigrationstatus" | "z_getmigrationstatus" => {
             rpc_shielded_wallet_not_implemented(params, "zgetmigrationstatus")
         }
-        "zgetnewaddress" | "z_getnewaddress" => {
-            rpc_shielded_wallet_not_implemented(params, "zgetnewaddress")
-        }
+        "zgetnewaddress" | "z_getnewaddress" => rpc_zgetnewaddress(wallet, params, chain_params),
         "zgetoperationresult" | "z_getoperationresult" => {
             rpc_shielded_wallet_not_implemented(params, "zgetoperationresult")
         }
@@ -4132,7 +4130,7 @@ fn rpc_decodescript(params: Vec<Value>, chain_params: &ChainParams) -> Result<Va
 }
 
 fn rpc_zvalidateaddress(
-    _wallet: &Mutex<Wallet>,
+    wallet: &Mutex<Wallet>,
     params: Vec<Value>,
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
@@ -4163,11 +4161,21 @@ fn rpc_zvalidateaddress(
     if let Some((diversifier, diversified_transmission_key)) =
         decode_sapling_payment_address(address, chain_params.network)
     {
+        let ismine = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+            .sapling_address_is_mine(&{
+                let mut bytes = [0u8; 43];
+                bytes[..11].copy_from_slice(&diversifier);
+                bytes[11..].copy_from_slice(&diversified_transmission_key);
+                bytes
+            })
+            .unwrap_or(false);
         return Ok(json!({
             "isvalid": true,
             "address": address,
             "type": "sapling",
-            "ismine": false,
+            "ismine": ismine,
             "diversifier": hex_bytes(&diversifier),
             "diversifiedtransmissionkey": hex_bytes(&diversified_transmission_key),
         }));
@@ -4176,6 +4184,44 @@ fn rpc_zvalidateaddress(
     Ok(json!({
         "isvalid": false,
     }))
+}
+
+fn rpc_zgetnewaddress(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zgetnewaddress expects 0 or 1 parameters",
+        ));
+    }
+
+    let addr_type = params.first().and_then(Value::as_str).unwrap_or("sapling");
+
+    if addr_type != "sapling" {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "only sapling addresses are supported",
+        ));
+    }
+
+    let bytes = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .generate_new_sapling_address_bytes()
+        .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "failed to generate sapling address"))?;
+
+    let hrp = match chain_params.network {
+        Network::Mainnet => "za",
+        Network::Testnet => "ztestacadia",
+        Network::Regtest => "zregtestsapling",
+    };
+    let hrp = Hrp::parse(hrp).map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid hrp"))?;
+    let encoded = bech32::encode::<Bech32>(hrp, bytes.as_slice())
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling address"))?;
+    Ok(Value::String(encoded))
 }
 
 fn decode_sprout_payment_address(
@@ -11494,6 +11540,30 @@ mod tests {
         let value = rpc_zvalidateaddress(&wallet, vec![json!(sapling_addr)], &params).expect("rpc");
         let obj = value.as_object().expect("object");
         assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn zgetnewaddress_returns_sapling_address_and_is_mine() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = addr.as_str().expect("string").to_string();
+
+        let value = rpc_zvalidateaddress(&wallet, vec![json!(addr)], &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("type").and_then(Value::as_str), Some("sapling"));
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn zgetnewaddress_rejects_unknown_type() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let err = rpc_zgetnewaddress(&wallet, vec![json!("sprout")], &params).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
     }
 
     #[test]
