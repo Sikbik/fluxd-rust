@@ -894,7 +894,7 @@ Returns per-peer details:
 - `addr`, `subver`, `version`, `services`, `servicesnames`, `startingheight`
 - `conntime`, `lastsend`, `lastrecv`
 - `bytessent`, `bytesrecv`
-- `inbound` (currently always false)
+- `inbound` (true for inbound connections)
 - `kind` ("block", "header", or "relay")
 
 ### listbanned

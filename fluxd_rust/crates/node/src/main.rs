@@ -44,6 +44,7 @@ mod db_info;
 mod fee_estimator;
 mod mempool;
 mod p2p;
+mod p2p_server;
 mod peer_book;
 mod rpc;
 mod stats;
@@ -54,7 +55,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -255,6 +256,8 @@ struct Config {
     log_level: logging::Level,
     log_format: logging::Format,
     log_timestamps: bool,
+    p2p_listen: bool,
+    p2p_addr: Option<SocketAddr>,
     rpc_addr: Option<SocketAddr>,
     rpc_user: Option<String>,
     rpc_pass: Option<String>,
@@ -1451,6 +1454,34 @@ async fn run() -> Result<(), String> {
                 }
             });
         });
+    }
+
+    if config.p2p_listen {
+        let bind_addr = config.p2p_addr.unwrap_or_else(|| {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), params.default_port)
+        });
+        let listener = p2p_server::bind_inbound_p2p(bind_addr).await?;
+        let chainstate = Arc::clone(&chainstate);
+        let params = Arc::clone(&params);
+        let addr_book = Arc::clone(&addr_book);
+        let peer_registry = Arc::clone(&peer_registry);
+        let net_totals = Arc::clone(&net_totals);
+        tokio::spawn(async move {
+            if let Err(err) = p2p_server::serve_inbound_p2p(
+                listener,
+                chainstate,
+                params,
+                addr_book,
+                peer_registry,
+                net_totals,
+            )
+            .await
+            {
+                log_warn!("p2p listener stopped: {err}");
+            }
+        });
+    } else {
+        log_info!("P2P listener disabled (--no-p2p-listen)");
     }
 
     let start_height = start_height(&chainstate)?;
@@ -6276,6 +6307,10 @@ fn parse_args() -> Result<Config, String> {
     let mut log_format_set = false;
     let mut log_timestamps = true;
     let mut log_timestamps_set = false;
+    let mut p2p_listen = true;
+    let mut p2p_listen_set = false;
+    let mut p2p_addr: Option<SocketAddr> = None;
+    let mut p2p_addr_set = false;
     let mut rpc_addr: Option<SocketAddr> = None;
     let mut rpc_addr_set = false;
     let mut rpc_user: Option<String> = None;
@@ -6480,6 +6515,20 @@ fn parse_args() -> Result<Config, String> {
                     .ok_or_else(|| format!("missing value for --miner-address\n{}", usage()))?;
                 miner_address = Some(value);
                 miner_address_set = true;
+            }
+            "--p2p-addr" | "--p2paddr" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --p2p-addr\n{}", usage()))?;
+                p2p_addr = Some(
+                    parse_socket_addr_with_default_port(&value, default_p2p_addr(network).port())
+                        .ok_or_else(|| format!("invalid p2p addr '{value}'\n{}", usage()))?,
+                );
+                p2p_addr_set = true;
+            }
+            "--no-p2p-listen" | "--no-listen" => {
+                p2p_listen = false;
+                p2p_listen_set = true;
             }
             "--rpc-addr" => {
                 let value = args
@@ -6894,6 +6943,34 @@ fn parse_args() -> Result<Config, String> {
             }
         }
 
+        if !p2p_listen_set {
+            if let Some(values) = conf.get("listen") {
+                if let Some(raw) = values.last() {
+                    match parse_conf_bool(raw) {
+                        Some(value) => p2p_listen = value,
+                        None => {
+                            return Err(format!(
+                                "invalid listen value '{raw}' in {}",
+                                conf_file.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !p2p_addr_set {
+            if let Some(values) = conf.get("bind") {
+                if let Some(raw) = values.last() {
+                    p2p_addr = Some(
+                        parse_socket_addr_with_default_port(raw, default_port).ok_or_else(
+                            || format!("invalid bind '{raw}' in {}", conf_file.display()),
+                        )?,
+                    );
+                }
+            }
+        }
+
         if !miner_address_set {
             if let Some(values) = conf.get("mineraddress") {
                 if let Some(value) = values.last() {
@@ -6986,10 +7063,12 @@ fn parse_args() -> Result<Config, String> {
 
         let supported_keys = [
             "addnode",
+            "bind",
             "dbcache",
             "logformat",
             "loglevel",
             "logtimestamps",
+            "listen",
             "maxmempool",
             "mineraddress",
             "minrelaytxfee",
@@ -7184,6 +7263,8 @@ fn parse_args() -> Result<Config, String> {
         log_level,
         log_format,
         log_timestamps,
+        p2p_listen,
+        p2p_addr,
         rpc_addr,
         rpc_user,
         rpc_pass,
@@ -7395,6 +7476,14 @@ fn default_rpc_addr(network: Network) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
+fn default_p2p_addr(network: Network) -> SocketAddr {
+    let port = match network {
+        Network::Mainnet => 16_125,
+        Network::Testnet | Network::Regtest => 26_125,
+    };
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+}
+
 fn resolve_verify_settings(
     config: &Config,
     getdata_batch: usize,
@@ -7449,7 +7538,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -7473,6 +7562,8 @@ fn usage() -> String {
         "  --skip-script  Disable script validation (testing only)",
         "  --network   Network selection (default: mainnet)",
         "  --miner-address  Default miner address for getblocktemplate when wallet is not available",
+        "  --p2p-addr  Bind P2P listener (default: 0.0.0.0:16125 mainnet, 26125 testnet)",
+        "  --no-p2p-listen  Disable inbound P2P listener",
         "  --rpc-addr  Bind JSON-RPC server (default: 127.0.0.1:16124 mainnet, 26124 testnet)",
         "  --rpc-user  JSON-RPC basic auth username (required unless cookie exists)",
         "  --rpc-pass  JSON-RPC basic auth password (required unless cookie exists)",

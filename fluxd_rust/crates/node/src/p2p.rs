@@ -34,6 +34,7 @@ pub enum PeerKind {
 pub struct PeerInfoSnapshot {
     pub addr: SocketAddr,
     pub kind: PeerKind,
+    pub inbound: bool,
     pub version: i32,
     pub services: u64,
     pub user_agent: String,
@@ -49,6 +50,7 @@ pub struct PeerInfoSnapshot {
 struct PeerEntry {
     addr: SocketAddr,
     kind: PeerKind,
+    inbound: bool,
     version: i32,
     services: u64,
     user_agent: String,
@@ -67,6 +69,27 @@ pub struct PeerRegistry {
 }
 
 impl PeerRegistry {
+    fn register_internal(&self, addr: SocketAddr, kind: PeerKind, inbound: bool) {
+        let now = SystemTime::now();
+        let entry = PeerEntry {
+            addr,
+            kind,
+            inbound,
+            version: 0,
+            services: 0,
+            user_agent: String::new(),
+            start_height: -1,
+            connected_since: now,
+            last_send: now,
+            last_recv: now,
+            bytes_sent: 0,
+            bytes_recv: 0,
+        };
+        if let Ok(mut peers) = self.peers.lock() {
+            peers.insert(addr, entry);
+        }
+    }
+
     pub fn request_disconnect(&self, addr: SocketAddr) {
         if let Ok(mut requests) = self.disconnect_requests.lock() {
             requests.insert(addr);
@@ -81,23 +104,11 @@ impl PeerRegistry {
     }
 
     pub fn register(&self, addr: SocketAddr, kind: PeerKind) {
-        let now = SystemTime::now();
-        let entry = PeerEntry {
-            addr,
-            kind,
-            version: 0,
-            services: 0,
-            user_agent: String::new(),
-            start_height: -1,
-            connected_since: now,
-            last_send: now,
-            last_recv: now,
-            bytes_sent: 0,
-            bytes_recv: 0,
-        };
-        if let Ok(mut peers) = self.peers.lock() {
-            peers.insert(addr, entry);
-        }
+        self.register_internal(addr, kind, false);
+    }
+
+    pub fn register_inbound(&self, addr: SocketAddr, kind: PeerKind) {
+        self.register_internal(addr, kind, true);
     }
 
     pub fn update_version(
@@ -159,6 +170,7 @@ impl PeerRegistry {
             .map(|entry| PeerInfoSnapshot {
                 addr: entry.addr,
                 kind: entry.kind,
+                inbound: entry.inbound,
                 version: entry.version,
                 services: entry.services,
                 user_agent: entry.user_agent,
@@ -255,6 +267,30 @@ impl Peer {
             registry,
             net_totals,
         })
+    }
+
+    pub fn from_inbound(
+        stream: TcpStream,
+        addr: SocketAddr,
+        magic: [u8; 4],
+        kind: PeerKind,
+        registry: Arc<PeerRegistry>,
+        net_totals: Arc<NetTotals>,
+    ) -> Self {
+        net_totals.inc_connections();
+        registry.register_inbound(addr, kind);
+        Self {
+            stream,
+            magic,
+            remote_height: -1,
+            remote_version: 0,
+            remote_services: 0,
+            remote_user_agent: String::new(),
+            kind,
+            addr,
+            registry,
+            net_totals,
+        }
     }
 
     pub async fn send_message(&mut self, command: &str, payload: &[u8]) -> Result<(), String> {
@@ -453,6 +489,32 @@ pub fn parse_headers(payload: &[u8]) -> Result<Vec<BlockHeader>, String> {
     Ok(headers)
 }
 
+#[derive(Clone, Debug)]
+pub struct GetHeadersRequest {
+    pub locator: Vec<fluxd_consensus::Hash256>,
+    pub stop: fluxd_consensus::Hash256,
+}
+
+pub fn parse_getheaders(payload: &[u8]) -> Result<GetHeadersRequest, String> {
+    let mut decoder = Decoder::new(payload);
+    let _protocol_version = decoder.read_i32_le().map_err(|err| err.to_string())?;
+    let count = decoder.read_varint().map_err(|err| err.to_string())?;
+    let count = usize::try_from(count).map_err(|_| "locator count too large".to_string())?;
+    if count > 128 {
+        return Err("locator count too large".to_string());
+    }
+    let mut locator = Vec::with_capacity(count);
+    for _ in 0..count {
+        let hash = decoder.read_hash_le().map_err(|err| err.to_string())?;
+        locator.push(hash);
+    }
+    let stop = decoder.read_hash_le().map_err(|err| err.to_string())?;
+    if !decoder.is_empty() {
+        return Err("trailing bytes in getheaders payload".to_string());
+    }
+    Ok(GetHeadersRequest { locator, stop })
+}
+
 pub fn parse_addr(payload: &[u8]) -> Result<Vec<SocketAddr>, String> {
     let mut decoder = Decoder::new(payload);
     let count = decoder.read_varint().map_err(|err| err.to_string())?;
@@ -482,6 +544,38 @@ pub fn parse_addr(payload: &[u8]) -> Result<Vec<SocketAddr>, String> {
         addrs.push(SocketAddr::new(ip, port));
     }
     Ok(addrs)
+}
+
+pub fn build_headers_payload(headers: &[Vec<u8>]) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.write_varint(headers.len() as u64);
+    for header_bytes in headers {
+        encoder.write_bytes(header_bytes);
+        encoder.write_varint(0);
+    }
+    encoder.into_inner()
+}
+
+pub fn build_addr_payload(addrs: &[SocketAddr], now: u32) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.write_varint(addrs.len() as u64);
+    for addr in addrs {
+        encoder.write_u32_le(now);
+        encoder.write_u64_le(NODE_NETWORK);
+        let ip_bytes = match addr.ip() {
+            IpAddr::V4(ip4) => {
+                let mut out = [0u8; 16];
+                out[10] = 0xff;
+                out[11] = 0xff;
+                out[12..16].copy_from_slice(&ip4.octets());
+                out
+            }
+            IpAddr::V6(ip6) => ip6.octets(),
+        };
+        encoder.write_bytes(&ip_bytes);
+        encoder.write_bytes(&addr.port().to_be_bytes());
+    }
+    encoder.into_inner()
 }
 
 #[derive(Clone, Copy, Debug)]

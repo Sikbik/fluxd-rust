@@ -11126,7 +11126,7 @@ fn rpc_getpeerinfo(params: Vec<Value>, peer_registry: &PeerRegistry) -> Result<V
             "lastrecv": system_time_to_unix(peer.last_recv),
             "bytessent": peer.bytes_sent,
             "bytesrecv": peer.bytes_recv,
-            "inbound": false,
+            "inbound": peer.inbound,
             "kind": peer_kind_name(peer.kind),
         }));
     }

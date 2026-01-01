@@ -46,6 +46,8 @@ Currently supported keys:
 - `dbcache` (MiB; maps to `--db-cache-mb`)
 - `maxmempool` (MiB; maps to `--mempool-max-mb`)
 - `minrelaytxfee` (FLUX/kB; maps to `--minrelaytxfee`)
+- `listen` (`1|0`; enables/disables inbound P2P listener)
+- `bind` (IP or IP:PORT; binds inbound P2P listener; defaults to network P2P port)
 - `rpcuser`, `rpcpassword`
 - `rpcbind`, `rpcport`
 - `rpcallowip` (repeatable; IP or CIDR, e.g. `127.0.0.1`, `10.0.0.0/8`)
@@ -153,6 +155,8 @@ RPC defaults:
 
 ## Sync and peer behavior
 
+- `--p2p-addr IP:PORT` - bind address for inbound P2P connections (default: `0.0.0.0:<net p2p port>`).
+- `--no-p2p-listen` - disable inbound P2P listener (useful for running multiple local instances).
 - `--getdata-batch N` - max blocks per getdata request (default: 128).
 - `--block-peers N` - parallel peers for block download (default: 3).
 - `--header-peers N` - peers to probe for header sync (default: 4).

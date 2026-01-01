@@ -141,6 +141,14 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `reject`/`notfound` handling parity (owner: TBD)
   - [x] Ignore unsolicited `block` messages during getdata download (prevents sync stalls) (owner: TBD)
 - [x] [P2] Service flags and user agent compatibility (owner: TBD)
+- [ ] [P1] Inbound P2P listener (accept peers + serve headers/blocks) (owner: TBD)
+  - [x] Listen on network P2P port (`--p2p-addr`, `listen=1`, `bind=...`)
+  - [x] Populate `getpeerinfo` with `inbound=true` for inbound peers
+  - [x] Respond to `getaddr` and ingest `addr` messages
+  - [x] Respond to `getheaders` requests (up to 160 headers)
+  - [x] Respond to `getdata` block requests (bounded)
+  - [ ] Tx relay to inbound peers (`inv`/`getdata`/`tx`)
+  - [ ] DoS limits (maxconnections, per-peer rate limits)
 
 ## Mempool and mining
 

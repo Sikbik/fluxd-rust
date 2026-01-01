@@ -119,6 +119,16 @@ Fix:
 - Check `--data-dir/rpc.cookie` and use it for Basic Auth.
 - If you set `--rpc-user`/`--rpc-pass`, ensure your client matches those.
 
+## P2P listen bind fails
+
+Symptoms:
+- Startup error like: `failed to bind p2p listener 0.0.0.0:16125: ...`
+
+Fix:
+- If you are running another daemon on the same host (or multiple `fluxd` instances), either:
+  - disable inbound P2P with `--no-p2p-listen` (or `listen=0` in `flux.conf`), or
+  - bind to a different address/port via `--p2p-addr IP:PORT` (or `bind=...` in `flux.conf`).
+
 ## getblockhashes returns empty
 
 Symptoms:
