@@ -158,7 +158,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Longpoll wait behavior (honor request `longpollid`) (owner: TBD)
   - [x] Proposal mode support (`{"mode":"proposal","data":"..."}`) (owner: TBD)
   - [x] Miner address config (`--miner-address` / `flux.conf` `mineraddress=`) (owner: TBD)
-  - [ ] Wallet-backed miner script (coinbase script from wallet) (owner: TBD)
+  - [x] Wallet-backed miner script (coinbase script from wallet) (owner: TBD)
 - [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
 
 ## Wallet

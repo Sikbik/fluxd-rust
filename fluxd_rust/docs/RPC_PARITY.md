@@ -44,7 +44,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Mining
 
 - getblocksubsidy - Implemented
-- getblocktemplate - Partial (template fields + longpoll + proposal; falls back to first wallet key if mineraddress is unset; capability negotiation still WIP)
+- getblocktemplate - Partial (template fields + longpoll + proposal; falls back to `--miner-address` then the wallet if mineraddress is unset; capability negotiation still WIP)
 - getlocalsolps - Stub (returns 0.0)
 - getmininginfo - Partial (rates and mining fields are placeholders)
 - getnetworkhashps - Stub (returns 0.0)

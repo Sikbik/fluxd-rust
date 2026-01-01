@@ -211,6 +211,8 @@ If you do not specify user/pass, the daemon writes `rpc.cookie` into `--data-dir
 - `--miner-address TADDR`
   - Default miner address used by `getblocktemplate` when the request does not include
     `mineraddress` / `address`.
+  - If unset and the request omits `mineraddress`, the daemon uses the first wallet key
+    (creating one in `wallet.dat` if the wallet is empty).
   - Equivalent `flux.conf` key: `mineraddress=t1...` (CLI overrides config file).
 
 ## Dashboard

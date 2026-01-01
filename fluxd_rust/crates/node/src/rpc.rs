@@ -1250,11 +1250,11 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getaddressmempool" => rpc_getaddressmempool(chainstate, mempool, params, chain_params),
         "getmininginfo" => rpc_getmininginfo(chainstate, mempool, params, chain_params),
         "getblocktemplate" => {
-            let wallet_default = wallet
-                .lock()
-                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-                .default_address()
-                .map_err(map_wallet_error)?;
+            let wallet_default = default_miner_address_from_wallet_for_blocktemplate(
+                miner_address,
+                &params,
+                wallet,
+            )?;
             rpc_getblocktemplate(
                 chainstate,
                 mempool,
@@ -6782,8 +6782,8 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         .or(default_miner_address)
         .ok_or_else(|| {
             RpcError::new(
-                RPC_METHOD_NOT_FOUND,
-                "wallet support not implemented and mineraddress not set",
+                RPC_INVALID_PARAMETER,
+                "missing miner address for block template",
             )
         })?;
 
@@ -13775,6 +13775,89 @@ mod tests {
         assert!(coinbase.get("depends").and_then(Value::as_array).is_some());
         assert!(coinbase.get("required").and_then(Value::as_bool).is_some());
     }
+
+    #[test]
+    fn getblocktemplate_generates_wallet_miner_address_when_unset() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        assert_eq!(wallet.lock().expect("wallet lock").key_count(), 0);
+
+        let miner = default_miner_address_from_wallet_for_blocktemplate(None, &[], &wallet)
+            .expect("default miner");
+        assert!(miner.is_some());
+        assert_eq!(wallet.lock().expect("wallet lock").key_count(), 1);
+    }
+
+    #[test]
+    fn getblocktemplate_does_not_touch_wallet_for_proposal_mode() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        assert_eq!(wallet.lock().expect("wallet lock").key_count(), 0);
+
+        let params = vec![json!({"mode":"proposal","data":"00"})];
+        let miner = default_miner_address_from_wallet_for_blocktemplate(None, &params, &wallet)
+            .expect("default miner");
+        assert!(miner.is_none());
+        assert_eq!(wallet.lock().expect("wallet lock").key_count(), 0);
+    }
+
+    #[test]
+    fn getblocktemplate_does_not_touch_wallet_for_invalid_param_type() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        assert_eq!(wallet.lock().expect("wallet lock").key_count(), 0);
+
+        let params = vec![json!(1)];
+        let miner = default_miner_address_from_wallet_for_blocktemplate(None, &params, &wallet)
+            .expect("default miner");
+        assert!(miner.is_none());
+        assert_eq!(wallet.lock().expect("wallet lock").key_count(), 0);
+    }
+}
+
+fn default_miner_address_from_wallet_for_blocktemplate(
+    miner_address: Option<&str>,
+    params: &[Value],
+    wallet: &Mutex<Wallet>,
+) -> Result<Option<String>, RpcError> {
+    if miner_address.is_some() {
+        return Ok(None);
+    }
+
+    if params.len() > 1 {
+        return Ok(None);
+    }
+
+    let request_obj = params.get(0).and_then(Value::as_object);
+    if !params.is_empty() && request_obj.is_none() {
+        return Ok(None);
+    }
+
+    let mode = request_obj
+        .and_then(|obj| obj.get("mode").and_then(Value::as_str))
+        .unwrap_or("template");
+    if mode != "template" {
+        return Ok(None);
+    }
+
+    let request_miner_address = request_obj.and_then(|obj| {
+        obj.get("mineraddress")
+            .or_else(|| obj.get("address"))
+            .and_then(Value::as_str)
+    });
+    if request_miner_address.is_some() {
+        return Ok(None);
+    }
+
+    let mut guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    if let Some(address) = guard.default_address().map_err(map_wallet_error)? {
+        return Ok(Some(address));
+    }
+
+    let address = guard.generate_new_address(true).map_err(map_wallet_error)?;
+    Ok(Some(address))
 }
 
 fn system_time_to_unix(time: SystemTime) -> i64 {

@@ -712,7 +712,8 @@ Returns a block template suitable for pools/miners, modeled after the C++ daemon
   - Template mode (default):
     - `{"mineraddress":"t1..."}`
     - `{"address":"t1..."}` (alias)
-    - If omitted, the daemon uses the configured `--miner-address` / `flux.conf` `mineraddress=...` (if set).
+    - If omitted, the daemon uses the configured `--miner-address` / `flux.conf` `mineraddress=...` (if set),
+      otherwise it uses the first wallet key (creating one in `wallet.dat` if the wallet is empty).
   - Longpoll: include `longpollid` from a previous response to wait for a template update.
   - Proposal mode: `{"mode":"proposal","data":"<blockhex>"}`
 - Result: object including standard BIP22-style fields:
@@ -731,7 +732,7 @@ Returns a block template suitable for pools/miners, modeled after the C++ daemon
 Notes:
 - Longpoll waits until either the best block changes or the mempool revision changes.
 - Proposal mode returns `null` when the block would be accepted, otherwise a string reason (BIP22-style).
-- Until wallet integration is implemented, template mode requires a miner address either in the request or via `--miner-address` / `flux.conf`.
+- Template mode requires a miner address; if none is provided, the daemon falls back to `--miner-address` and then the wallet.
 
 ### submitblock
 
