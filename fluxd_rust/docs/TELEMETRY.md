@@ -14,6 +14,11 @@ to build dashboards and alerts (e.g. using `rate(fluxd_commit_blocks_total[5m])`
 `/stats` returns **cumulative counters** since process start. To get per-second rates or per-block
 costs, take two snapshots and compute deltas.
 
+Helper script:
+
+- `scripts/stats_delta.sh` fetches two snapshots and prints deltas plus ms/block breakdown. Example:
+  - `./scripts/stats_delta.sh --stats-addr 127.0.0.1:8080 --window-secs 60`
+
 Useful pairs:
 
 - `download_us` / `download_blocks` - time spent downloading blocks over P2P.
