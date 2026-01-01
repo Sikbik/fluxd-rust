@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use fluxd_consensus::params::Network;
 use sha2::{Digest, Sha256};
@@ -137,7 +138,7 @@ fn download_param(
     expected_sha256: &str,
 ) -> Result<(), ShieldedError> {
     let dest = params_dir.join(name);
-    if dest.exists() && verify_sha256(&dest, expected_sha256).is_ok() {
+    if dest.exists() && verify_sha256_cached(&dest, expected_sha256).is_ok() {
         return Ok(());
     }
 
@@ -145,7 +146,68 @@ fn download_param(
     download_parts(name, &tmp)?;
     verify_sha256(&tmp, expected_sha256)?;
     fs::rename(&tmp, &dest)?;
+    let _ = write_sha256_marker(&dest, expected_sha256);
     Ok(())
+}
+
+fn verify_sha256_cached(path: &Path, expected: &str) -> Result<(), ShieldedError> {
+    if is_sha256_marker_valid(path, expected).unwrap_or(false) {
+        return Ok(());
+    }
+    verify_sha256(path, expected)?;
+    let _ = write_sha256_marker(path, expected);
+    Ok(())
+}
+
+fn sha256_marker_path(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?.to_string_lossy();
+    Some(path.with_file_name(format!("{file_name}.sha256")))
+}
+
+fn sha256_marker_fingerprint(path: &Path) -> io::Result<(u64, u64)> {
+    let meta = fs::metadata(path)?;
+    let size = meta.len();
+    let modified = meta
+        .modified()
+        .unwrap_or(UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok((size, modified))
+}
+
+fn is_sha256_marker_valid(path: &Path, expected: &str) -> io::Result<bool> {
+    let Some(marker_path) = sha256_marker_path(path) else {
+        return Ok(false);
+    };
+    let marker = match fs::read_to_string(&marker_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let mut lines = marker.lines();
+    let marker_expected = lines.next().unwrap_or_default();
+    if marker_expected != expected {
+        return Ok(false);
+    }
+    let marker_size = match lines.next().and_then(|value| value.parse::<u64>().ok()) {
+        Some(value) => value,
+        None => return Ok(false),
+    };
+    let marker_modified = match lines.next().and_then(|value| value.parse::<u64>().ok()) {
+        Some(value) => value,
+        None => return Ok(false),
+    };
+    let (size, modified) = sha256_marker_fingerprint(path)?;
+    Ok(size == marker_size && modified == marker_modified)
+}
+
+fn write_sha256_marker(path: &Path, expected: &str) -> io::Result<()> {
+    let Some(marker_path) = sha256_marker_path(path) else {
+        return Ok(());
+    };
+    let (size, modified) = sha256_marker_fingerprint(path)?;
+    fs::write(&marker_path, format!("{expected}\n{size}\n{modified}\n"))
 }
 
 fn download_parts(name: &str, dest: &Path) -> Result<(), ShieldedError> {
