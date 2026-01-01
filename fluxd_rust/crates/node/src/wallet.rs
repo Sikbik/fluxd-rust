@@ -349,6 +349,37 @@ impl Wallet {
         Ok(address.to_bytes())
     }
 
+    pub fn sapling_addresses_bytes(&self) -> Result<Vec<[u8; 43]>, WalletError> {
+        let mut out = Vec::new();
+
+        for entry in &self.sapling_keys {
+            let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk)
+                .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
+            let dfvk = extsk.to_diversifiable_full_viewing_key();
+
+            let mut index = DiversifierIndex::from([0u8; 11]);
+            let stop = DiversifierIndex::from(entry.next_diversifier_index);
+
+            while index < stop {
+                let Some((found_index, address)) = dfvk.find_address(index) else {
+                    return Err(WalletError::InvalidData(
+                        "sapling diversifier space exhausted",
+                    ));
+                };
+                if found_index >= stop {
+                    break;
+                }
+                out.push(address.to_bytes());
+                index = found_index;
+                index
+                    .increment()
+                    .map_err(|_| WalletError::InvalidData("sapling diversifier index overflow"))?;
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn sapling_address_is_mine(&self, bytes: &[u8; 43]) -> Result<bool, WalletError> {
         let Some(addr) = PaymentAddress::from_bytes(bytes) else {
             return Ok(false);

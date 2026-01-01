@@ -207,6 +207,9 @@ echo "Checking zvalidateaddress (ismine) ..."
 zaddr1_enc="$(url_encode "$zaddr1")"
 rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("address")==addr, res; assert res.get("ismine") is True, res' "$zaddr1"
 
+echo "Checking zlistaddresses contains zaddr1 ..."
+rpc_get "zlistaddresses" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert addr in res, res' "$zaddr1"
+
 echo "Restarting node to confirm persistence ..."
 stop_node
 sleep 0.2
@@ -229,6 +232,9 @@ if [[ "$zaddr2" != "${expected_hrp}1"* ]]; then
   echo "unexpected address prefix: got '$zaddr2', expected '${expected_hrp}1...'" >&2
   exit 1
 fi
+
+echo "Checking zlistaddresses contains both addresses ..."
+rpc_get "zlistaddresses" | python3 -c 'import json,sys; a1=sys.argv[1]; a2=sys.argv[2]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert a1 in res, res; assert a2 in res, res' "$zaddr1" "$zaddr2"
 
 echo "OK: zaddr1=$zaddr1"
 echo "OK: zaddr2=$zaddr2"

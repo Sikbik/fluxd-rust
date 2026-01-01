@@ -150,8 +150,9 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 
 ### Wallet (shielded) (WIP)
 
-Shielded wallet RPCs are registered for parity. Only `zgetnewaddress` is currently implemented;
-the remaining shielded wallet RPCs return a wallet error (`-4`) while shielded wallet support is
+Shielded wallet RPCs are registered for parity. The initial Sapling wallet surface is implemented:
+`zgetnewaddress`, `zlistaddresses`, and Sapling ownership detection in `zvalidateaddress`.
+The remaining shielded wallet RPCs return a wallet error (`-4`) while shielded wallet support is
 still WIP.
 
 Consensus note (mainnet): after the Flux rebrand upgrade, transactions with transparent inputs and
@@ -161,7 +162,7 @@ still be spent out of the pool (z→t) and moved within the pool (z→z).
 - `zgetbalance` / `z_getbalance`
 - `zgettotalbalance` / `z_gettotalbalance`
 - `zgetnewaddress` / `z_getnewaddress` (Sapling only)
-- `zlistaddresses` / `z_listaddresses`
+- `zlistaddresses` / `z_listaddresses` (Sapling only)
 - `zlistunspent` / `z_listunspent`
 - `zsendmany` / `z_sendmany`
 - `zshieldcoinbase` / `z_shieldcoinbase`
@@ -175,6 +176,7 @@ still be spent out of the pool (z→t) and moved within the pool (z→z).
 - `zlistoperationids` / `z_listoperationids`
 - `zgetmigrationstatus` / `z_getmigrationstatus`
 - `zsetmigration` / `z_setmigration`
+- `zvalidateaddress` / `z_validateaddress` (Sapling `ismine` only)
 - `zlistreceivedbyaddress` / `z_listreceivedbyaddress`
 
 Joinsplit helper RPCs are also stubbed:

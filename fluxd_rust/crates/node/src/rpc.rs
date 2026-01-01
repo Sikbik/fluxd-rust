@@ -1417,9 +1417,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "zimportwallet" | "z_importwallet" => {
             rpc_shielded_wallet_not_implemented(params, "zimportwallet")
         }
-        "zlistaddresses" | "z_listaddresses" => {
-            rpc_shielded_wallet_not_implemented(params, "zlistaddresses")
-        }
+        "zlistaddresses" | "z_listaddresses" => rpc_zlistaddresses(wallet, params, chain_params),
         "zlistoperationids" | "z_listoperationids" => {
             rpc_shielded_wallet_not_implemented(params, "zlistoperationids")
         }
@@ -4222,6 +4220,50 @@ fn rpc_zgetnewaddress(
     let encoded = bech32::encode::<Bech32>(hrp, bytes.as_slice())
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling address"))?;
     Ok(Value::String(encoded))
+}
+
+fn rpc_zlistaddresses(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zlistaddresses expects 0 or 1 parameters",
+        ));
+    }
+
+    if let Some(value) = params.first() {
+        if value.as_bool().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "includeWatchonly must be a boolean",
+            ));
+        }
+    }
+
+    let bytes = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .sapling_addresses_bytes()
+        .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "failed to list sapling addresses"))?;
+
+    let hrp = match chain_params.network {
+        Network::Mainnet => "za",
+        Network::Testnet => "ztestacadia",
+        Network::Regtest => "zregtestsapling",
+    };
+    let hrp = Hrp::parse(hrp).map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid hrp"))?;
+
+    let mut out = Vec::with_capacity(bytes.len());
+    for addr_bytes in bytes {
+        let encoded = bech32::encode::<Bech32>(hrp, addr_bytes.as_slice())
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling address"))?;
+        out.push(Value::String(encoded));
+    }
+
+    Ok(Value::Array(out))
 }
 
 fn decode_sprout_payment_address(
@@ -11555,6 +11597,24 @@ mod tests {
         assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
         assert_eq!(obj.get("type").and_then(Value::as_str), Some("sapling"));
         assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn zlistaddresses_includes_generated_sapling_addresses() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let value = rpc_zlistaddresses(&wallet, Vec::new(), &params).expect("rpc");
+        assert_eq!(value.as_array().map(|values| values.len()), Some(0));
+
+        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = addr.as_str().expect("string").to_string();
+
+        let value = rpc_zlistaddresses(&wallet, vec![json!(false)], &params).expect("rpc");
+        let addrs = value.as_array().expect("array");
+        assert!(addrs
+            .iter()
+            .any(|value| value.as_str() == Some(addr.as_str())));
     }
 
     #[test]
