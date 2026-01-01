@@ -5262,8 +5262,9 @@ fn rpc_zsendmany<S: fluxd_storage::KeyValueStore + 'static>(
                 .map_err(map_internal)?
                 .map(|tip| tip.height)
                 .unwrap_or(0);
+            let target_height_i32 = tip_height.saturating_add(1);
             if !network_upgrade_active(
-                tip_height,
+                target_height_i32,
                 &chain_params.consensus.upgrades,
                 UpgradeIndex::Acadia,
             ) {
@@ -5404,7 +5405,7 @@ fn rpc_zsendmany<S: fluxd_storage::KeyValueStore + 'static>(
                 sapling_activation,
             };
             let target_height =
-                BlockHeight::from_u32(u32::try_from(best_height.saturating_add(1)).unwrap_or(0));
+                BlockHeight::from_u32(u32::try_from(target_height_i32).unwrap_or(0));
             let build_config = BuildConfig::Standard {
                 sapling_anchor: Some(anchor),
                 orchard_anchor: None,
