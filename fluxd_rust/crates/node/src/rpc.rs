@@ -3028,8 +3028,17 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
 
     let skip = usize::try_from(skip).unwrap_or(usize::MAX);
     let count = usize::try_from(count).unwrap_or(0);
-    let mut out = Vec::new();
-    for cand in candidates.into_iter().skip(skip).take(count) {
+    if count == 0 {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let target = skip.saturating_add(count);
+    let mut newest_to_oldest = Vec::new();
+
+    'outer: for cand in candidates {
+        if newest_to_oldest.len() >= target {
+            break;
+        }
         let view = rpc_gettransaction(
             chainstate,
             mempool,
@@ -3044,101 +3053,106 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
             .as_object()
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid gettransaction result"))?;
 
-        let amount_zat = obj.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
-        let details = obj.get("details").and_then(Value::as_array);
+        let size = obj
+            .get("hex")
+            .and_then(Value::as_str)
+            .and_then(|hex| (hex.len() % 2 == 0).then_some((hex.len() / 2) as i64))
+            .map(|size| Value::Number(size.into()));
 
-        let category = if amount_zat < 0 {
-            "send".to_string()
-        } else if let Some(rows) = details {
-            rows.iter()
-                .filter_map(Value::as_object)
-                .find_map(|row| match row.get("category").and_then(Value::as_str) {
-                    Some("orphan") | Some("immature") | Some("generate") => {
-                        row.get("category").and_then(Value::as_str)
-                    }
-                    _ => None,
-                })
-                .unwrap_or("receive")
-                .to_string()
-        } else {
-            "receive".to_string()
+        let details = obj.get("details").and_then(Value::as_array);
+        let Some(details) = details else {
+            continue;
         };
 
-        let first_detail = details.and_then(|rows| {
-            rows.iter()
-                .filter_map(Value::as_object)
-                .find(|row| row.get("category").and_then(Value::as_str) == Some(category.as_str()))
-                .or_else(|| rows.first().and_then(Value::as_object))
-        });
-
-        let address = first_detail
-            .and_then(|row| row.get("address"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-        let vout = first_detail.and_then(|row| row.get("vout")).cloned();
-
-        let mut row = serde_json::Map::new();
-        row.insert("account".to_string(), Value::String(String::new()));
-        if let Some(value) = obj.get("involvesWatchonly") {
-            row.insert("involvesWatchonly".to_string(), value.clone());
-        }
-        if let Some(address) = address {
-            row.insert("address".to_string(), Value::String(address));
-        }
-        if let Some(vout) = vout {
-            row.insert("vout".to_string(), vout);
-        }
-        row.insert("category".to_string(), Value::String(category.clone()));
-        row.insert(
-            "amount".to_string(),
-            obj.get("amount")
-                .cloned()
-                .unwrap_or_else(|| amount_to_value(amount_zat)),
-        );
-        row.insert(
-            "confirmations".to_string(),
-            obj.get("confirmations").cloned().unwrap_or(0.into()),
-        );
-        row.insert(
-            "txid".to_string(),
-            obj.get("txid")
-                .cloned()
-                .unwrap_or(Value::String(hash256_to_hex(&cand.txid))),
-        );
-        if let Some(value) = obj.get("blockhash") {
-            row.insert("blockhash".to_string(), value.clone());
-        }
-        if let Some(value) = obj.get("blockindex") {
-            row.insert("blockindex".to_string(), value.clone());
-        }
-        if let Some(value) = obj.get("blocktime") {
-            row.insert("blocktime".to_string(), value.clone());
-        }
-        if let Some(value) = obj.get("time") {
-            row.insert("time".to_string(), value.clone());
-        }
-        if let Some(value) = obj.get("timereceived") {
-            row.insert("timereceived".to_string(), value.clone());
-        }
-        if let Some(hex) = obj.get("hex").and_then(Value::as_str) {
-            if hex.len() % 2 == 0 {
-                let size = (hex.len() / 2) as i64;
-                row.insert("size".to_string(), Value::Number(size.into()));
+        let mut send_details = Vec::new();
+        let mut other_details = Vec::new();
+        for detail in details {
+            let cat = detail
+                .as_object()
+                .and_then(|row| row.get("category").and_then(Value::as_str));
+            if cat == Some("send") {
+                send_details.push(detail);
+            } else {
+                other_details.push(detail);
             }
         }
-        row.insert("amount_zat".to_string(), Value::Number(amount_zat.into()));
-        if category == "send" {
-            if let Some(value) = obj.get("fee") {
+
+        for detail in send_details.into_iter().chain(other_details) {
+            let Some(detail) = detail.as_object() else {
+                continue;
+            };
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "account".to_string(),
+                detail
+                    .get("account")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
+            );
+            if let Some(value) = detail.get("involvesWatchonly") {
+                row.insert("involvesWatchonly".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("address") {
+                row.insert("address".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("category") {
+                row.insert("category".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("amount") {
+                row.insert("amount".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("amount_zat") {
+                row.insert("amount_zat".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("vout") {
+                row.insert("vout".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("fee") {
                 row.insert("fee".to_string(), value.clone());
             }
-            if let Some(value) = obj.get("fee_zat") {
+            if let Some(value) = detail.get("fee_zat") {
                 row.insert("fee_zat".to_string(), value.clone());
             }
-        }
 
-        out.push(Value::Object(row));
+            if let Some(value) = obj.get("confirmations") {
+                row.insert("confirmations".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("txid") {
+                row.insert("txid".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("blockhash") {
+                row.insert("blockhash".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("blockindex") {
+                row.insert("blockindex".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("blocktime") {
+                row.insert("blocktime".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("time") {
+                row.insert("time".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("timereceived") {
+                row.insert("timereceived".to_string(), value.clone());
+            }
+            if let Some(size) = &size {
+                row.insert("size".to_string(), size.clone());
+            }
+
+            newest_to_oldest.push(Value::Object(row));
+            if newest_to_oldest.len() >= target {
+                break 'outer;
+            }
+        }
     }
 
+    let skip = skip.min(newest_to_oldest.len());
+    let count = count.min(newest_to_oldest.len().saturating_sub(skip));
+    let mut out = newest_to_oldest
+        .into_iter()
+        .skip(skip)
+        .take(count)
+        .collect::<Vec<_>>();
     out.reverse();
     Ok(Value::Array(out))
 }
@@ -3332,99 +3346,94 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
             }
         }
 
-        let amount_zat = obj.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
-        let details = obj.get("details").and_then(Value::as_array);
+        let size = obj
+            .get("hex")
+            .and_then(Value::as_str)
+            .and_then(|hex| (hex.len() % 2 == 0).then_some((hex.len() / 2) as i64))
+            .map(|size| Value::Number(size.into()));
 
-        let category = if amount_zat < 0 {
-            "send".to_string()
-        } else if let Some(rows) = details {
-            rows.iter()
-                .filter_map(Value::as_object)
-                .find_map(|row| match row.get("category").and_then(Value::as_str) {
-                    Some("orphan") | Some("immature") | Some("generate") => {
-                        row.get("category").and_then(Value::as_str)
-                    }
-                    _ => None,
-                })
-                .unwrap_or("receive")
-                .to_string()
-        } else {
-            "receive".to_string()
+        let details = obj.get("details").and_then(Value::as_array);
+        let Some(details) = details else {
+            continue;
         };
 
-        let first_detail = details.and_then(|rows| {
-            rows.iter()
-                .filter_map(Value::as_object)
-                .find(|row| row.get("category").and_then(Value::as_str) == Some(category.as_str()))
-                .or_else(|| rows.first().and_then(Value::as_object))
-        });
-
-        let address = first_detail
-            .and_then(|row| row.get("address"))
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-        let vout = first_detail.and_then(|row| row.get("vout")).cloned();
-
-        let mut row = serde_json::Map::new();
-        row.insert("account".to_string(), Value::String(String::new()));
-        if let Some(value) = obj.get("involvesWatchonly") {
-            row.insert("involvesWatchonly".to_string(), value.clone());
-        }
-        if let Some(address) = address {
-            row.insert("address".to_string(), Value::String(address));
-        }
-        if let Some(vout) = vout {
-            row.insert("vout".to_string(), vout);
-        }
-        row.insert("category".to_string(), Value::String(category.clone()));
-        row.insert(
-            "amount".to_string(),
-            obj.get("amount")
-                .cloned()
-                .unwrap_or_else(|| amount_to_value(amount_zat)),
-        );
-        row.insert(
-            "confirmations".to_string(),
-            obj.get("confirmations").cloned().unwrap_or(0.into()),
-        );
-        row.insert(
-            "txid".to_string(),
-            obj.get("txid")
-                .cloned()
-                .unwrap_or(Value::String(hash256_to_hex(&cand.txid))),
-        );
-        if let Some(value) = obj.get("blockhash") {
-            row.insert("blockhash".to_string(), value.clone());
-        }
-        if let Some(value) = obj.get("blockindex") {
-            row.insert("blockindex".to_string(), value.clone());
-        }
-        if let Some(value) = obj.get("blocktime") {
-            row.insert("blocktime".to_string(), value.clone());
-        }
-        if let Some(value) = obj.get("time") {
-            row.insert("time".to_string(), value.clone());
-        }
-        if let Some(value) = obj.get("timereceived") {
-            row.insert("timereceived".to_string(), value.clone());
-        }
-        if let Some(hex) = obj.get("hex").and_then(Value::as_str) {
-            if hex.len() % 2 == 0 {
-                let size = (hex.len() / 2) as i64;
-                row.insert("size".to_string(), Value::Number(size.into()));
+        let mut send_details = Vec::new();
+        let mut other_details = Vec::new();
+        for detail in details {
+            let cat = detail
+                .as_object()
+                .and_then(|row| row.get("category").and_then(Value::as_str));
+            if cat == Some("send") {
+                send_details.push(detail);
+            } else {
+                other_details.push(detail);
             }
         }
-        row.insert("amount_zat".to_string(), Value::Number(amount_zat.into()));
-        if category == "send" {
-            if let Some(value) = obj.get("fee") {
+
+        for detail in send_details.into_iter().chain(other_details) {
+            let Some(detail) = detail.as_object() else {
+                continue;
+            };
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "account".to_string(),
+                detail
+                    .get("account")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
+            );
+            if let Some(value) = detail.get("involvesWatchonly") {
+                row.insert("involvesWatchonly".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("address") {
+                row.insert("address".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("category") {
+                row.insert("category".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("amount") {
+                row.insert("amount".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("amount_zat") {
+                row.insert("amount_zat".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("vout") {
+                row.insert("vout".to_string(), value.clone());
+            }
+            if let Some(value) = detail.get("fee") {
                 row.insert("fee".to_string(), value.clone());
             }
-            if let Some(value) = obj.get("fee_zat") {
+            if let Some(value) = detail.get("fee_zat") {
                 row.insert("fee_zat".to_string(), value.clone());
             }
-        }
 
-        transactions.push(Value::Object(row));
+            if let Some(value) = obj.get("confirmations") {
+                row.insert("confirmations".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("txid") {
+                row.insert("txid".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("blockhash") {
+                row.insert("blockhash".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("blockindex") {
+                row.insert("blockindex".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("blocktime") {
+                row.insert("blocktime".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("time") {
+                row.insert("time".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("timereceived") {
+                row.insert("timereceived".to_string(), value.clone());
+            }
+            if let Some(size) = &size {
+                row.insert("size".to_string(), size.clone());
+            }
+
+            transactions.push(Value::Object(row));
+        }
     }
     transactions.reverse();
 
@@ -15452,9 +15461,10 @@ mod tests {
         let value =
             rpc_listtransactions(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
         let arr = value.as_array().expect("array");
-        assert_eq!(arr.len(), 1);
-        let row = arr[0].as_object().expect("object");
-        assert_eq!(row.get("fee_zat").and_then(Value::as_i64), Some(-100));
+        assert!(arr.iter().filter_map(Value::as_object).any(|row| {
+            row.get("category").and_then(Value::as_str) == Some("send")
+                && row.get("fee_zat").and_then(Value::as_i64) == Some(-100)
+        }));
     }
 
     #[test]

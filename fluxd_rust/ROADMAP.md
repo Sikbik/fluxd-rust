@@ -190,13 +190,14 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `listtransactions` (partial)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag
+    - [x] One entry per wallet-relevant output (send entries first; C++ `ListTransactions`-style)
     - [x] `fee` output for `send` entries (via `gettransaction`)
-    - [x] `vout` output (best-effort; derived from first `gettransaction.details[]` entry matching the row category)
-    - [x] `size` output (derived from `gettransaction.hex`)
+    - [x] `vout` output per entry (from `gettransaction.details[].vout`)
+    - [x] `size` output (derived from `gettransaction.hex`, repeated per entry)
   - [x] `listsinceblock` (partial)
     - [x] `fee` output for `send` entries (via `gettransaction`)
-    - [x] `vout` output (best-effort; derived from first `gettransaction.details[]` entry matching the row category)
-    - [x] `size` output (derived from `gettransaction.hex`)
+    - [x] `vout` output per entry (from `gettransaction.details[].vout`)
+    - [x] `size` output (derived from `gettransaction.hex`, repeated per entry)
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index

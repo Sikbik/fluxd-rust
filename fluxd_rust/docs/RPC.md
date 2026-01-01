@@ -360,13 +360,13 @@ Notes:
 ### listtransactions
 
 - Params: `[account] [count] [skip] [include_watchonly]` (partial; `account` is ignored, `include_watchonly` is honored).
-- Result: array of wallet transactions (ordered oldest → newest; mempool entries appear last).
+- Result: array of wallet transaction entries (ordered oldest → newest; mempool entries appear last). Each entry corresponds to a wallet-relevant output (send/receive/generate/etc), similar to `fluxd`.
 
 Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
 - `fee` / `fee_zat` is included for `send` entries when available.
-- `vout` is included (best-effort; derived from the first `details[]` entry matching the row category).
-- `size` is included (transaction size in bytes).
+- `vout` is included per entry (index of the referenced output in the transaction).
+- `size` is included (transaction size in bytes) and is repeated across entries for the same `txid`.
 - For coinbase wallet receives, `category` may be `orphan` / `immature` / `generate` (matches `fluxd`).
 
 ### listsinceblock
@@ -378,8 +378,8 @@ Notes:
 - If `blockhash` is omitted (or unknown), returns all wallet transactions.
 - `lastblock` is the best block at depth `target_confirmations` (1 = chain tip).
 - `fee` / `fee_zat` is included for `send` entries when available.
-- `vout` is included (best-effort; derived from the first `details[]` entry matching the row category).
-- `size` is included (transaction size in bytes).
+- `vout` is included per entry (index of the referenced output in the transaction).
+- `size` is included (transaction size in bytes) and is repeated across entries for the same `txid`.
 - For coinbase wallet receives, `category` may be `orphan` / `immature` / `generate` (matches `fluxd`).
 
 ### addmultisigaddress
