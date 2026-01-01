@@ -280,7 +280,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `sendrawtransaction` (relays; confirmed inputs only) | `fundrawtransaction`<br>`signrawtransaction`<br>`estimatepriority`<br>`prioritisetransaction` |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `sendrawtransaction` (relays; confirmed inputs only)<br>`fundrawtransaction` (P2PKH only)<br>`signrawtransaction` (P2PKH only)<br>`estimatepriority` (returns -1.0) | - |
 
 ### Mempool and relay
 
@@ -292,7 +292,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getmininginfo`<br>`submitblock` | `getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps` | - |
+| `getmininginfo`<br>`submitblock`<br>`prioritisetransaction` | `getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps` | - |
 
 ### Fluxnode
 

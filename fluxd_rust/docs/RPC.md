@@ -156,7 +156,9 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `getnetworkhashps` (returns 0.0)
 - `getnetworksolps` (returns 0.0)
 - `getlocalsolps` (returns 0.0)
+- `prioritisetransaction <txid> <priority_delta> <fee_delta_sat>` (mining selection hint)
 - `estimatefee <nblocks>`
+- `estimatepriority <nblocks>` (returns -1.0; priority estimator not implemented)
 
 ### Fluxnode
 
@@ -754,6 +756,27 @@ within `nblocks` blocks.
 Notes:
 - This is currently based on a rolling sample of mempool-accepted transactions.
 - Samples are persisted to `fee_estimates.dat` in `--data-dir`.
+
+### estimatepriority
+
+Estimates the approximate priority a zero-fee transaction needs to begin confirmation within
+`nblocks` blocks.
+
+- Params: `nblocks` (numeric).
+- Result: numeric priority estimate.
+  - Currently returns `-1.0` (priority estimator not implemented).
+
+### prioritisetransaction
+
+Adds a fee/priority delta for an in-mempool transaction (or stores it for later if the tx is
+not yet in the mempool). This affects *mining selection only*; it does not change the fee that
+would actually be paid on-chain.
+
+- Params:
+  - `txid` (string)
+  - `priority_delta` (numeric)
+  - `fee_delta_sat` (numeric) - delta in zatoshis/satoshis (can be negative)
+- Result: `true`
 
 ### getconnectioncount
 

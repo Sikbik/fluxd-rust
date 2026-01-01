@@ -157,6 +157,8 @@ const RPC_METHODS: &[&str] = &[
     "getnetworksolps",
     "getlocalsolps",
     "estimatefee",
+    "estimatepriority",
+    "prioritisetransaction",
     "getconnectioncount",
     "getnettotals",
     "listbanned",
@@ -1136,6 +1138,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getnetworksolps" => rpc_getnetworksolps(params),
         "getlocalsolps" => rpc_getlocalsolps(params),
         "estimatefee" => rpc_estimatefee(params, fee_estimator),
+        "estimatepriority" => rpc_estimatepriority(params),
+        "prioritisetransaction" => rpc_prioritisetransaction(params, mempool),
         "getconnectioncount" => rpc_getconnectioncount(params, peer_registry, net_totals),
         "getnettotals" => rpc_getnettotals(params, net_totals),
         "getnetworkinfo" => rpc_getnetworkinfo(params, peer_registry, net_totals, mempool_policy),
@@ -6863,6 +6867,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     #[derive(Clone)]
     struct TemplateTx {
         fee: i64,
+        modified_fee: i64,
         size: usize,
         parents: Vec<Hash256>,
     }
@@ -6916,6 +6921,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                 entry.txid,
                 TemplateTx {
                     fee: entry.fee,
+                    modified_fee: entry.modified_fee(),
                     size: entry.size(),
                     parents: entry.parents.clone(),
                 },
@@ -6947,7 +6953,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
             if parent_count == 0 {
                 heap.push(FeeRateTx {
                     txid: *txid,
-                    fee: tx.fee,
+                    fee: tx.modified_fee,
                     size: tx.size,
                 });
             }
@@ -6987,7 +6993,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                         if let Some(child_tx) = templates.get(child) {
                             heap.push(FeeRateTx {
                                 txid: *child,
-                                fee: child_tx.fee,
+                                fee: child_tx.modified_fee,
                                 size: child_tx.size,
                             });
                         }
@@ -8819,6 +8825,46 @@ fn rpc_estimatefee(
     }
 }
 
+fn rpc_estimatepriority(params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "estimatepriority expects 1 parameter",
+        ));
+    }
+    let mut blocks = parse_u32(&params[0], "nblocks")?;
+    if blocks < 1 {
+        blocks = 1;
+    }
+    let _ = blocks;
+    Ok(Number::from_f64(-1.0)
+        .map(Value::Number)
+        .unwrap_or(Value::Number((-1).into())))
+}
+
+fn rpc_prioritisetransaction(
+    params: Vec<Value>,
+    mempool: &Mutex<Mempool>,
+) -> Result<Value, RpcError> {
+    if params.len() != 3 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "prioritisetransaction expects 3 parameters",
+        ));
+    }
+
+    let txid = parse_hash(&params[0])?;
+    let priority_delta = parse_f64(&params[1], "priority_delta")?;
+    let fee_delta = parse_i64(&params[2], "fee_delta")?;
+
+    mempool
+        .lock()
+        .map_err(|_| map_internal("mempool lock poisoned"))?
+        .prioritise_transaction(txid, priority_delta, fee_delta);
+
+    Ok(Value::Bool(true))
+}
+
 fn rpc_getnetworkinfo(
     params: Vec<Value>,
     peer_registry: &PeerRegistry,
@@ -10569,6 +10615,8 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: Vec::new(),
             parents: Vec::new(),
         };
@@ -10776,6 +10824,62 @@ mod tests {
         let fee_estimator = Mutex::new(FeeEstimator::new(128));
         let value = rpc_estimatefee(vec![json!(1)], &fee_estimator).expect("rpc");
         assert!(value.is_number());
+    }
+
+    #[test]
+    fn estimatepriority_returns_number() {
+        let value = rpc_estimatepriority(vec![json!(1)]).expect("rpc");
+        assert!(value.is_number());
+    }
+
+    #[test]
+    fn prioritisetransaction_applies_fee_delta_to_mempool_entries() {
+        let mut inner = Mempool::new(0);
+        let txid: Hash256 = [0x11u8; 32];
+        inner
+            .insert(MempoolEntry {
+                txid,
+                tx: Transaction {
+                    f_overwintered: false,
+                    version: 1,
+                    version_group_id: 0,
+                    vin: Vec::new(),
+                    vout: Vec::new(),
+                    lock_time: 0,
+                    expiry_height: 0,
+                    value_balance: 0,
+                    shielded_spends: Vec::new(),
+                    shielded_outputs: Vec::new(),
+                    join_splits: Vec::new(),
+                    join_split_pub_key: [0u8; 32],
+                    join_split_sig: [0u8; 64],
+                    binding_sig: [0u8; 64],
+                    fluxnode: None,
+                },
+                raw: vec![0u8; 10],
+                time: 0,
+                height: 0,
+                fee: 100,
+                fee_delta: 0,
+                priority_delta: 0.0,
+                spent_outpoints: Vec::new(),
+                parents: Vec::new(),
+            })
+            .expect("insert");
+        let mempool = Mutex::new(inner);
+
+        let txid_hex = hash256_to_hex(&txid);
+        let value =
+            rpc_prioritisetransaction(vec![json!(txid_hex), json!(1000.0), json!(200)], &mempool)
+                .expect("rpc");
+        assert_eq!(value, Value::Bool(true));
+
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("entry");
+        assert_eq!(entry.fee, 100);
+        assert_eq!(entry.fee_delta, 200);
+        assert_eq!(entry.modified_fee(), 300);
+        assert_eq!(entry.priority_delta, 1000.0);
     }
 
     #[test]
@@ -11119,6 +11223,8 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: Vec::new(),
             parents: Vec::new(),
         };
@@ -12302,6 +12408,8 @@ mod tests {
                 time: 0,
                 height: 0,
                 fee: 0,
+                fee_delta: 0,
+                priority_delta: 0.0,
                 spent_outpoints: vec![incoming_prevout],
                 parents: Vec::new(),
             })
@@ -12396,6 +12504,8 @@ mod tests {
                 time: 0,
                 height: 0,
                 fee: 0,
+                fee_delta: 0,
+                priority_delta: 0.0,
                 spent_outpoints: vec![OutPoint {
                     hash: incoming_txid,
                     index: 0,
@@ -12503,6 +12613,8 @@ mod tests {
                 time: 0,
                 height: 0,
                 fee: 0,
+                fee_delta: 0,
+                priority_delta: 0.0,
                 spent_outpoints: vec![incoming_prevout],
                 parents: Vec::new(),
             })
@@ -12645,6 +12757,8 @@ mod tests {
             time: 123,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: Vec::new(),
             parents: Vec::new(),
         };
@@ -12785,6 +12899,8 @@ mod tests {
             time: 200,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: Vec::new(),
             parents: Vec::new(),
         };
@@ -12900,6 +13016,8 @@ mod tests {
             time: 200,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: Vec::new(),
             parents: Vec::new(),
         };
@@ -13591,6 +13709,57 @@ fn parse_u32(value: &Value, label: &str) -> Result<u32, RpcError> {
                 .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "invalid number"))?;
             return Ok(parsed);
         }
+    }
+    Err(RpcError::new(
+        RPC_INVALID_PARAMETER,
+        format!("{label} must be numeric"),
+    ))
+}
+
+fn parse_i64(value: &Value, label: &str) -> Result<i64, RpcError> {
+    if let Some(num) = value.as_i64() {
+        return Ok(num);
+    }
+    if let Some(num) = value.as_u64() {
+        if num <= i64::MAX as u64 {
+            return Ok(num as i64);
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(RpcError::new(RPC_INVALID_PARAMETER, "invalid number"));
+        }
+        let parsed = text
+            .parse::<i64>()
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "invalid number"))?;
+        return Ok(parsed);
+    }
+    Err(RpcError::new(
+        RPC_INVALID_PARAMETER,
+        format!("{label} must be numeric"),
+    ))
+}
+
+fn parse_f64(value: &Value, label: &str) -> Result<f64, RpcError> {
+    if let Some(num) = value.as_f64() {
+        return Ok(num);
+    }
+    if let Some(num) = value.as_i64() {
+        return Ok(num as f64);
+    }
+    if let Some(num) = value.as_u64() {
+        return Ok(num as f64);
+    }
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(RpcError::new(RPC_INVALID_PARAMETER, "invalid number"));
+        }
+        let parsed = text
+            .parse::<f64>()
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "invalid number"))?;
+        return Ok(parsed);
     }
     Err(RpcError::new(
         RPC_INVALID_PARAMETER,

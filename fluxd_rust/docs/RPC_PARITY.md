@@ -69,7 +69,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - sendrawtransaction - Partial (supports spending mempool parents; orphan pool + full policy parity WIP)
 - createmultisig - Partial (hex pubkeys only; wallet address lookup not available)
 - estimatefee - Implemented
-- estimatepriority - Missing
+- estimatepriority - Stub (returns -1.0; priority estimator not implemented)
 - validateaddress - Implemented
 - verifymessage - Implemented
 
@@ -91,11 +91,11 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Node control
 
-- sendfrom - Missing
+- sendfrom - Implemented (fromaccount ignored; minconf supported)
 - submitblock - Partial (accepts blocks; return codes are simplified)
 - zcrawjoinsplit - Missing
 - zcrawreceive - Missing
-- prioritisetransaction - Missing
+- prioritisetransaction - Implemented (stores fee/priority deltas for mining selection)
 
 - reindex - Partial (requests shutdown + wipes `db/` + `blocks/` on next start; does not rebuild indexes from existing flatfiles)
 - stop - Implemented

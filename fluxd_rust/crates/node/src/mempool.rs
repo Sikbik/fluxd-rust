@@ -62,6 +62,8 @@ pub struct MempoolEntry {
     pub time: u64,
     pub height: i32,
     pub fee: i64,
+    pub fee_delta: i64,
+    pub priority_delta: f64,
     pub spent_outpoints: Vec<OutPoint>,
     pub parents: Vec<Hash256>,
 }
@@ -69,6 +71,10 @@ pub struct MempoolEntry {
 impl MempoolEntry {
     pub fn size(&self) -> usize {
         self.raw.len()
+    }
+
+    pub fn modified_fee(&self) -> i64 {
+        self.fee.saturating_add(self.fee_delta)
     }
 }
 
@@ -83,9 +89,16 @@ pub struct Mempool {
     entries: HashMap<Hash256, MempoolEntry>,
     spent: HashMap<OutPoint, Hash256>,
     children: HashMap<Hash256, Vec<Hash256>>,
+    prioritisations: HashMap<Hash256, Prioritisation>,
     total_bytes: usize,
     max_bytes: usize,
     revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Prioritisation {
+    pub priority_delta: f64,
+    pub fee_delta: i64,
 }
 
 impl Mempool {
@@ -94,6 +107,7 @@ impl Mempool {
             entries: HashMap::new(),
             spent: HashMap::new(),
             children: HashMap::new(),
+            prioritisations: HashMap::new(),
             total_bytes: 0,
             max_bytes,
             revision: 0,
@@ -165,7 +179,25 @@ impl Mempool {
         self.entries.values()
     }
 
+    pub fn prioritise_transaction(&mut self, txid: Hash256, priority_delta: f64, fee_delta: i64) {
+        let entry = self.prioritisations.entry(txid).or_default();
+        entry.priority_delta += priority_delta;
+        entry.fee_delta = entry.fee_delta.saturating_add(fee_delta);
+
+        if let Some(tx) = self.entries.get_mut(&txid) {
+            tx.priority_delta += priority_delta;
+            tx.fee_delta = tx.fee_delta.saturating_add(fee_delta);
+        }
+        self.revision = self.revision.saturating_add(1);
+    }
+
     pub fn insert(&mut self, entry: MempoolEntry) -> Result<MempoolInsertOutcome, MempoolError> {
+        let mut entry = entry;
+        if let Some(priority) = self.prioritisations.get(&entry.txid) {
+            entry.priority_delta += priority.priority_delta;
+            entry.fee_delta = entry.fee_delta.saturating_add(priority.fee_delta);
+        }
+
         let inserted_txid = entry.txid;
         let parents = entry.parents.clone();
         if self.max_bytes > 0 && entry.size() > self.max_bytes {
@@ -297,7 +329,7 @@ impl Mempool {
             .values()
             .map(|entry| EvictCandidate {
                 txid: entry.txid,
-                fee: entry.fee,
+                fee: entry.modified_fee(),
                 size: entry.size().max(1),
                 time: entry.time,
             })
@@ -588,6 +620,8 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
         time: now,
         height: best_height,
         fee,
+        fee_delta: 0,
+        priority_delta: 0.0,
         spent_outpoints,
         parents,
     })
@@ -1076,6 +1110,8 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: Vec::new(),
             parents: Vec::new(),
         };
@@ -1096,6 +1132,8 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: vec![parent_outpoint],
             parents: vec![parent_txid],
         };
@@ -1139,6 +1177,8 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: Vec::new(),
             parents: Vec::new(),
         };
@@ -1159,6 +1199,8 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
             spent_outpoints: vec![parent_outpoint],
             parents: vec![parent_txid],
         };
