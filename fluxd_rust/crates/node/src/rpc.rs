@@ -194,6 +194,130 @@ pub struct RpcAuth {
     pass: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct RpcAllowList {
+    rules: Vec<IpNet>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IpNet {
+    V4 { network: u32, mask: u32 },
+    V6 { network: u128, mask: u128 },
+}
+
+impl RpcAllowList {
+    pub fn from_allow_ips(allow_ips: &[String]) -> Result<Self, String> {
+        let mut rules = Vec::with_capacity(allow_ips.len().saturating_add(2));
+        rules.push(
+            IpNet::from_cidr(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), None)
+                .map_err(|_| "failed to build default RPC allowlist".to_string())?,
+        );
+        rules.push(
+            IpNet::from_cidr(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), None)
+                .map_err(|_| "failed to build default RPC allowlist".to_string())?,
+        );
+        for raw in allow_ips {
+            rules.push(IpNet::parse(raw)?);
+        }
+        Ok(Self { rules })
+    }
+
+    pub fn allows(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4() {
+                    if self.rules.iter().any(|rule| rule.contains(IpAddr::V4(v4))) {
+                        return true;
+                    }
+                }
+                self.rules.iter().any(|rule| rule.contains(IpAddr::V6(v6)))
+            }
+            other => self.rules.iter().any(|rule| rule.contains(other)),
+        }
+    }
+}
+
+impl IpNet {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("rpcallowip entry is empty".to_string());
+        }
+
+        let (ip_raw, prefix_raw) = match raw.split_once('/') {
+            Some((ip, prefix)) => (ip, Some(prefix)),
+            None => (raw, None),
+        };
+
+        let ip = ip_raw
+            .trim()
+            .parse::<IpAddr>()
+            .map_err(|_| format!("invalid rpcallowip '{raw}'"))?;
+        let prefix = match prefix_raw {
+            None => None,
+            Some(prefix) => {
+                let prefix = prefix.trim();
+                if prefix.is_empty() {
+                    return Err(format!("invalid rpcallowip '{raw}'"));
+                }
+                Some(
+                    prefix
+                        .parse::<u8>()
+                        .map_err(|_| format!("invalid rpcallowip '{raw}'"))?,
+                )
+            }
+        };
+        Self::from_cidr(ip, prefix).map_err(|_| format!("invalid rpcallowip '{raw}'"))
+    }
+
+    fn from_cidr(ip: IpAddr, prefix: Option<u8>) -> Result<Self, ()> {
+        match ip {
+            IpAddr::V4(ip) => {
+                let prefix = prefix.unwrap_or(32);
+                if prefix > 32 {
+                    return Err(());
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    (!0u32).checked_shl(u32::from(32 - prefix)).ok_or(())?
+                };
+                let ip_u32 = u32::from_be_bytes(ip.octets());
+                let network = ip_u32 & mask;
+                Ok(IpNet::V4 { network, mask })
+            }
+            IpAddr::V6(ip) => {
+                let prefix = prefix.unwrap_or(128);
+                if prefix > 128 {
+                    return Err(());
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    (!0u128).checked_shl(u32::from(128 - prefix)).ok_or(())?
+                };
+                let ip_u128 = u128::from_be_bytes(ip.octets());
+                let network = ip_u128 & mask;
+                Ok(IpNet::V6 { network, mask })
+            }
+        }
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (IpNet::V4 { network, mask }, IpAddr::V4(ip)) => {
+                let ip = u32::from_be_bytes(ip.octets());
+                (ip & mask) == *network
+            }
+            (IpNet::V6 { network, mask }, IpAddr::V6(ip)) => {
+                let ip = u128::from_be_bytes(ip.octets());
+                (ip & mask) == *network
+            }
+            _ => false,
+        }
+    }
+}
+
 pub fn load_or_create_auth(
     user: Option<String>,
     pass: Option<String>,
@@ -231,6 +355,7 @@ pub fn load_or_create_auth(
 pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     addr: SocketAddr,
     auth: RpcAuth,
+    allowlist: RpcAllowList,
     chainstate: Arc<ChainState<S>>,
     store: Arc<Store>,
     write_lock: Arc<Mutex<()>>,
@@ -257,11 +382,19 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     println!("RPC listening on http://{addr}");
 
     let auth = Arc::new(auth);
+    let allowlist = Arc::new(allowlist);
     loop {
-        let (stream, _) = listener
+        let (mut stream, peer_addr) = listener
             .accept()
             .await
             .map_err(|err| format!("rpc accept failed: {err}"))?;
+        if !allowlist.allows(peer_addr.ip()) {
+            let response = build_forbidden();
+            tokio::spawn(async move {
+                let _ = stream.write_all(&response).await;
+            });
+            continue;
+        }
         let auth = Arc::clone(&auth);
         let chainstate = Arc::clone(&chainstate);
         let store = Arc::clone(&store);
@@ -10094,6 +10227,33 @@ mod tests {
     }
 
     #[test]
+    fn rpc_allowlist_defaults_to_localhost_only() {
+        let list = RpcAllowList::from_allow_ips(&[]).expect("allowlist");
+        assert!(list.allows(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+        assert!(list.allows(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+        assert!(!list.allows(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn rpc_allowlist_parses_ipv4_cidr_ranges() {
+        let list = RpcAllowList::from_allow_ips(&["10.0.0.0/8".to_string()]).expect("allowlist");
+        assert!(list.allows(IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3))));
+        assert!(!list.allows(IpAddr::V4(std::net::Ipv4Addr::new(11, 0, 0, 1))));
+    }
+
+    #[test]
+    fn rpc_allowlist_parses_allow_all_ipv4() {
+        let list = RpcAllowList::from_allow_ips(&["0.0.0.0/0".to_string()]).expect("allowlist");
+        assert!(list.allows(IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))));
+    }
+
+    #[test]
+    fn rpc_allowlist_rejects_invalid_entries() {
+        let err = RpcAllowList::from_allow_ips(&["10.0.0.0/33".to_string()]).unwrap_err();
+        assert!(err.contains("invalid rpcallowip"));
+    }
+
+    #[test]
     fn getblockchaininfo_has_cpp_schema_keys() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let value =
@@ -14643,4 +14803,8 @@ fn build_unauthorized() -> Vec<u8> {
     response.push_str("Connection: close\r\n\r\n");
     response.push_str(body);
     response.into_bytes()
+}
+
+fn build_forbidden() -> Vec<u8> {
+    build_response("403 Forbidden", "text/plain", "forbidden")
 }

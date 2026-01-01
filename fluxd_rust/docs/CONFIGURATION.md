@@ -33,9 +33,14 @@ The daemon optionally reads a `flux.conf` config file.
 Currently supported keys:
 - `rpcuser`, `rpcpassword`
 - `rpcbind`, `rpcport`
+- `rpcallowip` (repeatable; IP or CIDR, e.g. `127.0.0.1`, `10.0.0.0/8`)
 - `addnode` (repeatable)
 - `mineraddress` (default coinbase/miner address for `getblocktemplate`)
 - `testnet=1` / `regtest=1` (network selection; CLI `--network ...` overrides)
+
+RPC allowlist notes:
+- By default, RPC only allows connections from `127.0.0.1` and `::1` (localhost).
+- Use `rpcallowip=...` (or CLI `--rpc-allow-ip ...`) to permit non-local RPC clients.
 
 Unsupported keys are ignored; `fluxd` prints a warning listing the ignored keys to help catch
 misconfigurations.

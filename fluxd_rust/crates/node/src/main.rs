@@ -214,6 +214,7 @@ struct Config {
     rpc_addr: Option<SocketAddr>,
     rpc_user: Option<String>,
     rpc_pass: Option<String>,
+    rpc_allow_ips: Vec<String>,
     getdata_batch: usize,
     block_peers: usize,
     header_peers: usize,
@@ -1050,7 +1051,16 @@ async fn run() -> Result<(), String> {
     let rpc_addr = config.rpc_addr.unwrap_or_else(|| default_rpc_addr(network));
     let rpc_auth =
         rpc::load_or_create_auth(config.rpc_user.clone(), config.rpc_pass.clone(), data_dir)?;
+    let rpc_allowlist =
+        rpc::RpcAllowList::from_allow_ips(&config.rpc_allow_ips).map_err(|err| err.to_string())?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    if !rpc_addr.ip().is_loopback() && config.rpc_allow_ips.is_empty() {
+        eprintln!(
+            "Warning: RPC is bound to {} but no rpcallowip is set; only localhost connections will be permitted",
+            rpc_addr
+        );
+    }
 
     if config.fetch_params {
         fetch_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
@@ -1119,6 +1129,7 @@ async fn run() -> Result<(), String> {
                 if let Err(err) = rpc::serve_rpc(
                     rpc_addr,
                     rpc_auth,
+                    rpc_allowlist,
                     chainstate,
                     store,
                     write_lock,
@@ -6181,6 +6192,7 @@ fn parse_args() -> Result<Config, String> {
     let mut rpc_user_set = false;
     let mut rpc_pass: Option<String> = None;
     let mut rpc_pass_set = false;
+    let mut rpc_allow_ips: Vec<String> = Vec::new();
     let mut network = Network::Mainnet;
     let mut network_set = false;
     let mut getdata_batch: usize = DEFAULT_GETDATA_BATCH;
@@ -6378,6 +6390,12 @@ fn parse_args() -> Result<Config, String> {
                     .ok_or_else(|| format!("missing value for --rpc-pass\n{}", usage()))?;
                 rpc_pass = Some(value);
                 rpc_pass_set = true;
+            }
+            "--rpc-allow-ip" | "--rpcallowip" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --rpc-allow-ip\n{}", usage()))?;
+                rpc_allow_ips.push(value);
             }
             "--network" => {
                 let value = args
@@ -6719,6 +6737,9 @@ fn parse_args() -> Result<Config, String> {
                 }
             }
         }
+        if let Some(values) = conf.get("rpcallowip") {
+            rpc_allow_ips.extend(values.iter().cloned());
+        }
 
         if !rpc_addr_set {
             let mut bind_socket: Option<SocketAddr> = None;
@@ -6778,6 +6799,7 @@ fn parse_args() -> Result<Config, String> {
         let supported_keys = [
             "addnode",
             "mineraddress",
+            "rpcallowip",
             "rpcbind",
             "rpcpassword",
             "rpcport",
@@ -6961,6 +6983,7 @@ fn parse_args() -> Result<Config, String> {
         rpc_addr,
         rpc_user,
         rpc_pass,
+        rpc_allow_ips,
         getdata_batch,
         block_peers,
         header_peers,
@@ -7222,7 +7245,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -7245,6 +7268,7 @@ fn usage() -> String {
         "  --rpc-addr  Bind JSON-RPC server (default: 127.0.0.1:16124 mainnet, 26124 testnet)",
         "  --rpc-user  JSON-RPC basic auth username (required unless cookie exists)",
         "  --rpc-pass  JSON-RPC basic auth password (required unless cookie exists)",
+        "  --rpc-allow-ip  Allow JSON-RPC requests from IP/CIDR (repeatable; default: localhost only)",
         "  --getdata-batch  Max blocks per getdata request (default: 128)",
         "  --block-peers  Number of parallel peers for block download (default: 3)",
         "  --header-peers  Number of peers to probe for header sync (default: 4)",
