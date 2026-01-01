@@ -140,6 +140,46 @@ const RPC_METHODS: &[&str] = &[
     "sendfrom",
     "sendtoaddress",
     "sendmany",
+    "zvalidateaddress",
+    "z_validateaddress",
+    "zcrawjoinsplit",
+    "zcrawreceive",
+    "zexportkey",
+    "z_exportkey",
+    "zexportviewingkey",
+    "z_exportviewingkey",
+    "zgetbalance",
+    "z_getbalance",
+    "zgetmigrationstatus",
+    "z_getmigrationstatus",
+    "zgetnewaddress",
+    "z_getnewaddress",
+    "zgetoperationresult",
+    "z_getoperationresult",
+    "zgetoperationstatus",
+    "z_getoperationstatus",
+    "zgettotalbalance",
+    "z_gettotalbalance",
+    "zimportkey",
+    "z_importkey",
+    "zimportviewingkey",
+    "z_importviewingkey",
+    "zimportwallet",
+    "z_importwallet",
+    "zlistaddresses",
+    "z_listaddresses",
+    "zlistoperationids",
+    "z_listoperationids",
+    "zlistreceivedbyaddress",
+    "z_listreceivedbyaddress",
+    "zlistunspent",
+    "z_listunspent",
+    "zsendmany",
+    "z_sendmany",
+    "zsetmigration",
+    "z_setmigration",
+    "zshieldcoinbase",
+    "z_shieldcoinbase",
     "getmempoolinfo",
     "getrawmempool",
     "gettxout",
@@ -1348,6 +1388,56 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         }
         "verifychain" => rpc_verifychain(chainstate, params),
         "validateaddress" => rpc_validateaddress(params, chain_params),
+        "zcrawjoinsplit" => rpc_shielded_not_implemented(params, "zcrawjoinsplit"),
+        "zcrawreceive" => rpc_shielded_not_implemented(params, "zcrawreceive"),
+        "zexportkey" | "z_exportkey" => rpc_shielded_wallet_not_implemented(params, "zexportkey"),
+        "zexportviewingkey" | "z_exportviewingkey" => {
+            rpc_shielded_wallet_not_implemented(params, "zexportviewingkey")
+        }
+        "zgetbalance" | "z_getbalance" => {
+            rpc_shielded_wallet_not_implemented(params, "zgetbalance")
+        }
+        "zgetmigrationstatus" | "z_getmigrationstatus" => {
+            rpc_shielded_wallet_not_implemented(params, "zgetmigrationstatus")
+        }
+        "zgetnewaddress" | "z_getnewaddress" => {
+            rpc_shielded_wallet_not_implemented(params, "zgetnewaddress")
+        }
+        "zgetoperationresult" | "z_getoperationresult" => {
+            rpc_shielded_wallet_not_implemented(params, "zgetoperationresult")
+        }
+        "zgetoperationstatus" | "z_getoperationstatus" => {
+            rpc_shielded_wallet_not_implemented(params, "zgetoperationstatus")
+        }
+        "zgettotalbalance" | "z_gettotalbalance" => {
+            rpc_shielded_wallet_not_implemented(params, "zgettotalbalance")
+        }
+        "zimportkey" | "z_importkey" => rpc_shielded_wallet_not_implemented(params, "zimportkey"),
+        "zimportviewingkey" | "z_importviewingkey" => {
+            rpc_shielded_wallet_not_implemented(params, "zimportviewingkey")
+        }
+        "zimportwallet" | "z_importwallet" => {
+            rpc_shielded_wallet_not_implemented(params, "zimportwallet")
+        }
+        "zlistaddresses" | "z_listaddresses" => {
+            rpc_shielded_wallet_not_implemented(params, "zlistaddresses")
+        }
+        "zlistoperationids" | "z_listoperationids" => {
+            rpc_shielded_wallet_not_implemented(params, "zlistoperationids")
+        }
+        "zlistreceivedbyaddress" | "z_listreceivedbyaddress" => {
+            rpc_shielded_wallet_not_implemented(params, "zlistreceivedbyaddress")
+        }
+        "zlistunspent" | "z_listunspent" => {
+            rpc_shielded_wallet_not_implemented(params, "zlistunspent")
+        }
+        "zsendmany" | "z_sendmany" => rpc_shielded_wallet_not_implemented(params, "zsendmany"),
+        "zsetmigration" | "z_setmigration" => {
+            rpc_shielded_wallet_not_implemented(params, "zsetmigration")
+        }
+        "zshieldcoinbase" | "z_shieldcoinbase" => {
+            rpc_shielded_wallet_not_implemented(params, "zshieldcoinbase")
+        }
         "zvalidateaddress" | "z_validateaddress" => {
             rpc_zvalidateaddress(wallet, params, chain_params)
         }
@@ -1365,6 +1455,26 @@ fn rpc_ping(params: Vec<Value>) -> Result<Value, RpcError> {
 fn rpc_start(params: Vec<Value>) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
     Ok(Value::String("fluxd already running".to_string()))
+}
+
+fn rpc_shielded_wallet_not_implemented(
+    _params: Vec<Value>,
+    method: &'static str,
+) -> Result<Value, RpcError> {
+    Err(RpcError::new(
+        RPC_WALLET_ERROR,
+        format!("{method} not implemented (shielded wallet WIP)"),
+    ))
+}
+
+fn rpc_shielded_not_implemented(
+    _params: Vec<Value>,
+    method: &'static str,
+) -> Result<Value, RpcError> {
+    Err(RpcError::new(
+        RPC_INTERNAL_ERROR,
+        format!("{method} not implemented"),
+    ))
 }
 
 fn rpc_stop(params: Vec<Value>, shutdown_tx: &watch::Sender<bool>) -> Result<Value, RpcError> {
@@ -13952,6 +14062,26 @@ mod tests {
     fn start_rejects_params() {
         let err = rpc_start(vec![json!(1)]).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn shielded_wallet_stubs_return_wallet_error() {
+        let err = rpc_shielded_wallet_not_implemented(Vec::new(), "zgetbalance").unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_ERROR);
+        assert!(err.message.contains("zgetbalance not implemented"));
+    }
+
+    #[test]
+    fn zcraw_stubs_return_internal_error() {
+        let err = rpc_shielded_not_implemented(Vec::new(), "zcrawjoinsplit").unwrap_err();
+        assert_eq!(err.code, RPC_INTERNAL_ERROR);
+        assert_eq!(err.message, "zcrawjoinsplit not implemented");
+    }
+
+    #[test]
+    fn help_accepts_zvalidateaddress_alias() {
+        let value = rpc_help(vec![json!("z_validateaddress")]).expect("rpc");
+        assert!(value.as_str().unwrap_or_default().contains("supported"));
     }
 
     #[test]

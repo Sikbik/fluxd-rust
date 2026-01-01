@@ -334,4 +334,4 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | `zvalidateaddress` (partial; `ismine` is always false) | `zgetbalance`<br>`zgettotalbalance`<br>`zgetnewaddress`<br>`zlistaddresses`<br>`zlistunspent`<br>`zsendmany`<br>`zshieldcoinbase`<br>`zexportkey`<br>`zexportviewingkey`<br>`zimportkey`<br>`zimportviewingkey`<br>`zimportwallet`<br>`zgetoperationstatus`<br>`zgetoperationresult`<br>`zlistoperationids`<br>`zgetmigrationstatus`<br>`zsetmigration`<br>`zcrawjoinsplit`<br>`zcrawreceive` |
+| - | `zvalidateaddress` (partial; `ismine` is always false)<br>`zgetbalance` (stub)<br>`zgettotalbalance` (stub)<br>`zgetnewaddress` (stub)<br>`zlistaddresses` (stub)<br>`zlistunspent` (stub)<br>`zsendmany` (stub)<br>`zshieldcoinbase` (stub)<br>`zexportkey` (stub)<br>`zexportviewingkey` (stub)<br>`zimportkey` (stub)<br>`zimportviewingkey` (stub)<br>`zimportwallet` (stub)<br>`zgetoperationstatus` (stub)<br>`zgetoperationresult` (stub)<br>`zlistoperationids` (stub)<br>`zgetmigrationstatus` (stub)<br>`zsetmigration` (stub)<br>`zcrawjoinsplit` (stub)<br>`zcrawreceive` (stub) | - |

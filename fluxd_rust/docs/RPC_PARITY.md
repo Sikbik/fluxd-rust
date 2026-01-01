@@ -93,8 +93,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - sendfrom - Implemented (fromaccount ignored; minconf supported)
 - submitblock - Partial (accepts blocks; return codes are simplified)
-- zcrawjoinsplit - Missing
-- zcrawreceive - Missing
+- zcrawjoinsplit - Stub (returns error; joinsplit tooling not implemented)
+- zcrawreceive - Stub (returns error; joinsplit tooling not implemented)
 - prioritisetransaction - Implemented (stores fee/priority deltas for mining selection)
 
 - reindex - Partial (requests shutdown + wipes `db/` + `blocks/` on next start; does not rebuild indexes from existing flatfiles)
@@ -145,24 +145,24 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Shielded
 
-- zexportkey - Missing
-- zexportviewingkey - Missing
-- zgetbalance - Missing
-- zgetmigrationstatus - Missing
-- zgetnewaddress - Missing
-- zgetoperationresult - Missing
-- zgetoperationstatus - Missing
-- zgettotalbalance - Missing
-- zimportkey - Missing
-- zimportviewingkey - Missing
-- zimportwallet - Missing
-- zlistaddresses - Missing
-- zlistoperationids - Missing
-- zlistreceivedbyaddress - Missing
-- zlistunspent - Missing
-- zsendmany - Missing
-- zsetmigration - Missing
-- zshieldcoinbase - Missing
+- zexportkey - Stub (returns wallet error; shielded wallet WIP)
+- zexportviewingkey - Stub (returns wallet error; shielded wallet WIP)
+- zgetbalance - Stub (returns wallet error; shielded wallet WIP)
+- zgetmigrationstatus - Stub (returns wallet error; shielded wallet WIP)
+- zgetnewaddress - Stub (returns wallet error; shielded wallet WIP)
+- zgetoperationresult - Stub (returns wallet error; shielded wallet WIP)
+- zgetoperationstatus - Stub (returns wallet error; shielded wallet WIP)
+- zgettotalbalance - Stub (returns wallet error; shielded wallet WIP)
+- zimportkey - Stub (returns wallet error; shielded wallet WIP)
+- zimportviewingkey - Stub (returns wallet error; shielded wallet WIP)
+- zimportwallet - Stub (returns wallet error; shielded wallet WIP)
+- zlistaddresses - Stub (returns wallet error; shielded wallet WIP)
+- zlistoperationids - Stub (returns wallet error; shielded wallet WIP)
+- zlistreceivedbyaddress - Stub (returns wallet error; shielded wallet WIP)
+- zlistunspent - Stub (returns wallet error; shielded wallet WIP)
+- zsendmany - Stub (returns wallet error; shielded wallet WIP)
+- zsetmigration - Stub (returns wallet error; shielded wallet WIP)
+- zshieldcoinbase - Stub (returns wallet error; shielded wallet WIP)
 
 ## Admin and benchmarking
 

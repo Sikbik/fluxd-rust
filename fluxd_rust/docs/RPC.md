@@ -148,6 +148,34 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `sendtoaddress <address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
 - `sendmany <fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]` (partial)
 
+### Wallet (shielded) (WIP)
+
+Shielded wallet RPCs are registered for parity, but currently return a wallet error (`-4`)
+because shielded wallet support is not implemented yet.
+
+- `zgetbalance` / `z_getbalance`
+- `zgettotalbalance` / `z_gettotalbalance`
+- `zgetnewaddress` / `z_getnewaddress`
+- `zlistaddresses` / `z_listaddresses`
+- `zlistunspent` / `z_listunspent`
+- `zsendmany` / `z_sendmany`
+- `zshieldcoinbase` / `z_shieldcoinbase`
+- `zexportkey` / `z_exportkey`
+- `zexportviewingkey` / `z_exportviewingkey`
+- `zimportkey` / `z_importkey`
+- `zimportviewingkey` / `z_importviewingkey`
+- `zimportwallet` / `z_importwallet`
+- `zgetoperationstatus` / `z_getoperationstatus`
+- `zgetoperationresult` / `z_getoperationresult`
+- `zlistoperationids` / `z_listoperationids`
+- `zgetmigrationstatus` / `z_getmigrationstatus`
+- `zsetmigration` / `z_setmigration`
+- `zlistreceivedbyaddress` / `z_listreceivedbyaddress`
+
+Joinsplit helper RPCs are also stubbed:
+- `zcrawjoinsplit` (returns error)
+- `zcrawreceive` (returns error)
+
 ### Mining and mempool
 
 - `getmempoolinfo`
