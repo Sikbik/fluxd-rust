@@ -189,11 +189,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag
     - [x] `fee` output for `send` entries (via `gettransaction`)
-    - [x] `vout` output (best-effort; derived from `gettransaction.details[0]`)
+    - [x] `vout` output (best-effort; derived from first `gettransaction.details[]` entry matching the row category)
     - [x] `size` output (derived from `gettransaction.hex`)
   - [x] `listsinceblock` (partial)
     - [x] `fee` output for `send` entries (via `gettransaction`)
-    - [x] `vout` output (best-effort; derived from `gettransaction.details[0]`)
+    - [x] `vout` output (best-effort; derived from first `gettransaction.details[]` entry matching the row category)
     - [x] `size` output (derived from `gettransaction.hex`)
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`

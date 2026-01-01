@@ -363,7 +363,7 @@ Notes:
 Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
 - `fee` / `fee_zat` is included for `send` entries when available.
-- `vout` is included (taken from the first wallet-relevant output in the transaction).
+- `vout` is included (best-effort; derived from the first `details[]` entry matching the row category).
 - `size` is included (transaction size in bytes).
 
 ### listsinceblock
@@ -375,7 +375,7 @@ Notes:
 - If `blockhash` is omitted (or unknown), returns all wallet transactions.
 - `lastblock` is the best block at depth `target_confirmations` (1 = chain tip).
 - `fee` / `fee_zat` is included for `send` entries when available.
-- `vout` is included (taken from the first wallet-relevant output in the transaction).
+- `vout` is included (best-effort; derived from the first `details[]` entry matching the row category).
 - `size` is included (transaction size in bytes).
 
 ### addmultisigaddress

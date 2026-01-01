@@ -3017,8 +3017,12 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         let first_detail = obj
             .get("details")
             .and_then(Value::as_array)
-            .and_then(|rows| rows.first())
-            .and_then(Value::as_object);
+            .and_then(|rows| {
+                rows.iter()
+                    .filter_map(Value::as_object)
+                    .find(|row| row.get("category").and_then(Value::as_str) == Some(category))
+                    .or_else(|| rows.first().and_then(Value::as_object))
+            });
 
         let address = first_detail
             .and_then(|row| row.get("address"))
@@ -3287,8 +3291,12 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
         let first_detail = obj
             .get("details")
             .and_then(Value::as_array)
-            .and_then(|rows| rows.first())
-            .and_then(Value::as_object);
+            .and_then(|rows| {
+                rows.iter()
+                    .filter_map(Value::as_object)
+                    .find(|row| row.get("category").and_then(Value::as_str) == Some(category))
+                    .or_else(|| rows.first().and_then(Value::as_object))
+            });
 
         let address = first_detail
             .and_then(|row| row.get("address"))
