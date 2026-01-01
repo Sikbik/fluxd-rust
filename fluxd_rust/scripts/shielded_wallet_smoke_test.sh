@@ -231,6 +231,9 @@ rpc_get "zgettotalbalance" | python3 -c 'import json,sys; obj=json.load(sys.stdi
 echo "Checking zlistunspent returns empty list ..."
 rpc_get "zlistunspent" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
 
+echo "Checking zlistreceivedbyaddress returns empty list ..."
+rpc_get "zlistreceivedbyaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
+
 echo "Checking zexportkey returns a Sapling spending key (no output) ..."
 zkey1="$(rpc_get "zexportkey?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
 if [[ -z "$zkey1" || "$zkey1" == "null" ]]; then
@@ -309,6 +312,12 @@ rpc_get "zgetbalance?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=jso
 
 echo "Checking zgetbalance succeeds with includeWatchonly=true on watch-only wallet ..."
 rpc_get "zgetbalance?zaddr=${zaddr1_enc}&minconf=1&includeWatchonly=true" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result"); assert isinstance(res,(int,float)), res; assert abs(float(res) - 0.0) < 1e-12, res'
+
+echo "Checking zlistreceivedbyaddress errors without includeWatchonly on watch-only wallet ..."
+rpc_get "zlistreceivedbyaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
+
+echo "Checking zlistreceivedbyaddress succeeds with includeWatchonly=true on watch-only wallet ..."
+rpc_get "zlistreceivedbyaddress?zaddr=${zaddr1_enc}&minconf=1&includeWatchonly=true" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
 
 echo "Importing zkey into a fresh wallet (no output) ..."
 stop_node

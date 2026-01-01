@@ -153,8 +153,8 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 Shielded wallet RPCs are registered for parity. The initial Sapling wallet surface is implemented:
 `zgetnewaddress`, `zlistaddresses` (supports watch-only via `includeWatchonly=true`), `zexportkey`, `zexportviewingkey`,
 `zimportkey`, `zimportviewingkey`, `zimportwallet`, and Sapling ownership detection in `zvalidateaddress`.
-Sapling shielded note tracking is implemented for read-only balance queries via incremental (on-demand) scanning:
-`zgetbalance`, `zgettotalbalance`, and `zlistunspent`. The wallet persists a Sapling scan cursor in `wallet.dat` and
+Sapling shielded note tracking is implemented for read-only wallet queries via incremental (on-demand) scanning:
+`zgetbalance`, `zgettotalbalance`, `zlistunspent`, and `zlistreceivedbyaddress`. The wallet persists a Sapling scan cursor in `wallet.dat` and
 advances it during these RPCs; imports reset the scan cursor so historical notes can be discovered (which may require
 a full rescan and can be slow on large chains).
 

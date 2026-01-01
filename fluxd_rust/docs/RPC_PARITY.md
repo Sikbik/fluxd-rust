@@ -158,7 +158,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zimportwallet - Partial (imports Sapling spending keys and WIFs from file; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
 - zlistaddresses - Partial (Sapling only; `includeWatchonly=true` includes watch-only addresses)
 - zlistoperationids - Stub (returns wallet error; shielded wallet WIP)
-- zlistreceivedbyaddress - Stub (returns wallet error; shielded wallet WIP)
+- zlistreceivedbyaddress - Partial (Sapling only; lists received Sapling notes for a zaddr; supports watch-only via includeWatchonly; memo is placeholder)
 - zlistunspent - Partial (Sapling only; lists unspent Sapling notes; supports watch-only via includeWatchonly)
 - zsendmany - Stub (returns wallet error; shielded wallet WIP)
 - zsetmigration - Stub (returns wallet error; shielded wallet WIP)

@@ -1420,7 +1420,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             rpc_shielded_wallet_not_implemented(params, "zlistoperationids")
         }
         "zlistreceivedbyaddress" | "z_listreceivedbyaddress" => {
-            rpc_shielded_wallet_not_implemented(params, "zlistreceivedbyaddress")
+            rpc_zlistreceivedbyaddress(chainstate, wallet, params, chain_params)
         }
         "zlistunspent" | "z_listunspent" => {
             rpc_zlistunspent(chainstate, wallet, params, chain_params)
@@ -4987,6 +4987,148 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
             "spendable": row.spendable,
         }));
     }
+
+    Ok(Value::Array(out))
+}
+
+fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 3 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zlistreceivedbyaddress expects 1 to 3 parameters",
+        ));
+    }
+
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zaddr must be a string"))?;
+    let minconf = match params.get(1) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
+        _ => 1,
+    };
+    let include_watchonly = match params.get(2) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Null) | None => false,
+        Some(_) => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "includeWatchonly must be a boolean",
+            ));
+        }
+    };
+
+    let addr_bytes = parse_sapling_zaddr_bytes(address, chain_params)?;
+
+    #[derive(Clone)]
+    struct NoteRow {
+        txid: Hash256,
+        out_index: u32,
+        note: crate::wallet::SaplingNoteRecord,
+        spendable: bool,
+    }
+
+    let notes: Vec<NoteRow> = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard
+            .sync_sapling_notes(chainstate)
+            .map_err(map_wallet_error)?;
+
+        let spendable = guard
+            .sapling_extsk_for_address(&addr_bytes)
+            .map_err(map_wallet_error)?
+            .is_some();
+        if !spendable {
+            let has_viewing_key = guard
+                .sapling_extfvk_for_address(&addr_bytes)
+                .map_err(map_wallet_error)?
+                .is_some();
+            if !has_viewing_key {
+                return Err(RpcError::new(
+                    RPC_WALLET_ERROR,
+                    "Wallet does not hold private key or viewing key for this zaddr",
+                ));
+            }
+            if !include_watchonly {
+                return Err(RpcError::new(
+                    RPC_WALLET_ERROR,
+                    "Wallet does not hold private key for this zaddr",
+                ));
+            }
+        }
+
+        guard
+            .sapling_note_map()
+            .iter()
+            .filter_map(|(&(txid, out_index), note)| {
+                if note.address != addr_bytes {
+                    return None;
+                }
+                Some(NoteRow {
+                    txid,
+                    out_index,
+                    note: note.clone(),
+                    spendable,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let best_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    for row in notes {
+        let confirmations = best_height
+            .saturating_sub(row.note.height)
+            .saturating_add(1);
+        if confirmations < minconf {
+            continue;
+        }
+
+        let spent = chainstate
+            .sapling_nullifier_spent(&row.note.nullifier)
+            .map_err(map_internal)?;
+
+        out.push(json!({
+            "txid": hash256_to_hex(&row.txid),
+            "amount": amount_to_value(row.note.value),
+            "amountZat": row.note.value,
+            "memo": "",
+            "confirmations": confirmations,
+            "outindex": row.out_index,
+            "blockheight": row.note.height,
+            "spent": spent,
+            "spendable": row.spendable,
+            "change": false,
+        }));
+    }
+
+    out.sort_by(|a, b| {
+        let a_height = a.get("blockheight").and_then(Value::as_i64).unwrap_or(0);
+        let b_height = b.get("blockheight").and_then(Value::as_i64).unwrap_or(0);
+        b_height
+            .cmp(&a_height)
+            .then_with(|| {
+                let a_txid = a.get("txid").and_then(Value::as_str).unwrap_or("");
+                let b_txid = b.get("txid").and_then(Value::as_str).unwrap_or("");
+                a_txid.cmp(b_txid)
+            })
+            .then_with(|| {
+                let a_out = a.get("outindex").and_then(Value::as_u64).unwrap_or(0);
+                let b_out = b.get("outindex").and_then(Value::as_u64).unwrap_or(0);
+                a_out.cmp(&b_out)
+            })
+    });
 
     Ok(Value::Array(out))
 }
@@ -13437,6 +13579,20 @@ mod tests {
             Some(shield_txid_hex.as_str())
         );
         assert_eq!(entry.get("amountZat").and_then(Value::as_i64), Some(value));
+
+        let received =
+            rpc_zlistreceivedbyaddress(&chainstate, &wallet, vec![json!(zaddr)], &params)
+                .expect("rpc");
+        let list = received.as_array().expect("array");
+        assert_eq!(list.len(), 1);
+        let entry = list[0].as_object().expect("object");
+        assert_eq!(
+            entry.get("txid").and_then(Value::as_str),
+            Some(shield_txid_hex.as_str())
+        );
+        assert_eq!(entry.get("outindex").and_then(Value::as_u64), Some(0));
+        assert_eq!(entry.get("amountZat").and_then(Value::as_i64), Some(value));
+        assert_eq!(entry.get("spent").and_then(Value::as_bool), Some(false));
     }
 
     #[test]
