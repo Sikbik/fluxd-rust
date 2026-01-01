@@ -120,7 +120,7 @@ Type notes:
 - `gettxout <txid> <vout> [include_mempool]`
 - `gettxoutsetinfo`
 - `validateaddress <fluxaddress>`
-- `zvalidateaddress <zaddr>` (partial; validates Sprout/Sapling encoding; does not check ownership)
+- `zvalidateaddress <zaddr>` (partial; validates Sprout/Sapling encoding; reports Sapling wallet ownership)
 - `verifymessage <fluxaddress> <signature> <message>`
 
 ### Wallet (transparent)
@@ -177,7 +177,7 @@ still be spent out of the pool (z→t) and moved within the pool (z→z).
 - `zlistoperationids` / `z_listoperationids`
 - `zgetmigrationstatus` / `z_getmigrationstatus`
 - `zsetmigration` / `z_setmigration`
-- `zvalidateaddress` / `z_validateaddress` (Sapling `ismine` only)
+- `zvalidateaddress` / `z_validateaddress` (Sapling `ismine` and `iswatchonly`)
 - `zlistreceivedbyaddress` / `z_listreceivedbyaddress`
 
 Joinsplit helper RPCs are also stubbed:
@@ -571,12 +571,12 @@ Notes:
 - Params: `zaddr` (string)
 - Result:
   - If invalid: `{ "isvalid": false }`
-  - If valid Sprout: `{ "isvalid": true, "address": "...", "type": "sprout", "ismine": false, "payingkey": "<hex>", "transmissionkey": "<hex>" }`
-  - If valid Sapling: `{ "isvalid": true, "address": "...", "type": "sapling", "ismine": false, "diversifier": "<hex>", "diversifiedtransmissionkey": "<hex>" }`
+  - If valid Sprout: `{ "isvalid": true, "address": "...", "type": "sprout", "ismine": false, "iswatchonly": false, "payingkey": "<hex>", "transmissionkey": "<hex>" }`
+  - If valid Sapling: `{ "isvalid": true, "address": "...", "type": "sapling", "ismine": <bool>, "iswatchonly": <bool>, "diversifier": "<hex>", "diversifiedtransmissionkey": "<hex>" }`
 
 Notes:
 - Uses Flux network HRPs (mainnet `za`, testnet `ztestacadia`, regtest `zregtestsapling`).
-- `ismine` is always false until shielded wallet support exists.
+- For Sapling addresses, `ismine=true` when the wallet has a spending key for the address, and `iswatchonly=true` when the wallet has an imported viewing key (watch-only) for the address.
 
 ### createmultisig
 

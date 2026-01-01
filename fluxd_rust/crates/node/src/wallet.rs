@@ -560,6 +560,30 @@ impl Wallet {
         Ok(false)
     }
 
+    pub fn sapling_address_is_watchonly(&self, bytes: &[u8; 43]) -> Result<bool, WalletError> {
+        if self.sapling_extsk_for_address(bytes)?.is_some() {
+            return Ok(false);
+        }
+
+        let Some(addr) = PaymentAddress::from_bytes(bytes) else {
+            return Ok(false);
+        };
+
+        for entry in &self.sapling_viewing_keys {
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let dfvk = extfvk.to_diversifiable_full_viewing_key();
+            if dfvk.decrypt_diversifier(&addr).is_some() {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     pub fn refill_keypool(&mut self, newsize: usize) -> Result<(), WalletError> {
         if self.keypool.len() >= newsize {
             return Ok(());

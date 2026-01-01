@@ -4149,6 +4149,7 @@ fn rpc_zvalidateaddress(
             "address": address,
             "type": "sprout",
             "ismine": false,
+            "iswatchonly": false,
             "payingkey": hex_bytes(&payingkey),
             "transmissionkey": hex_bytes(&transmissionkey),
         }));
@@ -4157,21 +4158,31 @@ fn rpc_zvalidateaddress(
     if let Some((diversifier, diversified_transmission_key)) =
         decode_sapling_payment_address(address, chain_params.network)
     {
-        let ismine = wallet
+        let addr_bytes = {
+            let mut bytes = [0u8; 43];
+            bytes[..11].copy_from_slice(&diversifier);
+            bytes[11..].copy_from_slice(&diversified_transmission_key);
+            bytes
+        };
+        let wallet_guard = wallet
             .lock()
-            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-            .sapling_address_is_mine(&{
-                let mut bytes = [0u8; 43];
-                bytes[..11].copy_from_slice(&diversifier);
-                bytes[11..].copy_from_slice(&diversified_transmission_key);
-                bytes
-            })
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let ismine = wallet_guard
+            .sapling_address_is_mine(&addr_bytes)
             .unwrap_or(false);
+        let iswatchonly = if ismine {
+            false
+        } else {
+            wallet_guard
+                .sapling_address_is_watchonly(&addr_bytes)
+                .unwrap_or(false)
+        };
         return Ok(json!({
             "isvalid": true,
             "address": address,
             "type": "sapling",
             "ismine": ismine,
+            "iswatchonly": iswatchonly,
             "diversifier": hex_bytes(&diversifier),
             "diversifiedtransmissionkey": hex_bytes(&diversified_transmission_key),
         }));
@@ -12122,6 +12133,7 @@ mod tests {
         );
         assert_eq!(obj.get("type").and_then(Value::as_str), Some("sprout"));
         assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(false));
         let expected_payingkey = hex_bytes(&sprout_payingkey);
         assert_eq!(
             obj.get("payingkey").and_then(Value::as_str),
@@ -12152,6 +12164,7 @@ mod tests {
         );
         assert_eq!(obj.get("type").and_then(Value::as_str), Some("sapling"));
         assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(false));
         let expected_diversifier = hex_bytes(&sapling_diversifier);
         assert_eq!(
             obj.get("diversifier").and_then(Value::as_str),
@@ -12203,6 +12216,30 @@ mod tests {
         assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
         assert_eq!(obj.get("type").and_then(Value::as_str), Some("sapling"));
         assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn zvalidateaddress_sets_iswatchonly_for_imported_viewing_key() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = addr.as_str().expect("string").to_string();
+        let vkey = rpc_zexportviewingkey(&wallet, vec![json!(addr.clone())], &params).expect("rpc");
+        let vkey = vkey.as_str().expect("string").to_string();
+
+        let data_dir2 = temp_data_dir("fluxd-zvalidateaddress-watchonly-test");
+        let wallet2 =
+            Mutex::new(Wallet::load_or_create(&data_dir2, params.network).expect("wallet"));
+        rpc_zimportviewingkey(&wallet2, vec![json!(vkey)], &params).expect("rpc");
+
+        let value = rpc_zvalidateaddress(&wallet2, vec![json!(addr)], &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("type").and_then(Value::as_str), Some("sapling"));
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(true));
     }
 
     #[test]

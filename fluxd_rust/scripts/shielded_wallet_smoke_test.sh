@@ -220,7 +220,7 @@ fi
 
 echo "Checking zvalidateaddress (ismine) ..."
 zaddr1_enc="$(url_encode "$zaddr1")"
-rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("address")==addr, res; assert res.get("ismine") is True, res' "$zaddr1"
+rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("address")==addr, res; assert res.get("ismine") is True, res; assert res.get("iswatchonly") is False, res' "$zaddr1"
 
 echo "Checking zexportkey returns a Sapling spending key (no output) ..."
 zkey1="$(rpc_get "zexportkey?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
@@ -253,7 +253,7 @@ sleep 0.2
 start_node
 
 echo "Re-checking zvalidateaddress (ismine persists) ..."
-rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("address")==addr, res; assert res.get("ismine") is True, res' "$zaddr1"
+rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("address")==addr, res; assert res.get("ismine") is True, res; assert res.get("iswatchonly") is False, res' "$zaddr1"
 
 echo "Checking zgetnewaddress returns a new address ..."
 zaddr2="$(rpc_get "zgetnewaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
@@ -293,7 +293,7 @@ echo "Checking zlistaddresses(includeWatchonly=true) includes zaddr1 ..."
 rpc_get "zlistaddresses?params=[true]" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert addr in res, res' "$zaddr1"
 
 echo "Checking zvalidateaddress ismine=false for watch-only wallet ..."
-rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("ismine") is False, res'
+rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("ismine") is False, res; assert res.get("iswatchonly") is True, res'
 
 echo "Importing zkey into a fresh wallet (no output) ..."
 stop_node
