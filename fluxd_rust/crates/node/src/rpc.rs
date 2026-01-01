@@ -3064,6 +3064,14 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
             row.insert("timereceived".to_string(), value.clone());
         }
         row.insert("amount_zat".to_string(), Value::Number(amount_zat.into()));
+        if category == "send" {
+            if let Some(value) = obj.get("fee") {
+                row.insert("fee".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("fee_zat") {
+                row.insert("fee_zat".to_string(), value.clone());
+            }
+        }
 
         out.push(Value::Object(row));
     }
@@ -3314,6 +3322,14 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
             row.insert("timereceived".to_string(), value.clone());
         }
         row.insert("amount_zat".to_string(), Value::Number(amount_zat.into()));
+        if category == "send" {
+            if let Some(value) = obj.get("fee") {
+                row.insert("fee".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("fee_zat") {
+                row.insert("fee_zat".to_string(), value.clone());
+            }
+        }
 
         transactions.push(Value::Object(row));
     }
@@ -15046,6 +15062,94 @@ mod tests {
         );
         assert_eq!(row2.get("confirmations").and_then(Value::as_i64), Some(0));
         assert_eq!(row2.get("amount_zat").and_then(Value::as_i64), Some(COIN));
+    }
+
+    #[test]
+    fn listtransactions_includes_fee_for_send_tx() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let wallet_script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let prevout = OutPoint {
+            hash: [0x55u8; 32],
+            index: 0,
+        };
+        let input_value = 10_000i64;
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: input_value,
+            script_pubkey: wallet_script_pubkey.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&prevout);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let sent_value = 9_000i64;
+        let change_value = 900i64;
+        let other_script = p2pkh_script([0x66u8; 20]);
+        let spend_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![
+                TxOut {
+                    value: sent_value,
+                    script_pubkey: other_script,
+                },
+                TxOut {
+                    value: change_value,
+                    script_pubkey: wallet_script_pubkey,
+                },
+            ],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let txid = spend_tx.txid().expect("txid");
+        let raw = spend_tx.consensus_encode().expect("encode tx");
+
+        let entry = MempoolEntry {
+            txid,
+            tx: spend_tx,
+            raw,
+            time: 123,
+            height: 0,
+            fee: 100,
+            fee_delta: 0,
+            priority_delta: 0.0,
+            spent_outpoints: vec![prevout],
+            parents: Vec::new(),
+        };
+        let mut inner = Mempool::new(0);
+        inner.insert(entry).expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let value =
+            rpc_listtransactions(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("object");
+        assert_eq!(row.get("fee_zat").and_then(Value::as_i64), Some(-100));
     }
 
     #[test]
