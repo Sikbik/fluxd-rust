@@ -644,6 +644,7 @@ dependencies = [
  "fluxd-shielded",
  "fluxd-storage",
  "fs2",
+ "jubjub",
  "primitive-types",
  "rand",
  "sapling-crypto",

@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fluxd_chainstate::state::ChainState;
 use rand::RngCore;
 use sapling_crypto::keys::{NullifierDerivingKey, PreparedIncomingViewingKey};
-use sapling_crypto::note::ExtractedNoteCommitment;
+use sapling_crypto::note::{ExtractedNoteCommitment, Rseed};
 use sapling_crypto::note_encryption::{
     try_sapling_note_decryption, SaplingDomain, Zip212Enforcement,
 };
@@ -36,7 +36,7 @@ use fluxd_storage::KeyValueStore;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 9;
+pub const WALLET_FILE_VERSION: u32 = 10;
 
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
 
@@ -58,6 +58,30 @@ struct SaplingViewingKeyEntry {
     next_diversifier_index: [u8; 11],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SaplingRseedBytes {
+    BeforeZip212([u8; 32]),
+    AfterZip212([u8; 32]),
+}
+
+impl SaplingRseedBytes {
+    pub(crate) fn from_rseed(rseed: &Rseed) -> Self {
+        match *rseed {
+            Rseed::BeforeZip212(rcm) => SaplingRseedBytes::BeforeZip212(rcm.to_bytes()),
+            Rseed::AfterZip212(bytes) => SaplingRseedBytes::AfterZip212(bytes),
+        }
+    }
+
+    pub(crate) fn to_rseed(self) -> Option<Rseed> {
+        match self {
+            SaplingRseedBytes::BeforeZip212(bytes) => {
+                Option::from(jubjub::Fr::from_bytes(&bytes)).map(Rseed::BeforeZip212)
+            }
+            SaplingRseedBytes::AfterZip212(bytes) => Some(Rseed::AfterZip212(bytes)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SaplingNoteRecord {
     pub(crate) address: [u8; 43],
@@ -65,6 +89,7 @@ pub(crate) struct SaplingNoteRecord {
     pub(crate) height: i32,
     pub(crate) position: u64,
     pub(crate) nullifier: [u8; 32],
+    pub(crate) rseed: Option<SaplingRseedBytes>,
 }
 
 pub(crate) type SaplingNoteKey = (Hash256, u32);
@@ -399,6 +424,31 @@ impl Wallet {
 
     pub(crate) fn sapling_tree(&self) -> &SaplingCommitmentTree {
         &self.sapling_tree
+    }
+
+    pub(crate) fn backfill_sapling_note_rseed(
+        &mut self,
+        key: SaplingNoteKey,
+        rseed: SaplingRseedBytes,
+    ) -> Result<bool, WalletError> {
+        let Some(note) = self.sapling_notes.get(&key) else {
+            return Ok(false);
+        };
+        if note.rseed.is_some() {
+            return Ok(false);
+        }
+
+        if let Some(note) = self.sapling_notes.get_mut(&key) {
+            note.rseed = Some(rseed);
+        }
+        if let Err(err) = self.save() {
+            if let Some(note) = self.sapling_notes.get_mut(&key) {
+                note.rseed = None;
+            }
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(true)
     }
 
     pub fn reset_sapling_scan(&mut self) -> Result<(), WalletError> {
@@ -1217,6 +1267,20 @@ impl Wallet {
                 let value = decoder.read_i64_le()?;
                 let address = decoder.read_fixed::<43>()?;
                 let nullifier = decoder.read_fixed::<32>()?;
+                let rseed = if version >= 10 {
+                    match decoder.read_u8()? {
+                        0 => None,
+                        1 => Some(SaplingRseedBytes::BeforeZip212(decoder.read_fixed::<32>()?)),
+                        2 => Some(SaplingRseedBytes::AfterZip212(decoder.read_fixed::<32>()?)),
+                        _ => {
+                            return Err(WalletError::InvalidData(
+                                "invalid sapling note rseed encoding",
+                            ))
+                        }
+                    }
+                } else {
+                    None
+                };
                 sapling_notes.insert(
                     (txid, out_index),
                     SaplingNoteRecord {
@@ -1225,6 +1289,7 @@ impl Wallet {
                         height,
                         position,
                         nullifier,
+                        rseed,
                     },
                 );
             }
@@ -1336,6 +1401,17 @@ impl Wallet {
             encoder.write_i64_le(note.value);
             encoder.write_bytes(&note.address);
             encoder.write_bytes(&note.nullifier);
+            match note.rseed {
+                None => encoder.write_u8(0),
+                Some(SaplingRseedBytes::BeforeZip212(bytes)) => {
+                    encoder.write_u8(1);
+                    encoder.write_bytes(&bytes);
+                }
+                Some(SaplingRseedBytes::AfterZip212(bytes)) => {
+                    encoder.write_u8(2);
+                    encoder.write_bytes(&bytes);
+                }
+            }
         }
         let mut sapling_tree_bytes = Vec::new();
         write_commitment_tree(&self.sapling_tree, &mut sapling_tree_bytes)
@@ -1435,6 +1511,7 @@ fn scan_sapling_output(
             height,
             position,
             nullifier,
+            rseed: Some(SaplingRseedBytes::from_rseed(note.rseed())),
         });
     }
     None

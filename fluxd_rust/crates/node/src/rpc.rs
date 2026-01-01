@@ -1533,12 +1533,16 @@ fn rpc_zlistoperationids(params: Vec<Value>) -> Result<Value, RpcError> {
                 let status = value.as_str().ok_or_else(|| {
                     RpcError::new(RPC_INVALID_PARAMETER, "status must be a string")
                 })?;
-                if status == "cancelled" {
-                    return Ok(Value::Array(Vec::new()));
+                if status == "all" {
+                    None
+                } else {
+                    if status == "cancelled" {
+                        return Ok(Value::Array(Vec::new()));
+                    }
+                    Some(AsyncOpState::parse_filter(status).ok_or_else(|| {
+                        RpcError::new(RPC_INVALID_PARAMETER, "invalid operation status")
+                    })?)
                 }
-                Some(AsyncOpState::parse_filter(status).ok_or_else(|| {
-                    RpcError::new(RPC_INVALID_PARAMETER, "invalid operation status")
-                })?)
             }
         };
 
@@ -5413,22 +5417,50 @@ fn rpc_zsendmany<S: fluxd_storage::KeyValueStore + 'static>(
             let mut builder = ZcashTxBuilder::new(params, target_height, build_config);
 
             for candidate in &selected {
-                let output = read_sapling_output_by_key(
-                    chainstate.as_ref(),
-                    &candidate.key.0,
-                    candidate.key.1,
-                )?;
-                let output_ref = SaplingOutputRef { output: &output };
-                let (note, recipient, _memo) =
-                    try_sapling_note_decryption(&ivk, &output_ref, Zip212Enforcement::GracePeriod)
-                        .ok_or_else(|| {
-                            RpcError::new(RPC_WALLET_ERROR, "failed to decrypt sapling note")
-                        })?;
-                if recipient.to_bytes() != candidate.note.address {
-                    return Err(RpcError::new(
-                        RPC_WALLET_ERROR,
-                        "sapling note recipient mismatch",
-                    ));
+                let cached_note = candidate
+                    .note
+                    .rseed
+                    .and_then(|rseed| rseed.to_rseed())
+                    .and_then(|rseed| {
+                        let recipient = PaymentAddress::from_bytes(&candidate.note.address)?;
+                        let value_u64 = u64::try_from(candidate.note.value).ok()?;
+                        let note_value = sapling_crypto::value::NoteValue::from_raw(value_u64);
+                        Some(recipient.create_note(note_value, rseed))
+                    });
+
+                let (note, rseed_backfill) = if let Some(note) = cached_note {
+                    (note, None)
+                } else {
+                    let output = read_sapling_output_by_key(
+                        chainstate.as_ref(),
+                        &candidate.key.0,
+                        candidate.key.1,
+                    )?;
+                    let output_ref = SaplingOutputRef { output: &output };
+                    let (note, recipient, _memo) = try_sapling_note_decryption(
+                        &ivk,
+                        &output_ref,
+                        Zip212Enforcement::GracePeriod,
+                    )
+                    .ok_or_else(|| {
+                        RpcError::new(RPC_WALLET_ERROR, "failed to decrypt sapling note")
+                    })?;
+                    if recipient.to_bytes() != candidate.note.address {
+                        return Err(RpcError::new(
+                            RPC_WALLET_ERROR,
+                            "sapling note recipient mismatch",
+                        ));
+                    }
+                    let rseed = crate::wallet::SaplingRseedBytes::from_rseed(note.rseed());
+                    (note, Some(rseed))
+                };
+
+                if candidate.note.rseed.is_none() {
+                    if let Some(rseed) = rseed_backfill {
+                        if let Ok(mut guard) = wallet.lock() {
+                            let _ = guard.backfill_sapling_note_rseed(candidate.key, rseed);
+                        }
+                    }
                 }
                 let witness_path: SaplingMerklePath = candidate
                     .witness
@@ -14543,17 +14575,19 @@ mod tests {
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit block");
 
+        let mempool = Mutex::new(Mempool::new(0));
         let balance =
-            rpc_zgetbalance(&chainstate, &wallet, vec![json!(zaddr)], &params).expect("rpc");
+            rpc_zgetbalance(&chainstate, &mempool, &wallet, vec![json!(zaddr)], &params)
+                .expect("rpc");
         assert_eq!(balance, amount_to_value(value));
 
-        let mempool = Mutex::new(Mempool::new(0));
         let total =
             rpc_zgettotalbalance(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
         let obj = total.as_object().expect("object");
         assert_eq!(obj.get("private").cloned(), Some(amount_to_value(value)));
 
-        let unspent = rpc_zlistunspent(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
+        let unspent =
+            rpc_zlistunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
         let list = unspent.as_array().expect("array");
         assert_eq!(list.len(), 1);
         let entry = list[0].as_object().expect("object");
@@ -14577,6 +14611,29 @@ mod tests {
         assert_eq!(entry.get("outindex").and_then(Value::as_u64), Some(0));
         assert_eq!(entry.get("amountZat").and_then(Value::as_i64), Some(value));
         assert_eq!(entry.get("spent").and_then(Value::as_bool), Some(false));
+
+        {
+            let guard = wallet.lock().expect("wallet lock");
+            let note = guard
+                .sapling_note_map()
+                .get(&(shield_txid, 0))
+                .expect("sapling note record");
+            assert_eq!(
+                note.rseed,
+                Some(crate::wallet::SaplingRseedBytes::AfterZip212(rseed))
+            );
+        }
+
+        drop(wallet);
+        let wallet_reload = Wallet::load_or_create(&data_dir, params.network).expect("wallet");
+        let note = wallet_reload
+            .sapling_note_map()
+            .get(&(shield_txid, 0))
+            .expect("sapling note record");
+        assert_eq!(
+            note.rseed,
+            Some(crate::wallet::SaplingRseedBytes::AfterZip212(rseed))
+        );
     }
 
     #[test]
