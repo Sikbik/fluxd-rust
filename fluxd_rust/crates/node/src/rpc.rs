@@ -2583,6 +2583,14 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "transaction index out of range"))?;
     let encoded = tx.consensus_encode().map_err(map_internal)?;
     let block_hash = block.header.hash();
+    let header_entry = chainstate.header_entry(&block_hash).map_err(map_internal)?;
+    let mut confirmations = -1;
+    if let Some(entry) = header_entry.as_ref() {
+        let best_height = best_block_height(chainstate)?;
+        confirmations =
+            confirmations_for_height(chainstate, entry.height, best_height, &block_hash)?;
+    }
+    let is_coinbase = tx.vin.len() == 1 && tx.vin[0].prevout == OutPoint::null();
 
     let mut credit_zat: i64 = 0;
     let mut debit_zat: i64 = 0;
@@ -2703,6 +2711,17 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
 
     let mut details = Vec::new();
+    let receive_category = if is_coinbase {
+        if confirmations < 1 {
+            "orphan"
+        } else if confirmations < COINBASE_MATURITY {
+            "immature"
+        } else {
+            "generate"
+        }
+    } else {
+        "receive"
+    };
     for (vout, output) in tx.vout.iter().enumerate() {
         if wallet_script_set.contains(output.script_pubkey.as_slice()) {
             if debit_zat > 0 {
@@ -2722,7 +2741,10 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 row.insert("involvesWatchonly".to_string(), Value::Bool(true));
             }
             row.insert("address".to_string(), Value::String(address));
-            row.insert("category".to_string(), Value::String("receive".to_string()));
+            row.insert(
+                "category".to_string(),
+                Value::String(receive_category.to_string()),
+            );
             row.insert("amount".to_string(), amount_to_value(output.value));
             row.insert("amount_zat".to_string(), Value::Number(output.value.into()));
             row.insert("vout".to_string(), Value::Number((vout as i64).into()));
@@ -2757,7 +2779,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
     let mut obj = json!({
         "amount": amount_to_value(amount_zat),
         "amount_zat": amount_zat,
-        "confirmations": -1,
+        "confirmations": confirmations,
         "involvesWatchonly": involves_watchonly,
         "txid": hash256_to_hex(&txid),
         "time": block.header.time,
@@ -2773,15 +2795,8 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    if let Ok(Some(entry)) = chainstate.header_entry(&block_hash) {
-        let best_height = best_block_height(chainstate)?;
-        let confirmations =
-            confirmations_for_height(chainstate, entry.height, best_height, &block_hash)?;
+    if header_entry.is_some() {
         if let Value::Object(map) = &mut obj {
-            map.insert(
-                "confirmations".to_string(),
-                Value::Number(confirmations.into()),
-            );
             map.insert(
                 "blockhash".to_string(),
                 Value::String(hash256_to_hex(&block_hash)),
@@ -3030,17 +3045,31 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid gettransaction result"))?;
 
         let amount_zat = obj.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
-        let category = if amount_zat >= 0 { "receive" } else { "send" };
+        let details = obj.get("details").and_then(Value::as_array);
 
-        let first_detail = obj
-            .get("details")
-            .and_then(Value::as_array)
-            .and_then(|rows| {
-                rows.iter()
-                    .filter_map(Value::as_object)
-                    .find(|row| row.get("category").and_then(Value::as_str) == Some(category))
-                    .or_else(|| rows.first().and_then(Value::as_object))
-            });
+        let category = if amount_zat < 0 {
+            "send".to_string()
+        } else if let Some(rows) = details {
+            rows.iter()
+                .filter_map(Value::as_object)
+                .find_map(|row| match row.get("category").and_then(Value::as_str) {
+                    Some("orphan") | Some("immature") | Some("generate") => {
+                        row.get("category").and_then(Value::as_str)
+                    }
+                    _ => None,
+                })
+                .unwrap_or("receive")
+                .to_string()
+        } else {
+            "receive".to_string()
+        };
+
+        let first_detail = details.and_then(|rows| {
+            rows.iter()
+                .filter_map(Value::as_object)
+                .find(|row| row.get("category").and_then(Value::as_str) == Some(category.as_str()))
+                .or_else(|| rows.first().and_then(Value::as_object))
+        });
 
         let address = first_detail
             .and_then(|row| row.get("address"))
@@ -3059,7 +3088,7 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         if let Some(vout) = vout {
             row.insert("vout".to_string(), vout);
         }
-        row.insert("category".to_string(), Value::String(category.to_string()));
+        row.insert("category".to_string(), Value::String(category.clone()));
         row.insert(
             "amount".to_string(),
             obj.get("amount")
@@ -3304,17 +3333,31 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
         }
 
         let amount_zat = obj.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
-        let category = if amount_zat >= 0 { "receive" } else { "send" };
+        let details = obj.get("details").and_then(Value::as_array);
 
-        let first_detail = obj
-            .get("details")
-            .and_then(Value::as_array)
-            .and_then(|rows| {
-                rows.iter()
-                    .filter_map(Value::as_object)
-                    .find(|row| row.get("category").and_then(Value::as_str) == Some(category))
-                    .or_else(|| rows.first().and_then(Value::as_object))
-            });
+        let category = if amount_zat < 0 {
+            "send".to_string()
+        } else if let Some(rows) = details {
+            rows.iter()
+                .filter_map(Value::as_object)
+                .find_map(|row| match row.get("category").and_then(Value::as_str) {
+                    Some("orphan") | Some("immature") | Some("generate") => {
+                        row.get("category").and_then(Value::as_str)
+                    }
+                    _ => None,
+                })
+                .unwrap_or("receive")
+                .to_string()
+        } else {
+            "receive".to_string()
+        };
+
+        let first_detail = details.and_then(|rows| {
+            rows.iter()
+                .filter_map(Value::as_object)
+                .find(|row| row.get("category").and_then(Value::as_str) == Some(category.as_str()))
+                .or_else(|| rows.first().and_then(Value::as_object))
+        });
 
         let address = first_detail
             .and_then(|row| row.get("address"))
@@ -3333,7 +3376,7 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
         if let Some(vout) = vout {
             row.insert("vout".to_string(), vout);
         }
-        row.insert("category".to_string(), Value::String(category.to_string()));
+        row.insert("category".to_string(), Value::String(category.clone()));
         row.insert(
             "amount".to_string(),
             obj.get("amount")
@@ -14573,6 +14616,94 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[test]
+    fn gettransaction_coinbase_category_is_immature_then_generate() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let (txid, _vout, height, miner_value) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey);
+        assert_eq!(height, 1);
+        let txid_hex = hash256_to_hex(&txid);
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_gettransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(txid_hex.clone())],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(
+            obj.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value)
+        );
+        assert_eq!(obj.get("confirmations").and_then(Value::as_i64), Some(1));
+        let details = obj
+            .get("details")
+            .and_then(Value::as_array)
+            .expect("details");
+        let first = details[0].as_object().expect("detail row");
+        assert_eq!(
+            first.get("category").and_then(Value::as_str),
+            Some("immature")
+        );
+
+        let value =
+            rpc_listtransactions(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("row");
+        assert_eq!(
+            row.get("category").and_then(Value::as_str),
+            Some("immature")
+        );
+
+        extend_regtest_chain_to_height(&chainstate, &params, COINBASE_MATURITY);
+
+        let value = rpc_gettransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(txid_hex.clone())],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(
+            obj.get("confirmations").and_then(Value::as_i64),
+            Some(i64::from(COINBASE_MATURITY))
+        );
+        let details = obj
+            .get("details")
+            .and_then(Value::as_array)
+            .expect("details");
+        let first = details[0].as_object().expect("detail row");
+        assert_eq!(
+            first.get("category").and_then(Value::as_str),
+            Some("generate")
+        );
+
+        let value =
+            rpc_listtransactions(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("row");
+        assert_eq!(
+            row.get("category").and_then(Value::as_str),
+            Some("generate")
+        );
     }
 
     #[test]

@@ -355,6 +355,7 @@ Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
 - If the wallet spends inputs, the response includes `fee` / `fee_zat` (negative) and `amount` / `amount_zat` excludes the fee (matches `fluxd` behavior).
 - Change outputs (to addresses reserved via `getrawchangeaddress` / `fundrawtransaction`) are omitted from `details` on outgoing transactions (closer to C++ wallet RPC behavior).
+- Coinbase transaction `details[].category` follows `fluxd` wallet semantics: `orphan` (not in main chain), `immature` (not yet matured), or `generate` (matured).
 
 ### listtransactions
 
@@ -366,6 +367,7 @@ Notes:
 - `fee` / `fee_zat` is included for `send` entries when available.
 - `vout` is included (best-effort; derived from the first `details[]` entry matching the row category).
 - `size` is included (transaction size in bytes).
+- For coinbase wallet receives, `category` may be `orphan` / `immature` / `generate` (matches `fluxd`).
 
 ### listsinceblock
 
@@ -378,6 +380,7 @@ Notes:
 - `fee` / `fee_zat` is included for `send` entries when available.
 - `vout` is included (best-effort; derived from the first `details[]` entry matching the row category).
 - `size` is included (transaction size in bytes).
+- For coinbase wallet receives, `category` may be `orphan` / `immature` / `generate` (matches `fluxd`).
 
 ### addmultisigaddress
 
