@@ -184,6 +184,15 @@ const RPC_METHODS: &[&str] = &[
     "startzelnode",
     "startdeterministicfluxnode",
     "startdeterministiczelnode",
+    "getbenchmarks",
+    "getbenchstatus",
+    "startbenchmark",
+    "stopbenchmark",
+    "startfluxbenchd",
+    "stopfluxbenchd",
+    "startzelbenchd",
+    "stopzelbenchd",
+    "zcbenchmark",
     "verifychain",
     "addnode",
     "disconnectnode",
@@ -1295,6 +1304,13 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "getfluxnodestatus" => rpc_getfluxnodestatus(chainstate, params, chain_params, data_dir),
         "getdoslist" => rpc_getdoslist(chainstate, params, chain_params),
         "getstartlist" => rpc_getstartlist(chainstate, params, chain_params),
+        "getbenchmarks" => rpc_getbenchmarks(params, data_dir),
+        "getbenchstatus" => rpc_getbenchstatus(params, data_dir),
+        "startbenchmark" | "startfluxbenchd" | "startzelbenchd" => {
+            rpc_startbenchmark(params, data_dir)
+        }
+        "stopbenchmark" | "stopfluxbenchd" | "stopzelbenchd" => rpc_stopbenchmark(params, data_dir),
+        "zcbenchmark" => rpc_zcbenchmark(params),
         "createfluxnodekey" | "createzelnodekey" => rpc_createfluxnodekey(params, chain_params),
         "listfluxnodeconf" | "listzelnodeconf" => {
             rpc_listfluxnodeconf(chainstate, params, chain_params, data_dir)
@@ -8812,6 +8828,52 @@ fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
     Ok(Value::Object(info))
 }
 
+fn ensure_fluxnode_mode(data_dir: &Path) -> Result<(), RpcError> {
+    let conf_entries = read_fluxnode_conf(data_dir)?;
+    if conf_entries.is_empty() {
+        return Err(RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "This is not a Flux Node (no fluxnode.conf entry found)",
+        ));
+    }
+    Ok(())
+}
+
+fn rpc_getbenchmarks(params: Vec<Value>, data_dir: &Path) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    ensure_fluxnode_mode(data_dir)?;
+    Ok(Value::String("Benchmark not running".to_string()))
+}
+
+fn rpc_getbenchstatus(params: Vec<Value>, data_dir: &Path) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    ensure_fluxnode_mode(data_dir)?;
+    Ok(Value::String("Benchmark not running".to_string()))
+}
+
+fn rpc_startbenchmark(params: Vec<Value>, data_dir: &Path) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    ensure_fluxnode_mode(data_dir)?;
+    Ok(Value::String(
+        "Benchmark daemon control not implemented".to_string(),
+    ))
+}
+
+fn rpc_stopbenchmark(params: Vec<Value>, data_dir: &Path) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    ensure_fluxnode_mode(data_dir)?;
+    Ok(Value::String(
+        "Benchmark daemon control not implemented".to_string(),
+    ))
+}
+
+fn rpc_zcbenchmark(_params: Vec<Value>) -> Result<Value, RpcError> {
+    Err(RpcError::new(
+        RPC_INTERNAL_ERROR,
+        "zcbenchmark not implemented",
+    ))
+}
+
 fn rpc_getdoslist<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
@@ -12040,6 +12102,69 @@ mod tests {
         for key in ["alias", "outpoint", "result", "errorMessage"] {
             assert!(entry.contains_key(key), "missing key {key}");
         }
+    }
+
+    #[test]
+    fn getbenchmarks_requires_fluxnode_conf() {
+        let (_chainstate, _params, data_dir) = setup_regtest_chainstate();
+        let err = rpc_getbenchmarks(Vec::new(), &data_dir).expect_err("expected error");
+        assert_eq!(err.code, RPC_INTERNAL_ERROR);
+        assert_eq!(
+            err.message,
+            "This is not a Flux Node (no fluxnode.conf entry found)"
+        );
+    }
+
+    #[test]
+    fn getbenchmarks_returns_benchmark_not_running() {
+        let (_chainstate, _params, data_dir) = setup_regtest_chainstate();
+        let txhash_hex = hash256_to_hex(&[0x55u8; 32]);
+        std::fs::write(
+            data_dir.join("fluxnode.conf"),
+            format!("fn1 127.0.0.1:16125 operatorkey {txhash_hex} 0\n"),
+        )
+        .expect("write fluxnode.conf");
+
+        let value = rpc_getbenchmarks(Vec::new(), &data_dir).expect("rpc");
+        assert_eq!(value, Value::String("Benchmark not running".to_string()));
+    }
+
+    #[test]
+    fn getbenchstatus_returns_benchmark_not_running() {
+        let (_chainstate, _params, data_dir) = setup_regtest_chainstate();
+        let txhash_hex = hash256_to_hex(&[0x56u8; 32]);
+        std::fs::write(
+            data_dir.join("fluxnode.conf"),
+            format!("fn1 127.0.0.1:16125 operatorkey {txhash_hex} 0\n"),
+        )
+        .expect("write fluxnode.conf");
+
+        let value = rpc_getbenchstatus(Vec::new(), &data_dir).expect("rpc");
+        assert_eq!(value, Value::String("Benchmark not running".to_string()));
+    }
+
+    #[test]
+    fn startbenchmark_returns_not_implemented() {
+        let (_chainstate, _params, data_dir) = setup_regtest_chainstate();
+        let txhash_hex = hash256_to_hex(&[0x57u8; 32]);
+        std::fs::write(
+            data_dir.join("fluxnode.conf"),
+            format!("fn1 127.0.0.1:16125 operatorkey {txhash_hex} 0\n"),
+        )
+        .expect("write fluxnode.conf");
+
+        let value = rpc_startbenchmark(Vec::new(), &data_dir).expect("rpc");
+        assert_eq!(
+            value,
+            Value::String("Benchmark daemon control not implemented".to_string())
+        );
+    }
+
+    #[test]
+    fn zcbenchmark_returns_error() {
+        let err = rpc_zcbenchmark(Vec::new()).expect_err("expected error");
+        assert_eq!(err.code, RPC_INTERNAL_ERROR);
+        assert_eq!(err.message, "zcbenchmark not implemented");
     }
 
     #[test]

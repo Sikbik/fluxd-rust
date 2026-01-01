@@ -175,6 +175,11 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `getfluxnodestatus [alias|txid:vout]` (partial; uses `--data-dir/fluxnode.conf` when called with no params)
 - `getdoslist`
 - `getstartlist`
+- `getbenchmarks` (stub; Fluxnode-only)
+- `getbenchstatus` (stub; Fluxnode-only)
+- `startbenchmark` / `startfluxbenchd` / `startzelbenchd` (stub; Fluxnode-only)
+- `stopbenchmark` / `stopfluxbenchd` / `stopzelbenchd` (stub; Fluxnode-only)
+- `zcbenchmark` (stub; returns error)
 
 ### Indexer endpoints (insight-style)
 
@@ -968,3 +973,37 @@ Partial parity implementation.
 
 For wallet-less start RPCs, `fluxd-rust` also supports optional extra columns:
 `<collateral_privkey_wif> [redeem_script_hex]`.
+
+### getbenchmarks
+
+Fluxnode-only benchmark query (fluxbenchd integration is not implemented yet).
+
+- Params: none
+- Result: string (`"Benchmark not running"`)
+
+### getbenchstatus
+
+Fluxnode-only benchmark status (fluxbenchd integration is not implemented yet).
+
+- Params: none
+- Result: string (`"Benchmark not running"`)
+
+### startbenchmark / startfluxbenchd / startzelbenchd
+
+Fluxnode-only benchmark daemon control (not implemented yet).
+
+- Params: none
+- Result: string (`"Benchmark daemon control not implemented"`)
+
+### stopbenchmark / stopfluxbenchd / stopzelbenchd
+
+Fluxnode-only benchmark daemon control (not implemented yet).
+
+- Params: none
+- Result: string (`"Benchmark daemon control not implemented"`)
+
+### zcbenchmark
+
+Zcash benchmark RPC (not implemented yet).
+
+- Result: error (`-32603`, `"zcbenchmark not implemented"`)

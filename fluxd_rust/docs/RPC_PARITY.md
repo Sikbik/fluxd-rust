@@ -77,8 +77,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - gettransaction - Partial (wallet-only view based on address deltas + mempool script matching; field parity is WIP)
 - zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; `ismine` is always false until shielded wallet support exists)
-- getbenchmarks - Missing
-- getbenchstatus - Missing
+- getbenchmarks - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
+- getbenchstatus - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
 - getblockhashes - Implemented
 
 ## Address index (insight)
@@ -169,9 +169,9 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - start - Missing
 - restart - Implemented
 - ping - Implemented
-- zcbenchmark - Missing
-- startbenchmark - Missing
-- stopbenchmark - Missing
+- zcbenchmark - Stub (returns error; zcash benchmarks not implemented)
+- startbenchmark - Stub (alias: `startfluxbenchd`/`startzelbenchd`; control not implemented)
+- stopbenchmark - Stub (alias: `stopfluxbenchd`/`stopzelbenchd`; control not implemented)
 
 ## fluxd-rust extensions
 

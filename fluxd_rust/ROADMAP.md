@@ -306,6 +306,12 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 | --- | --- | --- |
 | `getfluxnodecount`<br>`listfluxnodes`<br>`viewdeterministicfluxnodelist`<br>`getdoslist`<br>`getstartlist`<br>`createfluxnodekey`<br>`listfluxnodeconf`<br>`getfluxnodeoutputs` | `fluxnodecurrentwinner`<br>`getfluxnodestatus`<br>`startfluxnode`<br>`startdeterministicfluxnode` | - |
 
+### Benchmarking
+
+| Implemented | Partial | Missing |
+| --- | --- | --- |
+| - | `getbenchmarks` (stub)<br>`getbenchstatus` (stub)<br>`startbenchmark` (stub; alias: `startfluxbenchd`/`startzelbenchd`)<br>`stopbenchmark` (stub; alias: `stopfluxbenchd`/`stopzelbenchd`)<br>`zcbenchmark` (stub; returns error) | - |
+
 ### Address and insight-style indexes
 
 | Implemented | Partial | Missing |
@@ -328,4 +334,4 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | - | `zgetbalance`<br>`zgettotalbalance`<br>`zgetnewaddress`<br>`zlistaddresses`<br>`zlistunspent`<br>`zsendmany`<br>`zshieldcoinbase`<br>`zexportkey`<br>`zexportviewingkey`<br>`zimportkey`<br>`zimportviewingkey`<br>`zimportwallet`<br>`zgetoperationstatus`<br>`zgetoperationresult`<br>`zlistoperationids`<br>`zgetmigrationstatus`<br>`zsetmigration`<br>`zvalidateaddress`<br>`zcrawjoinsplit`<br>`zcrawreceive`<br>`zcbenchmark` |
+| - | `zvalidateaddress` (partial; `ismine` is always false) | `zgetbalance`<br>`zgettotalbalance`<br>`zgetnewaddress`<br>`zlistaddresses`<br>`zlistunspent`<br>`zsendmany`<br>`zshieldcoinbase`<br>`zexportkey`<br>`zexportviewingkey`<br>`zimportkey`<br>`zimportviewingkey`<br>`zimportwallet`<br>`zgetoperationstatus`<br>`zgetoperationresult`<br>`zlistoperationids`<br>`zgetmigrationstatus`<br>`zsetmigration`<br>`zcrawjoinsplit`<br>`zcrawreceive` |
