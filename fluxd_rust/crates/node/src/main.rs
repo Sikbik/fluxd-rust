@@ -6027,7 +6027,10 @@ fn connect_pending<S: KeyValueStore>(
     }
 
     let mut received_heights = HashMap::new();
-    for (hash, received_block) in received.drain() {
+    for hash in pending.iter().copied() {
+        let Some(received_block) = received.remove(&hash) else {
+            break;
+        };
         let height = match chainstate
             .header_entry(&hash)
             .map_err(|err| err.to_string())?
@@ -6053,6 +6056,7 @@ fn connect_pending<S: KeyValueStore>(
             .map_err(|_| "verify queue closed".to_string())?;
         received_heights.insert(hash, height);
     }
+    received.clear();
 
     drop(verify_tx);
     drop(shielded_tx);

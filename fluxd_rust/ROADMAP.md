@@ -49,7 +49,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Reuse txids across validation/connect/mempool purge (avoid redundant txid hashing)
   - [x] Optimize fluxnode signed-message verification (verify vs recover)
   - [x] Parallelize fluxnode signature checks during connect (multi-core)
-  - [x] Fix shielded pipeline ordering bug (prevents rare sync stalls)
+  - [x] Prioritize verify/shielded pipeline by height (avoid head-of-line stalls)
   - [x] Expose Fjall flush/compaction worker knobs (`--db-flush-workers`, `--db-compaction-workers`)
   - [x] Warn when `--db-write-buffer-mb` is below `--db-memtable-mb × partitions` (prevents hidden L0 stalls)
   - [x] Raise default Fjall buffers/workers (avoid write stalls during heavy indexing)
