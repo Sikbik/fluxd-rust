@@ -75,7 +75,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Extra queries
 
-- gettransaction - Partial (wallet-only view based on address deltas + mempool script matching; field parity is WIP)
+- gettransaction - Partial (wallet-only view; amount/fee match `fluxd` semantics; detail parity + change detection WIP)
 - zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; Sapling `ismine` checks wallet spending keys; `iswatchonly` checks imported Sapling viewing keys)
 - getbenchmarks - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
 - getbenchstatus - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)

@@ -184,6 +184,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `gettransaction` (partial)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag
+    - [x] `fee` output and amount excludes fee (C++ parity)
   - [x] `listtransactions` (partial)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag

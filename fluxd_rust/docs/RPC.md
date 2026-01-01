@@ -353,6 +353,7 @@ Notes:
 
 Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
+- If the wallet spends inputs, the response includes `fee` / `fee_zat` (negative) and `amount` / `amount_zat` excludes the fee (matches `fluxd` behavior).
 
 ### listtransactions
 
