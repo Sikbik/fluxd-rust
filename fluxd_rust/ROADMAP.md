@@ -219,9 +219,12 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `zvalidateaddress` `ismine=true` for Sapling addresses owned by wallet
   - [x] `zexportkey` (Sapling only)
   - [x] `zexportviewingkey` (Sapling only; exports Sapling full viewing key; enables watch-only import)
-  - [x] `zimportkey` (Sapling only; rescan ignored)
-  - [x] `zimportviewingkey` (Sapling only; stores watch-only viewing keys; rescan ignored)
-  - [x] `zimportwallet` (Sapling only; rescan ignored)
+  - [x] `zimportkey` (Sapling only; resets Sapling scan cursor; rescan/startHeight params currently ignored)
+  - [x] `zimportviewingkey` (Sapling only; stores watch-only viewing keys; resets Sapling scan cursor; rescan/startHeight params currently ignored)
+  - [x] `zimportwallet` (Sapling only; resets Sapling scan cursor; rescan/startHeight params currently ignored)
+  - [x] `zgetbalance` (Sapling only; scans chain for Sapling notes; supports watch-only via `includeWatchonly`)
+  - [x] `zgettotalbalance` (Sapling only for private balance; scans chain for Sapling notes; supports watch-only via `includeWatchonly`)
+  - [x] `zlistunspent` (Sapling only; lists unspent Sapling notes; supports watch-only via `includeWatchonly`)
   - [x] Regtest/testnet RPC smoke harness (`scripts/shielded_wallet_smoke_test.sh`)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)
 - [ ] [P2] Wallet encryption and key management parity (owner: TBD)
@@ -359,4 +362,4 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | `zvalidateaddress` (partial; Sapling `ismine` + `iswatchonly`)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zexportkey` (partial; Sapling only)<br>`zexportviewingkey` (partial; Sapling only)<br>`zimportkey` (partial; Sapling only)<br>`zimportviewingkey` (partial; Sapling only)<br>`zimportwallet` (partial; Sapling only)<br>`zgetbalance` (stub)<br>`zgettotalbalance` (stub)<br>`zlistunspent` (stub)<br>`zsendmany` (stub)<br>`zshieldcoinbase` (stub)<br>`zgetoperationstatus` (stub)<br>`zgetoperationresult` (stub)<br>`zlistoperationids` (stub)<br>`zgetmigrationstatus` (stub)<br>`zsetmigration` (stub)<br>`zlistreceivedbyaddress` (stub)<br>`zcrawjoinsplit` (stub)<br>`zcrawreceive` (stub) | - |
+| - | `zvalidateaddress` (partial; Sapling `ismine` + `iswatchonly`)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zexportkey` (partial; Sapling only)<br>`zexportviewingkey` (partial; Sapling only)<br>`zimportkey` (partial; Sapling only)<br>`zimportviewingkey` (partial; Sapling only)<br>`zimportwallet` (partial; Sapling only)<br>`zgetbalance` (partial; Sapling note scanning)<br>`zgettotalbalance` (partial; Sapling note scanning)<br>`zlistunspent` (partial; Sapling note scanning)<br>`zsendmany` (stub)<br>`zshieldcoinbase` (stub)<br>`zgetoperationstatus` (stub)<br>`zgetoperationresult` (stub)<br>`zlistoperationids` (stub)<br>`zgetmigrationstatus` (stub)<br>`zsetmigration` (stub)<br>`zlistreceivedbyaddress` (stub)<br>`zcrawjoinsplit` (stub)<br>`zcrawreceive` (stub) | - |

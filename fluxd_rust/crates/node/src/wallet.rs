@@ -1,25 +1,33 @@
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fluxd_chainstate::state::ChainState;
 use rand::RngCore;
+use sapling_crypto::keys::{NullifierDerivingKey, PreparedIncomingViewingKey};
+use sapling_crypto::note_encryption::{
+    try_sapling_note_decryption, SaplingDomain, Zip212Enforcement,
+};
 use sapling_crypto::{zip32::ExtendedSpendingKey, PaymentAddress};
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+use zcash_note_encryption::{EphemeralKeyBytes, ShieldedOutput, ENC_CIPHERTEXT_SIZE};
 use zip32::DiversifierIndex;
 
 use fluxd_consensus::params::Network;
 use fluxd_consensus::Hash256;
+use fluxd_primitives::block::Block;
 use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
 use fluxd_primitives::hash::hash160;
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::{script_pubkey_to_address, secret_key_to_wif, wif_to_secret_key};
 use fluxd_script::message::signed_message_hash;
+use fluxd_storage::KeyValueStore;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 7;
+pub const WALLET_FILE_VERSION: u32 = 8;
 
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
 
@@ -41,11 +49,23 @@ struct SaplingViewingKeyEntry {
     next_diversifier_index: [u8; 11],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SaplingNoteRecord {
+    pub(crate) address: [u8; 43],
+    pub(crate) value: i64,
+    pub(crate) height: i32,
+    pub(crate) position: u64,
+    pub(crate) nullifier: [u8; 32],
+}
+
+pub(crate) type SaplingNoteKey = (Hash256, u32);
+
 #[derive(Debug)]
 pub enum WalletError {
     Io(std::io::Error),
     Decode(DecodeError),
     InvalidData(&'static str),
+    ChainState(String),
     NetworkMismatch { expected: Network, found: Network },
     InvalidSecretKey,
 }
@@ -56,6 +76,7 @@ impl std::fmt::Display for WalletError {
             WalletError::Io(err) => write!(f, "{err}"),
             WalletError::Decode(err) => write!(f, "{err}"),
             WalletError::InvalidData(msg) => write!(f, "{msg}"),
+            WalletError::ChainState(message) => write!(f, "{message}"),
             WalletError::NetworkMismatch { expected, found } => write!(
                 f,
                 "wallet network mismatch (expected {expected:?}, found {found:?})"
@@ -135,6 +156,10 @@ pub struct Wallet {
     sapling_keys: Vec<SaplingKeyEntry>,
     sapling_viewing_keys: Vec<SaplingViewingKeyEntry>,
     change_key_hashes: BTreeSet<[u8; 20]>,
+    sapling_scan_height: i32,
+    sapling_scan_hash: Hash256,
+    sapling_next_position: u64,
+    sapling_notes: BTreeMap<SaplingNoteKey, SaplingNoteRecord>,
     revision: u64,
     locked_outpoints: HashSet<OutPoint>,
     pay_tx_fee_per_kb: i64,
@@ -158,6 +183,10 @@ impl Wallet {
                 sapling_keys: Vec::new(),
                 sapling_viewing_keys: Vec::new(),
                 change_key_hashes: BTreeSet::new(),
+                sapling_scan_height: -1,
+                sapling_scan_hash: [0u8; 32],
+                sapling_next_position: 0,
+                sapling_notes: BTreeMap::new(),
                 revision: 0,
                 locked_outpoints: HashSet::new(),
                 pay_tx_fee_per_kb: 0,
@@ -197,6 +226,10 @@ impl Wallet {
     #[cfg(test)]
     pub fn sapling_viewing_key_count(&self) -> usize {
         self.sapling_viewing_keys.len()
+    }
+
+    pub(crate) fn has_sapling_keys(&self) -> bool {
+        !self.sapling_keys.is_empty() || !self.sapling_viewing_keys.is_empty()
     }
 
     pub fn keypool_oldest(&self) -> u64 {
@@ -339,6 +372,177 @@ impl Wallet {
 
     pub fn change_key_hashes(&self) -> Vec<[u8; 20]> {
         self.change_key_hashes.iter().copied().collect()
+    }
+
+    pub(crate) fn sapling_note_map(&self) -> &BTreeMap<SaplingNoteKey, SaplingNoteRecord> {
+        &self.sapling_notes
+    }
+
+    pub fn reset_sapling_scan(&mut self) -> Result<(), WalletError> {
+        let prev_scan_height = self.sapling_scan_height;
+        let prev_scan_hash = self.sapling_scan_hash;
+        let prev_next_position = self.sapling_next_position;
+        let prev_notes = self.sapling_notes.clone();
+
+        self.sapling_scan_height = -1;
+        self.sapling_scan_hash = [0u8; 32];
+        self.sapling_next_position = 0;
+        self.sapling_notes.clear();
+
+        if let Err(err) = self.save() {
+            self.sapling_scan_height = prev_scan_height;
+            self.sapling_scan_hash = prev_scan_hash;
+            self.sapling_next_position = prev_next_position;
+            self.sapling_notes = prev_notes;
+            return Err(err);
+        }
+
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn ensure_sapling_scan_initialized_to_tip<S: KeyValueStore>(
+        &mut self,
+        chainstate: &ChainState<S>,
+    ) -> Result<(), WalletError> {
+        if self.sapling_scan_height >= 0 {
+            return Ok(());
+        }
+        if !self.sapling_notes.is_empty() {
+            return Ok(());
+        }
+
+        let tip = chainstate
+            .best_block()
+            .map_err(|err| WalletError::ChainState(err.to_string()))?;
+        let Some(tip) = tip else {
+            return Ok(());
+        };
+        let sapling_count = chainstate
+            .sapling_commitment_count()
+            .map_err(|err| WalletError::ChainState(err.to_string()))?;
+
+        self.sapling_scan_height = tip.height;
+        self.sapling_scan_hash = tip.hash;
+        self.sapling_next_position = sapling_count;
+
+        self.save()?;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn sync_sapling_notes<S: KeyValueStore>(
+        &mut self,
+        chainstate: &ChainState<S>,
+    ) -> Result<(), WalletError> {
+        if self.sapling_keys.is_empty() && self.sapling_viewing_keys.is_empty() {
+            return Ok(());
+        }
+
+        let tip = chainstate
+            .best_block()
+            .map_err(|err| WalletError::ChainState(err.to_string()))?;
+        let Some(tip) = tip else {
+            return Ok(());
+        };
+
+        let prev_scan_height = self.sapling_scan_height;
+        let prev_scan_hash = self.sapling_scan_hash;
+        let prev_next_position = self.sapling_next_position;
+        let prev_notes = self.sapling_notes.clone();
+
+        if self.sapling_scan_height < 0 {
+            self.sapling_scan_hash = [0u8; 32];
+            self.sapling_next_position = 0;
+        }
+
+        let scan_keys = self.sapling_scan_keys()?;
+
+        while self.sapling_scan_height >= 0 {
+            let best_hash = chainstate
+                .height_hash(self.sapling_scan_height)
+                .map_err(|err| WalletError::ChainState(err.to_string()))?;
+            if best_hash == Some(self.sapling_scan_hash) {
+                break;
+            }
+
+            let rollback_hash = self.sapling_scan_hash;
+            let rollback_height = self.sapling_scan_height;
+            let sapling_outputs = count_sapling_outputs(chainstate, &rollback_hash)?;
+            self.sapling_next_position = self
+                .sapling_next_position
+                .checked_sub(sapling_outputs as u64)
+                .ok_or(WalletError::InvalidData("sapling position underflow"))?;
+            self.sapling_notes
+                .retain(|_, note| note.height != rollback_height);
+
+            if rollback_height == 0 {
+                self.sapling_scan_height = -1;
+                self.sapling_scan_hash = [0u8; 32];
+                self.sapling_next_position = 0;
+                break;
+            }
+
+            let prev_hash = chainstate
+                .header_entry(&rollback_hash)
+                .map_err(|err| WalletError::ChainState(err.to_string()))?
+                .ok_or(WalletError::InvalidData(
+                    "missing header entry for wallet scan rollback",
+                ))?
+                .prev_hash;
+            self.sapling_scan_hash = prev_hash;
+            self.sapling_scan_height = rollback_height.saturating_sub(1);
+        }
+
+        let mut height = self.sapling_scan_height.saturating_add(1);
+        while height <= tip.height {
+            let hash = chainstate
+                .height_hash(height)
+                .map_err(|err| WalletError::ChainState(err.to_string()))?
+                .ok_or(WalletError::InvalidData(
+                    "missing block hash for wallet scan",
+                ))?;
+            let block = read_block_by_hash(chainstate, &hash)?;
+
+            for tx in &block.transactions {
+                let txid = tx
+                    .txid()
+                    .map_err(|_| WalletError::InvalidData("invalid transaction encoding"))?;
+                for (out_index, output) in tx.shielded_outputs.iter().enumerate() {
+                    let position = self.sapling_next_position;
+                    self.sapling_next_position = self.sapling_next_position.saturating_add(1);
+                    if let Some(note_record) =
+                        scan_sapling_output(&scan_keys, output, position, height)
+                    {
+                        self.sapling_notes
+                            .entry((txid, out_index as u32))
+                            .or_insert(note_record);
+                    }
+                }
+            }
+
+            self.sapling_scan_height = height;
+            self.sapling_scan_hash = hash;
+            height = height.saturating_add(1);
+        }
+
+        let changed = self.sapling_scan_height != prev_scan_height
+            || self.sapling_scan_hash != prev_scan_hash
+            || self.sapling_next_position != prev_next_position
+            || self.sapling_notes != prev_notes;
+
+        if changed {
+            if let Err(err) = self.save() {
+                self.sapling_scan_height = prev_scan_height;
+                self.sapling_scan_hash = prev_scan_hash;
+                self.sapling_next_position = prev_next_position;
+                self.sapling_notes = prev_notes;
+                return Err(err);
+            }
+            self.revision = self.revision.saturating_add(1);
+        }
+
+        Ok(())
     }
 
     pub fn generate_new_sapling_address_bytes(&mut self) -> Result<[u8; 43], WalletError> {
@@ -920,6 +1124,39 @@ impl Wallet {
             }
         }
 
+        let mut sapling_scan_height = -1i32;
+        let mut sapling_scan_hash = [0u8; 32];
+        let mut sapling_next_position = 0u64;
+        let mut sapling_notes: BTreeMap<SaplingNoteKey, SaplingNoteRecord> = BTreeMap::new();
+        if version >= 8 {
+            sapling_scan_height = decoder.read_i32_le()?;
+            sapling_scan_hash = decoder.read_fixed::<32>()?;
+            sapling_next_position = decoder.read_u64_le()?;
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("sapling note count too large"))?;
+            sapling_notes = BTreeMap::new();
+            for _ in 0..count {
+                let txid = decoder.read_fixed::<32>()?;
+                let out_index = decoder.read_u32_le()?;
+                let height = decoder.read_i32_le()?;
+                let position = decoder.read_u64_le()?;
+                let value = decoder.read_i64_le()?;
+                let address = decoder.read_fixed::<43>()?;
+                let nullifier = decoder.read_fixed::<32>()?;
+                sapling_notes.insert(
+                    (txid, out_index),
+                    SaplingNoteRecord {
+                        address,
+                        value,
+                        height,
+                        position,
+                        nullifier,
+                    },
+                );
+            }
+        }
+
         if !decoder.is_empty() {
             return Err(WalletError::InvalidData("wallet file has trailing bytes"));
         }
@@ -933,6 +1170,10 @@ impl Wallet {
             sapling_keys,
             sapling_viewing_keys,
             change_key_hashes,
+            sapling_scan_height,
+            sapling_scan_hash,
+            sapling_next_position,
+            sapling_notes,
             revision: 0,
             locked_outpoints: HashSet::new(),
             pay_tx_fee_per_kb,
@@ -983,10 +1224,135 @@ impl Wallet {
         for key_hash in &self.change_key_hashes {
             encoder.write_bytes(key_hash);
         }
+
+        encoder.write_i32_le(self.sapling_scan_height);
+        encoder.write_bytes(&self.sapling_scan_hash);
+        encoder.write_u64_le(self.sapling_next_position);
+        encoder.write_varint(self.sapling_notes.len() as u64);
+        for ((txid, out_index), note) in &self.sapling_notes {
+            encoder.write_bytes(txid);
+            encoder.write_u32_le(*out_index);
+            encoder.write_i32_le(note.height);
+            encoder.write_u64_le(note.position);
+            encoder.write_i64_le(note.value);
+            encoder.write_bytes(&note.address);
+            encoder.write_bytes(&note.nullifier);
+        }
         let bytes = encoder.into_inner();
         write_file_atomic(&self.path, &bytes)?;
         Ok(())
     }
+}
+
+struct SaplingScanKey {
+    ivk: PreparedIncomingViewingKey,
+    nk: NullifierDerivingKey,
+}
+
+impl Wallet {
+    fn sapling_scan_keys(&self) -> Result<Vec<SaplingScanKey>, WalletError> {
+        let mut keys =
+            Vec::with_capacity(self.sapling_keys.len() + self.sapling_viewing_keys.len());
+
+        for entry in &self.sapling_keys {
+            let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk)
+                .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
+            let dfvk = extsk.to_diversifiable_full_viewing_key();
+            let fvk = dfvk.fvk().clone();
+            let ivk = fvk.vk.ivk();
+            keys.push(SaplingScanKey {
+                ivk: PreparedIncomingViewingKey::new(&ivk),
+                nk: fvk.vk.nk,
+            });
+        }
+
+        for entry in &self.sapling_viewing_keys {
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let ivk = extfvk.fvk.vk.ivk();
+            keys.push(SaplingScanKey {
+                ivk: PreparedIncomingViewingKey::new(&ivk),
+                nk: extfvk.fvk.vk.nk,
+            });
+        }
+
+        Ok(keys)
+    }
+}
+
+struct SaplingOutputRef<'a> {
+    output: &'a fluxd_primitives::transaction::OutputDescription,
+}
+
+impl ShieldedOutput<SaplingDomain, ENC_CIPHERTEXT_SIZE> for SaplingOutputRef<'_> {
+    fn ephemeral_key(&self) -> EphemeralKeyBytes {
+        EphemeralKeyBytes(self.output.ephemeral_key)
+    }
+
+    fn cmstar_bytes(
+        &self,
+    ) -> <SaplingDomain as zcash_note_encryption::Domain>::ExtractedCommitmentBytes {
+        self.output.cm
+    }
+
+    fn enc_ciphertext(&self) -> &[u8; ENC_CIPHERTEXT_SIZE] {
+        &self.output.enc_ciphertext
+    }
+}
+
+fn scan_sapling_output(
+    keys: &[SaplingScanKey],
+    output: &fluxd_primitives::transaction::OutputDescription,
+    position: u64,
+    height: i32,
+) -> Option<SaplingNoteRecord> {
+    let output_ref = SaplingOutputRef { output };
+    for key in keys {
+        let (note, recipient, _memo) =
+            try_sapling_note_decryption(&key.ivk, &output_ref, Zip212Enforcement::GracePeriod)?;
+        let value_u64 = note.value().inner();
+        let value = i64::try_from(value_u64).ok()?;
+        let nullifier = note.nf(&key.nk, position).0;
+        return Some(SaplingNoteRecord {
+            address: recipient.to_bytes(),
+            value,
+            height,
+            position,
+            nullifier,
+        });
+    }
+    None
+}
+
+fn read_block_by_hash<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    hash: &Hash256,
+) -> Result<Block, WalletError> {
+    let location = chainstate
+        .block_location(hash)
+        .map_err(|err| WalletError::ChainState(err.to_string()))?
+        .ok_or(WalletError::InvalidData(
+            "missing block location for wallet scan",
+        ))?;
+    let bytes = chainstate
+        .read_block(location)
+        .map_err(|err| WalletError::ChainState(err.to_string()))?;
+    Block::consensus_decode(&bytes).map_err(|_| WalletError::InvalidData("invalid block bytes"))
+}
+
+fn count_sapling_outputs<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    hash: &Hash256,
+) -> Result<usize, WalletError> {
+    let block = read_block_by_hash(chainstate, hash)?;
+    Ok(block
+        .transactions
+        .iter()
+        .map(|tx| tx.shielded_outputs.len())
+        .sum())
 }
 
 #[cfg(test)]

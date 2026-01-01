@@ -1394,13 +1394,13 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "zexportviewingkey" | "z_exportviewingkey" => {
             rpc_zexportviewingkey(wallet, params, chain_params)
         }
-        "zgetbalance" | "z_getbalance" => {
-            rpc_shielded_wallet_not_implemented(params, "zgetbalance")
-        }
+        "zgetbalance" | "z_getbalance" => rpc_zgetbalance(chainstate, wallet, params, chain_params),
         "zgetmigrationstatus" | "z_getmigrationstatus" => {
             rpc_shielded_wallet_not_implemented(params, "zgetmigrationstatus")
         }
-        "zgetnewaddress" | "z_getnewaddress" => rpc_zgetnewaddress(wallet, params, chain_params),
+        "zgetnewaddress" | "z_getnewaddress" => {
+            rpc_zgetnewaddress(chainstate, wallet, params, chain_params)
+        }
         "zgetoperationresult" | "z_getoperationresult" => {
             rpc_shielded_wallet_not_implemented(params, "zgetoperationresult")
         }
@@ -1408,7 +1408,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             rpc_shielded_wallet_not_implemented(params, "zgetoperationstatus")
         }
         "zgettotalbalance" | "z_gettotalbalance" => {
-            rpc_shielded_wallet_not_implemented(params, "zgettotalbalance")
+            rpc_zgettotalbalance(chainstate, mempool, wallet, params, chain_params)
         }
         "zimportkey" | "z_importkey" => rpc_zimportkey(wallet, params, chain_params),
         "zimportviewingkey" | "z_importviewingkey" => {
@@ -1423,7 +1423,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             rpc_shielded_wallet_not_implemented(params, "zlistreceivedbyaddress")
         }
         "zlistunspent" | "z_listunspent" => {
-            rpc_shielded_wallet_not_implemented(params, "zlistunspent")
+            rpc_zlistunspent(chainstate, wallet, params, chain_params)
         }
         "zsendmany" | "z_sendmany" => rpc_shielded_wallet_not_implemented(params, "zsendmany"),
         "zsetmigration" | "z_setmigration" => {
@@ -4570,7 +4570,8 @@ fn rpc_zvalidateaddress(
     }))
 }
 
-fn rpc_zgetnewaddress(
+fn rpc_zgetnewaddress<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
     chain_params: &ChainParams,
@@ -4591,11 +4592,21 @@ fn rpc_zgetnewaddress(
         ));
     }
 
-    let bytes = wallet
-        .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .generate_new_sapling_address_bytes()
-        .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "failed to generate sapling address"))?;
+    let bytes = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let had_sapling_keys = guard.has_sapling_keys();
+        let bytes = guard
+            .generate_new_sapling_address_bytes()
+            .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "failed to generate sapling address"))?;
+        if !had_sapling_keys {
+            guard
+                .ensure_sapling_scan_initialized_to_tip(chainstate)
+                .map_err(map_wallet_error)?;
+        }
+        bytes
+    };
 
     let hrp = match chain_params.network {
         Network::Mainnet => "za",
@@ -4606,6 +4617,378 @@ fn rpc_zgetnewaddress(
     let encoded = bech32::encode::<Bech32>(hrp, bytes.as_slice())
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling address"))?;
     Ok(Value::String(encoded))
+}
+
+fn parse_sapling_zaddr_bytes(
+    address: &str,
+    chain_params: &ChainParams,
+) -> Result<[u8; 43], RpcError> {
+    if decode_sprout_payment_address(address, chain_params.network).is_ok() {
+        return Err(RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"));
+    }
+
+    let Some((diversifier, diversified_transmission_key)) =
+        decode_sapling_payment_address(address, chain_params.network)
+    else {
+        return Err(RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"));
+    };
+
+    let mut addr_bytes = [0u8; 43];
+    addr_bytes[..11].copy_from_slice(&diversifier);
+    addr_bytes[11..].copy_from_slice(&diversified_transmission_key);
+    Ok(addr_bytes)
+}
+
+fn rpc_zgetbalance<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 3 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zgetbalance expects 1 to 3 parameters",
+        ));
+    }
+
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zaddr must be a string"))?;
+    let minconf = match params.get(1) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
+        _ => 1,
+    };
+    let include_watchonly = match params.get(2) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Null) | None => false,
+        Some(_) => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "includeWatchonly must be a boolean",
+            ));
+        }
+    };
+
+    let addr_bytes = parse_sapling_zaddr_bytes(address, chain_params)?;
+    let notes = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard
+            .sync_sapling_notes(chainstate)
+            .map_err(map_wallet_error)?;
+
+        let is_spendable = guard
+            .sapling_extsk_for_address(&addr_bytes)
+            .map_err(map_wallet_error)?
+            .is_some();
+        if !is_spendable {
+            let has_viewing_key = guard
+                .sapling_extfvk_for_address(&addr_bytes)
+                .map_err(map_wallet_error)?
+                .is_some();
+            if !has_viewing_key {
+                return Err(RpcError::new(
+                    RPC_WALLET_ERROR,
+                    "Wallet does not hold private key or viewing key for this zaddr",
+                ));
+            }
+            if !include_watchonly {
+                return Err(RpcError::new(
+                    RPC_WALLET_ERROR,
+                    "Wallet does not hold private key for this zaddr",
+                ));
+            }
+        }
+
+        guard
+            .sapling_note_map()
+            .values()
+            .filter(|note| note.address == addr_bytes)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let best_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+
+    let mut total = 0i64;
+    for note in notes {
+        let confirmations = best_height.saturating_sub(note.height).saturating_add(1);
+        if confirmations < minconf {
+            continue;
+        }
+        if chainstate
+            .sapling_nullifier_spent(&note.nullifier)
+            .map_err(map_internal)?
+        {
+            continue;
+        }
+        total = total
+            .checked_add(note.value)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+    }
+
+    Ok(amount_to_value(total))
+}
+
+fn rpc_zgettotalbalance<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zgettotalbalance expects 0 to 2 parameters",
+        ));
+    }
+
+    let minconf = match params.get(0) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
+        _ => 1,
+    };
+    let include_watchonly = match params.get(1) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Null) | None => false,
+        Some(_) => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "includeWatchonly must be a boolean",
+            ));
+        }
+    };
+
+    let (scripts, locked_outpoints, notes) = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard
+            .sync_sapling_notes(chainstate)
+            .map_err(map_wallet_error)?;
+
+        let scripts = if include_watchonly {
+            guard
+                .all_script_pubkeys_including_watchonly()
+                .map_err(map_wallet_error)?
+        } else {
+            guard.all_script_pubkeys().map_err(map_wallet_error)?
+        };
+        let locked_outpoints = guard.locked_outpoints();
+
+        let mut notes = Vec::new();
+        for note in guard.sapling_note_map().values() {
+            if !include_watchonly {
+                let spendable = guard
+                    .sapling_extsk_for_address(&note.address)
+                    .map_err(map_wallet_error)?
+                    .is_some();
+                if !spendable {
+                    continue;
+                }
+            }
+            notes.push(note.clone());
+        }
+
+        (scripts, locked_outpoints, notes)
+    };
+
+    let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
+    let include_mempool_outputs = minconf == 0;
+    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, include_mempool_outputs)?;
+    let mut transparent_total = 0i64;
+    for utxo in utxos {
+        if utxo.confirmations < minconf {
+            continue;
+        }
+        if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        if locked_set.contains(&utxo.outpoint) {
+            continue;
+        }
+        transparent_total = transparent_total
+            .checked_add(utxo.value)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+    }
+
+    let best_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+    let mut shielded_total = 0i64;
+    for note in notes {
+        let confirmations = best_height.saturating_sub(note.height).saturating_add(1);
+        if confirmations < minconf {
+            continue;
+        }
+        if chainstate
+            .sapling_nullifier_spent(&note.nullifier)
+            .map_err(map_internal)?
+        {
+            continue;
+        }
+        shielded_total = shielded_total
+            .checked_add(note.value)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+    }
+
+    let total = transparent_total
+        .checked_add(shielded_total)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+
+    let _ = chain_params;
+    Ok(json!({
+        "transparent": amount_to_value(transparent_total),
+        "private": amount_to_value(shielded_total),
+        "total": amount_to_value(total),
+    }))
+}
+
+fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zlistunspent expects 0 to 4 parameters",
+        ));
+    }
+
+    let minconf = match params.get(0) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
+        _ => 1,
+    };
+    let maxconf = match params.get(1) {
+        Some(value) if !value.is_null() => parse_u32(value, "maxconf")? as i32,
+        _ => i32::MAX,
+    };
+    if maxconf < minconf {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "maxconf must be >= minconf",
+        ));
+    }
+    let include_watchonly = match params.get(2) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Null) | None => false,
+        Some(_) => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "includeWatchonly must be a boolean",
+            ));
+        }
+    };
+    let filter_addresses: HashSet<[u8; 43]> = match params.get(3) {
+        Some(Value::Array(values)) => {
+            let mut out = HashSet::new();
+            for value in values {
+                let addr = value.as_str().ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "addresses must be strings")
+                })?;
+                out.insert(parse_sapling_zaddr_bytes(addr, chain_params)?);
+            }
+            out
+        }
+        Some(Value::Null) | None => HashSet::new(),
+        Some(_) => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "addresses must be an array",
+            ));
+        }
+    };
+
+    #[derive(Clone)]
+    struct NoteRow {
+        txid: Hash256,
+        out_index: u32,
+        note: crate::wallet::SaplingNoteRecord,
+        spendable: bool,
+    }
+
+    let notes: Vec<NoteRow> = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard
+            .sync_sapling_notes(chainstate)
+            .map_err(map_wallet_error)?;
+
+        let mut out = Vec::new();
+        for (&(txid, out_index), note) in guard.sapling_note_map() {
+            if !filter_addresses.is_empty() && !filter_addresses.contains(&note.address) {
+                continue;
+            }
+            let spendable = guard
+                .sapling_extsk_for_address(&note.address)
+                .map_err(map_wallet_error)?
+                .is_some();
+            if !include_watchonly && !spendable {
+                continue;
+            }
+            out.push(NoteRow {
+                txid,
+                out_index,
+                note: note.clone(),
+                spendable,
+            });
+        }
+        out
+    };
+
+    let best_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+
+    let hrp = match chain_params.network {
+        Network::Mainnet => "za",
+        Network::Testnet => "ztestacadia",
+        Network::Regtest => "zregtestsapling",
+    };
+    let hrp = Hrp::parse(hrp).map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid hrp"))?;
+
+    let mut out = Vec::new();
+    for row in notes {
+        let confirmations = best_height
+            .saturating_sub(row.note.height)
+            .saturating_add(1);
+        if confirmations < minconf || confirmations > maxconf {
+            continue;
+        }
+        if chainstate
+            .sapling_nullifier_spent(&row.note.nullifier)
+            .map_err(map_internal)?
+        {
+            continue;
+        }
+
+        let address = bech32::encode::<Bech32>(hrp, row.note.address.as_slice())
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling address"))?;
+        out.push(json!({
+            "txid": hash256_to_hex(&row.txid),
+            "outindex": row.out_index,
+            "address": address,
+            "amount": amount_to_value(row.note.value),
+            "amountZat": row.note.value,
+            "confirmations": confirmations,
+            "spendable": row.spendable,
+        }));
+    }
+
+    Ok(Value::Array(out))
 }
 
 fn rpc_zlistaddresses(
@@ -4838,11 +5221,20 @@ fn rpc_zimportkey(
         .try_into()
         .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid spending key"))?;
 
-    let inserted = wallet
-        .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .import_sapling_extsk(extsk)
-        .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "Error adding spending key to wallet"))?;
+    let inserted = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let inserted = guard
+            .import_sapling_extsk(extsk)
+            .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "Error adding spending key to wallet"))?;
+        if inserted {
+            guard.reset_sapling_scan().map_err(|_| {
+                RpcError::new(RPC_WALLET_ERROR, "Error adding spending key to wallet")
+            })?;
+        }
+        inserted
+    };
 
     if !inserted {
         return Ok(Value::Null);
@@ -4914,16 +5306,25 @@ fn rpc_zimportviewingkey(
         .try_into()
         .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid viewing key"))?;
 
-    let inserted = wallet
-        .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .import_sapling_extfvk(extfvk)
-        .map_err(|err| match err {
-            WalletError::InvalidData("invalid sapling viewing key encoding") => {
-                RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid viewing key")
-            }
-            _ => RpcError::new(RPC_WALLET_ERROR, "Error adding viewing key to wallet"),
-        })?;
+    let inserted = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let inserted = guard
+            .import_sapling_extfvk(extfvk)
+            .map_err(|err| match err {
+                WalletError::InvalidData("invalid sapling viewing key encoding") => {
+                    RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid viewing key")
+                }
+                _ => RpcError::new(RPC_WALLET_ERROR, "Error adding viewing key to wallet"),
+            })?;
+        if inserted {
+            guard.reset_sapling_scan().map_err(|_| {
+                RpcError::new(RPC_WALLET_ERROR, "Error adding viewing key to wallet")
+            })?;
+        }
+        inserted
+    };
 
     if !inserted {
         return Ok(Value::Null);
@@ -4965,6 +5366,7 @@ fn rpc_zimportwallet(
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
 
     let mut failed = false;
+    let mut imported_sapling_key = false;
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -4980,7 +5382,10 @@ fn rpc_zimportwallet(
                 let data: Vec<u8> = checked.byte_iter().collect();
                 if let Ok(extsk) = <[u8; 169]>::try_from(data.as_slice()) {
                     match guard.import_sapling_extsk(extsk) {
-                        Ok(_) => continue,
+                        Ok(inserted) => {
+                            imported_sapling_key |= inserted;
+                            continue;
+                        }
                         Err(WalletError::InvalidData("invalid sapling spending key encoding")) => {}
                         Err(_) => {
                             failed = true;
@@ -5005,6 +5410,12 @@ fn rpc_zimportwallet(
             RPC_WALLET_ERROR,
             "Error adding some keys to wallet",
         ));
+    }
+
+    if imported_sapling_key {
+        guard
+            .reset_sapling_scan()
+            .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "Error adding some keys to wallet"))?;
     }
 
     Ok(Value::Null)
@@ -11133,10 +11544,16 @@ mod tests {
     use fluxd_primitives::block::BlockHeader;
     use fluxd_storage::memory::MemoryStore;
     use fluxd_storage::{Column, WriteBatch};
+    use rand::RngCore;
+    use sapling_crypto::note::Rseed;
+    use sapling_crypto::note_encryption::{sapling_note_encryption, SaplingDomain};
+    use sapling_crypto::value::NoteValue;
+    use sapling_crypto::PaymentAddress;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zcash_note_encryption::Domain;
 
     fn temp_data_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -12663,10 +13080,10 @@ mod tests {
 
     #[test]
     fn zgetnewaddress_returns_sapling_address_and_is_mine() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
-        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
         let addr = addr.as_str().expect("string").to_string();
 
         let value = rpc_zvalidateaddress(&wallet, vec![json!(addr)], &params).expect("rpc");
@@ -12679,10 +13096,10 @@ mod tests {
 
     #[test]
     fn zvalidateaddress_sets_iswatchonly_for_imported_viewing_key() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
-        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
         let addr = addr.as_str().expect("string").to_string();
         let vkey = rpc_zexportviewingkey(&wallet, vec![json!(addr.clone())], &params).expect("rpc");
         let vkey = vkey.as_str().expect("string").to_string();
@@ -12702,13 +13119,13 @@ mod tests {
 
     #[test]
     fn zlistaddresses_includes_generated_sapling_addresses() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
         let value = rpc_zlistaddresses(&wallet, Vec::new(), &params).expect("rpc");
         assert_eq!(value.as_array().map(|values| values.len()), Some(0));
 
-        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
         let addr = addr.as_str().expect("string").to_string();
 
         let value = rpc_zlistaddresses(&wallet, vec![json!(false)], &params).expect("rpc");
@@ -12720,10 +13137,10 @@ mod tests {
 
     #[test]
     fn zexportkey_exports_sapling_extsk_for_own_address() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
-        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
         let addr = addr.as_str().expect("string").to_string();
 
         let key = rpc_zexportkey(&wallet, vec![json!(addr)], &params).expect("rpc");
@@ -12733,9 +13150,9 @@ mod tests {
 
     #[test]
     fn zexportkey_rejects_address_not_in_wallet() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
-        let addr = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
         let addr = addr.as_str().expect("string").to_string();
 
         let other_dir = temp_data_dir("fluxd-rpc-test-zexportkey");
@@ -12749,10 +13166,10 @@ mod tests {
 
     #[test]
     fn zimportkey_roundtrips_sapling_extsk() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
-        let addr1 = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr1 = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
         let addr1 = addr1.as_str().expect("string").to_string();
         let zkey = rpc_zexportkey(&wallet, vec![json!(addr1.clone())], &params).expect("rpc");
         let zkey = zkey.as_str().expect("string").to_string();
@@ -12763,7 +13180,8 @@ mod tests {
             Mutex::new(Wallet::load_or_create(&other_dir, params.network).expect("wallet"));
 
         rpc_zimportkey(&other_wallet, vec![json!(zkey)], &params).expect("rpc");
-        let addr2 = rpc_zgetnewaddress(&other_wallet, Vec::new(), &params).expect("rpc");
+        let addr2 =
+            rpc_zgetnewaddress(&chainstate, &other_wallet, Vec::new(), &params).expect("rpc");
         let addr2 = addr2.as_str().expect("string").to_string();
         assert_eq!(addr2, addr1);
     }
@@ -12779,10 +13197,10 @@ mod tests {
 
     #[test]
     fn zimportwallet_imports_sapling_key_from_file() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
-        let addr1 = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr1 = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
         let addr1 = addr1.as_str().expect("string").to_string();
         let zkey = rpc_zexportkey(&wallet, vec![json!(addr1.clone())], &params).expect("rpc");
         let zkey = zkey.as_str().expect("string").to_string();
@@ -12803,18 +13221,222 @@ mod tests {
             &params,
         )
         .expect("rpc");
-        let addr2 = rpc_zgetnewaddress(&other_wallet, Vec::new(), &params).expect("rpc");
+        let addr2 =
+            rpc_zgetnewaddress(&chainstate, &other_wallet, Vec::new(), &params).expect("rpc");
         let addr2 = addr2.as_str().expect("string").to_string();
         assert_eq!(addr2, addr1);
     }
 
     #[test]
     fn zgetnewaddress_rejects_unknown_type() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
-        let err = rpc_zgetnewaddress(&wallet, vec![json!("sprout")], &params).unwrap_err();
+        let err =
+            rpc_zgetnewaddress(&chainstate, &wallet, vec![json!("sprout")], &params).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn zgetbalance_and_zlistunspent_track_sapling_notes() {
+        let (chainstate, params, data_dir, _taddr, coinbase_txid, coinbase_vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        extend_regtest_chain_to_height(&chainstate, &params, COINBASE_MATURITY);
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let zaddr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
+        let zaddr = zaddr.as_str().expect("string").to_string();
+
+        let addr_bytes = parse_sapling_zaddr_bytes(&zaddr, &params).expect("sapling bytes");
+        let to = PaymentAddress::from_bytes(&addr_bytes).expect("payment address");
+
+        let value = block_subsidy(1, &params.consensus);
+        let note_value = NoteValue::from_raw(u64::try_from(value).expect("note value"));
+        let mut rng = rand::rngs::OsRng;
+        let mut rseed = [0u8; 32];
+        rng.fill_bytes(&mut rseed);
+        let note = to.create_note(note_value, Rseed::AfterZip212(rseed));
+
+        let enc = sapling_note_encryption(None, note.clone(), [0u8; 512], &mut rng);
+        let epk_bytes = <SaplingDomain as Domain>::epk_bytes(enc.epk()).0;
+
+        let output = fluxd_primitives::transaction::OutputDescription {
+            cv: [0u8; 32],
+            cm: note.cmu().to_bytes(),
+            ephemeral_key: epk_bytes,
+            enc_ciphertext: enc.encrypt_note_plaintext(),
+            out_ciphertext: [0u8; fluxd_primitives::transaction::SAPLING_OUT_CIPHERTEXT_SIZE],
+            zkproof: [0u8; fluxd_primitives::transaction::GROTH_PROOF_SIZE],
+        };
+
+        let shield_tx = Transaction {
+            f_overwintered: true,
+            version: 4,
+            version_group_id: fluxd_primitives::transaction::SAPLING_VERSION_GROUP_ID,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: coinbase_txid,
+                    index: coinbase_vout,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: -value,
+            shielded_spends: Vec::new(),
+            shielded_outputs: vec![output.clone()],
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let shield_txid = shield_tx.txid().expect("txid");
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let exchange_amount = exchange_fund_amount(height, &params.funding);
+        let foundation_amount = foundation_fund_amount(height, &params.funding);
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+        let mut vout = Vec::new();
+        vout.push(TxOut {
+            value: miner_value,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout.push(TxOut {
+                value: exchange_amount,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout.push(TxOut {
+                value: foundation_amount,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout.push(TxOut {
+                value: swap_amount,
+                script_pubkey: script,
+            });
+        }
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate
+            .sapling_root_after_commitments(&[output.cm])
+            .expect("sapling root");
+
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase, shield_tx],
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                &params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+
+        let balance =
+            rpc_zgetbalance(&chainstate, &wallet, vec![json!(zaddr)], &params).expect("rpc");
+        assert_eq!(balance, amount_to_value(value));
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let total =
+            rpc_zgettotalbalance(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let obj = total.as_object().expect("object");
+        assert_eq!(obj.get("private").cloned(), Some(amount_to_value(value)));
+
+        let unspent = rpc_zlistunspent(&chainstate, &wallet, Vec::new(), &params).expect("rpc");
+        let list = unspent.as_array().expect("array");
+        assert_eq!(list.len(), 1);
+        let entry = list[0].as_object().expect("object");
+        let shield_txid_hex = hash256_to_hex(&shield_txid);
+        assert_eq!(
+            entry.get("txid").and_then(Value::as_str),
+            Some(shield_txid_hex.as_str())
+        );
+        assert_eq!(entry.get("amountZat").and_then(Value::as_i64), Some(value));
     }
 
     #[test]
@@ -16183,9 +16805,9 @@ mod tests {
 
     #[test]
     fn shielded_wallet_stubs_return_wallet_error() {
-        let err = rpc_shielded_wallet_not_implemented(Vec::new(), "zgetbalance").unwrap_err();
+        let err = rpc_shielded_wallet_not_implemented(Vec::new(), "zsendmany").unwrap_err();
         assert_eq!(err.code, RPC_WALLET_ERROR);
-        assert!(err.message.contains("zgetbalance not implemented"));
+        assert!(err.message.contains("zsendmany not implemented"));
     }
 
     #[test]

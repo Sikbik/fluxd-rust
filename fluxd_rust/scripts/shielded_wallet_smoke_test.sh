@@ -115,7 +115,7 @@ PID=""
 
 rpc_get() {
   local method="$1"
-  curl -g -sS --fail -u "$COOKIE" "http://127.0.0.1:${RPC_PORT}/daemon/${method}"
+  curl -g -sS -u "$COOKIE" "http://127.0.0.1:${RPC_PORT}/daemon/${method}"
 }
 
 url_encode() {
@@ -222,6 +222,15 @@ echo "Checking zvalidateaddress (ismine) ..."
 zaddr1_enc="$(url_encode "$zaddr1")"
 rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("address")==addr, res; assert res.get("ismine") is True, res; assert res.get("iswatchonly") is False, res' "$zaddr1"
 
+echo "Checking zgetbalance returns 0.0 ..."
+rpc_get "zgetbalance?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result"); assert isinstance(res,(int,float)), res; assert abs(float(res) - 0.0) < 1e-12, res'
+
+echo "Checking zgettotalbalance returns 0.0 totals ..."
+rpc_get "zgettotalbalance" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or {}; assert isinstance(res, dict), res; keys=("transparent","private","total"); assert all(k in res for k in keys), res; assert all(isinstance(res[k],(int,float)) for k in keys), res; assert all(abs(float(res[k]) - 0.0) < 1e-12 for k in keys), res'
+
+echo "Checking zlistunspent returns empty list ..."
+rpc_get "zlistunspent" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
+
 echo "Checking zexportkey returns a Sapling spending key (no output) ..."
 zkey1="$(rpc_get "zexportkey?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
 if [[ -z "$zkey1" || "$zkey1" == "null" ]]; then
@@ -294,6 +303,12 @@ rpc_get "zlistaddresses?params=[true]" | python3 -c 'import json,sys; addr=sys.a
 
 echo "Checking zvalidateaddress ismine=false for watch-only wallet ..."
 rpc_get "zvalidateaddress?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is True, res; assert res.get("type")=="sapling", res; assert res.get("ismine") is False, res; assert res.get("iswatchonly") is True, res'
+
+echo "Checking zgetbalance errors without includeWatchonly on watch-only wallet ..."
+rpc_get "zgetbalance?zaddr=${zaddr1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
+
+echo "Checking zgetbalance succeeds with includeWatchonly=true on watch-only wallet ..."
+rpc_get "zgetbalance?zaddr=${zaddr1_enc}&minconf=1&includeWatchonly=true" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result"); assert isinstance(res,(int,float)), res; assert abs(float(res) - 0.0) < 1e-12, res'
 
 echo "Importing zkey into a fresh wallet (no output) ..."
 stop_node

@@ -4321,6 +4321,20 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(cache.sprout_tree.size() as u64)
     }
 
+    pub fn sapling_commitment_count(&self) -> Result<u64, ChainStateError> {
+        let mut cache = self
+            .shielded_cache
+            .lock()
+            .map_err(|_| ChainStateError::CorruptIndex("shielded cache poisoned"))?;
+        if cache.is_none() {
+            *cache = Some(ShieldedTreesCache::load(&self.store)?);
+        }
+        let cache = cache
+            .as_ref()
+            .ok_or(ChainStateError::CorruptIndex("missing shielded cache"))?;
+        Ok(cache.sapling_tree.size() as u64)
+    }
+
     pub fn sapling_root_after_commitments(
         &self,
         commitments: &[Hash256],

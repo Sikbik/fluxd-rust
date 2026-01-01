@@ -153,8 +153,12 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 Shielded wallet RPCs are registered for parity. The initial Sapling wallet surface is implemented:
 `zgetnewaddress`, `zlistaddresses` (supports watch-only via `includeWatchonly=true`), `zexportkey`, `zexportviewingkey`,
 `zimportkey`, `zimportviewingkey`, `zimportwallet`, and Sapling ownership detection in `zvalidateaddress`.
-The remaining shielded wallet RPCs return a wallet error (`-4`) while shielded wallet support is
-still WIP.
+Sapling shielded note tracking is implemented for read-only balance queries via incremental (on-demand) scanning:
+`zgetbalance`, `zgettotalbalance`, and `zlistunspent`. The wallet persists a Sapling scan cursor in `wallet.dat` and
+advances it during these RPCs; imports reset the scan cursor so historical notes can be discovered (which may require
+a full rescan and can be slow on large chains).
+
+Other shielded wallet RPCs still return a wallet error (`-4`) while shielded wallet support is WIP.
 
 Consensus note (mainnet): after the Flux rebrand upgrade, transactions with transparent inputs and
 Sapling outputs / JoinSplits are rejected (t→z shielding disabled). Existing shielded funds can
@@ -169,9 +173,9 @@ still be spent out of the pool (z→t) and moved within the pool (z→z).
 - `zshieldcoinbase` / `z_shieldcoinbase`
 - `zexportkey` / `z_exportkey` (Sapling only)
 - `zexportviewingkey` / `z_exportviewingkey`
-- `zimportkey` / `z_importkey` (Sapling only; rescan ignored)
-- `zimportviewingkey` / `z_importviewingkey`
-- `zimportwallet` / `z_importwallet` (Sapling only; rescan ignored)
+- `zimportkey` / `z_importkey` (Sapling only; resets Sapling scan cursor so historical notes can be discovered)
+- `zimportviewingkey` / `z_importviewingkey` (resets Sapling scan cursor so historical notes can be discovered)
+- `zimportwallet` / `z_importwallet` (Sapling only; resets Sapling scan cursor so historical notes can be discovered)
 - `zgetoperationstatus` / `z_getoperationstatus`
 - `zgetoperationresult` / `z_getoperationresult`
 - `zlistoperationids` / `z_listoperationids`
