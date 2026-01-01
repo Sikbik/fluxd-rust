@@ -134,21 +134,21 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Address manager v1 (last-seen timestamps + persistence) (owner: TBD)
 - [x] [P2] Address manager parity (bucket-based selection like C++) (owner: TBD)
   - [x] Bucketed sampling by netgroup + tried/new split (reduces peer herding on large address books)
-- [ ] [P2] P2P message coverage parity (addr/getaddr/feefilter/mempool, etc.) (owner: TBD)
+- [x] [P2] P2P message coverage parity (addr/getaddr/feefilter/mempool, etc.) (owner: TBD)
   - [x] Address discovery: `getaddr` + `addr` ingest (owner: TBD)
   - [x] Tx relay: `inv`/`getdata`/`tx` + `mempool` (owner: TBD)
   - [x] `feefilter` and fee-based relay policies (owner: TBD)
   - [x] `reject`/`notfound` handling parity (owner: TBD)
   - [x] Ignore unsolicited `block` messages during getdata download (prevents sync stalls) (owner: TBD)
 - [x] [P2] Service flags and user agent compatibility (owner: TBD)
-- [ ] [P1] Inbound P2P listener (accept peers + serve headers/blocks) (owner: TBD)
+- [x] [P1] Inbound P2P listener (accept peers + serve headers/blocks) (owner: TBD)
   - [x] Listen on network P2P port (`--p2p-addr`, `listen=1`, `bind=...`)
   - [x] Populate `getpeerinfo` with `inbound=true` for inbound peers
   - [x] Respond to `getaddr` and ingest `addr` messages
   - [x] Respond to `getheaders` requests (up to 160 headers)
   - [x] Respond to `getdata` block requests (bounded)
   - [x] Tx relay to inbound peers (`inv`/`getdata`/`tx`)
-  - [ ] DoS limits (owner: TBD)
+  - [x] DoS limits (owner: TBD)
     - [x] Enforce `maxconnections` for inbound accepts
     - [x] Per-peer rate limits
 
