@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use bech32::primitives::decode::CheckedHrpstring;
+use bech32::{Bech32, Hrp};
 use rand::RngCore;
 use serde_json::{json, Number, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1328,6 +1330,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         }
         "verifychain" => rpc_verifychain(chainstate, params),
         "validateaddress" => rpc_validateaddress(params, chain_params),
+        "zvalidateaddress" | "z_validateaddress" => {
+            rpc_zvalidateaddress(wallet, params, chain_params)
+        }
         "verifymessage" => rpc_verifymessage(params, chain_params),
         "createmultisig" => rpc_createmultisig(params, chain_params),
         _ => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "method not found")),
@@ -3991,6 +3996,115 @@ fn rpc_decodescript(params: Vec<Value>, chain_params: &ChainParams) -> Result<Va
         Value::String(script_p2sh_address(&script, chain_params.network)),
     );
     Ok(Value::Object(map))
+}
+
+fn rpc_zvalidateaddress(
+    _wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zvalidateaddress expects 1 parameter",
+        ));
+    }
+
+    let address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zaddr must be a string"))?;
+
+    if let Ok((payingkey, transmissionkey)) =
+        decode_sprout_payment_address(address, chain_params.network)
+    {
+        return Ok(json!({
+            "isvalid": true,
+            "address": address,
+            "type": "sprout",
+            "ismine": false,
+            "payingkey": hex_bytes(&payingkey),
+            "transmissionkey": hex_bytes(&transmissionkey),
+        }));
+    }
+
+    if let Some((diversifier, diversified_transmission_key)) =
+        decode_sapling_payment_address(address, chain_params.network)
+    {
+        return Ok(json!({
+            "isvalid": true,
+            "address": address,
+            "type": "sapling",
+            "ismine": false,
+            "diversifier": hex_bytes(&diversifier),
+            "diversifiedtransmissionkey": hex_bytes(&diversified_transmission_key),
+        }));
+    }
+
+    Ok(json!({
+        "isvalid": false,
+    }))
+}
+
+fn decode_sprout_payment_address(
+    address: &str,
+    network: Network,
+) -> Result<([u8; 32], [u8; 32]), AddressError> {
+    const SPROUT_SIZE: usize = 64;
+    const PREFIX_MAINNET: [u8; 2] = [0x16, 0x9a];
+    const PREFIX_TESTNET: [u8; 2] = [0x16, 0xb6];
+
+    let prefix: &[u8] = match network {
+        Network::Mainnet => &PREFIX_MAINNET,
+        Network::Testnet | Network::Regtest => &PREFIX_TESTNET,
+    };
+
+    let payload = base58check_decode(address)?;
+    if !payload.starts_with(prefix) {
+        return Err(AddressError::UnknownPrefix);
+    }
+
+    let body = &payload[prefix.len()..];
+    if body.len() != SPROUT_SIZE {
+        return Err(AddressError::InvalidLength);
+    }
+
+    let payingkey: [u8; 32] = body[..32]
+        .try_into()
+        .map_err(|_| AddressError::InvalidLength)?;
+    let transmissionkey: [u8; 32] = body[32..]
+        .try_into()
+        .map_err(|_| AddressError::InvalidLength)?;
+
+    Ok((payingkey, transmissionkey))
+}
+
+fn decode_sapling_payment_address(address: &str, network: Network) -> Option<([u8; 11], [u8; 32])> {
+    const SAPLING_SIZE: usize = 43;
+    const DIVERSIFIER_SIZE: usize = 11;
+    const PK_D_SIZE: usize = 32;
+
+    let expected_hrp = match network {
+        Network::Mainnet => "za",
+        Network::Testnet => "ztestacadia",
+        Network::Regtest => "zregtestsapling",
+    };
+
+    let expected_hrp = Hrp::parse(expected_hrp).ok()?;
+    let checked = CheckedHrpstring::new::<Bech32>(address).ok()?;
+    if checked.hrp() != expected_hrp {
+        return None;
+    }
+
+    let decoded: Vec<u8> = checked.byte_iter().collect();
+    if decoded.len() != SAPLING_SIZE {
+        return None;
+    }
+
+    let diversifier: [u8; DIVERSIFIER_SIZE] = decoded[..DIVERSIFIER_SIZE].try_into().ok()?;
+    let diversified_transmission_key: [u8; PK_D_SIZE] =
+        decoded[DIVERSIFIER_SIZE..].try_into().ok()?;
+
+    Some((diversifier, diversified_transmission_key))
 }
 
 fn rpc_validateaddress(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
@@ -11111,6 +11225,99 @@ mod tests {
     }
 
     #[test]
+    fn zvalidateaddress_reports_sprout_and_sapling_fields() {
+        use bech32::{Bech32, Hrp};
+
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let sprout_payingkey = [0x11u8; 32];
+        let sprout_transmissionkey = [0x22u8; 32];
+        let mut sprout_payload = Vec::new();
+        sprout_payload.extend_from_slice(&[0x16, 0xb6]);
+        sprout_payload.extend_from_slice(&sprout_payingkey);
+        sprout_payload.extend_from_slice(&sprout_transmissionkey);
+        let sprout_addr = base58check_encode(&sprout_payload);
+
+        let sprout =
+            rpc_zvalidateaddress(&wallet, vec![json!(sprout_addr.clone())], &params).expect("rpc");
+        let obj = sprout.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            obj.get("address").and_then(Value::as_str),
+            Some(sprout_addr.as_str())
+        );
+        assert_eq!(obj.get("type").and_then(Value::as_str), Some("sprout"));
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(false));
+        let expected_payingkey = hex_bytes(&sprout_payingkey);
+        assert_eq!(
+            obj.get("payingkey").and_then(Value::as_str),
+            Some(expected_payingkey.as_str())
+        );
+        let expected_transmissionkey = hex_bytes(&sprout_transmissionkey);
+        assert_eq!(
+            obj.get("transmissionkey").and_then(Value::as_str),
+            Some(expected_transmissionkey.as_str())
+        );
+
+        let sapling_diversifier = [0x33u8; 11];
+        let sapling_pk_d = [0x44u8; 32];
+        let mut sapling_payload = Vec::new();
+        sapling_payload.extend_from_slice(&sapling_diversifier);
+        sapling_payload.extend_from_slice(&sapling_pk_d);
+        let sapling_hrp = Hrp::parse("zregtestsapling").expect("hrp");
+        let sapling_addr =
+            bech32::encode::<Bech32>(sapling_hrp, &sapling_payload).expect("sapling bech32");
+
+        let sapling =
+            rpc_zvalidateaddress(&wallet, vec![json!(sapling_addr.clone())], &params).expect("rpc");
+        let obj = sapling.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            obj.get("address").and_then(Value::as_str),
+            Some(sapling_addr.as_str())
+        );
+        assert_eq!(obj.get("type").and_then(Value::as_str), Some("sapling"));
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(false));
+        let expected_diversifier = hex_bytes(&sapling_diversifier);
+        assert_eq!(
+            obj.get("diversifier").and_then(Value::as_str),
+            Some(expected_diversifier.as_str())
+        );
+        let expected_pk_d = hex_bytes(&sapling_pk_d);
+        assert_eq!(
+            obj.get("diversifiedtransmissionkey")
+                .and_then(Value::as_str),
+            Some(expected_pk_d.as_str())
+        );
+    }
+
+    #[test]
+    fn zvalidateaddress_rejects_other_network_prefixes() {
+        use bech32::{Bech32, Hrp};
+
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let mut sprout_payload = Vec::new();
+        sprout_payload.extend_from_slice(&[0x16, 0x9a]);
+        sprout_payload.extend_from_slice(&[0x11u8; 64]);
+        let sprout_addr = base58check_encode(&sprout_payload);
+
+        let value = rpc_zvalidateaddress(&wallet, vec![json!(sprout_addr)], &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(false));
+
+        let sapling_payload = vec![0x55u8; 43];
+        let sapling_hrp = Hrp::parse("za").expect("hrp");
+        let sapling_addr = bech32::encode::<Bech32>(sapling_hrp, &sapling_payload).expect("bech32");
+
+        let value = rpc_zvalidateaddress(&wallet, vec![json!(sapling_addr)], &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
     fn decodescript_has_cpp_schema_keys() {
         let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
         let script = p2pkh_script([0x55u8; 20]);
@@ -14698,6 +14905,98 @@ fn bytes_from_hex(input: &str) -> Option<Vec<u8>> {
         bytes.push(high << 4 | low);
     }
     Some(bytes)
+}
+
+fn base58check_decode(input: &str) -> Result<Vec<u8>, AddressError> {
+    let bytes = base58_decode(input)?;
+    if bytes.len() < 4 {
+        return Err(AddressError::InvalidLength);
+    }
+    let (payload, checksum) = bytes.split_at(bytes.len() - 4);
+    let digest = sha256d(payload);
+    if checksum != &digest[..4] {
+        return Err(AddressError::InvalidChecksum);
+    }
+    Ok(payload.to_vec())
+}
+
+#[cfg(test)]
+fn base58check_encode(payload: &[u8]) -> String {
+    let mut data = Vec::with_capacity(payload.len() + 4);
+    data.extend_from_slice(payload);
+    let checksum = sha256d(payload);
+    data.extend_from_slice(&checksum[..4]);
+    base58_encode(&data)
+}
+
+fn base58_decode(input: &str) -> Result<Vec<u8>, AddressError> {
+    if input.is_empty() {
+        return Err(AddressError::InvalidLength);
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    for ch in input.bytes() {
+        let value = base58_value(ch).ok_or(AddressError::InvalidCharacter)? as u32;
+        let mut carry = value;
+        for byte in bytes.iter_mut().rev() {
+            let val = (*byte as u32) * 58 + carry;
+            *byte = (val & 0xff) as u8;
+            carry = val >> 8;
+        }
+        while carry > 0 {
+            bytes.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+
+    let leading_zeros = input.bytes().take_while(|b| *b == b'1').count();
+    let mut out = vec![0u8; leading_zeros];
+    out.extend_from_slice(&bytes);
+    Ok(out)
+}
+
+#[cfg(test)]
+fn base58_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    if data.is_empty() {
+        return String::new();
+    }
+
+    let mut digits: Vec<u8> = vec![0u8];
+    for byte in data {
+        let mut carry = *byte as u32;
+        for digit in digits.iter_mut().rev() {
+            let val = (*digit as u32) * 256 + carry;
+            *digit = (val % 58) as u8;
+            carry = val / 58;
+        }
+        while carry > 0 {
+            digits.insert(0, (carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+
+    let leading_zeros = data.iter().take_while(|b| **b == 0).count();
+    let mut out = String::with_capacity(leading_zeros + digits.len());
+    for _ in 0..leading_zeros {
+        out.push('1');
+    }
+    for digit in digits {
+        out.push(ALPHABET[digit as usize] as char);
+    }
+    out
+}
+
+fn base58_value(ch: u8) -> Option<u8> {
+    match ch {
+        b'1' => Some(0),
+        b'2'..=b'9' => Some(ch - b'1'),
+        b'A'..=b'H' => Some(ch - b'A' + 9),
+        b'J'..=b'N' => Some(ch - b'J' + 17),
+        b'P'..=b'Z' => Some(ch - b'P' + 22),
+        b'a'..=b'k' => Some(ch - b'a' + 33),
+        b'm'..=b'z' => Some(ch - b'm' + 44),
+        _ => None,
+    }
 }
 
 fn rpc_ok(id: Value, result: Value) -> Value {

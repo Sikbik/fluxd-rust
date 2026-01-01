@@ -632,6 +632,7 @@ name = "fluxd"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bech32",
  "crossbeam-channel",
  "fluxd-chainstate",
  "fluxd-consensus",

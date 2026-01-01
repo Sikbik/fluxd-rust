@@ -119,6 +119,7 @@ Type notes:
 - `gettxout <txid> <vout> [include_mempool]`
 - `gettxoutsetinfo`
 - `validateaddress <fluxaddress>`
+- `zvalidateaddress <zaddr>` (partial; validates Sprout/Sapling encoding; does not check ownership)
 - `verifymessage <fluxaddress> <signature> <message>`
 
 ### Wallet (transparent)
@@ -513,6 +514,18 @@ Notes:
 - Result:
   - If invalid: `{ "isvalid": false }`
   - If valid: `{ "isvalid": true, "address": "...", "scriptPubKey": "..." }`
+
+### zvalidateaddress
+
+- Params: `zaddr` (string)
+- Result:
+  - If invalid: `{ "isvalid": false }`
+  - If valid Sprout: `{ "isvalid": true, "address": "...", "type": "sprout", "ismine": false, "payingkey": "<hex>", "transmissionkey": "<hex>" }`
+  - If valid Sapling: `{ "isvalid": true, "address": "...", "type": "sapling", "ismine": false, "diversifier": "<hex>", "diversifiedtransmissionkey": "<hex>" }`
+
+Notes:
+- Uses Flux network HRPs (mainnet `za`, testnet `ztestacadia`, regtest `zregtestsapling`).
+- `ismine` is always false until shielded wallet support exists.
 
 ### createmultisig
 
