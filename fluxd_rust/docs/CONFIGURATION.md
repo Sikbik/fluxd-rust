@@ -43,6 +43,9 @@ The daemon optionally reads a `flux.conf` config file.
 - Precedence: CLI flags override config file values
 
 Currently supported keys:
+- `dbcache` (MiB; maps to `--db-cache-mb`)
+- `maxmempool` (MiB; maps to `--mempool-max-mb`)
+- `minrelaytxfee` (FLUX/kB; maps to `--minrelaytxfee`)
 - `rpcuser`, `rpcpassword`
 - `rpcbind`, `rpcport`
 - `rpcallowip` (repeatable; IP or CIDR, e.g. `127.0.0.1`, `10.0.0.0/8`)
@@ -67,8 +70,9 @@ and worker configuration).
 
 Precedence (highest to lowest):
 1. Explicit CLI flags (e.g. `--db-cache-mb 512`)
-2. `--profile ...`
-3. Built-in defaults
+2. `flux.conf` values
+3. `--profile ...`
+4. Built-in defaults
 
 The daemon prints `Using profile <name>` at startup when a non-default profile is selected.
 

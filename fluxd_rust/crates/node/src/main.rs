@@ -6277,6 +6277,7 @@ fn parse_args() -> Result<Config, String> {
     let mut inflight_per_peer_set = false;
     let mut require_standard: Option<bool> = None;
     let mut min_relay_fee_per_kb: i64 = 100;
+    let mut min_relay_fee_per_kb_set = false;
     let mut miner_address: Option<String> = None;
     let mut miner_address_set = false;
     let mut mempool_max_mb: u64 = DEFAULT_MEMPOOL_MAX_MB;
@@ -6577,6 +6578,7 @@ fn parse_args() -> Result<Config, String> {
                     .ok_or_else(|| format!("missing value for --minrelaytxfee\n{}", usage()))?;
                 min_relay_fee_per_kb =
                     parse_fee_rate_per_kb(&value).map_err(|err| format!("{err}\n{}", usage()))?;
+                min_relay_fee_per_kb_set = true;
             }
             "--accept-non-standard" => {
                 require_standard = Some(false);
@@ -6876,6 +6878,41 @@ fn parse_args() -> Result<Config, String> {
             }
         }
 
+        if !db_cache_set {
+            if let Some(values) = conf.get("dbcache") {
+                if let Some(raw) = values.last() {
+                    db_cache_mb = raw.parse::<u64>().map_err(|_| {
+                        format!("invalid dbcache '{raw}' in {}", conf_file.display())
+                    })?;
+                    db_cache_set = true;
+                }
+            }
+        }
+
+        if !mempool_max_mb_set {
+            if let Some(values) = conf.get("maxmempool") {
+                if let Some(raw) = values.last() {
+                    mempool_max_mb = raw.parse::<u64>().map_err(|_| {
+                        format!("invalid maxmempool '{raw}' in {}", conf_file.display())
+                    })?;
+                    mempool_max_mb_set = true;
+                }
+            }
+        }
+
+        if !min_relay_fee_per_kb_set {
+            if let Some(values) = conf.get("minrelaytxfee") {
+                if let Some(raw) = values.last() {
+                    min_relay_fee_per_kb = parse_fee_rate_per_kb(raw).map_err(|err| {
+                        format!(
+                            "invalid minrelaytxfee '{raw}' in {}: {err}",
+                            conf_file.display()
+                        )
+                    })?;
+                }
+            }
+        }
+
         if !log_level_set {
             if let Some(values) = conf.get("loglevel") {
                 if let Some(raw) = values.last() {
@@ -6925,10 +6962,13 @@ fn parse_args() -> Result<Config, String> {
 
         let supported_keys = [
             "addnode",
+            "dbcache",
             "logformat",
             "loglevel",
             "logtimestamps",
+            "maxmempool",
             "mineraddress",
+            "minrelaytxfee",
             "rpcallowip",
             "rpcbind",
             "rpcpassword",

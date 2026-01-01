@@ -213,6 +213,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [ ] Remaining `flux.conf` keys parity
     - [x] Enforce RPC allowlist via `rpcallowip` (localhost-only default)
     - [x] Support `testnet`/`regtest` toggles and warn on unsupported keys
+    - [x] Support `dbcache`, `maxmempool`, `minrelaytxfee`
 - [ ] [P2] Structured CLI help output and subcommands (owner: TBD)
 - [ ] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
   - [x] `--db-info`
