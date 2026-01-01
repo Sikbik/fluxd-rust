@@ -153,6 +153,10 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 Shielded wallet RPCs are registered for parity, but currently return a wallet error (`-4`)
 because shielded wallet support is not implemented yet.
 
+Consensus note (mainnet): after the Flux rebrand upgrade, transactions with transparent inputs and
+Sapling outputs / JoinSplits are rejected (t→z shielding disabled). Existing shielded funds can
+still be spent out of the pool (z→t) and moved within the pool (z→z).
+
 - `zgetbalance` / `z_getbalance`
 - `zgettotalbalance` / `z_gettotalbalance`
 - `zgetnewaddress` / `z_getnewaddress`

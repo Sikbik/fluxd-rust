@@ -20,3 +20,14 @@ sapling-crypto = "0.5"
 group = "0.13"
 sha2 = "0.10"
 zcash_proofs = { version = "0.26", default-features = false, features = ["multicore"] }
+
+[dev-dependencies]
+incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
+rand_chacha = "0.3"
+rand_core = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+transparent = { package = "zcash_transparent", version = "0.6.3", default-features = false, features = ["std"] }
+zcash_primitives = { version = "0.26", default-features = false, features = ["std", "circuits"] }
+zcash_protocol = { version = "0.7.2", default-features = false, features = ["std"] }
+zcash_proofs = { version = "0.26", default-features = false, features = ["local-prover"] }

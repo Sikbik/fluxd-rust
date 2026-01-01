@@ -753,12 +753,20 @@ dependencies = [
  "fluxd-primitives",
  "fluxd-script",
  "group",
+ "incrementalmerkletree",
  "jubjub",
  "minreq",
+ "rand_chacha",
+ "rand_core",
  "redjubjub",
  "sapling-crypto",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "zcash_primitives",
  "zcash_proofs",
+ "zcash_protocol",
+ "zcash_transparent",
 ]
 
 [[package]]
@@ -958,6 +966,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "home"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1051,6 +1068,15 @@ dependencies = [
  "group",
  "rand_core",
  "subtle",
+]
+
+[[package]]
+name = "known-folders"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d463f34ca3c400fde3a054da0e0b8c6ffa21e4590922f3e18281bb5eeef4cbdc"
+dependencies = [
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2388,6 +2414,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "xdg"
+version = "2.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "213b7324336b53d2414b2db8537e56544d981803139155afa84f76eeebb7a546"
+
+[[package]]
 name = "xxhash-rust"
 version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2483,12 +2515,15 @@ dependencies = [
  "bls12_381",
  "document-features",
  "group",
+ "home",
  "jubjub",
+ "known-folders",
  "lazy_static",
  "rand_core",
  "redjubjub",
  "sapling-crypto",
  "tracing",
+ "xdg",
  "zcash_primitives",
 ]
 

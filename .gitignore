@@ -10,6 +10,7 @@
 # Rust local caches
 /fluxd_rust/.cargo/
 /fluxd_rust/.cargo-home/
+/fluxd_rust/.cargo_home/
 /.cargo_home/
 /.cargo-home/
 

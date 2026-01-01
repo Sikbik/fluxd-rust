@@ -149,3 +149,20 @@ ssh <vps-user>@<vps-host> "cat <remote-data-dir>/rpc.cookie"
 ```
 
 Use the cookie with curl from a trusted host.
+
+## Shielded proof tests
+
+Shielded proof verification tests are marked `#[ignore]` because they require Sapling/Sprout params
+and are CPU-heavy.
+
+Run them locally from `fluxd_rust/`:
+
+```bash
+./scripts/run_shielded_tests.sh
+```
+
+Override the params location:
+
+```bash
+./scripts/run_shielded_tests.sh --params-dir /path/to/zcash-params
+```
