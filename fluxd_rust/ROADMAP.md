@@ -250,6 +250,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 - [x] [P2] Sync/run profiles (`--profile low|default|high`) for worker + DB presets (owner: TBD)
 - [x] [P1] Data-dir lock file (`--data-dir/.lock`) to prevent multi-instance corruption (owner: TBD)
+- [x] [P2] Graceful shutdown on SIGINT/SIGTERM (owner: TBD)
 - [ ] [P2] Config file support (`flux.conf` parity) (owner: TBD)
   - [x] Basic `flux.conf` parsing (`rpcuser`, `rpcpassword`, `rpcbind`, `rpcport`, `rpcallowip`, `addnode`, `mineraddress`)
   - [ ] Remaining `flux.conf` keys parity

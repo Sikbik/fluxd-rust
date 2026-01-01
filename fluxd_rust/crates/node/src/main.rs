@@ -1109,6 +1109,35 @@ async fn run() -> Result<(), String> {
     let rpc_allowlist =
         rpc::RpcAllowList::from_allow_ips(&config.rpc_allow_ips).map_err(|err| err.to_string())?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(signal) => signal,
+                    Err(err) => {
+                        log_warn!("failed to install SIGTERM handler: {err}");
+                        let _ = tokio::signal::ctrl_c().await;
+                        let _ = shutdown_tx.send(true);
+                        return;
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+
+            log_info!("Signal received; requesting shutdown.");
+            let _ = shutdown_tx.send(true);
+        });
+    }
 
     if !rpc_addr.ip().is_loopback() && config.rpc_allow_ips.is_empty() {
         log_warn!(

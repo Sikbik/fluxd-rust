@@ -93,7 +93,11 @@ curl http://127.0.0.1:8080/healthz
 Stop the daemon, delete the data dir, and restart:
 
 ```bash
-pkill -f fluxd
+# Prefer a graceful shutdown.
+curl -u "$(cat ./data/rpc.cookie)" http://127.0.0.1:16124/daemon/stop
+# Or send SIGTERM directly (equivalent):
+pkill -TERM -x fluxd
+
 rm -rf ./data
 ./target/release/fluxd --network mainnet --backend fjall --data-dir ./data --fetch-params
 ```

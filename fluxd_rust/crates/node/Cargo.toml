@@ -16,7 +16,7 @@ fluxd-script = { path = "../script" }
 fluxd-shielded = { path = "../shielded" }
 fluxd-storage = { path = "../storage", features = ["fjall"] }
 rand = "0.8"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 crossbeam-channel = "0.5"
 base64 = "0.22"
 bech32 = "0.11"

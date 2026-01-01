@@ -123,6 +123,8 @@ The daemon writes a few non-db helper files into `--data-dir`:
 ssh <vps-user>@<vps-host> "pkill -x fluxd"
 ```
 
+`pkill` sends SIGTERM; `fluxd` handles SIGTERM/CTRL-C and will shut down cleanly.
+
 Or via RPC (requires Basic Auth):
 
 ```bash
