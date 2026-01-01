@@ -417,7 +417,8 @@ Notes:
 
 Notes:
 - Builds a transparent transaction, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
-- Currently only supports P2PKH wallet UTXOs and does not support `subtractfeefromamount`.
+- Currently only supports P2PKH wallet UTXOs.
+- Supports `subtractfeefromamount=true` (fee is deducted from the destination output).
 
 ### sendmany
 
@@ -428,7 +429,8 @@ Notes:
 
 Notes:
 - Builds a transparent transaction with multiple outputs, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
-- Currently only supports P2PKH wallet UTXOs and does not support `subtractfeefromamount`.
+- Currently only supports P2PKH wallet UTXOs.
+- Supports `subtractfeefrom` (fee is split across the selected destination outputs).
 
 ### getdbinfo
 

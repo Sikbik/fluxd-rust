@@ -5479,6 +5479,45 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))
     })?;
 
+    let mut subtract_fee_from_outputs: Vec<usize> = Vec::new();
+    if let Some(value) = params.get(1) {
+        if let Some(opts) = value.as_object() {
+            if let Some(raw_outputs) = opts.get("subtractFeeFromOutputs") {
+                if !raw_outputs.is_null() {
+                    let outputs = raw_outputs.as_array().ok_or_else(|| {
+                        RpcError::new(
+                            RPC_INVALID_PARAMETER,
+                            "subtractFeeFromOutputs must be an array",
+                        )
+                    })?;
+                    let mut seen = HashSet::new();
+                    for output_index in outputs {
+                        let index = parse_u32(output_index, "subtractFeeFromOutputs")?;
+                        let index = usize::try_from(index).map_err(|_| {
+                            RpcError::new(
+                                RPC_INVALID_PARAMETER,
+                                "subtractFeeFromOutputs out of range",
+                            )
+                        })?;
+                        if index >= recipient_vout_len {
+                            return Err(RpcError::new(
+                                RPC_INVALID_PARAMETER,
+                                "subtractFeeFromOutputs out of range",
+                            ));
+                        }
+                        if !seen.insert(index) {
+                            return Err(RpcError::new(
+                                RPC_INVALID_PARAMETER,
+                                "subtractFeeFromOutputs contains duplicate indices",
+                            ));
+                        }
+                        subtract_fee_from_outputs.push(index);
+                    }
+                }
+            }
+        }
+    }
+
     let mut used_outpoints: HashSet<OutPoint> = HashSet::new();
     let mut base_inputs_value: i64 = 0;
     let base_prevtxs = HashMap::new();
@@ -5567,9 +5606,13 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             fee = target_fee;
         }
 
-        let required = recipient_value
-            .checked_add(fee)
-            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+        let required = if subtract_fee_from_outputs.is_empty() {
+            recipient_value
+                .checked_add(fee)
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?
+        } else {
+            recipient_value
+        };
         let total_inputs = base_inputs_value
             .checked_add(selected_value)
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
@@ -5635,6 +5678,51 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             continue;
         }
         break;
+    }
+
+    if !subtract_fee_from_outputs.is_empty() && fee > 0 {
+        let split = i64::try_from(subtract_fee_from_outputs.len()).map_err(|_| {
+            RpcError::new(RPC_INVALID_PARAMETER, "subtractFeeFromOutputs out of range")
+        })?;
+        if split <= 0 {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "subtractFeeFromOutputs is empty",
+            ));
+        }
+
+        let per_output = fee / split;
+        let remainder = fee % split;
+        for (pos, output_index) in subtract_fee_from_outputs.iter().enumerate() {
+            let extra = if (pos as i64) < remainder { 1 } else { 0 };
+            let to_subtract = per_output
+                .checked_add(extra)
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+            let out = tx.vout.get_mut(*output_index).ok_or_else(|| {
+                RpcError::new(RPC_INVALID_PARAMETER, "subtractFeeFromOutputs out of range")
+            })?;
+            out.value = out.value.checked_sub(to_subtract).ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "Transaction amount too small to pay the fee",
+                )
+            })?;
+            if out.value <= 0 {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "Transaction amount too small to pay the fee",
+                ));
+            }
+            if mempool_policy.require_standard
+                && is_dust(
+                    out.value,
+                    &out.script_pubkey,
+                    mempool_policy.min_relay_fee_per_kb,
+                )
+            {
+                return Err(RpcError::new(RPC_INVALID_PARAMETER, "dust"));
+            }
+        }
     }
 
     let final_outputs_value = tx.vout.iter().try_fold(0i64, |total, output| {
@@ -5845,17 +5933,27 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
     let amount = parse_amount(&params[1])?;
 
-    if let Some(value) = params.get(4) {
-        if !value.is_null() {
-            let subtract_fee = parse_bool(value)?;
-            if subtract_fee {
-                return Err(RpcError::new(
-                    RPC_INVALID_PARAMETER,
-                    "subtractfeefromamount not supported yet",
-                ));
-            }
+    if let Some(value) = params.get(2) {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "comment must be a string",
+            ));
         }
     }
+    if let Some(value) = params.get(3) {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "comment_to must be a string",
+            ));
+        }
+    }
+
+    let subtract_fee = match params.get(4) {
+        Some(value) if !value.is_null() => parse_bool(value)?,
+        _ => false,
+    };
 
     let script_pubkey = address_to_script_pubkey(address, chain_params.network)
         .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
@@ -5902,12 +6000,17 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
 
     let unsigned_hex = hex_bytes(&tx.consensus_encode().map_err(map_internal)?);
 
+    let mut fund_params = vec![Value::String(unsigned_hex)];
+    if subtract_fee {
+        fund_params.push(json!({ "subtractFeeFromOutputs": [0] }));
+    }
+
     let funded = rpc_fundrawtransaction(
         chainstate,
         mempool,
         mempool_policy,
         wallet,
-        vec![Value::String(unsigned_hex)],
+        fund_params,
         chain_params,
     )?;
     let funded_hex = funded
@@ -6008,14 +6111,32 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
     }
     if let Some(value) = params.get(4) {
         if !value.is_null() {
-            let subtract = value.as_array().ok_or_else(|| {
-                RpcError::new(RPC_INVALID_PARAMETER, "subtractfeefrom must be an array")
-            })?;
-            if !subtract.is_empty() {
+            if value.as_array().is_none() {
                 return Err(RpcError::new(
                     RPC_INVALID_PARAMETER,
-                    "subtractfeefromamount not supported yet",
+                    "subtractfeefrom must be an array",
                 ));
+            }
+        }
+    }
+
+    let mut subtract_fee_from_outputs: HashSet<String> = HashSet::new();
+    if let Some(value) = params.get(4) {
+        if let Some(subtract) = value.as_array() {
+            for entry in subtract {
+                let addr = entry.as_str().ok_or_else(|| {
+                    RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "subtractfeefrom entries must be strings",
+                    )
+                })?;
+                if !outputs.contains_key(addr) {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "subtractfeefrom address not found in outputs",
+                    ));
+                }
+                subtract_fee_from_outputs.insert(addr.to_string());
             }
         }
     }
@@ -6031,8 +6152,13 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         UpgradeIndex::Acadia,
     );
 
-    let mut vout = Vec::with_capacity(outputs.len());
-    for (address, amount) in outputs {
+    let mut ordered: Vec<(&String, &Value)> = outputs.iter().collect();
+    ordered.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut vout = Vec::with_capacity(ordered.len());
+    let mut subtract_fee_from_vout: Vec<usize> = Vec::new();
+
+    for (address, amount) in ordered {
         let value = parse_amount(amount)?;
         let script_pubkey = address_to_script_pubkey(address, chain_params.network)
             .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
@@ -6045,6 +6171,9 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
             value,
             script_pubkey,
         });
+        if subtract_fee_from_outputs.contains(address.as_str()) {
+            subtract_fee_from_vout.push(vout.len().saturating_sub(1));
+        }
     }
 
     let tx = Transaction {
@@ -6075,12 +6204,21 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
 
     let unsigned_hex = hex_bytes(&tx.consensus_encode().map_err(map_internal)?);
 
+    let mut options = serde_json::Map::new();
+    options.insert("minconf".to_string(), json!(minconf));
+    if !subtract_fee_from_vout.is_empty() {
+        options.insert(
+            "subtractFeeFromOutputs".to_string(),
+            json!(subtract_fee_from_vout),
+        );
+    }
+
     let funded = rpc_fundrawtransaction(
         chainstate,
         mempool,
         mempool_policy,
         wallet,
-        vec![Value::String(unsigned_hex), json!({ "minconf": minconf })],
+        vec![Value::String(unsigned_hex), Value::Object(options)],
         chain_params,
     )?;
     let funded_hex = funded
@@ -14639,6 +14777,100 @@ mod tests {
     }
 
     #[test]
+    fn sendtoaddress_supports_subtractfeefromamount() {
+        let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x13u8; 32],
+            index: 0,
+        };
+        let input_value = 5 * COIN;
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: input_value,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("address");
+        let to_script = address_to_script_pubkey(&to_address, params.network).expect("script");
+
+        let value = rpc_sendtoaddress(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![
+                json!(to_address),
+                json!("1.0"),
+                Value::Null,
+                Value::Null,
+                Value::Bool(true),
+            ],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("parse txid");
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("mempool entry");
+
+        let outputs_value: i64 = entry.tx.vout.iter().map(|out| out.value).sum();
+        let fee = input_value - outputs_value;
+        assert!(fee > 0);
+
+        let to_value = entry
+            .tx
+            .vout
+            .iter()
+            .find(|out| out.script_pubkey == to_script)
+            .expect("destination output")
+            .value;
+        assert_eq!(to_value, COIN - fee);
+
+        let other_value: i64 = entry
+            .tx
+            .vout
+            .iter()
+            .filter(|out| out.script_pubkey != to_script)
+            .map(|out| out.value)
+            .sum();
+        assert_eq!(other_value, input_value - COIN);
+    }
+
+    #[test]
     fn sendmany_funds_signs_and_broadcasts_sapling_tx_when_upgrade_active() {
         let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
         params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
@@ -14726,6 +14958,109 @@ mod tests {
         }
         assert!(found_a);
         assert!(found_b);
+    }
+
+    #[test]
+    fn sendmany_supports_subtractfeefromamount() {
+        let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x14u8; 32],
+            index: 0,
+        };
+        let input_value = 10 * COIN;
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: input_value,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address_a =
+            script_pubkey_to_address(&p2pkh_script([0x21u8; 20]), params.network).expect("a addr");
+        let to_address_b =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("b addr");
+
+        let script_a = address_to_script_pubkey(&to_address_a, params.network).expect("script a");
+        let script_b = address_to_script_pubkey(&to_address_b, params.network).expect("script b");
+
+        let mut amounts = serde_json::Map::new();
+        amounts.insert(to_address_a.clone(), json!("1.0"));
+        amounts.insert(to_address_b.clone(), json!("2.0"));
+
+        let subtract = vec![Value::String(to_address_a.clone())];
+
+        let value = rpc_sendmany(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![
+                json!(""),
+                Value::Object(amounts),
+                json!(1),
+                Value::Null,
+                Value::Array(subtract),
+            ],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("parse txid");
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("mempool entry");
+
+        let outputs_value: i64 = entry.tx.vout.iter().map(|out| out.value).sum();
+        let fee = input_value - outputs_value;
+        assert!(fee > 0);
+
+        let mut a_value = None;
+        let mut b_value = None;
+        let mut other_value = 0i64;
+        for out in &entry.tx.vout {
+            if out.script_pubkey == script_a {
+                a_value = Some(out.value);
+            } else if out.script_pubkey == script_b {
+                b_value = Some(out.value);
+            } else {
+                other_value = other_value.saturating_add(out.value);
+            }
+        }
+
+        assert_eq!(b_value, Some(2 * COIN));
+        assert_eq!(a_value, Some(COIN - fee));
+        assert_eq!(other_value, input_value - (COIN + 2 * COIN));
     }
 
     #[test]

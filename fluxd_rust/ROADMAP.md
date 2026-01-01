@@ -198,8 +198,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `backupwallet`
   - [x] `fundrawtransaction` (P2PKH only)
   - [x] `signrawtransaction` (P2PKH only)
-  - [x] `sendtoaddress` (P2PKH only; no `subtractfeefromamount`)
-  - [x] `sendmany` (P2PKH only; no `subtractfeefromamount`)
+  - [x] `sendtoaddress` (P2PKH only; supports `subtractfeefromamount`)
+  - [x] `sendmany` (P2PKH only; supports `subtractfeefrom`)
   - [x] `sendfrom` (fromaccount ignored; minconf supported)
   - [x] `rescanblockchain` (scans address delta index; populates wallet tx history)
 - [ ] [P1] Shielded wallet RPCs (owner: TBD)
