@@ -259,6 +259,11 @@ fi
 echo "Checking zlistaddresses contains zaddr1 ..."
 rpc_get "zlistaddresses" | python3 -c 'import json,sys; addr=sys.argv[1]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert addr in res, res' "$zaddr1"
 
+echo "Checking shielded operation RPCs return empty lists ..."
+rpc_get "zlistoperationids" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
+rpc_get "zgetoperationstatus" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
+rpc_get "zgetoperationresult" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
+
 echo "Restarting node to confirm persistence ..."
 stop_node
 sleep 0.2

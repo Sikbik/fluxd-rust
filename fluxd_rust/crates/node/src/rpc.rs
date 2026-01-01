@@ -1401,12 +1401,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "zgetnewaddress" | "z_getnewaddress" => {
             rpc_zgetnewaddress(chainstate, wallet, params, chain_params)
         }
-        "zgetoperationresult" | "z_getoperationresult" => {
-            rpc_shielded_wallet_not_implemented(params, "zgetoperationresult")
-        }
-        "zgetoperationstatus" | "z_getoperationstatus" => {
-            rpc_shielded_wallet_not_implemented(params, "zgetoperationstatus")
-        }
+        "zgetoperationresult" | "z_getoperationresult" => rpc_zgetoperationresult(params),
+        "zgetoperationstatus" | "z_getoperationstatus" => rpc_zgetoperationstatus(params),
         "zgettotalbalance" | "z_gettotalbalance" => {
             rpc_zgettotalbalance(chainstate, mempool, wallet, params, chain_params)
         }
@@ -1416,9 +1412,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         }
         "zimportwallet" | "z_importwallet" => rpc_zimportwallet(wallet, params, chain_params),
         "zlistaddresses" | "z_listaddresses" => rpc_zlistaddresses(wallet, params, chain_params),
-        "zlistoperationids" | "z_listoperationids" => {
-            rpc_shielded_wallet_not_implemented(params, "zlistoperationids")
-        }
+        "zlistoperationids" | "z_listoperationids" => rpc_zlistoperationids(params),
         "zlistreceivedbyaddress" | "z_listreceivedbyaddress" => {
             rpc_zlistreceivedbyaddress(chainstate, wallet, params, chain_params)
         }
@@ -1449,6 +1443,74 @@ fn rpc_ping(params: Vec<Value>) -> Result<Value, RpcError> {
 fn rpc_start(params: Vec<Value>) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
     Ok(Value::String("fluxd already running".to_string()))
+}
+
+fn rpc_zlistoperationids(params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zlistoperationids expects 0 or 1 parameters",
+        ));
+    }
+    if let Some(value) = params.first() {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "status must be a string",
+            ));
+        }
+    }
+    Ok(Value::Array(Vec::new()))
+}
+
+fn rpc_zgetoperationstatus(params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zgetoperationstatus expects 0 or 1 parameters",
+        ));
+    }
+    if let Some(value) = params.first() {
+        if !value.is_null() {
+            let ids = value.as_array().ok_or_else(|| {
+                RpcError::new(RPC_INVALID_PARAMETER, "operationids must be an array")
+            })?;
+            for id in ids {
+                if id.as_str().is_none() {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "operationids must be strings",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Value::Array(Vec::new()))
+}
+
+fn rpc_zgetoperationresult(params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zgetoperationresult expects 0 or 1 parameters",
+        ));
+    }
+    if let Some(value) = params.first() {
+        if !value.is_null() {
+            let ids = value.as_array().ok_or_else(|| {
+                RpcError::new(RPC_INVALID_PARAMETER, "operationids must be an array")
+            })?;
+            for id in ids {
+                if id.as_str().is_none() {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "operationids must be strings",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Value::Array(Vec::new()))
 }
 
 fn rpc_shielded_wallet_not_implemented(
@@ -13593,6 +13655,33 @@ mod tests {
         assert_eq!(entry.get("outindex").and_then(Value::as_u64), Some(0));
         assert_eq!(entry.get("amountZat").and_then(Value::as_i64), Some(value));
         assert_eq!(entry.get("spent").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn shielded_operation_rpcs_return_empty_lists() {
+        let value = rpc_zlistoperationids(Vec::new()).expect("rpc");
+        assert_eq!(value.as_array().map(Vec::len), Some(0));
+
+        let value = rpc_zlistoperationids(vec![json!("all")]).expect("rpc");
+        assert_eq!(value.as_array().map(Vec::len), Some(0));
+
+        let value = rpc_zgetoperationstatus(Vec::new()).expect("rpc");
+        assert_eq!(value.as_array().map(Vec::len), Some(0));
+
+        let value = rpc_zgetoperationstatus(vec![json!(["opid1", "opid2"])]).expect("rpc");
+        assert_eq!(value.as_array().map(Vec::len), Some(0));
+
+        let err = rpc_zgetoperationstatus(vec![json!("opid")]).expect_err("err");
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+
+        let value = rpc_zgetoperationresult(Vec::new()).expect("rpc");
+        assert_eq!(value.as_array().map(Vec::len), Some(0));
+
+        let value = rpc_zgetoperationresult(vec![json!(["opid1"])]).expect("rpc");
+        assert_eq!(value.as_array().map(Vec::len), Some(0));
+
+        let err = rpc_zgetoperationresult(vec![json!("opid")]).expect_err("err");
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
     }
 
     #[test]

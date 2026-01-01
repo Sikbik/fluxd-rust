@@ -158,6 +158,9 @@ Sapling shielded note tracking is implemented for read-only wallet queries via i
 advances it during these RPCs; imports reset the scan cursor so historical notes can be discovered (which may require
 a full rescan and can be slow on large chains).
 
+Async operation-tracking RPCs currently return empty lists (until shielded send/shield ops are implemented):
+`zlistoperationids`, `zgetoperationstatus`, and `zgetoperationresult`.
+
 Other shielded wallet RPCs still return a wallet error (`-4`) while shielded wallet support is WIP.
 
 Consensus note (mainnet): after the Flux rebrand upgrade, transactions with transparent inputs and
