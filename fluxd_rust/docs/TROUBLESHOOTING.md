@@ -129,6 +129,16 @@ Fix:
   - disable inbound P2P with `--no-p2p-listen` (or `listen=0` in `flux.conf`), or
   - bind to a different address/port via `--p2p-addr IP:PORT` (or `bind=...` in `flux.conf`).
 
+## P2P mempool probe times out
+
+Symptoms:
+- `./scripts/p2p_mempool_probe.sh` prints `ERROR: did not receive inv in time`.
+
+Checks:
+- Confirm the node is listening on the expected P2P port (Linux): `ss -ltnp | grep :16125`
+- If running multiple `fluxd` instances, ensure you probe the correct `--p2p-addr`.
+- Increase verbosity to see inbound peer closures: `--log-level debug`
+
 ## getblockhashes returns empty
 
 Symptoms:

@@ -18,6 +18,9 @@ Helper script:
 
 - `scripts/stats_delta.sh` fetches two snapshots and prints deltas plus ms/block breakdown. Example:
   - `./scripts/stats_delta.sh --stats-addr 127.0.0.1:8080 --window-secs 60`
+- `scripts/p2p_mempool_probe.sh` connects to a P2P port, performs a minimal handshake, requests `mempool`,
+  and fetches one tx via `getdata` (useful to validate inbound tx relay without RPC access).
+  - `./scripts/p2p_mempool_probe.sh --addr 127.0.0.1:16125`
 
 Useful pairs:
 

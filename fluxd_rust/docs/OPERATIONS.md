@@ -42,6 +42,16 @@ If peer discovery is slow on your VPS, seed the smoke test from an existing data
 ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/remote_smoke_test.sh --profile high --seed-peers-from <remote-data-dir> --min-headers-advance 1\"'"
 ```
 
+## P2P mempool probe (inbound tx relay)
+
+To validate inbound tx relay on the P2P port (without needing RPC credentials), run:
+
+```bash
+ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/p2p_mempool_probe.sh --addr 127.0.0.1:16125\"'"
+```
+
+Expected output includes an `inv_count=...` line and a `tx_payload_bytes=...` line.
+
 ## Shielded wallet smoke test (regtest/testnet)
 
 To exercise the Sapling wallet RPCs (without relying on mainnet policy around t→z), run:
