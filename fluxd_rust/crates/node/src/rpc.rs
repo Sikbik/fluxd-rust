@@ -1414,9 +1414,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "zimportviewingkey" | "z_importviewingkey" => {
             rpc_shielded_wallet_not_implemented(params, "zimportviewingkey")
         }
-        "zimportwallet" | "z_importwallet" => {
-            rpc_shielded_wallet_not_implemented(params, "zimportwallet")
-        }
+        "zimportwallet" | "z_importwallet" => rpc_zimportwallet(wallet, params, chain_params),
         "zlistaddresses" | "z_listaddresses" => rpc_zlistaddresses(wallet, params, chain_params),
         "zlistoperationids" | "z_listoperationids" => {
             rpc_shielded_wallet_not_implemented(params, "zlistoperationids")
@@ -4393,6 +4391,84 @@ fn rpc_zimportkey(
 
     if !inserted {
         return Ok(Value::Null);
+    }
+
+    Ok(Value::Null)
+}
+
+fn rpc_zimportwallet(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zimportwallet expects 1 parameter",
+        ));
+    }
+
+    let filename = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "filename must be a string"))?;
+    if filename.trim().is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "filename is empty"));
+    }
+
+    let contents = std::fs::read_to_string(filename)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "Cannot open wallet dump file"))?;
+
+    let expected_hrp = match chain_params.network {
+        Network::Mainnet => "secret-extended-key-main",
+        Network::Testnet => "secret-extended-key-test",
+        Network::Regtest => "secret-extended-key-regtest",
+    };
+
+    let mut guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+
+    let mut failed = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some(token) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+
+        if let Ok(checked) = CheckedHrpstring::new::<Bech32>(token) {
+            if checked.hrp().as_str() == expected_hrp {
+                let data: Vec<u8> = checked.byte_iter().collect();
+                if let Ok(extsk) = <[u8; 169]>::try_from(data.as_slice()) {
+                    match guard.import_sapling_extsk(extsk) {
+                        Ok(_) => continue,
+                        Err(WalletError::InvalidData("invalid sapling spending key encoding")) => {}
+                        Err(_) => {
+                            failed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        match guard.import_wif(token) {
+            Ok(()) => {}
+            Err(WalletError::InvalidData("invalid wif")) => {}
+            Err(_) => {
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        return Err(RpcError::new(
+            RPC_WALLET_ERROR,
+            "Error adding some keys to wallet",
+        ));
     }
 
     Ok(Value::Null)
@@ -11806,6 +11882,37 @@ mod tests {
 
         let err = rpc_zimportkey(&wallet, vec![json!("notakey")], &params).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[test]
+    fn zimportwallet_imports_sapling_key_from_file() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr1 = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr1 = addr1.as_str().expect("string").to_string();
+        let zkey = rpc_zexportkey(&wallet, vec![json!(addr1.clone())], &params).expect("rpc");
+        let zkey = zkey.as_str().expect("string").to_string();
+
+        let dump_dir = temp_data_dir("fluxd-rpc-test-zimportwallet-file");
+        std::fs::create_dir_all(&dump_dir).expect("create dir");
+        let dump_path = dump_dir.join("walletdump.txt");
+        std::fs::write(&dump_path, format!("{zkey} 0 # zaddr={addr1}\n")).expect("write");
+
+        let other_dir = temp_data_dir("fluxd-rpc-test-zimportwallet");
+        std::fs::create_dir_all(&other_dir).expect("create dir");
+        let other_wallet =
+            Mutex::new(Wallet::load_or_create(&other_dir, params.network).expect("wallet"));
+
+        rpc_zimportwallet(
+            &other_wallet,
+            vec![json!(dump_path.to_string_lossy().to_string())],
+            &params,
+        )
+        .expect("rpc");
+        let addr2 = rpc_zgetnewaddress(&other_wallet, Vec::new(), &params).expect("rpc");
+        let addr2 = addr2.as_str().expect("string").to_string();
+        assert_eq!(addr2, addr1);
     }
 
     #[test]

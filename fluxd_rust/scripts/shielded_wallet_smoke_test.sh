@@ -267,8 +267,11 @@ LOG_PATH="${DATA_DIR}.log"
 : >"$LOG_PATH"
 start_node
 
-zkey1_enc="$(url_encode "$zkey1")"
-rpc_get "zimportkey?zkey=${zkey1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
+import_file="${DATA_DIR}/zimportwallet.txt"
+printf '%s\n' "$zkey1" >"$import_file"
+import_file_enc="$(url_encode "$import_file")"
+rpc_get "zimportwallet?filename=${import_file_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
+rm -f "$import_file" || true
 
 import_addr="$(rpc_get "zgetnewaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
 if [[ "$import_addr" != "$zaddr1" ]]; then

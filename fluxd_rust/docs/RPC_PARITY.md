@@ -155,7 +155,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zgettotalbalance - Stub (returns wallet error; shielded wallet WIP)
 - zimportkey - Partial (Sapling only; rescan ignored)
 - zimportviewingkey - Stub (returns wallet error; shielded wallet WIP)
-- zimportwallet - Stub (returns wallet error; shielded wallet WIP)
+- zimportwallet - Partial (imports Sapling spending keys and WIFs from file; rescan ignored)
 - zlistaddresses - Partial (Sapling only)
 - zlistoperationids - Stub (returns wallet error; shielded wallet WIP)
 - zlistreceivedbyaddress - Stub (returns wallet error; shielded wallet WIP)
