@@ -1469,15 +1469,32 @@ async fn run() -> Result<(), String> {
         registry: Arc::clone(&peer_registry),
         kind: PeerKind::Header,
     };
-    let mut block_peer = connect_to_peer(
-        params.as_ref(),
-        start_height,
-        min_peer_height,
-        addr_book.as_ref(),
-        &block_peer_ctx,
-        Some(header_peer_book.as_ref()),
-    )
-    .await?;
+    let mut retry_delay = Duration::from_secs(1);
+    let mut block_peer = loop {
+        match connect_to_peer(
+            params.as_ref(),
+            start_height,
+            min_peer_height,
+            addr_book.as_ref(),
+            &block_peer_ctx,
+            Some(header_peer_book.as_ref()),
+        )
+        .await
+        {
+            Ok(peer) => break peer,
+            Err(err) => {
+                if *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+                log_warn!(
+                    "block peer connect failed: {err}; retrying in {}s",
+                    retry_delay.as_secs()
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+        }
+    };
     log_info!("Block peer handshake complete");
     log_info!("Block peer height {}", block_peer.remote_height());
     log_info!(
@@ -1489,7 +1506,7 @@ async fn run() -> Result<(), String> {
     let mut block_peers = if block_peers_target == 0 {
         Vec::new()
     } else {
-        connect_to_peers(
+        match connect_to_peers(
             params.as_ref(),
             block_peers_target,
             start_height,
@@ -1498,7 +1515,14 @@ async fn run() -> Result<(), String> {
             &block_peer_ctx,
             Some(header_peer_book.as_ref()),
         )
-        .await?
+        .await
+        {
+            Ok(peers) => peers,
+            Err(err) => {
+                log_warn!("failed to connect to additional block peers: {err}");
+                Vec::new()
+            }
+        }
     };
     if block_peers.is_empty() {
         log_warn!("no block peers available, falling back to block peer");
