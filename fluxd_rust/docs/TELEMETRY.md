@@ -61,6 +61,11 @@ additional counters to explain why `verify_ms_per_block` changes over time:
   - `undo_encode_us` - time spent encoding undo bytes (CPU).
   - `undo_bytes` - total undo bytes produced.
   - `undo_append_us` - time spent appending undo bytes to the undo flatfiles.
+- Fluxnode / PoN / payout checks:
+  - `fluxnode_tx_us`, `fluxnode_tx_count` - time/count for stateful fluxnode tx validation during connect (start/confirm rules, collateral checks).
+  - `fluxnode_sig_us`, `fluxnode_sig_checks` - time/count for fluxnode signed-message verification (operator + benchmark).
+  - `pon_sig_us`, `pon_sig_blocks` - time/blocks for PoN header signature verification.
+  - `payout_us`, `payout_blocks` - time/blocks for deterministic fluxnode payout selection + coinbase payout matching.
 
 Tuning hint:
 
@@ -70,10 +75,17 @@ Tuning hint:
 ## When UTXO/index look cheap but `verify_us` is high
 
 If `verify_ms_per_block` is high while `utxo_ms_per_block`, `index_ms_per_block`, and `undo_*`
-remain low, the remaining time is typically **signature-heavy CPU work**, e.g.:
+remain low, the remaining time is typically CPU-bound validation not captured by UTXO/index timers.
+Use the extra counters first:
+
+- High `fluxnode_sig_us` ⇒ fluxnode signature verification dominates.
+- High `pon_sig_us` ⇒ PoN header signature verification dominates (PoN era).
+- High `payout_us` ⇒ deterministic payout selection/matching dominates (often only during cache warmup).
+
+If those are low, the remainder is typically **signature-heavy CPU work**, e.g.:
 
 - Script signature checks (ECDSA/secp256k1 via `verify_script`).
-- Fluxnode signed-message checks (start/confirm/benchmark).
+- Other signature-heavy checks not currently broken out.
 
 In this case, CPU profiling is the fastest way to confirm the hotspot:
 

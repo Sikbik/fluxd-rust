@@ -55,7 +55,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Raise default Fjall buffers/workers (avoid write stalls during heavy indexing)
   - [x] Log slow Fjall commits (helps diagnose stalls in the field)
   - [x] Surface Fjall health stats in `/stats` (write buffer, compactions, per-partition segments/flushes)
-  - [x] Add detailed connect-stage telemetry in `/stats` (UTXO get/put/delete, undo encode/append, index op counts)
+  - [x] Add detailed connect-stage telemetry in `/stats` (UTXO get/put/delete, undo encode/append, index op counts, fluxnode tx/sig, PoN sig, payout checks)
   - [x] Review index write amplification (txindex/address index) and batching opportunities
     - [x] Reuse address script hash across indexes (avoid double hashing per I/O)
   - [x] Defer UTXO + address-outpoint writes to end-of-block (eliminate intrablock put+delete pairs)

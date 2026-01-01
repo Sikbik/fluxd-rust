@@ -505,14 +505,30 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           <div class="label">Anchor ms / Block</div>
           <div class="value" id="anchorMs">-</div>
         </div>
-        <div class="card">
-          <div class="label">Flatfile ms / Block</div>
-          <div class="value" id="flatfileMs">-</div>
-        </div>
-        <div class="card">
-          <div class="label">Uptime</div>
-          <div class="value" id="uptime">-</div>
-        </div>
+	        <div class="card">
+	          <div class="label">Flatfile ms / Block</div>
+	          <div class="value" id="flatfileMs">-</div>
+	        </div>
+	        <div class="card">
+	          <div class="label">Fluxnode Tx ms / Block</div>
+	          <div class="value" id="fluxnodeTxMs">-</div>
+	        </div>
+	        <div class="card">
+	          <div class="label">Fluxnode Sig ms / Block</div>
+	          <div class="value" id="fluxnodeSigMs">-</div>
+	        </div>
+	        <div class="card">
+	          <div class="label">PoN Sig ms / PoN Block</div>
+	          <div class="value" id="ponSigMs">-</div>
+	        </div>
+	        <div class="card">
+	          <div class="label">Payout ms / Block</div>
+	          <div class="value" id="payoutMs">-</div>
+	        </div>
+	        <div class="card">
+	          <div class="label">Uptime</div>
+	          <div class="value" id="uptime">-</div>
+	        </div>
         <div class="card wide">
           <div class="label">Best Header Hash</div>
           <div class="value small" id="bestHeaderHash">-</div>
@@ -556,13 +572,17 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         let validateMs = "-";
         let scriptMs = "-";
         let shieldedMs = "-";
-        let utxoMs = "-";
-        let indexMs = "-";
-        let anchorMs = "-";
-        let flatfileMs = "-";
-        if (lastSample && data.unix_time_secs > lastSample.unix_time_secs) {
-          const dt = data.unix_time_secs - lastSample.unix_time_secs;
-          const blocksDelta = data.block_count - lastSample.block_count;
+	        let utxoMs = "-";
+	        let indexMs = "-";
+	        let anchorMs = "-";
+	        let flatfileMs = "-";
+	        let fluxnodeTxMs = "-";
+	        let fluxnodeSigMs = "-";
+	        let ponSigMs = "-";
+	        let payoutMs = "-";
+	        if (lastSample && data.unix_time_secs > lastSample.unix_time_secs) {
+	          const dt = data.unix_time_secs - lastSample.unix_time_secs;
+	          const blocksDelta = data.block_count - lastSample.block_count;
           const headersDelta = data.header_count - lastSample.header_count;
           blocksPerSec = (blocksDelta / dt).toFixed(2);
           headersPerSec = (headersDelta / dt).toFixed(2);
@@ -603,10 +623,22 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           if (anchorBlocks > 0) {
             anchorMs = ((data.anchor_us - lastSample.anchor_us) / 1000 / anchorBlocks).toFixed(2);
           }
-          if (flatfileBlocks > 0) {
-            flatfileMs = ((data.flatfile_us - lastSample.flatfile_us) / 1000 / flatfileBlocks).toFixed(2);
-          }
-        }
+	          if (flatfileBlocks > 0) {
+	            flatfileMs = ((data.flatfile_us - lastSample.flatfile_us) / 1000 / flatfileBlocks).toFixed(2);
+	          }
+	          if (verifyBlocks > 0) {
+	            fluxnodeTxMs = ((data.fluxnode_tx_us - lastSample.fluxnode_tx_us) / 1000 / verifyBlocks).toFixed(2);
+	            fluxnodeSigMs = ((data.fluxnode_sig_us - lastSample.fluxnode_sig_us) / 1000 / verifyBlocks).toFixed(2);
+	          }
+	          const ponBlocks = data.pon_sig_blocks - lastSample.pon_sig_blocks;
+	          if (ponBlocks > 0) {
+	            ponSigMs = ((data.pon_sig_us - lastSample.pon_sig_us) / 1000 / ponBlocks).toFixed(2);
+	          }
+	          const payoutBlocks = data.payout_blocks - lastSample.payout_blocks;
+	          if (payoutBlocks > 0) {
+	            payoutMs = ((data.payout_us - lastSample.payout_us) / 1000 / payoutBlocks).toFixed(2);
+	          }
+	        }
 
         el("network").textContent = data.network;
         el("backend").textContent = data.backend;
@@ -623,13 +655,17 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         el("validateMs").textContent = validateMs;
         el("scriptMs").textContent = scriptMs;
         el("shieldedMs").textContent = shieldedMs;
-        el("utxoMs").textContent = utxoMs;
-        el("indexMs").textContent = indexMs;
-        el("anchorMs").textContent = anchorMs;
-        el("flatfileMs").textContent = flatfileMs;
-        el("bestHeaderHash").textContent = data.best_header_hash || "-";
-        el("bestBlockHash").textContent = data.best_block_hash || "-";
-        el("uptime").textContent = formatUptime(data.uptime_secs);
+	        el("utxoMs").textContent = utxoMs;
+	        el("indexMs").textContent = indexMs;
+	        el("anchorMs").textContent = anchorMs;
+	        el("flatfileMs").textContent = flatfileMs;
+	        el("fluxnodeTxMs").textContent = fluxnodeTxMs;
+	        el("fluxnodeSigMs").textContent = fluxnodeSigMs;
+	        el("ponSigMs").textContent = ponSigMs;
+	        el("payoutMs").textContent = payoutMs;
+	        el("bestHeaderHash").textContent = data.best_header_hash || "-";
+	        el("bestBlockHash").textContent = data.best_block_hash || "-";
+	        el("uptime").textContent = formatUptime(data.uptime_secs);
         el("serverTime").textContent = new Date(data.unix_time_secs * 1000).toLocaleString();
         el("lastUpdate").textContent = new Date().toLocaleTimeString();
 

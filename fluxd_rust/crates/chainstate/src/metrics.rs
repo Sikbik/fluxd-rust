@@ -31,6 +31,14 @@ pub struct ConnectMetrics {
     undo_encode_us: AtomicU64,
     undo_bytes: AtomicU64,
     undo_append_us: AtomicU64,
+    fluxnode_tx_us: AtomicU64,
+    fluxnode_tx_count: AtomicU64,
+    fluxnode_sig_us: AtomicU64,
+    fluxnode_sig_checks: AtomicU64,
+    pon_sig_us: AtomicU64,
+    pon_sig_blocks: AtomicU64,
+    payout_us: AtomicU64,
+    payout_blocks: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -61,6 +69,14 @@ pub struct ConnectMetricsSnapshot {
     pub undo_encode_us: u64,
     pub undo_bytes: u64,
     pub undo_append_us: u64,
+    pub fluxnode_tx_us: u64,
+    pub fluxnode_tx_count: u64,
+    pub fluxnode_sig_us: u64,
+    pub fluxnode_sig_checks: u64,
+    pub pon_sig_us: u64,
+    pub pon_sig_blocks: u64,
+    pub payout_us: u64,
+    pub payout_blocks: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -87,6 +103,14 @@ pub struct ConnectMetricsDelta {
     pub undo_encode_us: u64,
     pub undo_bytes: u64,
     pub undo_append_us: u64,
+    pub fluxnode_tx_us: u64,
+    pub fluxnode_tx_count: u64,
+    pub fluxnode_sig_us: u64,
+    pub fluxnode_sig_checks: u64,
+    pub pon_sig_us: u64,
+    pub pon_sig_blocks: u64,
+    pub payout_us: u64,
+    pub payout_blocks: u64,
 }
 
 impl ConnectMetrics {
@@ -139,6 +163,22 @@ impl ConnectMetrics {
             .fetch_add(delta.undo_bytes, Ordering::Relaxed);
         self.undo_append_us
             .fetch_add(delta.undo_append_us, Ordering::Relaxed);
+
+        self.fluxnode_tx_us
+            .fetch_add(delta.fluxnode_tx_us, Ordering::Relaxed);
+        self.fluxnode_tx_count
+            .fetch_add(delta.fluxnode_tx_count, Ordering::Relaxed);
+        self.fluxnode_sig_us
+            .fetch_add(delta.fluxnode_sig_us, Ordering::Relaxed);
+        self.fluxnode_sig_checks
+            .fetch_add(delta.fluxnode_sig_checks, Ordering::Relaxed);
+        self.pon_sig_us
+            .fetch_add(delta.pon_sig_us, Ordering::Relaxed);
+        self.pon_sig_blocks
+            .fetch_add(delta.pon_sig_blocks, Ordering::Relaxed);
+        self.payout_us.fetch_add(delta.payout_us, Ordering::Relaxed);
+        self.payout_blocks
+            .fetch_add(delta.payout_blocks, Ordering::Relaxed);
     }
 
     pub fn record_utxo(&self, elapsed: Duration) {
@@ -193,6 +233,14 @@ impl ConnectMetrics {
             undo_encode_us: self.undo_encode_us.load(Ordering::Relaxed),
             undo_bytes: self.undo_bytes.load(Ordering::Relaxed),
             undo_append_us: self.undo_append_us.load(Ordering::Relaxed),
+            fluxnode_tx_us: self.fluxnode_tx_us.load(Ordering::Relaxed),
+            fluxnode_tx_count: self.fluxnode_tx_count.load(Ordering::Relaxed),
+            fluxnode_sig_us: self.fluxnode_sig_us.load(Ordering::Relaxed),
+            fluxnode_sig_checks: self.fluxnode_sig_checks.load(Ordering::Relaxed),
+            pon_sig_us: self.pon_sig_us.load(Ordering::Relaxed),
+            pon_sig_blocks: self.pon_sig_blocks.load(Ordering::Relaxed),
+            payout_us: self.payout_us.load(Ordering::Relaxed),
+            payout_blocks: self.payout_blocks.load(Ordering::Relaxed),
         }
     }
 }

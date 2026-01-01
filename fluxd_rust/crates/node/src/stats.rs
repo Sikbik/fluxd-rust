@@ -86,6 +86,14 @@ pub struct StatsSnapshot {
     pub undo_encode_us: u64,
     pub undo_bytes: u64,
     pub undo_append_us: u64,
+    pub fluxnode_tx_us: u64,
+    pub fluxnode_tx_count: u64,
+    pub fluxnode_sig_us: u64,
+    pub fluxnode_sig_checks: u64,
+    pub pon_sig_us: u64,
+    pub pon_sig_blocks: u64,
+    pub payout_us: u64,
+    pub payout_blocks: u64,
     pub db_write_buffer_bytes: Option<u64>,
     pub db_max_write_buffer_bytes: Option<u64>,
     pub db_journal_count: Option<u64>,
@@ -264,6 +272,22 @@ impl StatsSnapshot {
         json.push_str(&self.undo_bytes.to_string());
         json.push_str(",\"undo_append_us\":");
         json.push_str(&self.undo_append_us.to_string());
+        json.push_str(",\"fluxnode_tx_us\":");
+        json.push_str(&self.fluxnode_tx_us.to_string());
+        json.push_str(",\"fluxnode_tx_count\":");
+        json.push_str(&self.fluxnode_tx_count.to_string());
+        json.push_str(",\"fluxnode_sig_us\":");
+        json.push_str(&self.fluxnode_sig_us.to_string());
+        json.push_str(",\"fluxnode_sig_checks\":");
+        json.push_str(&self.fluxnode_sig_checks.to_string());
+        json.push_str(",\"pon_sig_us\":");
+        json.push_str(&self.pon_sig_us.to_string());
+        json.push_str(",\"pon_sig_blocks\":");
+        json.push_str(&self.pon_sig_blocks.to_string());
+        json.push_str(",\"payout_us\":");
+        json.push_str(&self.payout_us.to_string());
+        json.push_str(",\"payout_blocks\":");
+        json.push_str(&self.payout_blocks.to_string());
 
         json.push_str(",\"db_write_buffer_bytes\":");
         push_json_u64_opt(&mut json, self.db_write_buffer_bytes);
@@ -436,6 +460,14 @@ impl StatsSnapshot {
         gauge!("fluxd_undo_encode_us_total", self.undo_encode_us);
         gauge!("fluxd_undo_bytes_total", self.undo_bytes);
         gauge!("fluxd_undo_append_us_total", self.undo_append_us);
+        gauge!("fluxd_fluxnode_tx_us_total", self.fluxnode_tx_us);
+        gauge!("fluxd_fluxnode_tx_count_total", self.fluxnode_tx_count);
+        gauge!("fluxd_fluxnode_sig_us_total", self.fluxnode_sig_us);
+        gauge!("fluxd_fluxnode_sig_checks_total", self.fluxnode_sig_checks);
+        gauge!("fluxd_pon_sig_us_total", self.pon_sig_us);
+        gauge!("fluxd_pon_sig_blocks_total", self.pon_sig_blocks);
+        gauge!("fluxd_payout_us_total", self.payout_us);
+        gauge!("fluxd_payout_blocks_total", self.payout_blocks);
 
         if let Some(value) = self.db_write_buffer_bytes {
             gauge!("fluxd_db_write_buffer_bytes", value);
@@ -847,6 +879,14 @@ pub fn snapshot_stats<S: KeyValueStore>(
         undo_encode_us: connect.undo_encode_us,
         undo_bytes: connect.undo_bytes,
         undo_append_us: connect.undo_append_us,
+        fluxnode_tx_us: connect.fluxnode_tx_us,
+        fluxnode_tx_count: connect.fluxnode_tx_count,
+        fluxnode_sig_us: connect.fluxnode_sig_us,
+        fluxnode_sig_checks: connect.fluxnode_sig_checks,
+        pon_sig_us: connect.pon_sig_us,
+        pon_sig_blocks: connect.pon_sig_blocks,
+        payout_us: connect.payout_us,
+        payout_blocks: connect.payout_blocks,
         db_write_buffer_bytes: db.as_ref().map(|db| db.write_buffer_bytes),
         db_max_write_buffer_bytes: db.as_ref().and_then(|db| db.max_write_buffer_bytes),
         db_journal_count: db.as_ref().map(|db| db.journal_count),

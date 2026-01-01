@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fluxd_consensus::constants::{
@@ -16,7 +16,7 @@ use fluxd_consensus::{
     fluxnode_tier_from_collateral, foundation_fund_amount, is_swap_pool_interval,
     min_dev_fund_amount, swap_pool_amount, ChainParams, ConsensusParams, Hash256,
 };
-use fluxd_fluxnode::cache::{apply_fluxnode_tx, lookup_operator_pubkey, FluxnodeStartMeta};
+use fluxd_fluxnode::cache::{apply_fluxnode_tx, FluxnodeStartMeta};
 use fluxd_fluxnode::storage::{FluxnodeRecord, KeyId};
 use fluxd_primitives::address_to_script_pubkey;
 use fluxd_primitives::block::Block;
@@ -71,8 +71,8 @@ struct ScriptCheck {
 }
 
 enum FluxnodeSigPubkeys {
-    Single(Vec<u8>),
-    Any(Vec<Vec<u8>>),
+    Single(Arc<[u8]>),
+    Any(Vec<Arc<[u8]>>),
 }
 
 struct FluxnodeSigCheck {
@@ -86,12 +86,12 @@ impl FluxnodeSigCheck {
     fn verify(&self) -> Result<(), &'static str> {
         match &self.pubkeys {
             FluxnodeSigPubkeys::Single(pubkey) => {
-                verify_signed_message(pubkey, &self.signature, &self.message)
+                verify_signed_message(pubkey.as_ref(), &self.signature, &self.message)
                     .map_err(|_| self.error)
             }
             FluxnodeSigPubkeys::Any(pubkeys) => {
                 if pubkeys.iter().any(|pubkey| {
-                    verify_signed_message(pubkey, &self.signature, &self.message).is_ok()
+                    verify_signed_message(pubkey.as_ref(), &self.signature, &self.message).is_ok()
                 }) {
                     Ok(())
                 } else {
@@ -182,7 +182,10 @@ impl From<pon_validation::PonError> for ChainStateError {
 
 const HEADER_CACHE_CAPACITY: usize = 200_000;
 const UTXO_CACHE_CAPACITY: usize = 200_000;
+const FLUXNODE_KEY_CACHE_CAPACITY: usize = 50_000;
 const MTP_WINDOW_SIZE: usize = 11;
+
+static HEX_BYTES_CACHE: OnceLock<Mutex<HashMap<&'static str, Arc<[u8]>>>> = OnceLock::new();
 
 fn invert_lowest_one(value: i32) -> i32 {
     value & value.saturating_sub(1)
@@ -276,6 +279,75 @@ impl UtxoCache {
     }
 
     fn remove(&mut self, key: &OutPointKey) {
+        self.entries.remove(key);
+    }
+
+    fn bump_stamp(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > self.capacity {
+            let Some((key, stamp)) = self.order.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            if entry.stamp != stamp {
+                continue;
+            }
+            self.entries.remove(&key);
+        }
+    }
+}
+
+struct FluxnodeKeyCacheEntry {
+    bytes: Arc<[u8]>,
+    stamp: u64,
+}
+
+struct FluxnodeKeyCache {
+    entries: HashMap<Hash256, FluxnodeKeyCacheEntry>,
+    order: VecDeque<(Hash256, u64)>,
+    capacity: usize,
+    clock: u64,
+}
+
+impl FluxnodeKeyCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, key: &Hash256) -> Option<Arc<[u8]>> {
+        if self.capacity == 0 {
+            return None;
+        }
+        let stamp = self.bump_stamp();
+        let entry = self.entries.get_mut(key)?;
+        entry.stamp = stamp;
+        self.order.push_back((*key, stamp));
+        Some(Arc::clone(&entry.bytes))
+    }
+
+    fn insert(&mut self, key: Hash256, bytes: Arc<[u8]>) {
+        if self.capacity == 0 {
+            return;
+        }
+        let stamp = self.bump_stamp();
+        self.entries
+            .insert(key, FluxnodeKeyCacheEntry { bytes, stamp });
+        self.order.push_back((key, stamp));
+        self.evict();
+    }
+
+    fn remove(&mut self, key: &Hash256) {
         self.entries.remove(key);
     }
 
@@ -567,6 +639,7 @@ pub struct ChainState<S> {
     undo: FlatFileStore,
     header_cache: Mutex<HeaderCache>,
     utxo_cache: Mutex<UtxoCache>,
+    fluxnode_key_cache: Mutex<FluxnodeKeyCache>,
     shielded_cache: Mutex<Option<ShieldedTreesCache>>,
     file_meta: Mutex<FlatFileMetaCache>,
     fluxnode_payments: Mutex<FluxnodePaymentsCache>,
@@ -599,6 +672,7 @@ impl<S: KeyValueStore> ChainState<S> {
             undo,
             header_cache: Mutex::new(HeaderCache::new(HEADER_CACHE_CAPACITY)),
             utxo_cache: Mutex::new(UtxoCache::new(utxo_cache_capacity)),
+            fluxnode_key_cache: Mutex::new(FluxnodeKeyCache::new(FLUXNODE_KEY_CACHE_CAPACITY)),
             shielded_cache: Mutex::new(None),
             file_meta: Mutex::new(FlatFileMetaCache::default()),
             fluxnode_payments: Mutex::new(FluxnodePaymentsCache::new()),
@@ -1341,7 +1415,9 @@ impl<S: KeyValueStore> ChainState<S> {
                 let message = hash256_to_hex(txid).into_bytes();
                 if let Some(signature_checks) = signature_checks {
                     signature_checks.push(FluxnodeSigCheck {
-                        pubkeys: FluxnodeSigPubkeys::Single(start.collateral_pubkey.clone()),
+                        pubkeys: FluxnodeSigPubkeys::Single(Arc::from(
+                            start.collateral_pubkey.as_slice(),
+                        )),
                         signature: start.sig.clone(),
                         message,
                         error: "fluxnode start signature invalid",
@@ -1425,7 +1501,9 @@ impl<S: KeyValueStore> ChainState<S> {
                     let message = hash256_to_hex(txid).into_bytes();
                     if let Some(signature_checks) = signature_checks {
                         signature_checks.push(FluxnodeSigCheck {
-                            pubkeys: FluxnodeSigPubkeys::Single(collateral_pubkey.clone()),
+                            pubkeys: FluxnodeSigPubkeys::Single(Arc::from(
+                                collateral_pubkey.as_slice(),
+                            )),
                             signature: sig.clone(),
                             message,
                             error: "fluxnode start signature invalid",
@@ -1516,6 +1594,10 @@ impl<S: KeyValueStore> ChainState<S> {
 
                     let message = hash256_to_hex(txid).into_bytes();
                     if let Some(signature_checks) = signature_checks {
+                        let pubkeys = pubkeys
+                            .into_iter()
+                            .map(|pubkey| Arc::from(pubkey.into_boxed_slice()))
+                            .collect();
                         signature_checks.push(FluxnodeSigCheck {
                             pubkeys: FluxnodeSigPubkeys::Any(pubkeys),
                             signature: sig.clone(),
@@ -1598,17 +1680,17 @@ impl<S: KeyValueStore> ChainState<S> {
                     )));
                 }
 
-                let operator_pubkey = if let Some(pubkey) =
-                    operator_pubkeys.get(&confirm.collateral)
-                {
-                    pubkey.clone()
-                } else {
-                    lookup_operator_pubkey(&self.store, &confirm.collateral)?.ok_or_else(|| {
-                        ChainStateError::Validation(ValidationError::Fluxnode(
-                            "fluxnode operator pubkey missing",
-                        ))
-                    })?
-                };
+                let operator_pubkey =
+                    if let Some(pubkey) = operator_pubkeys.get(&confirm.collateral) {
+                        Arc::from(pubkey.as_slice())
+                    } else {
+                        self.fluxnode_key_bytes(record.operator_pubkey)?
+                            .ok_or_else(|| {
+                                ChainStateError::Validation(ValidationError::Fluxnode(
+                                    "fluxnode operator pubkey missing",
+                                ))
+                            })?
+                    };
 
                 let msg = fluxnode_confirm_message(confirm);
 
@@ -1621,7 +1703,7 @@ impl<S: KeyValueStore> ChainState<S> {
                         "fluxnode benchmark key missing",
                     ))
                 })?;
-                let benchmark_pubkey = hex_to_bytes(benchmark_key.key).ok_or_else(|| {
+                let benchmark_pubkey = hex_to_bytes_cached(benchmark_key.key).ok_or_else(|| {
                     ChainStateError::Validation(ValidationError::Fluxnode(
                         "invalid benchmark pubkey",
                     ))
@@ -1643,13 +1725,15 @@ impl<S: KeyValueStore> ChainState<S> {
                         error: "fluxnode benchmark signature invalid",
                     });
                 } else {
-                    verify_signed_message(&operator_pubkey, &confirm.sig, &msg).map_err(|_| {
-                        ChainStateError::Validation(ValidationError::Fluxnode(
-                            "fluxnode confirm signature invalid",
-                        ))
-                    })?;
+                    verify_signed_message(operator_pubkey.as_ref(), &confirm.sig, &msg).map_err(
+                        |_| {
+                            ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode confirm signature invalid",
+                            ))
+                        },
+                    )?;
                     verify_signed_message(
-                        &benchmark_pubkey,
+                        benchmark_pubkey.as_ref(),
                         &confirm.benchmark_sig,
                         &benchmark_msg,
                     )
@@ -1773,9 +1857,11 @@ impl<S: KeyValueStore> ChainState<S> {
         };
 
         if let Some(redeem_key) = meta.p2sh_script {
-            let redeem_script = self.store.get(Column::FluxnodeKey, &redeem_key.0)?.ok_or(
-                ChainStateError::CorruptIndex("missing fluxnode redeem script"),
-            )?;
+            let redeem_script =
+                self.fluxnode_key_bytes(redeem_key)?
+                    .ok_or(ChainStateError::CorruptIndex(
+                        "missing fluxnode redeem script",
+                    ))?;
             let script_hash = hash160(&redeem_script);
             return Ok(p2sh_script(&script_hash));
         }
@@ -1783,23 +1869,21 @@ impl<S: KeyValueStore> ChainState<S> {
         let collateral_key = meta.collateral_pubkey.ok_or(ChainStateError::CorruptIndex(
             "missing fluxnode collateral pubkey key",
         ))?;
-        let pubkey_bytes = self
-            .store
-            .get(Column::FluxnodeKey, &collateral_key.0)?
-            .ok_or(ChainStateError::CorruptIndex(
-                "missing fluxnode collateral pubkey bytes",
-            ))?;
+        let pubkey_bytes =
+            self.fluxnode_key_bytes(collateral_key)?
+                .ok_or(ChainStateError::CorruptIndex(
+                    "missing fluxnode collateral pubkey bytes",
+                ))?;
 
         let is_p2sh_signing_key = params.fluxnode.p2sh_public_keys.iter().any(|key| {
-            hex_to_bytes(key.key)
-                .as_ref()
-                .is_some_and(|expected| expected.as_slice() == pubkey_bytes.as_slice())
+            hex_to_bytes_cached(key.key)
+                .is_some_and(|expected| expected.as_ref() == pubkey_bytes.as_ref())
         });
         if is_p2sh_signing_key {
             return Ok(utxo.script_pubkey.clone());
         }
 
-        Ok(p2pkh_script(&hash160(&pubkey_bytes)))
+        Ok(p2pkh_script(&hash160(pubkey_bytes.as_ref())))
     }
 
     fn next_fluxnode_payee(
@@ -2147,18 +2231,30 @@ impl<S: KeyValueStore> ChainState<S> {
                 ))?
                 .as_slice()
         };
+        let mut pon_sig_time = Duration::ZERO;
+        let mut pon_sig_blocks = 0u64;
         if block.header.is_pon()
             && network_upgrade_active(height, &consensus.upgrades, UpgradeIndex::Pon)
         {
-            let operator_pubkey =
-                lookup_operator_pubkey(&self.store, &block.header.nodes_collateral)?.ok_or(
-                    ChainStateError::InvalidHeader("missing fluxnode entry for pon signature"),
-                )?;
-            pon_validation::validate_pon_signature(&block.header, consensus, &operator_pubkey)?;
+            let pon_sig_start = Instant::now();
+            let operator_pubkey = self
+                .operator_pubkey_bytes(&block.header.nodes_collateral)?
+                .ok_or(ChainStateError::InvalidHeader(
+                    "missing fluxnode entry for pon signature",
+                ))?;
+            pon_validation::validate_pon_signature(
+                &block.header,
+                consensus,
+                operator_pubkey.as_ref(),
+            )?;
+            pon_sig_time = pon_sig_start.elapsed();
+            pon_sig_blocks = 1;
         }
         check_coinbase_funding(&block.transactions[0], height, params)?;
+        let payout_start = Instant::now();
         let paid_fluxnodes =
             self.check_deterministic_fluxnode_payouts(&block.transactions[0], height, params)?;
+        let payout_time = payout_start.elapsed();
 
         let mut utxo_stats = self.utxo_stats_or_compute()?;
         let mut value_pools = self.value_pools_or_compute()?;
@@ -2232,6 +2328,9 @@ impl<S: KeyValueStore> ChainState<S> {
         let mut fluxnode_operator_pubkeys: HashMap<OutPoint, Vec<u8>> = HashMap::new();
         let mut fluxnode_sig_checks: Vec<FluxnodeSigCheck> = Vec::new();
         let mut fluxnode_start_meta: HashMap<OutPoint, FluxnodeStartMeta> = HashMap::new();
+        let mut fluxnode_tx_time = Duration::ZERO;
+        let mut fluxnode_tx_count = 0u64;
+        let mut fluxnode_sig_time = Duration::ZERO;
         for (index, tx) in block.transactions.iter().enumerate() {
             let is_coinbase = index == 0;
             let txid = txids
@@ -2240,16 +2339,21 @@ impl<S: KeyValueStore> ChainState<S> {
                 .ok_or(ChainStateError::CorruptIndex(
                     "transaction id cache mismatch",
                 ))?;
-            self.validate_fluxnode_tx(
-                tx,
-                &txid,
-                height,
-                params,
-                &created_utxos,
-                &fluxnode_operator_pubkeys,
-                Some(&mut fluxnode_sig_checks),
-                &mut fluxnode_start_meta,
-            )?;
+            if tx.fluxnode.is_some() {
+                let fluxnode_start = Instant::now();
+                self.validate_fluxnode_tx(
+                    tx,
+                    &txid,
+                    height,
+                    params,
+                    &created_utxos,
+                    &fluxnode_operator_pubkeys,
+                    Some(&mut fluxnode_sig_checks),
+                    &mut fluxnode_start_meta,
+                )?;
+                fluxnode_tx_time += fluxnode_start.elapsed();
+                fluxnode_tx_count = fluxnode_tx_count.saturating_add(1);
+            }
             let tx_value_out = tx_value_out(tx)?;
             let mut tx_value_in = tx_shielded_value_in(tx)?;
             let mut sprout_intermediates: HashMap<Hash256, SproutTree> = HashMap::new();
@@ -2604,10 +2708,13 @@ impl<S: KeyValueStore> ChainState<S> {
             }
         }
 
+        let fluxnode_sig_checks_count = fluxnode_sig_checks.len() as u64;
         if !fluxnode_sig_checks.is_empty() {
+            let sig_start = Instant::now();
             let result = fluxnode_sig_checks
                 .par_iter()
                 .try_for_each(|check| check.verify());
+            fluxnode_sig_time += sig_start.elapsed();
             if let Err(message) = result {
                 return Err(ChainStateError::Validation(ValidationError::Fluxnode(
                     message,
@@ -2933,6 +3040,14 @@ impl<S: KeyValueStore> ChainState<S> {
                 undo_encode_us,
                 undo_bytes: undo_bytes_total,
                 undo_append_us,
+                fluxnode_tx_us: fluxnode_tx_time.as_micros() as u64,
+                fluxnode_tx_count,
+                fluxnode_sig_us: fluxnode_sig_time.as_micros() as u64,
+                fluxnode_sig_checks: fluxnode_sig_checks_count,
+                pon_sig_us: pon_sig_time.as_micros() as u64,
+                pon_sig_blocks,
+                payout_us: payout_time.as_micros() as u64,
+                payout_blocks: 1,
             });
         }
 
@@ -3263,12 +3378,23 @@ impl<S: KeyValueStore> ChainState<S> {
             }
         }
         let mut fluxnode_updates: Vec<WriteOp> = Vec::new();
+        let mut fluxnode_key_updates: Vec<(Hash256, Arc<[u8]>)> = Vec::new();
+        let mut fluxnode_key_deletes: Vec<Hash256> = Vec::new();
         if let Ok(mut cache) = self.utxo_cache.lock() {
             for op in ops {
                 match op {
                     WriteOp::Put { column, key, value } => {
                         if column == Column::Fluxnode {
                             fluxnode_updates.push(WriteOp::Put { column, key, value });
+                            continue;
+                        }
+                        if column == Column::FluxnodeKey {
+                            if key.as_slice().len() == 32 {
+                                let mut hash = [0u8; 32];
+                                hash.copy_from_slice(key.as_slice());
+                                fluxnode_key_updates
+                                    .push((hash, Arc::from(value.into_boxed_slice())));
+                            }
                             continue;
                         }
                         if column != Column::Utxo {
@@ -3284,6 +3410,14 @@ impl<S: KeyValueStore> ChainState<S> {
                             fluxnode_updates.push(WriteOp::Delete { column, key });
                             continue;
                         }
+                        if column == Column::FluxnodeKey {
+                            if key.as_slice().len() == 32 {
+                                let mut hash = [0u8; 32];
+                                hash.copy_from_slice(key.as_slice());
+                                fluxnode_key_deletes.push(hash);
+                            }
+                            continue;
+                        }
                         if column != Column::Utxo {
                             continue;
                         }
@@ -3292,6 +3426,16 @@ impl<S: KeyValueStore> ChainState<S> {
                         };
                         cache.remove(&outpoint_key);
                     }
+                }
+            }
+        }
+        if !fluxnode_key_updates.is_empty() || !fluxnode_key_deletes.is_empty() {
+            if let Ok(mut cache) = self.fluxnode_key_cache.lock() {
+                for key in fluxnode_key_deletes {
+                    cache.remove(&key);
+                }
+                for (key, value) in fluxnode_key_updates {
+                    cache.insert(key, value);
                 }
             }
         }
@@ -3865,7 +4009,44 @@ impl<S: KeyValueStore> ChainState<S> {
     }
 
     pub fn fluxnode_key(&self, key: KeyId) -> Result<Option<Vec<u8>>, ChainStateError> {
-        Ok(self.store.get(Column::FluxnodeKey, &key.0)?)
+        Ok(self
+            .fluxnode_key_bytes(key)?
+            .map(|bytes| bytes.as_ref().to_vec()))
+    }
+
+    fn fluxnode_key_bytes(&self, key: KeyId) -> Result<Option<Arc<[u8]>>, ChainStateError> {
+        if let Ok(mut cache) = self.fluxnode_key_cache.lock() {
+            if let Some(bytes) = cache.get(&key.0) {
+                return Ok(Some(bytes));
+            }
+        }
+        let bytes = match self.store.get(Column::FluxnodeKey, &key.0)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let bytes = Arc::from(bytes.into_boxed_slice());
+        if let Ok(mut cache) = self.fluxnode_key_cache.lock() {
+            cache.insert(key.0, Arc::clone(&bytes));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn operator_pubkey_bytes(
+        &self,
+        collateral: &OutPoint,
+    ) -> Result<Option<Arc<[u8]>>, ChainStateError> {
+        let key = outpoint_key_bytes(collateral);
+        if let Ok(cache) = self.fluxnode_payments.lock() {
+            if cache.initialized {
+                if let Some(meta) = cache.meta_by_outpoint.get(&key).copied() {
+                    return self.fluxnode_key_bytes(meta.operator_pubkey);
+                }
+            }
+        }
+        let Some(record) = self.fluxnode_record(collateral)? else {
+            return Ok(None);
+        };
+        self.fluxnode_key_bytes(record.operator_pubkey)
     }
 
     pub fn validate_fluxnode_tx_for_mempool(
@@ -4716,12 +4897,12 @@ fn validate_fluxnode_collateral_script(
                     "fluxnode p2sh signing key missing",
                 ))
             })?;
-        let expected = hex_to_bytes(key.key).ok_or_else(|| {
+        let expected = hex_to_bytes_cached(key.key).ok_or_else(|| {
             ChainStateError::Validation(ValidationError::Fluxnode(
                 "invalid fluxnode p2sh signing pubkey",
             ))
         })?;
-        if collateral_pubkey != expected.as_slice() {
+        if collateral_pubkey != expected.as_ref() {
             return Err(ChainStateError::Validation(ValidationError::Fluxnode(
                 "fluxnode p2sh collateral pubkey mismatch",
             )));
@@ -4805,6 +4986,21 @@ fn hex_to_bytes(input: &str) -> Option<Vec<u8>> {
         bytes.push(high << 4 | low);
     }
     Some(bytes)
+}
+
+fn hex_to_bytes_cached(input: &'static str) -> Option<Arc<[u8]>> {
+    let cache = HEX_BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut cache) = cache.lock() {
+        if let Some(bytes) = cache.get(input) {
+            return Some(Arc::clone(bytes));
+        }
+        let bytes = hex_to_bytes(input)?;
+        let bytes = Arc::from(bytes.into_boxed_slice());
+        cache.insert(input, Arc::clone(&bytes));
+        return Some(bytes);
+    }
+    let bytes = hex_to_bytes(input)?;
+    Some(Arc::from(bytes.into_boxed_slice()))
 }
 
 fn parse_multisig_redeem_script(script: &[u8]) -> Option<Vec<Vec<u8>>> {
