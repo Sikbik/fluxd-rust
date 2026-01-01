@@ -231,6 +231,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 - [x] [P0] Automated consensus vector tests vs C++ (embedded sighash vectors) (owner: TBD)
 - [x] [P0] Shielded proof verification vectors (Sapling) + ignored harness (`fluxd-shielded`) (owner: TBD)
+- [x] [P0] Merkle tree parity vectors (Sprout/Sapling roots, witnesses, paths) (owner: TBD)
 - [ ] [P1] RPC golden tests against C++ behavior (owner: TBD)
   - [x] Schema parity: `getblockchaininfo` required keys
   - [x] Schema parity: `gettxoutsetinfo` required keys

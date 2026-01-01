@@ -748,6 +748,7 @@ dependencies = [
  "bellman",
  "blake2b_simd",
  "bls12_381",
+ "core2 0.4.0",
  "ed25519-dalek",
  "fluxd-consensus",
  "fluxd-primitives",
