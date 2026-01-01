@@ -274,7 +274,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `help`<br>`getinfo`<br>`ping`<br>`stop`<br>`restart`<br>`getnetworkinfo`<br>`getpeerinfo`<br>`getnettotals`<br>`getconnectioncount`<br>`listbanned`<br>`clearbanned`<br>`setban`<br>`addnode`<br>`getaddednodeinfo`<br>`disconnectnode`<br>`getdeprecationinfo` | - | `start` |
+| `help`<br>`getinfo`<br>`ping`<br>`stop`<br>`restart`<br>`getnetworkinfo`<br>`getpeerinfo`<br>`getnettotals`<br>`getconnectioncount`<br>`listbanned`<br>`clearbanned`<br>`setban`<br>`addnode`<br>`getaddednodeinfo`<br>`disconnectnode`<br>`getdeprecationinfo` | `start` (stub; no-op) | - |
 
 ### Chain and blocks
 

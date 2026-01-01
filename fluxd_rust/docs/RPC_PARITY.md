@@ -166,7 +166,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Admin and benchmarking
 
-- start - Missing
+- start - Stub (no-op; returns `"fluxd already running"`)
 - restart - Implemented
 - ping - Implemented
 - zcbenchmark - Stub (returns error; zcash benchmarks not implemented)

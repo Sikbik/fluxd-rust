@@ -88,6 +88,7 @@ const RPC_METHODS: &[&str] = &[
     "help",
     "getinfo",
     "ping",
+    "start",
     "stop",
     "restart",
     "reindex",
@@ -1138,6 +1139,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             mempool_policy,
         ),
         "ping" => rpc_ping(params),
+        "start" => rpc_start(params),
         "stop" => rpc_stop(params, shutdown_tx),
         "restart" => rpc_restart(params, shutdown_tx),
         "reindex" => rpc_reindex(params, data_dir, shutdown_tx),
@@ -1358,6 +1360,11 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
 fn rpc_ping(params: Vec<Value>) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
     Ok(Value::Null)
+}
+
+fn rpc_start(params: Vec<Value>) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    Ok(Value::String("fluxd already running".to_string()))
 }
 
 fn rpc_stop(params: Vec<Value>, shutdown_tx: &watch::Sender<bool>) -> Result<Value, RpcError> {
@@ -13932,6 +13939,18 @@ mod tests {
     #[test]
     fn ping_rejects_params() {
         let err = rpc_ping(vec![json!(1)]).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn start_returns_string() {
+        let value = rpc_start(Vec::new()).expect("rpc");
+        assert_eq!(value, Value::String("fluxd already running".to_string()));
+    }
+
+    #[test]
+    fn start_rejects_params() {
+        let err = rpc_start(vec![json!(1)]).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_PARAMETER);
     }
 

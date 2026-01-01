@@ -75,6 +75,7 @@ Type notes:
 - `help [method]`
 - `getinfo`
 - `ping`
+- `start` (stub; no-op)
 - `stop`
 - `restart`
 - `reindex`
@@ -219,6 +220,13 @@ Fields:
 ### ping
 
 - Result: `null`
+
+### start
+
+Not a standard `fluxd` RPC. Provided for compatibility with existing Flux infra.
+
+- Params: none
+- Result: string (`"fluxd already running"`)
 
 ### stop
 
