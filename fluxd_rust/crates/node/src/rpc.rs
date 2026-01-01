@@ -1410,7 +1410,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "zgettotalbalance" | "z_gettotalbalance" => {
             rpc_shielded_wallet_not_implemented(params, "zgettotalbalance")
         }
-        "zimportkey" | "z_importkey" => rpc_shielded_wallet_not_implemented(params, "zimportkey"),
+        "zimportkey" | "z_importkey" => rpc_zimportkey(wallet, params, chain_params),
         "zimportviewingkey" | "z_importviewingkey" => {
             rpc_shielded_wallet_not_implemented(params, "zimportviewingkey")
         }
@@ -4320,6 +4320,82 @@ fn rpc_zexportkey(
     let encoded = bech32::encode::<Bech32>(hrp, extsk_bytes.as_slice())
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling spending key"))?;
     Ok(Value::String(encoded))
+}
+
+fn rpc_zimportkey(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 3 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zimportkey expects 1 to 3 parameters",
+        ));
+    }
+
+    let zkey = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zkey must be a string"))?;
+
+    if let Some(rescan) = params.get(1) {
+        let ok = match rescan {
+            Value::String(value) => matches!(value.as_str(), "yes" | "no" | "whenkeyisnew"),
+            Value::Bool(_) => true,
+            _ => false,
+        };
+        if !ok {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "rescan must be \"yes\", \"no\" or \"whenkeyisnew\"",
+            ));
+        }
+    }
+
+    if let Some(start_height) = params.get(2) {
+        let height = start_height.as_i64().ok_or_else(|| {
+            RpcError::new(RPC_INVALID_PARAMETER, "startHeight must be an integer")
+        })?;
+        if height < 0 {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "Block height out of range",
+            ));
+        }
+    }
+
+    let expected_hrp = match chain_params.network {
+        Network::Mainnet => "secret-extended-key-main",
+        Network::Testnet => "secret-extended-key-test",
+        Network::Regtest => "secret-extended-key-regtest",
+    };
+
+    let checked = CheckedHrpstring::new::<Bech32>(zkey)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid spending key"))?;
+    if checked.hrp().as_str() != expected_hrp {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Invalid spending key",
+        ));
+    }
+
+    let data: Vec<u8> = checked.byte_iter().collect();
+    let extsk: [u8; 169] = data
+        .as_slice()
+        .try_into()
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid spending key"))?;
+
+    let inserted = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .import_sapling_extsk(extsk)
+        .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "Error adding spending key to wallet"))?;
+
+    if !inserted {
+        return Ok(Value::Null);
+    }
+
+    Ok(Value::Null)
 }
 
 fn decode_sprout_payment_address(
@@ -11700,6 +11776,36 @@ mod tests {
 
         let err = rpc_zexportkey(&other_wallet, vec![json!(addr)], &params).unwrap_err();
         assert_eq!(err.code, RPC_WALLET_ERROR);
+    }
+
+    #[test]
+    fn zimportkey_roundtrips_sapling_extsk() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr1 = rpc_zgetnewaddress(&wallet, Vec::new(), &params).expect("rpc");
+        let addr1 = addr1.as_str().expect("string").to_string();
+        let zkey = rpc_zexportkey(&wallet, vec![json!(addr1.clone())], &params).expect("rpc");
+        let zkey = zkey.as_str().expect("string").to_string();
+
+        let other_dir = temp_data_dir("fluxd-rpc-test-zimportkey");
+        std::fs::create_dir_all(&other_dir).expect("create dir");
+        let other_wallet =
+            Mutex::new(Wallet::load_or_create(&other_dir, params.network).expect("wallet"));
+
+        rpc_zimportkey(&other_wallet, vec![json!(zkey)], &params).expect("rpc");
+        let addr2 = rpc_zgetnewaddress(&other_wallet, Vec::new(), &params).expect("rpc");
+        let addr2 = addr2.as_str().expect("string").to_string();
+        assert_eq!(addr2, addr1);
+    }
+
+    #[test]
+    fn zimportkey_rejects_invalid_key() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let err = rpc_zimportkey(&wallet, vec![json!("notakey")], &params).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
     }
 
     #[test]

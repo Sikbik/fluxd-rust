@@ -257,5 +257,24 @@ fi
 echo "Checking zlistaddresses contains both addresses ..."
 rpc_get "zlistaddresses" | python3 -c 'import json,sys; a1=sys.argv[1]; a2=sys.argv[2]; obj=json.load(sys.stdin); res=obj.get("result", []) or []; assert isinstance(res, list), res; assert a1 in res, res; assert a2 in res, res' "$zaddr1" "$zaddr2"
 
+echo "Importing zkey into a fresh wallet (no output) ..."
+stop_node
+if [[ "$KEEP" != "1" ]]; then
+  rm -rf "$DATA_DIR" "$LOG_PATH" || true
+fi
+DATA_DIR="$(mktemp -d "/tmp/fluxd-shielded-wallet-import.XXXXXX")"
+LOG_PATH="${DATA_DIR}.log"
+: >"$LOG_PATH"
+start_node
+
+zkey1_enc="$(url_encode "$zkey1")"
+rpc_get "zimportkey?zkey=${zkey1_enc}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
+
+import_addr="$(rpc_get "zgetnewaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
+if [[ "$import_addr" != "$zaddr1" ]]; then
+  echo "imported key derived unexpected first address" >&2
+  exit 1
+fi
+
 echo "OK: zaddr1=$zaddr1"
 echo "OK: zaddr2=$zaddr2"

@@ -400,6 +400,28 @@ impl Wallet {
         Ok(None)
     }
 
+    pub fn import_sapling_extsk(&mut self, extsk: [u8; 169]) -> Result<bool, WalletError> {
+        let _ = ExtendedSpendingKey::from_bytes(&extsk)
+            .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
+
+        if self.sapling_keys.iter().any(|entry| entry.extsk == extsk) {
+            return Ok(false);
+        }
+
+        let prev_len = self.sapling_keys.len();
+        self.sapling_keys.push(SaplingKeyEntry {
+            extsk,
+            next_diversifier_index: [0u8; 11],
+        });
+
+        if let Err(err) = self.save() {
+            self.sapling_keys.truncate(prev_len);
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(true)
+    }
+
     pub fn sapling_address_is_mine(&self, bytes: &[u8; 43]) -> Result<bool, WalletError> {
         let Some(addr) = PaymentAddress::from_bytes(bytes) else {
             return Ok(false);
