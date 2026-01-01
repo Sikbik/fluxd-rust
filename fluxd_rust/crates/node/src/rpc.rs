@@ -2487,7 +2487,8 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 .checked_sub(fee_zat)
                 .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
 
-            let mut details = Vec::new();
+            let mut send_details = Vec::new();
+            let mut receive_details = Vec::new();
             for (vout, output) in entry.tx.vout.iter().enumerate() {
                 if wallet_script_set.contains(output.script_pubkey.as_slice()) {
                     if debit_zat > 0 {
@@ -2513,7 +2514,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                     row.insert("amount".to_string(), amount_to_value(output.value));
                     row.insert("amount_zat".to_string(), Value::Number(output.value.into()));
                     row.insert("vout".to_string(), Value::Number((vout as i64).into()));
-                    details.push(Value::Object(row));
+                    receive_details.push(Value::Object(row));
                     continue;
                 }
 
@@ -2537,9 +2538,13 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                     row.insert("vout".to_string(), Value::Number((vout as i64).into()));
                     row.insert("fee".to_string(), amount_to_value(fee_zat));
                     row.insert("fee_zat".to_string(), Value::Number(fee_zat.into()));
-                    details.push(Value::Object(row));
+                    send_details.push(Value::Object(row));
                 }
             }
+
+            let mut details = Vec::with_capacity(send_details.len() + receive_details.len());
+            details.extend(send_details);
+            details.extend(receive_details);
 
             let mut obj = json!({
                 "amount": amount_to_value(amount_zat),
@@ -2710,7 +2715,8 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         .checked_sub(fee_zat)
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
 
-    let mut details = Vec::new();
+    let mut send_details = Vec::new();
+    let mut receive_details = Vec::new();
     let receive_category = if is_coinbase {
         if confirmations < 1 {
             "orphan"
@@ -2748,7 +2754,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
             row.insert("amount".to_string(), amount_to_value(output.value));
             row.insert("amount_zat".to_string(), Value::Number(output.value.into()));
             row.insert("vout".to_string(), Value::Number((vout as i64).into()));
-            details.push(Value::Object(row));
+            receive_details.push(Value::Object(row));
             continue;
         }
 
@@ -2772,9 +2778,13 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
             row.insert("vout".to_string(), Value::Number((vout as i64).into()));
             row.insert("fee".to_string(), amount_to_value(fee_zat));
             row.insert("fee_zat".to_string(), Value::Number(fee_zat.into()));
-            details.push(Value::Object(row));
+            send_details.push(Value::Object(row));
         }
     }
+
+    let mut details = Vec::with_capacity(send_details.len() + receive_details.len());
+    details.extend(send_details);
+    details.extend(receive_details);
 
     let mut obj = json!({
         "amount": amount_to_value(amount_zat),

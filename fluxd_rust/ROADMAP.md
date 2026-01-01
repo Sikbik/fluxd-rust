@@ -187,6 +187,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `fee` output and amount excludes fee (C++ parity)
     - [x] Omit change outputs from `details` on send txs (wallet.dat v7 change tracking)
     - [x] Coinbase categories in `details` (`orphan`/`immature`/`generate`) (C++ parity)
+    - [x] `details` ordering: `send` entries first (C++ parity)
   - [x] `listtransactions` (partial)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag

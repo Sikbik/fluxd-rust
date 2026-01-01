@@ -356,6 +356,7 @@ Notes:
 - If the wallet spends inputs, the response includes `fee` / `fee_zat` (negative) and `amount` / `amount_zat` excludes the fee (matches `fluxd` behavior).
 - Change outputs (to addresses reserved via `getrawchangeaddress` / `fundrawtransaction`) are omitted from `details` on outgoing transactions (closer to C++ wallet RPC behavior).
 - Coinbase transaction `details[].category` follows `fluxd` wallet semantics: `orphan` (not in main chain), `immature` (not yet matured), or `generate` (matured).
+- `details[]` ordering matches `fluxd`: `send` entries appear first, then receive/generate entries.
 
 ### listtransactions
 
