@@ -3069,6 +3069,12 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         if let Some(value) = obj.get("timereceived") {
             row.insert("timereceived".to_string(), value.clone());
         }
+        if let Some(hex) = obj.get("hex").and_then(Value::as_str) {
+            if hex.len() % 2 == 0 {
+                let size = (hex.len() / 2) as i64;
+                row.insert("size".to_string(), Value::Number(size.into()));
+            }
+        }
         row.insert("amount_zat".to_string(), Value::Number(amount_zat.into()));
         if category == "send" {
             if let Some(value) = obj.get("fee") {
@@ -3332,6 +3338,12 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
         }
         if let Some(value) = obj.get("timereceived") {
             row.insert("timereceived".to_string(), value.clone());
+        }
+        if let Some(hex) = obj.get("hex").and_then(Value::as_str) {
+            if hex.len() % 2 == 0 {
+                let size = (hex.len() / 2) as i64;
+                row.insert("size".to_string(), Value::Number(size.into()));
+            }
         }
         row.insert("amount_zat".to_string(), Value::Number(amount_zat.into()));
         if category == "send" {
