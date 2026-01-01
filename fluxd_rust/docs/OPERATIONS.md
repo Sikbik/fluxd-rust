@@ -42,6 +42,19 @@ If peer discovery is slow on your VPS, seed the smoke test from an existing data
 ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/remote_smoke_test.sh --profile high --seed-peers-from <remote-data-dir> --min-headers-advance 1\"'"
 ```
 
+## Shielded wallet smoke test (regtest/testnet)
+
+To exercise the Sapling wallet RPCs (without relying on mainnet policy around t→z), run:
+
+```bash
+ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd <remote-repo-path> && ./scripts/shielded_wallet_smoke_test.sh --network regtest\"'"
+```
+
+This script validates:
+- `zgetnewaddress` returns a Sapling address for the selected network
+- `zvalidateaddress` reports `ismine=true`
+- the wallet persists across a restart (same data dir)
+
 ## Progress gate (stall detection)
 
 When doing a fresh sync (and expecting steady progress), you can run a simple RPC-based

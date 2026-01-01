@@ -201,6 +201,9 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `sendfrom` (fromaccount ignored; minconf supported)
   - [x] `rescanblockchain` (scans address delta index; populates wallet tx history)
 - [ ] [P1] Shielded wallet RPCs (owner: TBD)
+  - [x] `zgetnewaddress` (Sapling only; wallet persistence)
+  - [x] `zvalidateaddress` `ismine=true` for Sapling addresses owned by wallet
+  - [x] Regtest/testnet RPC smoke harness (`scripts/shielded_wallet_smoke_test.sh`)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)
 - [ ] [P2] Wallet encryption and key management parity (owner: TBD)
 
@@ -264,6 +267,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity (supports seeding peers.dat and progress thresholds)
   - [x] VPS progress gate (`scripts/progress_gate.sh`) to detect stalls/regressions during sync
   - [x] VPS watchdog loop (`scripts/longrun_watchdog.sh`) to combine stall detection + fatal log pattern checks
+- [x] [P1] Shielded wallet RPC smoke test (`scripts/shielded_wallet_smoke_test.sh`) (owner: TBD)
 - [x] [P1] Reorg and fork simulation tests (owner: TBD)
 - [ ] [P2] Snapshot/fast-sync evaluation (optional) (owner: TBD)
 - [ ] [P2] Performance profiling harness (owner: TBD)
