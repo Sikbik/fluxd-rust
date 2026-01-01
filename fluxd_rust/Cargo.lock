@@ -652,6 +652,10 @@ dependencies = [
  "serde_json",
  "tokio",
  "zcash_note_encryption",
+ "zcash_primitives",
+ "zcash_proofs",
+ "zcash_protocol",
+ "zcash_transparent",
  "zip32",
 ]
 

@@ -88,6 +88,8 @@ pub struct MempoolPrevout {
 pub struct Mempool {
     entries: HashMap<Hash256, MempoolEntry>,
     spent: HashMap<OutPoint, Hash256>,
+    sprout_nullifiers: HashMap<Hash256, Hash256>,
+    sapling_nullifiers: HashMap<Hash256, Hash256>,
     children: HashMap<Hash256, Vec<Hash256>>,
     prioritisations: HashMap<Hash256, Prioritisation>,
     total_bytes: usize,
@@ -106,6 +108,8 @@ impl Mempool {
         Self {
             entries: HashMap::new(),
             spent: HashMap::new(),
+            sprout_nullifiers: HashMap::new(),
+            sapling_nullifiers: HashMap::new(),
             children: HashMap::new(),
             prioritisations: HashMap::new(),
             total_bytes: 0,
@@ -128,6 +132,14 @@ impl Mempool {
 
     pub fn spender(&self, outpoint: &OutPoint) -> Option<Hash256> {
         self.spent.get(outpoint).copied()
+    }
+
+    pub fn sprout_nullifier_spender(&self, nullifier: &Hash256) -> Option<Hash256> {
+        self.sprout_nullifiers.get(nullifier).copied()
+    }
+
+    pub fn sapling_nullifier_spender(&self, nullifier: &Hash256) -> Option<Hash256> {
+        self.sapling_nullifiers.get(nullifier).copied()
     }
 
     pub fn size(&self) -> usize {
@@ -225,8 +237,42 @@ impl Mempool {
                 ));
             }
         }
+        for joinsplit in &entry.tx.join_splits {
+            for nullifier in &joinsplit.nullifiers {
+                if let Some(conflict) = self.sprout_nullifiers.get(nullifier) {
+                    return Err(MempoolError::new(
+                        MempoolErrorKind::ConflictingInput,
+                        format!(
+                            "sprout nullifier {} already spent by {}",
+                            hash256_to_hex(nullifier),
+                            hash256_to_hex(conflict)
+                        ),
+                    ));
+                }
+            }
+        }
+        for spend in &entry.tx.shielded_spends {
+            if let Some(conflict) = self.sapling_nullifiers.get(&spend.nullifier) {
+                return Err(MempoolError::new(
+                    MempoolErrorKind::ConflictingInput,
+                    format!(
+                        "sapling nullifier {} already spent by {}",
+                        hash256_to_hex(&spend.nullifier),
+                        hash256_to_hex(conflict)
+                    ),
+                ));
+            }
+        }
         for outpoint in &entry.spent_outpoints {
             self.spent.insert(outpoint.clone(), entry.txid);
+        }
+        for joinsplit in &entry.tx.join_splits {
+            for nullifier in &joinsplit.nullifiers {
+                self.sprout_nullifiers.insert(*nullifier, entry.txid);
+            }
+        }
+        for spend in &entry.tx.shielded_spends {
+            self.sapling_nullifiers.insert(spend.nullifier, entry.txid);
         }
         self.total_bytes = self.total_bytes.saturating_add(entry.raw.len());
         self.entries.insert(entry.txid, entry);
@@ -260,6 +306,18 @@ impl Mempool {
         for outpoint in &entry.spent_outpoints {
             if self.spent.get(outpoint) == Some(txid) {
                 self.spent.remove(outpoint);
+            }
+        }
+        for joinsplit in &entry.tx.join_splits {
+            for nullifier in &joinsplit.nullifiers {
+                if self.sprout_nullifiers.get(nullifier) == Some(txid) {
+                    self.sprout_nullifiers.remove(nullifier);
+                }
+            }
+        }
+        for spend in &entry.tx.shielded_spends {
+            if self.sapling_nullifiers.get(&spend.nullifier) == Some(txid) {
+                self.sapling_nullifiers.remove(&spend.nullifier);
             }
         }
         for parent in &entry.parents {

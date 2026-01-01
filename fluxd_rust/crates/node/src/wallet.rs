@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,12 +8,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fluxd_chainstate::state::ChainState;
 use rand::RngCore;
 use sapling_crypto::keys::{NullifierDerivingKey, PreparedIncomingViewingKey};
+use sapling_crypto::note::ExtractedNoteCommitment;
 use sapling_crypto::note_encryption::{
     try_sapling_note_decryption, SaplingDomain, Zip212Enforcement,
 };
-use sapling_crypto::{zip32::ExtendedSpendingKey, PaymentAddress};
+use sapling_crypto::{
+    zip32::ExtendedSpendingKey, CommitmentTree as SaplingCommitmentTree,
+    IncrementalWitness as SaplingIncrementalWitness, Node as SaplingNode, PaymentAddress,
+};
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 use zcash_note_encryption::{EphemeralKeyBytes, ShieldedOutput, ENC_CIPHERTEXT_SIZE};
+use zcash_primitives::merkle_tree::{
+    read_commitment_tree, read_incremental_witness, write_commitment_tree,
+    write_incremental_witness,
+};
 use zip32::DiversifierIndex;
 
 use fluxd_consensus::params::Network;
@@ -27,7 +36,7 @@ use fluxd_storage::KeyValueStore;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 8;
+pub const WALLET_FILE_VERSION: u32 = 9;
 
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
 
@@ -160,6 +169,8 @@ pub struct Wallet {
     sapling_scan_hash: Hash256,
     sapling_next_position: u64,
     sapling_notes: BTreeMap<SaplingNoteKey, SaplingNoteRecord>,
+    sapling_tree: SaplingCommitmentTree,
+    sapling_witnesses: BTreeMap<SaplingNoteKey, SaplingIncrementalWitness>,
     revision: u64,
     locked_outpoints: HashSet<OutPoint>,
     pay_tx_fee_per_kb: i64,
@@ -187,6 +198,8 @@ impl Wallet {
                 sapling_scan_hash: [0u8; 32],
                 sapling_next_position: 0,
                 sapling_notes: BTreeMap::new(),
+                sapling_tree: SaplingCommitmentTree::empty(),
+                sapling_witnesses: BTreeMap::new(),
                 revision: 0,
                 locked_outpoints: HashSet::new(),
                 pay_tx_fee_per_kb: 0,
@@ -378,22 +391,38 @@ impl Wallet {
         &self.sapling_notes
     }
 
+    pub(crate) fn sapling_witness_map(
+        &self,
+    ) -> &BTreeMap<SaplingNoteKey, SaplingIncrementalWitness> {
+        &self.sapling_witnesses
+    }
+
+    pub(crate) fn sapling_tree(&self) -> &SaplingCommitmentTree {
+        &self.sapling_tree
+    }
+
     pub fn reset_sapling_scan(&mut self) -> Result<(), WalletError> {
         let prev_scan_height = self.sapling_scan_height;
         let prev_scan_hash = self.sapling_scan_hash;
         let prev_next_position = self.sapling_next_position;
         let prev_notes = self.sapling_notes.clone();
+        let prev_tree = self.sapling_tree.clone();
+        let prev_witnesses = self.sapling_witnesses.clone();
 
         self.sapling_scan_height = -1;
         self.sapling_scan_hash = [0u8; 32];
         self.sapling_next_position = 0;
         self.sapling_notes.clear();
+        self.sapling_tree = SaplingCommitmentTree::empty();
+        self.sapling_witnesses.clear();
 
         if let Err(err) = self.save() {
             self.sapling_scan_height = prev_scan_height;
             self.sapling_scan_hash = prev_scan_hash;
             self.sapling_next_position = prev_next_position;
             self.sapling_notes = prev_notes;
+            self.sapling_tree = prev_tree;
+            self.sapling_witnesses = prev_witnesses;
             return Err(err);
         }
 
@@ -421,12 +450,32 @@ impl Wallet {
         let sapling_count = chainstate
             .sapling_commitment_count()
             .map_err(|err| WalletError::ChainState(err.to_string()))?;
+        let tree_bytes = chainstate
+            .sapling_tree_bytes()
+            .map_err(|err| WalletError::ChainState(err.to_string()))?;
+        let sapling_tree = read_commitment_tree(Cursor::new(tree_bytes))
+            .map_err(|_| WalletError::InvalidData("invalid sapling tree encoding"))?;
+
+        let prev_scan_height = self.sapling_scan_height;
+        let prev_scan_hash = self.sapling_scan_hash;
+        let prev_next_position = self.sapling_next_position;
+        let prev_tree = self.sapling_tree.clone();
+        let prev_witnesses = self.sapling_witnesses.clone();
 
         self.sapling_scan_height = tip.height;
         self.sapling_scan_hash = tip.hash;
         self.sapling_next_position = sapling_count;
+        self.sapling_tree = sapling_tree;
+        self.sapling_witnesses.clear();
 
-        self.save()?;
+        if let Err(err) = self.save() {
+            self.sapling_scan_height = prev_scan_height;
+            self.sapling_scan_hash = prev_scan_hash;
+            self.sapling_next_position = prev_next_position;
+            self.sapling_tree = prev_tree;
+            self.sapling_witnesses = prev_witnesses;
+            return Err(err);
+        }
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
@@ -450,48 +499,44 @@ impl Wallet {
         let prev_scan_hash = self.sapling_scan_hash;
         let prev_next_position = self.sapling_next_position;
         let prev_notes = self.sapling_notes.clone();
+        let prev_tree = self.sapling_tree.clone();
+        let prev_witnesses = self.sapling_witnesses.clone();
 
         if self.sapling_scan_height < 0 {
             self.sapling_scan_hash = [0u8; 32];
             self.sapling_next_position = 0;
+            self.sapling_tree = SaplingCommitmentTree::empty();
+            self.sapling_witnesses.clear();
         }
 
         let scan_keys = self.sapling_scan_keys()?;
 
-        while self.sapling_scan_height >= 0 {
+        let mut needs_full_rescan = false;
+        if self.sapling_scan_height >= 0 {
+            let tree_size = self.sapling_tree.size() as u64;
+            if tree_size != self.sapling_next_position
+                || self.sapling_witnesses.len() != self.sapling_notes.len()
+            {
+                needs_full_rescan = true;
+            }
+        }
+
+        if self.sapling_scan_height >= 0 && !needs_full_rescan {
             let best_hash = chainstate
                 .height_hash(self.sapling_scan_height)
                 .map_err(|err| WalletError::ChainState(err.to_string()))?;
-            if best_hash == Some(self.sapling_scan_hash) {
-                break;
+            if best_hash != Some(self.sapling_scan_hash) {
+                needs_full_rescan = true;
             }
+        }
 
-            let rollback_hash = self.sapling_scan_hash;
-            let rollback_height = self.sapling_scan_height;
-            let sapling_outputs = count_sapling_outputs(chainstate, &rollback_hash)?;
-            self.sapling_next_position = self
-                .sapling_next_position
-                .checked_sub(sapling_outputs as u64)
-                .ok_or(WalletError::InvalidData("sapling position underflow"))?;
-            self.sapling_notes
-                .retain(|_, note| note.height != rollback_height);
-
-            if rollback_height == 0 {
-                self.sapling_scan_height = -1;
-                self.sapling_scan_hash = [0u8; 32];
-                self.sapling_next_position = 0;
-                break;
-            }
-
-            let prev_hash = chainstate
-                .header_entry(&rollback_hash)
-                .map_err(|err| WalletError::ChainState(err.to_string()))?
-                .ok_or(WalletError::InvalidData(
-                    "missing header entry for wallet scan rollback",
-                ))?
-                .prev_hash;
-            self.sapling_scan_hash = prev_hash;
-            self.sapling_scan_height = rollback_height.saturating_sub(1);
+        if needs_full_rescan {
+            self.sapling_scan_height = -1;
+            self.sapling_scan_hash = [0u8; 32];
+            self.sapling_next_position = 0;
+            self.sapling_notes.clear();
+            self.sapling_tree = SaplingCommitmentTree::empty();
+            self.sapling_witnesses.clear();
         }
 
         let mut height = self.sapling_scan_height.saturating_add(1);
@@ -510,13 +555,36 @@ impl Wallet {
                     .map_err(|_| WalletError::InvalidData("invalid transaction encoding"))?;
                 for (out_index, output) in tx.shielded_outputs.iter().enumerate() {
                     let position = self.sapling_next_position;
+                    let cmu = Option::from(ExtractedNoteCommitment::from_bytes(&output.cm))
+                        .ok_or(WalletError::InvalidData("invalid sapling note commitment"))?;
+                    let node = SaplingNode::from_cmu(&cmu);
+                    self.sapling_tree
+                        .append(node.clone())
+                        .map_err(|_| WalletError::InvalidData("sapling tree append failed"))?;
+                    for witness in self.sapling_witnesses.values_mut() {
+                        witness.append(node.clone()).map_err(|_| {
+                            WalletError::InvalidData("sapling witness append failed")
+                        })?;
+                    }
                     self.sapling_next_position = self.sapling_next_position.saturating_add(1);
                     if let Some(note_record) =
                         scan_sapling_output(&scan_keys, output, position, height)
                     {
-                        self.sapling_notes
-                            .entry((txid, out_index as u32))
-                            .or_insert(note_record);
+                        let note_key = (txid, out_index as u32);
+                        let witness =
+                            SaplingIncrementalWitness::from_tree(self.sapling_tree.clone())
+                                .ok_or(WalletError::InvalidData("sapling witness state missing"))?;
+                        match self.sapling_notes.entry(note_key) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(note_record);
+                                self.sapling_witnesses.insert(note_key, witness);
+                            }
+                            std::collections::btree_map::Entry::Occupied(_) => {
+                                if !self.sapling_witnesses.contains_key(&note_key) {
+                                    self.sapling_witnesses.insert(note_key, witness);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -529,7 +597,10 @@ impl Wallet {
         let changed = self.sapling_scan_height != prev_scan_height
             || self.sapling_scan_hash != prev_scan_hash
             || self.sapling_next_position != prev_next_position
-            || self.sapling_notes != prev_notes;
+            || self.sapling_notes != prev_notes
+            || self.sapling_tree != prev_tree
+            || self.sapling_witnesses.len() != prev_witnesses.len()
+            || !self.sapling_witnesses.keys().eq(prev_witnesses.keys());
 
         if changed {
             if let Err(err) = self.save() {
@@ -537,6 +608,8 @@ impl Wallet {
                 self.sapling_scan_hash = prev_scan_hash;
                 self.sapling_next_position = prev_next_position;
                 self.sapling_notes = prev_notes;
+                self.sapling_tree = prev_tree;
+                self.sapling_witnesses = prev_witnesses;
                 return Err(err);
             }
             self.revision = self.revision.saturating_add(1);
@@ -1157,6 +1230,30 @@ impl Wallet {
             }
         }
 
+        let mut sapling_tree = SaplingCommitmentTree::empty();
+        let mut sapling_witnesses: BTreeMap<SaplingNoteKey, SaplingIncrementalWitness> =
+            BTreeMap::new();
+        if version >= 9 {
+            let tree_bytes = decoder.read_var_bytes()?;
+            if !tree_bytes.is_empty() {
+                sapling_tree = read_commitment_tree(Cursor::new(tree_bytes))
+                    .map_err(|_| WalletError::InvalidData("invalid sapling tree encoding"))?;
+            }
+
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("sapling witness count too large"))?;
+            sapling_witnesses = BTreeMap::new();
+            for _ in 0..count {
+                let txid = decoder.read_fixed::<32>()?;
+                let out_index = decoder.read_u32_le()?;
+                let witness_bytes = decoder.read_var_bytes()?;
+                let witness = read_incremental_witness(Cursor::new(witness_bytes))
+                    .map_err(|_| WalletError::InvalidData("invalid sapling witness encoding"))?;
+                sapling_witnesses.insert((txid, out_index), witness);
+            }
+        }
+
         if !decoder.is_empty() {
             return Err(WalletError::InvalidData("wallet file has trailing bytes"));
         }
@@ -1174,6 +1271,8 @@ impl Wallet {
             sapling_scan_hash,
             sapling_next_position,
             sapling_notes,
+            sapling_tree,
+            sapling_witnesses,
             revision: 0,
             locked_outpoints: HashSet::new(),
             pay_tx_fee_per_kb,
@@ -1237,6 +1336,20 @@ impl Wallet {
             encoder.write_i64_le(note.value);
             encoder.write_bytes(&note.address);
             encoder.write_bytes(&note.nullifier);
+        }
+        let mut sapling_tree_bytes = Vec::new();
+        write_commitment_tree(&self.sapling_tree, &mut sapling_tree_bytes)
+            .map_err(|_| WalletError::InvalidData("invalid sapling tree state"))?;
+        encoder.write_var_bytes(&sapling_tree_bytes);
+
+        encoder.write_varint(self.sapling_witnesses.len() as u64);
+        for ((txid, out_index), witness) in &self.sapling_witnesses {
+            encoder.write_bytes(txid);
+            encoder.write_u32_le(*out_index);
+            let mut bytes = Vec::new();
+            write_incremental_witness(witness, &mut bytes)
+                .map_err(|_| WalletError::InvalidData("invalid sapling witness state"))?;
+            encoder.write_var_bytes(&bytes);
         }
         let bytes = encoder.into_inner();
         write_file_atomic(&self.path, &bytes)?;

@@ -232,16 +232,17 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `zimportkey` (Sapling only; resets Sapling scan cursor; rescan/startHeight params currently ignored)
   - [x] `zimportviewingkey` (Sapling only; stores watch-only viewing keys; resets Sapling scan cursor; rescan/startHeight params currently ignored)
   - [x] `zimportwallet` (Sapling only; resets Sapling scan cursor; rescan/startHeight params currently ignored)
-  - [x] `zgetbalance` (Sapling only; scans chain for Sapling notes; supports watch-only via `includeWatchonly`)
-  - [x] `zgettotalbalance` (Sapling only for private balance; scans chain for Sapling notes; supports watch-only via `includeWatchonly`)
-  - [x] `zlistunspent` (Sapling only; lists unspent Sapling notes; supports watch-only via `includeWatchonly`)
+  - [x] `zgetbalance` (Sapling only; scans chain for Sapling notes; excludes notes spent by mempool txs; supports watch-only via `includeWatchonly`)
+  - [x] `zgettotalbalance` (Sapling only for private balance; scans chain for Sapling notes; excludes notes spent by mempool txs; supports watch-only via `includeWatchonly`)
+  - [x] `zlistunspent` (Sapling only; lists unspent Sapling notes; excludes notes spent by mempool txs; supports watch-only via `includeWatchonly`)
   - [x] `zlistreceivedbyaddress` (Sapling only; lists received Sapling notes; supports watch-only via `includeWatchonly`)
-  - [x] `zlistoperationids` (returns empty list; async shielded ops not implemented yet)
-  - [x] `zgetoperationstatus` (returns empty list; async shielded ops not implemented yet)
-  - [x] `zgetoperationresult` (returns empty list; async shielded ops not implemented yet)
+  - [x] `zlistoperationids` (tracks async ops; `zgetoperationresult` removes completed ops)
+  - [x] `zgetoperationstatus` (tracks async ops; supports optional filter)
+  - [x] `zgetoperationresult` (returns completed ops and removes them)
   - [x] `zgetmigrationstatus` (returns disabled migration status; migration not supported)
   - [x] `zsetmigration` (deprecated on Flux fork; returns misc error)
   - [x] `zshieldcoinbase` (deprecated on Flux fork; returns misc error)
+  - [ ] `zsendmany` (Sapling only; async op; tx construction + mempool submission; needs end-to-end spend tests)
   - [x] Regtest/testnet RPC smoke harness (`scripts/shielded_wallet_smoke_test.sh`)
 - [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)
 - [ ] [P2] Wallet encryption and key management parity (owner: TBD)
@@ -381,4 +382,4 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | `zvalidateaddress` (partial; Sapling `ismine` + `iswatchonly`)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zexportkey` (partial; Sapling only)<br>`zexportviewingkey` (partial; Sapling only)<br>`zimportkey` (partial; Sapling only)<br>`zimportviewingkey` (partial; Sapling only)<br>`zimportwallet` (partial; Sapling only)<br>`zgetbalance` (partial; Sapling note scanning)<br>`zgettotalbalance` (partial; Sapling note scanning)<br>`zlistunspent` (partial; Sapling note scanning)<br>`zlistreceivedbyaddress` (partial; Sapling note scanning)<br>`zgetoperationstatus` (implemented; empty list)<br>`zgetoperationresult` (implemented; empty list)<br>`zlistoperationids` (implemented; empty list)<br>`zgetmigrationstatus` (implemented; migration unsupported)<br>`zsetmigration` (implemented; deprecated)<br>`zshieldcoinbase` (implemented; deprecated)<br>`zsendmany` (stub)<br>`zcrawjoinsplit` (stub)<br>`zcrawreceive` (stub) | - |
+| `zgetoperationstatus`<br>`zgetoperationresult`<br>`zlistoperationids`<br>`zgetmigrationstatus`<br>`zsetmigration`<br>`zshieldcoinbase` | `zvalidateaddress` (partial; Sapling `ismine` + `iswatchonly`)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zexportkey` (partial; Sapling only)<br>`zexportviewingkey` (partial; Sapling only)<br>`zimportkey` (partial; Sapling only)<br>`zimportviewingkey` (partial; Sapling only)<br>`zimportwallet` (partial; Sapling only)<br>`zgetbalance` (partial; Sapling note scanning)<br>`zgettotalbalance` (partial; Sapling note scanning)<br>`zlistunspent` (partial; Sapling note scanning)<br>`zlistreceivedbyaddress` (partial; Sapling note scanning)<br>`zsendmany` (partial; Sapling only; async op; tx builder WIP)<br>`zcrawjoinsplit` (stub)<br>`zcrawreceive` (stub) | - |

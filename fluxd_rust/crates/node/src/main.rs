@@ -1196,6 +1196,7 @@ async fn run() -> Result<(), String> {
         let miner_address = config.miner_address.clone();
         let params = params.as_ref().clone();
         let data_dir = data_dir.clone();
+        let params_dir = config.params_dir.clone();
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
@@ -1225,6 +1226,7 @@ async fn run() -> Result<(), String> {
                     miner_address,
                     params,
                     data_dir,
+                    params_dir,
                     net_totals,
                     peer_registry,
                     header_peer_book,

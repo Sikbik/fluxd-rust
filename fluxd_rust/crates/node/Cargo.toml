@@ -28,3 +28,7 @@ fs2 = "0.4"
 sapling-crypto = "0.5"
 zip32 = "0.2"
 zcash_note_encryption = "0.4"
+zcash_primitives = { version = "0.26", default-features = false, features = ["std", "circuits", "non-standard-fees"] }
+zcash_protocol = { version = "0.7.2", default-features = false, features = ["std"] }
+zcash_proofs = { version = "0.26", default-features = false, features = ["local-prover"] }
+transparent = { package = "zcash_transparent", version = "0.6.3", default-features = false, features = ["std"] }

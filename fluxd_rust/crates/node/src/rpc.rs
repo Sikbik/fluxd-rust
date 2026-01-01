@@ -3,17 +3,32 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use bech32::primitives::decode::CheckedHrpstring;
 use bech32::{Bech32, Hrp};
 use rand::RngCore;
+use sapling_crypto::keys::{FullViewingKey as SaplingFullViewingKey, PreparedIncomingViewingKey};
+use sapling_crypto::note_encryption::{
+    try_sapling_note_decryption, SaplingDomain, Zip212Enforcement,
+};
+use sapling_crypto::{
+    IncrementalWitness as SaplingIncrementalWitness, MerklePath as SaplingMerklePath,
+    PaymentAddress,
+};
 use serde_json::{json, Number, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
+use transparent::address::TransparentAddress;
+use zcash_note_encryption::{EphemeralKeyBytes, ShieldedOutput, ENC_CIPHERTEXT_SIZE};
+use zcash_primitives::transaction::builder::{BuildConfig, Builder as ZcashTxBuilder};
+use zcash_proofs::prover::LocalTxProver;
+use zcash_protocol::consensus::{BlockHeight, NetworkType, NetworkUpgrade, Parameters};
+use zcash_protocol::memo::MemoBytes;
+use zcash_protocol::value::Zatoshis;
 
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::state::ChainState;
@@ -252,6 +267,241 @@ pub struct RpcAllowList {
     rules: Vec<IpNet>,
 }
 
+#[derive(Clone)]
+struct RpcContext<S> {
+    chainstate: Arc<ChainState<S>>,
+    store: Arc<Store>,
+    write_lock: Arc<Mutex<()>>,
+    mempool: Arc<Mutex<Mempool>>,
+    mempool_policy: Arc<MempoolPolicy>,
+    mempool_metrics: Arc<MempoolMetrics>,
+    fee_estimator: Arc<Mutex<FeeEstimator>>,
+    mempool_flags: ValidationFlags,
+    miner_address: Option<String>,
+    chain_params: ChainParams,
+    data_dir: PathBuf,
+    params_dir: PathBuf,
+    net_totals: Arc<NetTotals>,
+    peer_registry: Arc<PeerRegistry>,
+    header_peer_book: Arc<HeaderPeerBook>,
+    addr_book: Arc<AddrBook>,
+    added_nodes: Arc<Mutex<HashSet<SocketAddr>>>,
+    tx_announce: broadcast::Sender<Hash256>,
+    wallet: Arc<Mutex<Wallet>>,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AsyncOpState {
+    Queued,
+    Executing,
+    Success,
+    Failed,
+}
+
+impl AsyncOpState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Executing => "executing",
+            Self::Success => "success",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse_filter(raw: &str) -> Option<Self> {
+        match raw {
+            "queued" => Some(Self::Queued),
+            "executing" => Some(Self::Executing),
+            "success" => Some(Self::Success),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AsyncOpError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Clone, Debug)]
+struct AsyncOpEntry {
+    operationid: String,
+    status: AsyncOpState,
+    method: String,
+    params: Value,
+    creation_time: u64,
+    started_time: Option<u64>,
+    finished_time: Option<u64>,
+    result: Option<Value>,
+    error: Option<AsyncOpError>,
+}
+
+impl AsyncOpEntry {
+    fn status_object(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "operationid".to_string(),
+            Value::String(self.operationid.clone()),
+        );
+        obj.insert(
+            "status".to_string(),
+            Value::String(self.status.as_str().to_string()),
+        );
+        obj.insert(
+            "creation_time".to_string(),
+            Value::Number(Number::from(self.creation_time)),
+        );
+        obj.insert("method".to_string(), Value::String(self.method.clone()));
+        obj.insert("params".to_string(), self.params.clone());
+        if let (Some(started), Some(finished)) = (self.started_time, self.finished_time) {
+            if finished >= started {
+                obj.insert(
+                    "execution_time".to_string(),
+                    Value::Number(Number::from(finished - started)),
+                );
+            }
+        }
+        if self.status == AsyncOpState::Success {
+            if let Some(result) = self.result.clone() {
+                obj.insert("result".to_string(), result);
+            }
+        }
+        if self.status == AsyncOpState::Failed {
+            if let Some(err) = self.error.as_ref() {
+                obj.insert(
+                    "error".to_string(),
+                    json!({
+                        "code": err.code,
+                        "message": err.message,
+                    }),
+                );
+            }
+        }
+        Value::Object(obj)
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(self.status, AsyncOpState::Success | AsyncOpState::Failed)
+    }
+}
+
+#[derive(Default)]
+struct AsyncOpManager {
+    ops: HashMap<String, AsyncOpEntry>,
+}
+
+impl AsyncOpManager {
+    fn insert(&mut self, entry: AsyncOpEntry) {
+        self.ops.insert(entry.operationid.clone(), entry);
+    }
+
+    fn update_status(&mut self, opid: &str, status: AsyncOpState) {
+        let Some(entry) = self.ops.get_mut(opid) else {
+            return;
+        };
+        entry.status = status;
+        match status {
+            AsyncOpState::Executing => {
+                if entry.started_time.is_none() {
+                    entry.started_time = Some(current_unix_seconds_u64());
+                }
+            }
+            AsyncOpState::Success | AsyncOpState::Failed => {
+                entry.finished_time = Some(current_unix_seconds_u64());
+            }
+            AsyncOpState::Queued => {}
+        }
+    }
+
+    fn set_result(&mut self, opid: &str, result: Value) {
+        if let Some(entry) = self.ops.get_mut(opid) {
+            entry.result = Some(result);
+        }
+    }
+
+    fn set_error(&mut self, opid: &str, code: i64, message: String) {
+        if let Some(entry) = self.ops.get_mut(opid) {
+            entry.error = Some(AsyncOpError { code, message });
+        }
+    }
+
+    fn list_ids(&self, filter: Option<AsyncOpState>) -> Vec<Value> {
+        let mut ids: Vec<&str> = self
+            .ops
+            .values()
+            .filter(|entry| filter.map_or(true, |f| entry.status == f))
+            .map(|entry| entry.operationid.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .map(|id| Value::String(id.to_string()))
+            .collect()
+    }
+
+    fn status_objects(&self, ids: Option<&[String]>) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        match ids {
+            Some(ids) => {
+                for id in ids {
+                    if let Some(entry) = self.ops.get(id) {
+                        out.push(entry.status_object());
+                    }
+                }
+            }
+            None => {
+                let mut entries: Vec<&AsyncOpEntry> = self.ops.values().collect();
+                entries.sort_by(|a, b| a.operationid.cmp(&b.operationid));
+                out.extend(entries.into_iter().map(|entry| entry.status_object()));
+            }
+        }
+        out
+    }
+
+    fn take_finished(&mut self, ids: Option<&[String]>) -> Vec<Value> {
+        let mut to_take: Vec<String> = Vec::new();
+        match ids {
+            Some(ids) => {
+                for id in ids {
+                    if self.ops.get(id).is_some_and(|entry| entry.is_finished()) {
+                        to_take.push(id.clone());
+                    }
+                }
+            }
+            None => {
+                for (id, entry) in &self.ops {
+                    if entry.is_finished() {
+                        to_take.push(id.clone());
+                    }
+                }
+            }
+        }
+        to_take.sort_unstable();
+        let mut out = Vec::new();
+        for id in to_take {
+            if let Some(entry) = self.ops.remove(&id) {
+                out.push(entry.status_object());
+            }
+        }
+        out
+    }
+}
+
+static ASYNC_OP_MANAGER: OnceLock<Mutex<AsyncOpManager>> = OnceLock::new();
+
+fn async_ops() -> &'static Mutex<AsyncOpManager> {
+    ASYNC_OP_MANAGER.get_or_init(|| Mutex::new(AsyncOpManager::default()))
+}
+
+fn current_unix_seconds_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IpNet {
     V4 { network: u32, mask: u32 },
@@ -420,6 +670,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     miner_address: Option<String>,
     params: ChainParams,
     data_dir: PathBuf,
+    params_dir: PathBuf,
     net_totals: Arc<NetTotals>,
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
@@ -460,6 +711,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let miner_address = miner_address.clone();
         let params = params.clone();
         let data_dir = data_dir.clone();
+        let params_dir = params_dir.clone();
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
         let header_peer_book = Arc::clone(&header_peer_book);
@@ -483,6 +735,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 miner_address,
                 params,
                 data_dir,
+                params_dir,
                 net_totals,
                 peer_registry,
                 header_peer_book,
@@ -515,6 +768,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     miner_address: Option<String>,
     chain_params: ChainParams,
     data_dir: PathBuf,
+    params_dir: PathBuf,
     net_totals: Arc<NetTotals>,
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
@@ -549,6 +803,29 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         return Ok(());
     }
 
+    let ctx = RpcContext {
+        chainstate,
+        store,
+        write_lock,
+        mempool,
+        mempool_policy,
+        mempool_metrics,
+        fee_estimator,
+        mempool_flags,
+        miner_address,
+        chain_params,
+        data_dir,
+        params_dir,
+        net_totals,
+        peer_registry,
+        header_peer_book,
+        addr_book,
+        added_nodes,
+        tx_announce,
+        wallet,
+        shutdown_tx,
+    };
+
     if is_daemon {
         let method = request
             .path
@@ -578,14 +855,15 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
                     if let Some((watched_hash, watched_revision)) =
                         longpoll_state_from_params(&params)
                     {
-                        match current_longpoll_state(chainstate.as_ref(), mempool.as_ref()) {
+                        match current_longpoll_state(ctx.chainstate.as_ref(), ctx.mempool.as_ref())
+                        {
                             Ok((current_hash, current_revision))
                                 if current_hash == watched_hash
                                     && current_revision == watched_revision =>
                             {
                                 if let Err(err) = wait_longpoll(
-                                    chainstate.as_ref(),
-                                    mempool.as_ref(),
+                                    ctx.chainstate.as_ref(),
+                                    ctx.mempool.as_ref(),
                                     watched_hash,
                                     watched_revision,
                                 )
@@ -602,29 +880,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
                     if let Some(err) = longpoll_error {
                         rpc_error(Value::Null, err.code, err.message)
                     } else {
-                        match dispatch_method(
-                            method,
-                            params,
-                            chainstate.as_ref(),
-                            write_lock.as_ref(),
-                            mempool.as_ref(),
-                            mempool_policy.as_ref(),
-                            mempool_metrics.as_ref(),
-                            fee_estimator.as_ref(),
-                            &mempool_flags,
-                            &chain_params,
-                            miner_address.as_deref(),
-                            &data_dir,
-                            store.as_ref(),
-                            &net_totals,
-                            &peer_registry,
-                            &header_peer_book,
-                            addr_book.as_ref(),
-                            added_nodes.as_ref(),
-                            &tx_announce,
-                            wallet.as_ref(),
-                            &shutdown_tx,
-                        ) {
+                        match dispatch_method(method, params, &ctx) {
                             Ok(value) => rpc_ok(Value::Null, value),
                             Err(err) => rpc_error(Value::Null, err.code, err.message),
                         }
@@ -632,29 +888,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
                 }
             }
         } else {
-            match handle_daemon_request(
-                method,
-                &request,
-                chainstate.as_ref(),
-                write_lock.as_ref(),
-                mempool.as_ref(),
-                mempool_policy.as_ref(),
-                mempool_metrics.as_ref(),
-                fee_estimator.as_ref(),
-                &mempool_flags,
-                &chain_params,
-                miner_address.as_deref(),
-                &data_dir,
-                store.as_ref(),
-                &net_totals,
-                &peer_registry,
-                &header_peer_book,
-                addr_book.as_ref(),
-                added_nodes.as_ref(),
-                &tx_announce,
-                wallet.as_ref(),
-                &shutdown_tx,
-            ) {
+            match handle_daemon_request(method, &request, &ctx) {
                 Ok(value) => rpc_ok(Value::Null, value),
                 Err(err) => rpc_error(Value::Null, err.code, err.message),
             }
@@ -668,29 +902,8 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         return Ok(());
     }
 
-    if let Some(rpc_response) = handle_json_rpc_getblocktemplate_longpoll(
-        &request.body,
-        chainstate.as_ref(),
-        write_lock.as_ref(),
-        mempool.as_ref(),
-        mempool_policy.as_ref(),
-        mempool_metrics.as_ref(),
-        fee_estimator.as_ref(),
-        &mempool_flags,
-        &chain_params,
-        miner_address.as_deref(),
-        &data_dir,
-        store.as_ref(),
-        &net_totals,
-        &peer_registry,
-        &header_peer_book,
-        addr_book.as_ref(),
-        added_nodes.as_ref(),
-        &tx_announce,
-        wallet.as_ref(),
-        &shutdown_tx,
-    )
-    .await?
+    if let Some(rpc_response) =
+        handle_json_rpc_getblocktemplate_longpoll(&request.body, &ctx).await?
     {
         let body = rpc_response.to_string();
         let response = build_response("200 OK", "application/json", &body);
@@ -701,28 +914,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         return Ok(());
     }
 
-    let rpc_response = match handle_rpc_request(
-        &request.body,
-        chainstate.as_ref(),
-        write_lock.as_ref(),
-        mempool.as_ref(),
-        mempool_policy.as_ref(),
-        mempool_metrics.as_ref(),
-        fee_estimator.as_ref(),
-        &mempool_flags,
-        &chain_params,
-        miner_address.as_deref(),
-        &data_dir,
-        store.as_ref(),
-        &net_totals,
-        &peer_registry,
-        &header_peer_book,
-        addr_book.as_ref(),
-        added_nodes.as_ref(),
-        &tx_announce,
-        wallet.as_ref(),
-        &shutdown_tx,
-    ) {
+    let rpc_response = match handle_rpc_request(&request.body, &ctx) {
         Ok(value) => value,
         Err(err) => err,
     };
@@ -782,28 +974,9 @@ async fn wait_longpoll<S: fluxd_storage::KeyValueStore>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_json_rpc_getblocktemplate_longpoll<S: fluxd_storage::KeyValueStore>(
+async fn handle_json_rpc_getblocktemplate_longpoll<S: fluxd_storage::KeyValueStore + 'static>(
     body: &[u8],
-    chainstate: &ChainState<S>,
-    write_lock: &Mutex<()>,
-    mempool: &Mutex<Mempool>,
-    mempool_policy: &MempoolPolicy,
-    mempool_metrics: &MempoolMetrics,
-    fee_estimator: &Mutex<FeeEstimator>,
-    mempool_flags: &ValidationFlags,
-    chain_params: &ChainParams,
-    miner_address: Option<&str>,
-    data_dir: &Path,
-    store: &Store,
-    net_totals: &NetTotals,
-    peer_registry: &PeerRegistry,
-    header_peer_book: &HeaderPeerBook,
-    addr_book: &AddrBook,
-    added_nodes: &Mutex<HashSet<SocketAddr>>,
-    tx_announce: &broadcast::Sender<Hash256>,
-    wallet: &Mutex<Wallet>,
-    shutdown_tx: &watch::Sender<bool>,
+    ctx: &RpcContext<S>,
 ) -> Result<Option<Value>, String> {
     let value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -840,71 +1013,36 @@ async fn handle_json_rpc_getblocktemplate_longpoll<S: fluxd_storage::KeyValueSto
     };
 
     if let Some((watched_hash, watched_revision)) = longpoll_state_from_params(&params) {
-        let (current_hash, current_revision) = match current_longpoll_state(chainstate, mempool) {
-            Ok(state) => state,
-            Err(err) => return Ok(Some(rpc_error(id, err.code, err.message))),
-        };
+        let (current_hash, current_revision) =
+            match current_longpoll_state(ctx.chainstate.as_ref(), ctx.mempool.as_ref()) {
+                Ok(state) => state,
+                Err(err) => return Ok(Some(rpc_error(id, err.code, err.message))),
+            };
         if current_hash == watched_hash && current_revision == watched_revision {
-            if let Err(err) =
-                wait_longpoll(chainstate, mempool, watched_hash, watched_revision).await
+            if let Err(err) = wait_longpoll(
+                ctx.chainstate.as_ref(),
+                ctx.mempool.as_ref(),
+                watched_hash,
+                watched_revision,
+            )
+            .await
             {
                 return Ok(Some(rpc_error(id, err.code, err.message)));
             }
         }
     }
 
-    let rpc_response = match dispatch_method(
-        method,
-        params,
-        chainstate,
-        write_lock,
-        mempool,
-        mempool_policy,
-        mempool_metrics,
-        fee_estimator,
-        mempool_flags,
-        chain_params,
-        miner_address,
-        data_dir,
-        store,
-        net_totals,
-        peer_registry,
-        header_peer_book,
-        addr_book,
-        added_nodes,
-        tx_announce,
-        wallet,
-        shutdown_tx,
-    ) {
+    let rpc_response = match dispatch_method(method, params, ctx) {
         Ok(value) => rpc_ok(id, value),
         Err(err) => rpc_error(id, err.code, err.message),
     };
     Ok(Some(rpc_response))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
+fn handle_daemon_request<S: fluxd_storage::KeyValueStore + 'static>(
     method: &str,
     request: &HttpRequest,
-    chainstate: &ChainState<S>,
-    write_lock: &Mutex<()>,
-    mempool: &Mutex<Mempool>,
-    mempool_policy: &MempoolPolicy,
-    mempool_metrics: &MempoolMetrics,
-    fee_estimator: &Mutex<FeeEstimator>,
-    mempool_flags: &ValidationFlags,
-    chain_params: &ChainParams,
-    miner_address: Option<&str>,
-    data_dir: &Path,
-    store: &Store,
-    net_totals: &NetTotals,
-    peer_registry: &PeerRegistry,
-    header_peer_book: &HeaderPeerBook,
-    addr_book: &AddrBook,
-    added_nodes: &Mutex<HashSet<SocketAddr>>,
-    tx_announce: &broadcast::Sender<Hash256>,
-    wallet: &Mutex<Wallet>,
-    shutdown_tx: &watch::Sender<bool>,
+    ctx: &RpcContext<S>,
 ) -> Result<Value, RpcError> {
     let params = if request.method == "GET" {
         parse_query_params(request.query.as_deref().unwrap_or(""))?
@@ -913,52 +1051,12 @@ fn handle_daemon_request<S: fluxd_storage::KeyValueStore>(
     } else {
         return Err(RpcError::new(RPC_INVALID_REQUEST, "method not allowed"));
     };
-    dispatch_method(
-        method,
-        params,
-        chainstate,
-        write_lock,
-        mempool,
-        mempool_policy,
-        mempool_metrics,
-        fee_estimator,
-        mempool_flags,
-        chain_params,
-        miner_address,
-        data_dir,
-        store,
-        net_totals,
-        peer_registry,
-        header_peer_book,
-        addr_book,
-        added_nodes,
-        tx_announce,
-        wallet,
-        shutdown_tx,
-    )
+    dispatch_method(method, params, ctx)
 }
 
-fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
+fn handle_rpc_request<S: fluxd_storage::KeyValueStore + 'static>(
     body: &[u8],
-    chainstate: &ChainState<S>,
-    write_lock: &Mutex<()>,
-    mempool: &Mutex<Mempool>,
-    mempool_policy: &MempoolPolicy,
-    mempool_metrics: &MempoolMetrics,
-    fee_estimator: &Mutex<FeeEstimator>,
-    mempool_flags: &ValidationFlags,
-    chain_params: &ChainParams,
-    miner_address: Option<&str>,
-    data_dir: &Path,
-    store: &Store,
-    net_totals: &NetTotals,
-    peer_registry: &PeerRegistry,
-    header_peer_book: &HeaderPeerBook,
-    addr_book: &AddrBook,
-    added_nodes: &Mutex<HashSet<SocketAddr>>,
-    tx_announce: &broadcast::Sender<Hash256>,
-    wallet: &Mutex<Wallet>,
-    shutdown_tx: &watch::Sender<bool>,
+    ctx: &RpcContext<S>,
 ) -> Result<Value, Value> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| rpc_error(Value::Null, RPC_PARSE_ERROR, format!("parse error: {err}")))?;
@@ -992,29 +1090,7 @@ fn handle_rpc_request<S: fluxd_storage::KeyValueStore>(
         }
     };
 
-    let result = dispatch_method(
-        method,
-        params,
-        chainstate,
-        write_lock,
-        mempool,
-        mempool_policy,
-        mempool_metrics,
-        fee_estimator,
-        mempool_flags,
-        chain_params,
-        miner_address,
-        data_dir,
-        store,
-        net_totals,
-        peer_registry,
-        header_peer_book,
-        addr_book,
-        added_nodes,
-        tx_announce,
-        wallet,
-        shutdown_tx,
-    );
+    let result = dispatch_method(method, params, ctx);
 
     match result {
         Ok(value) => Ok(rpc_ok(id, value)),
@@ -1144,30 +1220,31 @@ fn hex_value(byte: u8) -> Result<u8, RpcError> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch_method<S: fluxd_storage::KeyValueStore>(
+fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
     method: &str,
     params: Vec<Value>,
-    chainstate: &ChainState<S>,
-    write_lock: &Mutex<()>,
-    mempool: &Mutex<Mempool>,
-    mempool_policy: &MempoolPolicy,
-    mempool_metrics: &MempoolMetrics,
-    fee_estimator: &Mutex<FeeEstimator>,
-    mempool_flags: &ValidationFlags,
-    chain_params: &ChainParams,
-    miner_address: Option<&str>,
-    data_dir: &Path,
-    store: &Store,
-    net_totals: &NetTotals,
-    peer_registry: &PeerRegistry,
-    header_peer_book: &HeaderPeerBook,
-    addr_book: &AddrBook,
-    added_nodes: &Mutex<HashSet<SocketAddr>>,
-    tx_announce: &broadcast::Sender<Hash256>,
-    wallet: &Mutex<Wallet>,
-    shutdown_tx: &watch::Sender<bool>,
+    ctx: &RpcContext<S>,
 ) -> Result<Value, RpcError> {
+    let chainstate = ctx.chainstate.as_ref();
+    let store = ctx.store.as_ref();
+    let write_lock = ctx.write_lock.as_ref();
+    let mempool = ctx.mempool.as_ref();
+    let mempool_policy = ctx.mempool_policy.as_ref();
+    let mempool_metrics = ctx.mempool_metrics.as_ref();
+    let fee_estimator = ctx.fee_estimator.as_ref();
+    let mempool_flags = &ctx.mempool_flags;
+    let miner_address = ctx.miner_address.as_deref();
+    let chain_params = &ctx.chain_params;
+    let data_dir = ctx.data_dir.as_path();
+    let net_totals = ctx.net_totals.as_ref();
+    let peer_registry = ctx.peer_registry.as_ref();
+    let header_peer_book = ctx.header_peer_book.as_ref();
+    let addr_book = ctx.addr_book.as_ref();
+    let added_nodes = ctx.added_nodes.as_ref();
+    let tx_announce = &ctx.tx_announce;
+    let wallet = ctx.wallet.as_ref();
+    let shutdown_tx = &ctx.shutdown_tx;
+
     match method {
         "help" => rpc_help(params),
         "getinfo" => rpc_getinfo(
@@ -1395,7 +1472,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
         "zexportviewingkey" | "z_exportviewingkey" => {
             rpc_zexportviewingkey(wallet, params, chain_params)
         }
-        "zgetbalance" | "z_getbalance" => rpc_zgetbalance(chainstate, wallet, params, chain_params),
+        "zgetbalance" | "z_getbalance" => {
+            rpc_zgetbalance(chainstate, mempool, wallet, params, chain_params)
+        }
         "zgetmigrationstatus" | "z_getmigrationstatus" => rpc_zgetmigrationstatus(params),
         "zgetnewaddress" | "z_getnewaddress" => {
             rpc_zgetnewaddress(chainstate, wallet, params, chain_params)
@@ -1416,9 +1495,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore>(
             rpc_zlistreceivedbyaddress(chainstate, wallet, params, chain_params)
         }
         "zlistunspent" | "z_listunspent" => {
-            rpc_zlistunspent(chainstate, wallet, params, chain_params)
+            rpc_zlistunspent(chainstate, mempool, wallet, params, chain_params)
         }
-        "zsendmany" | "z_sendmany" => rpc_shielded_wallet_not_implemented(params, "zsendmany"),
+        "zsendmany" | "z_sendmany" => rpc_zsendmany(ctx, params),
         "zsetmigration" | "z_setmigration" => rpc_zsetmigration(params),
         "zshieldcoinbase" | "z_shieldcoinbase" => rpc_zshieldcoinbase(params),
         "zvalidateaddress" | "z_validateaddress" => {
@@ -1447,15 +1526,26 @@ fn rpc_zlistoperationids(params: Vec<Value>) -> Result<Value, RpcError> {
             "zlistoperationids expects 0 or 1 parameters",
         ));
     }
-    if let Some(value) = params.first() {
-        if !value.is_null() && value.as_str().is_none() {
-            return Err(RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "status must be a string",
-            ));
-        }
-    }
-    Ok(Value::Array(Vec::new()))
+    let filter =
+        match params.first() {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let status = value.as_str().ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "status must be a string")
+                })?;
+                if status == "cancelled" {
+                    return Ok(Value::Array(Vec::new()));
+                }
+                Some(AsyncOpState::parse_filter(status).ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "invalid operation status")
+                })?)
+            }
+        };
+
+    let guard = async_ops()
+        .lock()
+        .map_err(|_| map_internal("operation manager lock poisoned"))?;
+    Ok(Value::Array(guard.list_ids(filter)))
 }
 
 fn rpc_zgetoperationstatus(params: Vec<Value>) -> Result<Value, RpcError> {
@@ -1465,22 +1555,31 @@ fn rpc_zgetoperationstatus(params: Vec<Value>) -> Result<Value, RpcError> {
             "zgetoperationstatus expects 0 or 1 parameters",
         ));
     }
-    if let Some(value) = params.first() {
-        if !value.is_null() {
+    let filter_ids = match params.first() {
+        None | Some(Value::Null) => None,
+        Some(value) => {
             let ids = value.as_array().ok_or_else(|| {
                 RpcError::new(RPC_INVALID_PARAMETER, "operationids must be an array")
             })?;
+            let mut out = Vec::with_capacity(ids.len());
             for id in ids {
-                if id.as_str().is_none() {
-                    return Err(RpcError::new(
-                        RPC_INVALID_PARAMETER,
-                        "operationids must be strings",
-                    ));
-                }
+                out.push(
+                    id.as_str()
+                        .ok_or_else(|| {
+                            RpcError::new(RPC_INVALID_PARAMETER, "operationids must be strings")
+                        })?
+                        .to_string(),
+                );
             }
+            Some(out)
         }
-    }
-    Ok(Value::Array(Vec::new()))
+    };
+
+    let guard = async_ops()
+        .lock()
+        .map_err(|_| map_internal("operation manager lock poisoned"))?;
+    let values = guard.status_objects(filter_ids.as_deref());
+    Ok(Value::Array(values))
 }
 
 fn rpc_zgetoperationresult(params: Vec<Value>) -> Result<Value, RpcError> {
@@ -1490,22 +1589,31 @@ fn rpc_zgetoperationresult(params: Vec<Value>) -> Result<Value, RpcError> {
             "zgetoperationresult expects 0 or 1 parameters",
         ));
     }
-    if let Some(value) = params.first() {
-        if !value.is_null() {
+    let filter_ids = match params.first() {
+        None | Some(Value::Null) => None,
+        Some(value) => {
             let ids = value.as_array().ok_or_else(|| {
                 RpcError::new(RPC_INVALID_PARAMETER, "operationids must be an array")
             })?;
+            let mut out = Vec::with_capacity(ids.len());
             for id in ids {
-                if id.as_str().is_none() {
-                    return Err(RpcError::new(
-                        RPC_INVALID_PARAMETER,
-                        "operationids must be strings",
-                    ));
-                }
+                out.push(
+                    id.as_str()
+                        .ok_or_else(|| {
+                            RpcError::new(RPC_INVALID_PARAMETER, "operationids must be strings")
+                        })?
+                        .to_string(),
+                );
             }
+            Some(out)
         }
-    }
-    Ok(Value::Array(Vec::new()))
+    };
+
+    let mut guard = async_ops()
+        .lock()
+        .map_err(|_| map_internal("operation manager lock poisoned"))?;
+    let values = guard.take_finished(filter_ids.as_deref());
+    Ok(Value::Array(values))
 }
 
 fn rpc_zgetmigrationstatus(params: Vec<Value>) -> Result<Value, RpcError> {
@@ -4734,8 +4842,720 @@ fn parse_sapling_zaddr_bytes(
     Ok(addr_bytes)
 }
 
+fn new_opid() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(5 + 36);
+    out.push_str("opid-");
+    for (idx, byte) in bytes.iter().enumerate() {
+        if matches!(idx, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+fn sapling_activation_height(chain_params: &ChainParams) -> BlockHeight {
+    let raw = chain_params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height;
+    let height = u32::try_from(raw.max(0)).unwrap_or(0);
+    BlockHeight::from_u32(height)
+}
+
+#[derive(Clone)]
+struct FluxZcashParams {
+    network: Network,
+    sapling_activation: BlockHeight,
+}
+
+impl Parameters for FluxZcashParams {
+    fn network_type(&self) -> NetworkType {
+        match self.network {
+            Network::Mainnet => NetworkType::Main,
+            Network::Testnet => NetworkType::Test,
+            Network::Regtest => NetworkType::Regtest,
+        }
+    }
+
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+        match nu {
+            NetworkUpgrade::Overwinter | NetworkUpgrade::Sapling => Some(self.sapling_activation),
+            _ => None,
+        }
+    }
+}
+
+struct LocalTxProverState {
+    network: Network,
+    params_dir: PathBuf,
+    prover: Arc<LocalTxProver>,
+}
+
+static LOCAL_TX_PROVER_STATE: OnceLock<Result<LocalTxProverState, String>> = OnceLock::new();
+
+fn local_tx_prover(params_dir: &Path, network: Network) -> Result<Arc<LocalTxProver>, RpcError> {
+    let state = LOCAL_TX_PROVER_STATE.get_or_init(|| {
+        let params_dir = params_dir.to_path_buf();
+        let (spend_path, output_path) = sapling_param_paths(&params_dir, network)?;
+        let prover = std::panic::catch_unwind(|| LocalTxProver::new(&spend_path, &output_path))
+            .map_err(|_| "failed to parse Sapling proving parameters".to_string())?;
+        Ok(LocalTxProverState {
+            network,
+            params_dir,
+            prover: Arc::new(prover),
+        })
+    });
+
+    match state {
+        Ok(state) => {
+            if state.network != network || state.params_dir != params_dir {
+                return Err(RpcError::new(
+                    RPC_INTERNAL_ERROR,
+                    "shielded prover initialized with different network/params-dir",
+                ));
+            }
+            Ok(Arc::clone(&state.prover))
+        }
+        Err(err) => Err(RpcError::new(RPC_WALLET_ERROR, err.clone())),
+    }
+}
+
+fn sapling_param_paths(params_dir: &Path, network: Network) -> Result<(PathBuf, PathBuf), String> {
+    const SAPLING_SPEND: &str = "sapling-spend.params";
+    const SAPLING_OUTPUT: &str = "sapling-output.params";
+    const SAPLING_SPEND_TESTNET: &str = "sapling-spend-testnet.params";
+    const SAPLING_OUTPUT_TESTNET: &str = "sapling-output-testnet.params";
+
+    let (spend_primary, output_primary, spend_fallback, output_fallback) = match network {
+        Network::Testnet => (
+            SAPLING_SPEND_TESTNET,
+            SAPLING_OUTPUT_TESTNET,
+            Some(SAPLING_SPEND),
+            Some(SAPLING_OUTPUT),
+        ),
+        _ => (SAPLING_SPEND, SAPLING_OUTPUT, None, None),
+    };
+
+    fn pick(params_dir: &Path, primary: &str, fallback: Option<&str>) -> Option<PathBuf> {
+        let primary_path = params_dir.join(primary);
+        if primary_path.exists() {
+            return Some(primary_path);
+        }
+        let fallback = fallback?;
+        let fallback_path = params_dir.join(fallback);
+        fallback_path.exists().then_some(fallback_path)
+    }
+
+    let spend = pick(params_dir, spend_primary, spend_fallback).ok_or_else(|| {
+        format!(
+            "missing Sapling spend parameters ({spend_primary}) in {} (run with --fetch-params)",
+            params_dir.display()
+        )
+    })?;
+    let output = pick(params_dir, output_primary, output_fallback).ok_or_else(|| {
+        format!(
+            "missing Sapling output parameters ({output_primary}) in {} (run with --fetch-params)",
+            params_dir.display()
+        )
+    })?;
+
+    Ok((spend, output))
+}
+
+struct SaplingOutputRef<'a> {
+    output: &'a fluxd_primitives::transaction::OutputDescription,
+}
+
+impl ShieldedOutput<SaplingDomain, ENC_CIPHERTEXT_SIZE> for SaplingOutputRef<'_> {
+    fn ephemeral_key(&self) -> EphemeralKeyBytes {
+        EphemeralKeyBytes(self.output.ephemeral_key)
+    }
+
+    fn cmstar_bytes(
+        &self,
+    ) -> <SaplingDomain as zcash_note_encryption::Domain>::ExtractedCommitmentBytes {
+        self.output.cm
+    }
+
+    fn enc_ciphertext(&self) -> &[u8; ENC_CIPHERTEXT_SIZE] {
+        &self.output.enc_ciphertext
+    }
+}
+
+fn transparent_address_from_flux_address(
+    address: &str,
+    network: Network,
+) -> Result<TransparentAddress, RpcError> {
+    let script_pubkey = address_to_script_pubkey(address, network)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "invalid address"))?;
+    if script_pubkey.len() == 25
+        && script_pubkey[0] == 0x76
+        && script_pubkey[1] == 0xa9
+        && script_pubkey[2] == 0x14
+        && script_pubkey[23] == 0x88
+        && script_pubkey[24] == 0xac
+    {
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&script_pubkey[3..23]);
+        return Ok(TransparentAddress::PublicKeyHash(hash));
+    }
+    if script_pubkey.len() == 23
+        && script_pubkey[0] == 0xa9
+        && script_pubkey[1] == 0x14
+        && script_pubkey[22] == 0x87
+    {
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&script_pubkey[2..22]);
+        return Ok(TransparentAddress::ScriptHash(hash));
+    }
+    Err(RpcError::new(
+        RPC_INVALID_ADDRESS_OR_KEY,
+        "unsupported transparent address script",
+    ))
+}
+
+fn read_sapling_output_by_key<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    txid: &Hash256,
+    out_index: u32,
+) -> Result<fluxd_primitives::transaction::OutputDescription, RpcError> {
+    let location = chainstate
+        .tx_location(txid)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "tx not found"))?;
+    let bytes = chainstate
+        .read_block(location.block)
+        .map_err(map_internal)?;
+    let block = Block::consensus_decode(&bytes)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid block encoding"))?;
+    let tx_index = usize::try_from(location.index)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid tx location"))?;
+    let tx = block
+        .transactions
+        .get(tx_index)
+        .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing transaction in block"))?;
+    let actual_txid = tx
+        .txid()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid transaction encoding"))?;
+    if &actual_txid != txid {
+        return Err(RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "tx index mismatch (reorg?)",
+        ));
+    }
+    let idx = usize::try_from(out_index)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "output index out of range"))?;
+    tx.shielded_outputs
+        .get(idx)
+        .cloned()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "sapling output not found"))
+}
+
+fn rpc_zsendmany<S: fluxd_storage::KeyValueStore + 'static>(
+    ctx: &RpcContext<S>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
+    if params.len() < 2 || params.len() > 4 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zsendmany expects 2 to 4 parameters",
+        ));
+    }
+
+    let from_address = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "fromaddress must be a string"))?;
+    let recipients_value = params[1].clone();
+    let minconf = match params.get(2) {
+        Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
+        _ => 1,
+    };
+    if minconf <= 0 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "minconf must be greater than zero when sending from zaddr",
+        ));
+    }
+    let fee = match params.get(3) {
+        Some(value) if !value.is_null() => parse_amount(value)?,
+        _ => 10_000, // 0.0001 FLUX
+    };
+
+    #[derive(Clone)]
+    enum ZSendDest {
+        Transparent(TransparentAddress),
+        Sapling([u8; 43], MemoBytes),
+    }
+
+    #[derive(Clone)]
+    struct ZSendRecipient {
+        dest: ZSendDest,
+        amount: i64,
+    }
+
+    fn parse_recipients(
+        value: &Value,
+        chain_params: &ChainParams,
+    ) -> Result<Vec<ZSendRecipient>, RpcError> {
+        let recipients = value
+            .as_array()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "amounts must be an array"))?;
+        if recipients.is_empty() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "amounts array is empty",
+            ));
+        }
+
+        let mut out = Vec::with_capacity(recipients.len());
+        let mut seen_addresses = HashSet::new();
+        for recipient in recipients {
+            let obj = recipient.as_object().ok_or_else(|| {
+                RpcError::new(RPC_INVALID_PARAMETER, "Invalid parameter, expected object")
+            })?;
+            for key in obj.keys() {
+                if key != "address" && key != "amount" && key != "memo" {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        format!("Invalid parameter, unknown key: {key}"),
+                    ));
+                }
+            }
+            let address = obj
+                .get("address")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing address"))?;
+            if !seen_addresses.insert(address.to_string()) {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, duplicated address",
+                ));
+            }
+            let amount_value = obj
+                .get("amount")
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing amount"))?;
+            let amount = parse_amount(amount_value)?;
+            if amount <= 0 {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, amount must be positive",
+                ));
+            }
+
+            let memo = obj.get("memo");
+            if address_to_script_pubkey(address, chain_params.network).is_ok() {
+                if memo.is_some_and(|v| !v.is_null()) {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "memo is only supported for zaddrs",
+                    ));
+                }
+                let dest = transparent_address_from_flux_address(address, chain_params.network)?;
+                out.push(ZSendRecipient {
+                    dest: ZSendDest::Transparent(dest),
+                    amount,
+                });
+                continue;
+            }
+
+            let sapling_bytes = parse_sapling_zaddr_bytes(address, chain_params)?;
+            if PaymentAddress::from_bytes(&sapling_bytes).is_none() {
+                return Err(RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"));
+            }
+
+            let memo_bytes = match memo {
+                None | Some(Value::Null) => MemoBytes::empty(),
+                Some(Value::String(raw)) => {
+                    let bytes = bytes_from_hex(raw).ok_or_else(|| {
+                        RpcError::new(RPC_INVALID_PARAMETER, "Memo must be in hexadecimal format")
+                    })?;
+                    MemoBytes::from_bytes(&bytes).map_err(|_| {
+                        RpcError::new(
+                            RPC_INVALID_PARAMETER,
+                            "Memo size is larger than maximum allowed 512",
+                        )
+                    })?
+                }
+                Some(_) => {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "memo must be a string",
+                    ))
+                }
+            };
+
+            out.push(ZSendRecipient {
+                dest: ZSendDest::Sapling(sapling_bytes, memo_bytes),
+                amount,
+            });
+        }
+        Ok(out)
+    }
+
+    let recipients = parse_recipients(&recipients_value, &ctx.chain_params)?;
+
+    let from_bytes = parse_sapling_zaddr_bytes(from_address, &ctx.chain_params)?;
+    {
+        let guard = ctx
+            .wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let spendable = guard
+            .sapling_extsk_for_address(&from_bytes)
+            .map_err(map_wallet_error)?
+            .is_some();
+        if !spendable {
+            return Err(RpcError::new(
+                RPC_WALLET_ERROR,
+                "From address does not belong to this node, zaddr spending key not found.",
+            ));
+        }
+    }
+
+    let opid = new_opid();
+    let op_params = json!({
+        "fromaddress": from_address,
+        "amounts": recipients_value,
+        "minconf": minconf,
+        "fee": amount_to_value(fee),
+    });
+    {
+        let mut guard = async_ops()
+            .lock()
+            .map_err(|_| map_internal("operation manager lock poisoned"))?;
+        guard.insert(AsyncOpEntry {
+            operationid: opid.clone(),
+            status: AsyncOpState::Queued,
+            method: "z_sendmany".to_string(),
+            params: op_params,
+            creation_time: current_unix_seconds_u64(),
+            started_time: None,
+            finished_time: None,
+            result: None,
+            error: None,
+        });
+    }
+
+    let opid_task = opid.clone();
+    let chainstate = Arc::clone(&ctx.chainstate);
+    let mempool = Arc::clone(&ctx.mempool);
+    let mempool_policy = Arc::clone(&ctx.mempool_policy);
+    let mempool_metrics = Arc::clone(&ctx.mempool_metrics);
+    let fee_estimator = Arc::clone(&ctx.fee_estimator);
+    let mempool_flags = ctx.mempool_flags.clone();
+    let chain_params = ctx.chain_params.clone();
+    let params_dir = ctx.params_dir.clone();
+    let tx_announce = ctx.tx_announce.clone();
+    let wallet = Arc::clone(&ctx.wallet);
+
+    tokio::task::spawn_blocking(move || {
+        {
+            if let Ok(mut ops) = async_ops().lock() {
+                ops.update_status(&opid_task, AsyncOpState::Executing);
+            }
+        }
+
+        let outcome: Result<String, RpcError> = (|| {
+            let tip_height = chainstate
+                .best_block()
+                .map_err(map_internal)?
+                .map(|tip| tip.height)
+                .unwrap_or(0);
+            if !network_upgrade_active(
+                tip_height,
+                &chain_params.consensus.upgrades,
+                UpgradeIndex::Acadia,
+            ) {
+                return Err(RpcError::new(
+                    RPC_TRANSACTION_REJECTED,
+                    "sapling is not active",
+                ));
+            }
+
+            let best_height = tip_height;
+            let required_amount = recipients
+                .iter()
+                .try_fold(0i64, |acc, recipient| {
+                    acc.checked_add(recipient.amount)
+                        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))
+                })?
+                .checked_add(fee)
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+
+            #[derive(Clone)]
+            struct Candidate {
+                key: crate::wallet::SaplingNoteKey,
+                note: crate::wallet::SaplingNoteRecord,
+                witness: SaplingIncrementalWitness,
+            }
+
+            let (extsk_bytes, fvk, ivk, candidates): (
+                [u8; 169],
+                SaplingFullViewingKey,
+                PreparedIncomingViewingKey,
+                Vec<Candidate>,
+            ) = {
+                let mut guard = wallet
+                    .lock()
+                    .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+                guard
+                    .sync_sapling_notes(chainstate.as_ref())
+                    .map_err(map_wallet_error)?;
+                let extsk_bytes = guard
+                    .sapling_extsk_for_address(&from_bytes)
+                    .map_err(map_wallet_error)?
+                    .ok_or_else(|| {
+                        RpcError::new(RPC_WALLET_ERROR, "zaddr spending key not found")
+                    })?;
+
+                let extsk = sapling_crypto::zip32::ExtendedSpendingKey::from_bytes(&extsk_bytes)
+                    .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "invalid sapling spending key"))?;
+                let dfvk = extsk.to_diversifiable_full_viewing_key();
+                let fvk = dfvk.fvk().clone();
+                let ivk = PreparedIncomingViewingKey::new(&fvk.vk.ivk());
+
+                let mut out = Vec::new();
+                for (&key, note) in guard.sapling_note_map() {
+                    if note.address != from_bytes {
+                        continue;
+                    }
+                    let confirmations = best_height.saturating_sub(note.height).saturating_add(1);
+                    if confirmations < minconf {
+                        continue;
+                    }
+                    if chainstate
+                        .sapling_nullifier_spent(&note.nullifier)
+                        .map_err(map_internal)?
+                    {
+                        continue;
+                    }
+                    let witness =
+                        guard
+                            .sapling_witness_map()
+                            .get(&key)
+                            .cloned()
+                            .ok_or_else(|| {
+                                RpcError::new(RPC_WALLET_ERROR, "missing sapling witness")
+                            })?;
+                    out.push(Candidate {
+                        key,
+                        note: note.clone(),
+                        witness,
+                    });
+                }
+                (extsk_bytes, fvk, ivk, out)
+            };
+
+            let mut available: Vec<Candidate> = Vec::new();
+            {
+                let guard = mempool
+                    .lock()
+                    .map_err(|_| map_internal("mempool lock poisoned"))?;
+                for candidate in candidates {
+                    if guard
+                        .sapling_nullifier_spender(&candidate.note.nullifier)
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    available.push(candidate);
+                }
+            }
+
+            available.sort_by(|a, b| {
+                b.note
+                    .value
+                    .cmp(&a.note.value)
+                    .then_with(|| a.note.height.cmp(&b.note.height))
+                    .then_with(|| a.key.0.cmp(&b.key.0))
+                    .then_with(|| a.key.1.cmp(&b.key.1))
+            });
+
+            let mut selected: Vec<Candidate> = Vec::new();
+            let mut selected_value: i64 = 0;
+            for candidate in available {
+                selected_value = selected_value
+                    .checked_add(candidate.note.value)
+                    .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+                selected.push(candidate);
+                if selected_value >= required_amount {
+                    break;
+                }
+            }
+            if selected_value < required_amount {
+                return Err(RpcError::new(RPC_WALLET_ERROR, "insufficient funds"));
+            }
+
+            let change = selected_value
+                .checked_sub(required_amount)
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+
+            let anchor = selected
+                .first()
+                .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "no notes to spend"))?
+                .witness
+                .root()
+                .into();
+
+            let sapling_activation = sapling_activation_height(&chain_params);
+            let params = FluxZcashParams {
+                network: chain_params.network,
+                sapling_activation,
+            };
+            let target_height =
+                BlockHeight::from_u32(u32::try_from(best_height.saturating_add(1)).unwrap_or(0));
+            let build_config = BuildConfig::Standard {
+                sapling_anchor: Some(anchor),
+                orchard_anchor: None,
+            };
+            let mut builder = ZcashTxBuilder::new(params, target_height, build_config);
+
+            for candidate in &selected {
+                let output = read_sapling_output_by_key(
+                    chainstate.as_ref(),
+                    &candidate.key.0,
+                    candidate.key.1,
+                )?;
+                let output_ref = SaplingOutputRef { output: &output };
+                let (note, recipient, _memo) =
+                    try_sapling_note_decryption(&ivk, &output_ref, Zip212Enforcement::GracePeriod)
+                        .ok_or_else(|| {
+                            RpcError::new(RPC_WALLET_ERROR, "failed to decrypt sapling note")
+                        })?;
+                if recipient.to_bytes() != candidate.note.address {
+                    return Err(RpcError::new(
+                        RPC_WALLET_ERROR,
+                        "sapling note recipient mismatch",
+                    ));
+                }
+                let witness_path: SaplingMerklePath = candidate
+                    .witness
+                    .path()
+                    .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "invalid sapling witness"))?;
+                builder
+                    .add_sapling_spend::<core::convert::Infallible>(fvk.clone(), note, witness_path)
+                    .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
+            }
+
+            let extsk = sapling_crypto::zip32::ExtendedSpendingKey::from_bytes(&extsk_bytes)
+                .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "invalid sapling spending key"))?;
+            let ovk = Some(extsk.expsk.ovk);
+
+            for recipient in &recipients {
+                let amount_u64 = u64::try_from(recipient.amount)
+                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+                let value = Zatoshis::from_u64(amount_u64)
+                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+                match &recipient.dest {
+                    ZSendDest::Transparent(addr) => builder
+                        .add_transparent_output(addr, value)
+                        .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?,
+                    ZSendDest::Sapling(addr_bytes, memo) => {
+                        let addr = PaymentAddress::from_bytes(addr_bytes).ok_or_else(|| {
+                            RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr")
+                        })?;
+                        builder
+                            .add_sapling_output::<core::convert::Infallible>(
+                                ovk,
+                                addr,
+                                value,
+                                memo.clone(),
+                            )
+                            .map_err(|err| {
+                                RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string())
+                            })?
+                    }
+                }
+            }
+
+            if change > 0 {
+                let change_u64 = u64::try_from(change)
+                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+                let change_value = Zatoshis::from_u64(change_u64)
+                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+                let to = PaymentAddress::from_bytes(&from_bytes)
+                    .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"))?;
+                builder
+                    .add_sapling_output::<core::convert::Infallible>(
+                        ovk,
+                        to,
+                        change_value,
+                        MemoBytes::empty(),
+                    )
+                    .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
+            }
+
+            let prover = local_tx_prover(&params_dir, chain_params.network)?;
+            let fee_u64 = u64::try_from(fee)
+                .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "fee out of range"))?;
+            let fee_value = Zatoshis::from_u64(fee_u64)
+                .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "fee out of range"))?;
+            let fee_rule =
+                zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_value);
+            let transparent_signing_set = transparent::builder::TransparentSigningSet::new();
+            let sapling_extsks = [extsk];
+            let build = builder
+                .build(
+                    &transparent_signing_set,
+                    &sapling_extsks,
+                    &[],
+                    rand::rngs::OsRng,
+                    prover.as_ref(),
+                    prover.as_ref(),
+                    &fee_rule,
+                )
+                .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
+
+            let ztx = build.transaction();
+            let mut raw = Vec::new();
+            ztx.write(&mut raw)
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "tx encode failed"))?;
+
+            let txid = submit_raw_transaction(
+                chainstate.as_ref(),
+                mempool.as_ref(),
+                mempool_policy.as_ref(),
+                mempool_metrics.as_ref(),
+                fee_estimator.as_ref(),
+                &mempool_flags,
+                &chain_params,
+                &tx_announce,
+                raw,
+            )?;
+
+            mempool_metrics.note_rpc_accept();
+
+            if let Ok(mut guard) = wallet.lock() {
+                let _ = guard.record_txids([txid]);
+            }
+
+            Ok(hash256_to_hex(&txid))
+        })();
+
+        match outcome {
+            Ok(txid_hex) => {
+                if let Ok(mut ops) = async_ops().lock() {
+                    ops.set_result(&opid_task, json!({ "txid": txid_hex }));
+                    ops.update_status(&opid_task, AsyncOpState::Success);
+                }
+            }
+            Err(err) => {
+                mempool_metrics.note_rpc_reject();
+                if let Ok(mut ops) = async_ops().lock() {
+                    ops.set_error(&opid_task, err.code, err.message);
+                    ops.update_status(&opid_task, AsyncOpState::Failed);
+                }
+            }
+        }
+    });
+
+    Ok(Value::String(opid))
+}
+
 fn rpc_zgetbalance<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
     chain_params: &ChainParams,
@@ -4820,6 +5640,14 @@ fn rpc_zgetbalance<S: fluxd_storage::KeyValueStore>(
         if chainstate
             .sapling_nullifier_spent(&note.nullifier)
             .map_err(map_internal)?
+        {
+            continue;
+        }
+        if mempool
+            .lock()
+            .map_err(|_| map_internal("mempool lock poisoned"))?
+            .sapling_nullifier_spender(&note.nullifier)
+            .is_some()
         {
             continue;
         }
@@ -4930,6 +5758,14 @@ fn rpc_zgettotalbalance<S: fluxd_storage::KeyValueStore>(
         {
             continue;
         }
+        if mempool
+            .lock()
+            .map_err(|_| map_internal("mempool lock poisoned"))?
+            .sapling_nullifier_spender(&note.nullifier)
+            .is_some()
+        {
+            continue;
+        }
         shielded_total = shielded_total
             .checked_add(note.value)
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
@@ -4949,6 +5785,7 @@ fn rpc_zgettotalbalance<S: fluxd_storage::KeyValueStore>(
 
 fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
     chain_params: &ChainParams,
@@ -5066,6 +5903,14 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
         if chainstate
             .sapling_nullifier_spent(&row.note.nullifier)
             .map_err(map_internal)?
+        {
+            continue;
+        }
+        if mempool
+            .lock()
+            .map_err(|_| map_internal("mempool lock poisoned"))?
+            .sapling_nullifier_spender(&row.note.nullifier)
+            .is_some()
         {
             continue;
         }
@@ -7341,6 +8186,131 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
     })
 }
 
+fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    chain_params: &ChainParams,
+    tx_announce: &broadcast::Sender<Hash256>,
+    raw: Vec<u8>,
+) -> Result<Hash256, RpcError> {
+    let tx = Transaction::consensus_decode(&raw)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    let txid = tx
+        .txid()
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+
+    if chainstate
+        .tx_location(&txid)
+        .map_err(map_internal)?
+        .is_some()
+    {
+        return Err(RpcError::new(
+            RPC_TRANSACTION_ALREADY_IN_CHAIN,
+            "transaction already in block chain",
+        ));
+    }
+
+    let mempool_prevouts = {
+        let guard = mempool
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
+        if guard.contains(&txid) {
+            let _ = tx_announce.send(txid);
+            return Ok(txid);
+        }
+        for input in &tx.vin {
+            if let Some(spender) = guard.spender(&input.prevout) {
+                return Err(RpcError::new(
+                    RPC_TRANSACTION_REJECTED,
+                    format!("input already spent by {}", hash256_to_hex(&spender)),
+                ));
+            }
+        }
+        for joinsplit in &tx.join_splits {
+            for nullifier in &joinsplit.nullifiers {
+                if let Some(spender) = guard.sprout_nullifier_spender(nullifier) {
+                    return Err(RpcError::new(
+                        RPC_TRANSACTION_REJECTED,
+                        format!(
+                            "sprout nullifier already spent by {}",
+                            hash256_to_hex(&spender)
+                        ),
+                    ));
+                }
+            }
+        }
+        for spend in &tx.shielded_spends {
+            if let Some(spender) = guard.sapling_nullifier_spender(&spend.nullifier) {
+                return Err(RpcError::new(
+                    RPC_TRANSACTION_REJECTED,
+                    format!(
+                        "sapling nullifier already spent by {}",
+                        hash256_to_hex(&spender)
+                    ),
+                ));
+            }
+        }
+        guard.prevouts_for_tx(&tx)
+    };
+
+    let entry = build_mempool_entry(
+        chainstate,
+        &mempool_prevouts,
+        chain_params,
+        mempool_flags,
+        mempool_policy,
+        tx,
+        raw,
+    )
+    .map_err(|err| match err.kind {
+        MempoolErrorKind::MissingInput => RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs"),
+        MempoolErrorKind::ConflictingInput => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+        MempoolErrorKind::InsufficientFee => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+        MempoolErrorKind::MempoolFull => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+        MempoolErrorKind::NonStandard => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+        MempoolErrorKind::InvalidTransaction
+        | MempoolErrorKind::InvalidScript
+        | MempoolErrorKind::InvalidShielded => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+        MempoolErrorKind::AlreadyInMempool => {
+            RpcError::new(RPC_INTERNAL_ERROR, "unexpected mempool duplicate")
+        }
+        MempoolErrorKind::Internal => RpcError::new(RPC_INTERNAL_ERROR, err.message),
+    })?;
+
+    let should_observe_fee = entry.tx.fluxnode.is_none();
+    let entry_fee = entry.fee;
+    let entry_size = entry.size();
+    let txid = entry.txid;
+
+    let mut guard = mempool
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
+    match guard.insert(entry) {
+        Ok(outcome) => {
+            if outcome.evicted > 0 {
+                mempool_metrics.note_evicted(outcome.evicted, outcome.evicted_bytes);
+            }
+            if should_observe_fee {
+                if let Ok(mut estimator) = fee_estimator.lock() {
+                    estimator.observe_tx(entry_fee, entry_size);
+                }
+            }
+        }
+        Err(err) => {
+            if err.kind != MempoolErrorKind::AlreadyInMempool {
+                return Err(RpcError::new(RPC_TRANSACTION_REJECTED, err.message));
+            }
+        }
+    }
+
+    let _ = tx_announce.send(txid);
+    Ok(txid)
+}
+
 fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
@@ -7369,99 +8339,17 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
         };
         let raw = bytes_from_hex(hex)
             .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
-        let tx = Transaction::consensus_decode(&raw)
-            .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
-        let txid = tx
-            .txid()
-            .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
-
-        if chainstate
-            .tx_location(&txid)
-            .map_err(map_internal)?
-            .is_some()
-        {
-            return Err(RpcError::new(
-                RPC_TRANSACTION_ALREADY_IN_CHAIN,
-                "transaction already in block chain",
-            ));
-        }
-
-        let mempool_prevouts = {
-            let guard = mempool
-                .lock()
-                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
-            if guard.contains(&txid) {
-                let _ = tx_announce.send(txid);
-                return Ok(Value::String(hash256_to_hex(&txid)));
-            }
-            for input in &tx.vin {
-                if let Some(spender) = guard.spender(&input.prevout) {
-                    return Err(RpcError::new(
-                        RPC_TRANSACTION_REJECTED,
-                        format!("input already spent by {}", hash256_to_hex(&spender)),
-                    ));
-                }
-            }
-            guard.prevouts_for_tx(&tx)
-        };
-
-        let entry = build_mempool_entry(
+        let txid = submit_raw_transaction(
             chainstate,
-            &mempool_prevouts,
-            chain_params,
-            mempool_flags,
+            mempool,
             mempool_policy,
-            tx,
+            mempool_metrics,
+            fee_estimator,
+            mempool_flags,
+            chain_params,
+            tx_announce,
             raw,
-        )
-        .map_err(|err| match err.kind {
-            MempoolErrorKind::MissingInput => {
-                RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs")
-            }
-            MempoolErrorKind::ConflictingInput => {
-                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
-            }
-            MempoolErrorKind::InsufficientFee => {
-                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
-            }
-            MempoolErrorKind::MempoolFull => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
-            MempoolErrorKind::NonStandard => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
-            MempoolErrorKind::InvalidTransaction
-            | MempoolErrorKind::InvalidScript
-            | MempoolErrorKind::InvalidShielded => {
-                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
-            }
-            MempoolErrorKind::AlreadyInMempool => {
-                RpcError::new(RPC_INTERNAL_ERROR, "unexpected mempool duplicate")
-            }
-            MempoolErrorKind::Internal => RpcError::new(RPC_INTERNAL_ERROR, err.message),
-        })?;
-
-        let should_observe_fee = entry.tx.fluxnode.is_none();
-        let entry_fee = entry.fee;
-        let entry_size = entry.size();
-        let txid = entry.txid;
-        let mut guard = mempool
-            .lock()
-            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
-        match guard.insert(entry) {
-            Ok(outcome) => {
-                if outcome.evicted > 0 {
-                    mempool_metrics.note_evicted(outcome.evicted, outcome.evicted_bytes);
-                }
-                if should_observe_fee {
-                    if let Ok(mut estimator) = fee_estimator.lock() {
-                        estimator.observe_tx(entry_fee, entry_size);
-                    }
-                }
-            }
-            Err(err) => {
-                if err.kind != MempoolErrorKind::AlreadyInMempool {
-                    return Err(RpcError::new(RPC_TRANSACTION_REJECTED, err.message));
-                }
-            }
-        }
-        let _ = tx_announce.send(txid);
+        )?;
         Ok(Value::String(hash256_to_hex(&txid)))
     })();
 

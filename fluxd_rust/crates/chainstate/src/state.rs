@@ -4307,6 +4307,21 @@ impl<S: KeyValueStore> ChainState<S> {
             .sapling_root)
     }
 
+    pub fn sapling_tree_bytes(&self) -> Result<Vec<u8>, ChainStateError> {
+        let mut cache = self
+            .shielded_cache
+            .lock()
+            .map_err(|_| ChainStateError::CorruptIndex("shielded cache poisoned"))?;
+        if cache.is_none() {
+            *cache = Some(ShieldedTreesCache::load(&self.store)?);
+        }
+        Ok(cache
+            .as_ref()
+            .ok_or(ChainStateError::CorruptIndex("missing shielded cache"))?
+            .sapling_bytes
+            .clone())
+    }
+
     pub fn sprout_commitment_count(&self) -> Result<u64, ChainStateError> {
         let mut cache = self
             .shielded_cache
