@@ -3,6 +3,7 @@ members = [
   "crates/chainstate",
   "crates/consensus",
   "crates/fluxnode",
+  "crates/log",
   "crates/node",
   "crates/pon",
   "crates/pow",

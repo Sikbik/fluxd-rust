@@ -274,7 +274,7 @@ impl FjallStore {
                     .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
             {
-                eprintln!(
+                fluxd_log::log_warn!(
                     "Warning: Fjall write buffer pressure {pressure:.1}% ({current}B/{limit}B); rotating memtables to trigger flushes",
                     pressure = current as f64 / limit as f64 * 100.0,
                 );
@@ -342,7 +342,7 @@ impl FjallStore {
                             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
                     {
-                        eprintln!(
+                        fluxd_log::log_warn!(
                             "Warning: Fjall journal pressure {pressure:.1}% ({current}B/{limit}B); rotated {rotated} memtable(s) to trigger flush + journal GC",
                             pressure = current as f64 / limit as f64 * 100.0,
                         );
@@ -433,7 +433,7 @@ impl KeyValueStore for FjallStore {
                     .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
             {
-                eprintln!(
+                fluxd_log::log_warn!(
                     "Warning: Fjall write_batch commit took {}ms (ops {}, write_buffer {}B, journals {}, active_compactions {})",
                     elapsed.as_millis(),
                     batch.len(),

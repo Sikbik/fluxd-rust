@@ -636,6 +636,7 @@ dependencies = [
  "fluxd-chainstate",
  "fluxd-consensus",
  "fluxd-fluxnode",
+ "fluxd-log",
  "fluxd-pow",
  "fluxd-primitives",
  "fluxd-script",
@@ -657,6 +658,7 @@ dependencies = [
  "core2 0.4.0",
  "fluxd-consensus",
  "fluxd-fluxnode",
+ "fluxd-log",
  "fluxd-pon",
  "fluxd-pow",
  "fluxd-primitives",
@@ -684,6 +686,13 @@ dependencies = [
  "fluxd-consensus",
  "fluxd-primitives",
  "fluxd-storage",
+]
+
+[[package]]
+name = "fluxd-log"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -723,6 +732,7 @@ version = "0.1.0"
 dependencies = [
  "blake2b_simd",
  "fluxd-consensus",
+ "fluxd-log",
  "fluxd-primitives",
  "ripemd 0.1.3",
  "secp256k1",
@@ -755,6 +765,7 @@ name = "fluxd-storage"
 version = "0.1.0"
 dependencies = [
  "fjall",
+ "fluxd-log",
  "smallvec",
 ]
 

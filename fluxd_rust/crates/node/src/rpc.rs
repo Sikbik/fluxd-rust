@@ -347,7 +347,7 @@ pub fn load_or_create_auth(
     let user = "__cookie__".to_string();
     let pass = hex_bytes(&bytes);
     write_cookie(&cookie_path, &user, &pass)?;
-    println!("RPC auth cookie: {}", cookie_path.display());
+    log_info!("RPC auth cookie: {}", cookie_path.display());
     Ok(RpcAuth { user, pass })
 }
 
@@ -379,7 +379,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|err| format!("rpc bind failed: {err}"))?;
-    println!("RPC listening on http://{addr}");
+    log_info!("RPC listening on http://{addr}");
 
     let auth = Arc::new(auth);
     let allowlist = Arc::new(allowlist);
@@ -441,7 +441,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
             )
             .await
             {
-                eprintln!("rpc error: {err}");
+                log_warn!("rpc error: {err}");
             }
         });
     }
@@ -5966,7 +5966,7 @@ fn rpc_verifychain<S: fluxd_storage::KeyValueStore>(
 
     let result = verify_chain_impl(chainstate, checklevel, numblocks);
     if let Err(reason) = result.as_ref() {
-        eprintln!("verifychain failed: {reason}");
+        log_warn!("verifychain failed: {reason}");
     }
     Ok(Value::Bool(result.is_ok()))
 }

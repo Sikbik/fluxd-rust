@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 fluxd-consensus = { path = "../consensus" }
+fluxd-log = { path = "../log" }
 fluxd-primitives = { path = "../primitives" }
 blake2b_simd = "1"
 secp256k1 = { version = "0.29", features = ["recovery"] }

@@ -9,6 +9,7 @@ publish = false
 fluxd-chainstate = { path = "../chainstate" }
 fluxd-consensus = { path = "../consensus" }
 fluxd-fluxnode = { path = "../fluxnode" }
+fluxd-log = { path = "../log" }
 fluxd-pow = { path = "../pow" }
 fluxd-primitives = { path = "../primitives" }
 fluxd-script = { path = "../script" }

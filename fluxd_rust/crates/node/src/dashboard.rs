@@ -36,7 +36,7 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|err| format!("dashboard bind failed: {err}"))?;
-    println!("Dashboard listening on http://{addr}");
+    log_info!("Dashboard listening on http://{addr}");
 
     loop {
         let (stream, _) = listener
@@ -68,7 +68,7 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
             )
             .await
             {
-                eprintln!("dashboard error: {err}");
+                log_warn!("dashboard error: {err}");
             }
         });
     }

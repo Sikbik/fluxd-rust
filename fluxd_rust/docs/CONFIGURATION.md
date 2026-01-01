@@ -21,6 +21,18 @@ and how they affect behavior.
 - `--conf PATH`
   - Config file path (default: `<data-dir>/flux.conf`).
 
+## Logging
+
+- `--log-level error|warn|info|debug|trace` (default: `info`)
+- `--log-format text|json` (default: `text`)
+- `--log-timestamps` / `--no-log-timestamps` (text logs only; default: timestamps enabled)
+
+Logs are written to stderr by default. CLI commands that return machine-readable output (like
+`--db-info`) print to stdout.
+
+When `--log-format json` is enabled, each line is a JSON object with keys like `ts_ms`, `level`,
+`target`, `file`, `line`, and `msg`.
+
 ## flux.conf
 
 The daemon optionally reads a `flux.conf` config file.
@@ -34,6 +46,9 @@ Currently supported keys:
 - `rpcuser`, `rpcpassword`
 - `rpcbind`, `rpcport`
 - `rpcallowip` (repeatable; IP or CIDR, e.g. `127.0.0.1`, `10.0.0.0/8`)
+- `loglevel` (`error|warn|info|debug|trace`)
+- `logformat` (`text|json`)
+- `logtimestamps` (`1|0`)
 - `addnode` (repeatable)
 - `mineraddress` (default coinbase/miner address for `getblocktemplate`)
 - `testnet=1` / `regtest=1` (network selection; CLI `--network ...` overrides)

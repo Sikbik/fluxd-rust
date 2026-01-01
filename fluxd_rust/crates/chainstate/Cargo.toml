@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 fluxd-consensus = { path = "../consensus" }
+fluxd-log = { path = "../log" }
 fluxd-primitives = { path = "../primitives" }
 fluxd-script = { path = "../script" }
 fluxd-pow = { path = "../pow" }

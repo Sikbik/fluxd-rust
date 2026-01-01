@@ -111,6 +111,10 @@ ssh <vps-user>@<vps-host> "curl -u \"$(cat <remote-data-dir>/rpc.cookie)\" http:
 - Log file: `<remote-log-dir>/longrun-public.log`
 - Dashboard: `http://<host>:8080/` and `/healthz`
 
+Logging controls:
+- Default verbosity is `info`. Increase to `debug`/`trace` to see peer/headers details: `--log-level debug`.
+- For structured logs, use `--log-format json` (one JSON object per line).
+
 By default, per-request block download logs are disabled (to avoid log spam). To enable them:
 
 ```bash

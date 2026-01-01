@@ -187,7 +187,7 @@ impl<'a> SignatureChecker<'a> {
 
         let der = &sig_bytes[..sig_bytes.len() - 1];
         let sig = Signature::from_der(der).map_err(|_| {
-            eprintln!(
+            fluxd_log::log_debug!(
                 "invalid DER signature (len {}): {}",
                 sig_bytes.len(),
                 bytes_to_hex(sig_bytes)
@@ -544,7 +544,7 @@ fn eval_script(
             }
             _ => {
                 if exec {
-                    eprintln!(
+                    fluxd_log::log_debug!(
                         "invalid opcode 0x{opcode:02x} in script {}",
                         bytes_to_hex(script)
                     );

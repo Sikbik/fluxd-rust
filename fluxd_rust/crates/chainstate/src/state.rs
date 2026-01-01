@@ -1036,9 +1036,11 @@ impl<S: KeyValueStore> ChainState<S> {
                 )?
             };
             if header.bits != expected_bits {
-                eprintln!(
+                fluxd_log::log_warn!(
                     "unexpected difficulty bits at height {}: expected {:#x}, got {:#x}",
-                    height, expected_bits, header.bits
+                    height,
+                    expected_bits,
+                    header.bits
                 );
                 return Err(ChainStateError::InvalidHeader("unexpected difficulty bits"));
             }
@@ -1253,9 +1255,11 @@ impl<S: KeyValueStore> ChainState<S> {
                 )?
             };
             if header.bits != expected_bits {
-                eprintln!(
+                fluxd_log::log_warn!(
                     "unexpected difficulty bits at height {}: expected {:#x}, got {:#x}",
-                    height, expected_bits, header.bits
+                    height,
+                    expected_bits,
+                    header.bits
                 );
                 return Err(ChainStateError::InvalidHeader("unexpected difficulty bits"));
             }
@@ -1372,7 +1376,7 @@ impl<S: KeyValueStore> ChainState<S> {
                     || !self.fluxnode_start_allowed(&start.collateral, height, params)?
                 {
                     if let Ok(Some(record)) = self.fluxnode_record(&start.collateral) {
-                        eprintln!(
+                        fluxd_log::log_debug!(
                             "fluxnode start rejected at height {}: tx {} collateral {} (start_height {} last_confirmed {})",
                             height,
                             hash256_to_hex(txid),
@@ -1449,7 +1453,7 @@ impl<S: KeyValueStore> ChainState<S> {
                         || !self.fluxnode_start_allowed(collateral, height, params)?
                     {
                         if let Ok(Some(record)) = self.fluxnode_record(collateral) {
-                            eprintln!(
+                            fluxd_log::log_debug!(
                                 "fluxnode start rejected at height {}: tx {} collateral {} (start_height {} last_confirmed {})",
                                 height,
                                 hash256_to_hex(txid),
@@ -1537,7 +1541,7 @@ impl<S: KeyValueStore> ChainState<S> {
                         || !self.fluxnode_start_allowed(collateral, height, params)?
                     {
                         if let Ok(Some(record)) = self.fluxnode_record(collateral) {
-                            eprintln!(
+                            fluxd_log::log_debug!(
                                 "fluxnode start rejected at height {}: tx {} collateral {} (start_height {} last_confirmed {})",
                                 height,
                                 hash256_to_hex(txid),
@@ -1913,7 +1917,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 })?;
                 let Some(key) = cache.by_tier[tier_index].iter().next().copied() else {
                     if removed > 0 {
-                        eprintln!(
+                        fluxd_log::log_debug!(
                             "no eligible fluxnodes for tier {} at pay height {} after removing {} entries (last={})",
                             tier, pay_height, removed, last_reason
                         );
@@ -2116,7 +2120,7 @@ impl<S: KeyValueStore> ChainState<S> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            eprintln!(
+            fluxd_log::log_warn!(
                 "dev fund remainder check failed at height {}: remainder={} min_dev={} tiers_present={:?} payouts={} dev_outputs={:?}",
                 height,
                 remainder,
@@ -2150,7 +2154,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 .enumerate()
                 .map(|(idx, out)| (idx, out.value, bytes_to_hex(&out.script_pubkey)))
                 .collect::<Vec<_>>();
-            eprintln!(
+            fluxd_log::log_warn!(
                 "deterministic fluxnode payout mismatch at height {}: missing={:?} coinbase_vout={:?}",
                 height, missing, coinbase_outputs
             );
@@ -2429,7 +2433,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 for (input_index, input) in tx.vin.iter().enumerate() {
                     let outpoint_key = outpoint_key_bytes(&input.prevout);
                     if !spent_outpoints.insert(outpoint_key) {
-                        eprintln!(
+                        fluxd_log::log_warn!(
                             "missing input for tx {} input {} prevout {}:{} at height {}",
                             hash256_to_hex(&txid),
                             input_index,
@@ -2459,7 +2463,7 @@ impl<S: KeyValueStore> ChainState<S> {
                                     (entry, address_key)
                                 }
                                 None => {
-                                    eprintln!(
+                                    fluxd_log::log_warn!(
                                         "missing input for tx {} input {} prevout {}:{} at height {}",
                                         hash256_to_hex(&txid),
                                         input_index,
@@ -2744,16 +2748,17 @@ impl<S: KeyValueStore> ChainState<S> {
             }
             if let Err((tx_index, input_index, err)) = result {
                 if let Ok(txid) = block.transactions[tx_index].txid() {
-                    eprintln!(
+                    fluxd_log::log_warn!(
                         "script validation failed for tx {} input {}: {}",
                         hash256_to_hex(&txid),
                         input_index,
                         err
                     );
                 } else {
-                    eprintln!(
+                    fluxd_log::log_warn!(
                         "script validation failed for input {}: {}",
-                        input_index, err
+                        input_index,
+                        err
                     );
                 }
                 return Err(ChainStateError::Validation(
@@ -2886,7 +2891,10 @@ impl<S: KeyValueStore> ChainState<S> {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    eprintln!("failed to read previous block logical timestamp: {}", err);
+                    fluxd_log::log_warn!(
+                        "failed to read previous block logical timestamp: {}",
+                        err
+                    );
                 }
             }
         }
@@ -3986,7 +3994,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 ));
             }
             if height > 0 && height % 100_000 == 0 {
-                println!(
+                fluxd_log::log_info!(
                     "Rebuilt value pools to height {} (elapsed {:?})",
                     height,
                     last_progress.elapsed()

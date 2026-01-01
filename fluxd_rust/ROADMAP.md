@@ -219,7 +219,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `--scan-flatfiles`
   - [x] `--scan-supply`
 - [x] [P2] Metrics export (Prometheus `/metrics`) (owner: TBD)
-- [ ] [P2] Log levels and structured logging parity (owner: TBD)
+- [x] [P2] Log levels and structured logging parity (owner: TBD)
+  - [x] `--log-level` + `flux.conf` `loglevel`
+  - [x] `--log-format text|json` + `flux.conf` `logformat`
+  - [x] `--log-timestamps`/`--no-log-timestamps` + `flux.conf` `logtimestamps`
+  - [x] Workspace-wide logging via `fluxd-log` (no `println!`/`eprintln!` in hot paths)
 - [ ] [P2] Database migrations and upgrade path (owner: TBD)
 
 ## Testing and release hardening

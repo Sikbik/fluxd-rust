@@ -1,3 +1,44 @@
+use fluxd_log as logging;
+
+macro_rules! log_at {
+    ($level:expr, $($arg:tt)*) => {{
+        if crate::logging::enabled($level) {
+            crate::logging::log($level, module_path!(), file!(), line!(), format_args!($($arg)*));
+        }
+    }};
+}
+
+macro_rules! log_error {
+    ($($arg:tt)*) => {{
+        log_at!(crate::logging::Level::Error, $($arg)*);
+    }};
+}
+
+macro_rules! log_warn {
+    ($($arg:tt)*) => {{
+        log_at!(crate::logging::Level::Warn, $($arg)*);
+    }};
+}
+
+macro_rules! log_info {
+    ($($arg:tt)*) => {{
+        log_at!(crate::logging::Level::Info, $($arg)*);
+    }};
+}
+
+macro_rules! log_debug {
+    ($($arg:tt)*) => {{
+        log_at!(crate::logging::Level::Debug, $($arg)*);
+    }};
+}
+
+#[allow(unused_macros)]
+macro_rules! log_trace {
+    ($($arg:tt)*) => {{
+        log_at!(crate::logging::Level::Trace, $($arg)*);
+    }};
+}
+
 mod dashboard;
 mod db_info;
 mod fee_estimator;
@@ -149,7 +190,7 @@ fn log_block_requests() -> bool {
 
 fn maybe_log_block_request(count: usize) {
     if log_block_requests() {
-        println!("Requesting {} block(s)", count);
+        log_debug!("Requesting {count} block(s)");
     }
 }
 
@@ -211,6 +252,9 @@ struct Config {
     debug_fluxnode_payout_height: Option<i32>,
     debug_fluxnode_payee_candidates: Option<DebugFluxnodePayeeCandidates>,
     check_script: bool,
+    log_level: logging::Level,
+    log_format: logging::Format,
+    log_timestamps: bool,
     rpc_addr: Option<SocketAddr>,
     rpc_user: Option<String>,
     rpc_pass: Option<String>,
@@ -833,7 +877,7 @@ impl KeyValueStore for Store {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(err) = run().await {
-        eprintln!("{err}");
+        log_error!("{err}");
         std::process::exit(1);
     }
 }
@@ -890,6 +934,11 @@ fn lock_data_dir(data_dir: &Path) -> Result<DataDirLock, String> {
 async fn run() -> Result<(), String> {
     let start_time = Instant::now();
     let config = parse_args()?;
+    logging::init(logging::LogConfig {
+        level: config.log_level,
+        format: config.log_format,
+        timestamps: config.log_timestamps,
+    });
     let params = Arc::new(chain_params(config.network));
     let network = config.network;
     let backend = config.backend;
@@ -910,7 +959,7 @@ async fn run() -> Result<(), String> {
     let _data_dir_lock = lock_data_dir(data_dir)?;
 
     if config.reindex || reindex_flag_path.exists() {
-        println!(
+        log_info!(
             "Reindex requested; removing {} and {}",
             db_path.display(),
             blocks_path.display()
@@ -970,10 +1019,10 @@ async fn run() -> Result<(), String> {
         Ok(entries) => {
             let loaded = addr_book.load_entries(entries);
             if loaded > 0 {
-                println!("Loaded {loaded} peers from {}", peers_path.display());
+                log_info!("Loaded {loaded} peers from {}", peers_path.display());
             }
         }
-        Err(err) => eprintln!("failed to load peers file: {err}"),
+        Err(err) => log_warn!("failed to load peers file: {err}"),
     }
 
     if !config.addnode_addrs.is_empty() {
@@ -981,7 +1030,7 @@ async fn run() -> Result<(), String> {
             guard.extend(config.addnode_addrs.iter().copied());
         }
         let inserted = addr_book.insert_many(config.addnode_addrs.clone());
-        println!(
+        log_info!(
             "Loaded {} addnode(s) from flux.conf (new {})",
             config.addnode_addrs.len(),
             inserted
@@ -990,10 +1039,10 @@ async fn run() -> Result<(), String> {
     match header_peer_book.load_banlist(&banlist_path) {
         Ok(loaded) => {
             if loaded > 0 {
-                println!("Loaded {loaded} bans from {}", banlist_path.display());
+                log_info!("Loaded {loaded} bans from {}", banlist_path.display());
             }
         }
-        Err(err) => eprintln!("failed to load banlist: {err}"),
+        Err(err) => log_warn!("failed to load banlist: {err}"),
     }
 
     {
@@ -1007,9 +1056,10 @@ async fn run() -> Result<(), String> {
         thread::spawn(move || persist_banlist_loop(header_peer_book, banlist_path));
     }
 
-    println!(
+    log_info!(
         "Initialized chainstate on {:?} ({:?})",
-        config.network, config.backend
+        config.network,
+        config.backend
     );
 
     if config.scan_flatfiles {
@@ -1056,7 +1106,7 @@ async fn run() -> Result<(), String> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     if !rpc_addr.ip().is_loopback() && config.rpc_allow_ips.is_empty() {
-        eprintln!(
+        log_warn!(
             "Warning: RPC is bound to {} but no rpcallowip is set; only localhost connections will be permitted",
             rpc_addr
         );
@@ -1088,7 +1138,7 @@ async fn run() -> Result<(), String> {
     ) {
         Ok(estimator) => estimator,
         Err(err) => {
-            eprintln!(
+            log_warn!(
                 "failed to load fee estimates from {}: {err}",
                 fee_estimates_path.display()
             );
@@ -1152,7 +1202,7 @@ async fn run() -> Result<(), String> {
                 )
                 .await
                 {
-                    eprintln!("{err}");
+                    log_error!("{err}");
                 }
             });
         });
@@ -1163,7 +1213,7 @@ async fn run() -> Result<(), String> {
         inflight_per_peer,
         block_peers_target,
     );
-    println!(
+    log_info!(
         "Worker settings: header_verify_workers={} verify_workers={} shielded_workers={} verify_queue={}",
         header_verify_workers,
         verify_settings.verify_workers,
@@ -1184,14 +1234,14 @@ async fn run() -> Result<(), String> {
         .map_err(|err| err.to_string())?
         .is_none()
     {
-        println!("UTXO stats missing; rebuilding from UTXO set (one-time).");
+        log_info!("UTXO stats missing; rebuilding from UTXO set (one-time).");
         let _guard = write_lock
             .lock()
             .map_err(|_| "write lock poisoned".to_string())?;
         chainstate
             .ensure_utxo_stats()
             .map_err(|err| err.to_string())?;
-        println!("UTXO stats rebuilt.");
+        log_info!("UTXO stats rebuilt.");
     }
 
     if chainstate
@@ -1199,21 +1249,21 @@ async fn run() -> Result<(), String> {
         .map_err(|err| err.to_string())?
         .is_none()
     {
-        println!("Shielded value pools missing; rebuilding from blocks (one-time).");
+        log_info!("Shielded value pools missing; rebuilding from blocks (one-time).");
         let _guard = write_lock
             .lock()
             .map_err(|_| "write lock poisoned".to_string())?;
         chainstate
             .ensure_value_pools()
             .map_err(|err| err.to_string())?;
-        println!("Shielded value pools rebuilt.");
+        log_info!("Shielded value pools rebuilt.");
     }
 
     if config.mempool_persist_interval_secs > 0 {
         match load_mempool_file(&mempool_path) {
             Ok(raws) => {
                 if !raws.is_empty() {
-                    println!(
+                    log_info!(
                         "Loading {} mempool tx(s) from {}",
                         raws.len(),
                         mempool_path.display()
@@ -1234,7 +1284,7 @@ async fn run() -> Result<(), String> {
                     let mempool_prevouts = match mempool.lock() {
                         Ok(guard) => guard.prevouts_for_tx(&tx),
                         Err(_) => {
-                            eprintln!("mempool lock poisoned");
+                            log_warn!("mempool lock poisoned");
                             rejected += 1;
                             continue;
                         }
@@ -1271,7 +1321,7 @@ async fn run() -> Result<(), String> {
                             ),
                         },
                         Err(_) => {
-                            eprintln!("mempool lock poisoned");
+                            log_warn!("mempool lock poisoned");
                             rejected += 1;
                             continue;
                         }
@@ -1288,9 +1338,12 @@ async fn run() -> Result<(), String> {
                     }
                 }
                 if accepted > 0 || rejected > 0 || evicted > 0 {
-                    println!(
+                    log_info!(
                         "Mempool load complete: accepted {} rejected {} evicted {} ({} bytes)",
-                        accepted, rejected, evicted, evicted_bytes
+                        accepted,
+                        rejected,
+                        evicted,
+                        evicted_bytes
                     );
                 }
                 if accepted > 0 {
@@ -1310,7 +1363,7 @@ async fn run() -> Result<(), String> {
                             .map(|entry| (entry.txid, entry.raw.clone()))
                             .collect::<Vec<_>>(),
                         Err(_) => {
-                            eprintln!("mempool lock poisoned; skipping mempool rewrite");
+                            log_warn!("mempool lock poisoned; skipping mempool rewrite");
                             Vec::new()
                         }
                     };
@@ -1318,7 +1371,7 @@ async fn run() -> Result<(), String> {
                     match save_mempool_file(&mempool_path, &snapshot) {
                         Ok(bytes) => mempool_metrics.note_persisted(bytes as u64),
                         Err(err) => {
-                            eprintln!(
+                            log_warn!(
                                 "failed to rewrite {} after load: {err}",
                                 mempool_path.display()
                             );
@@ -1326,7 +1379,7 @@ async fn run() -> Result<(), String> {
                     }
                 }
             }
-            Err(err) => eprintln!("failed to load mempool file: {err}"),
+            Err(err) => log_warn!("failed to load mempool file: {err}"),
         }
 
         let mempool = Arc::clone(&mempool);
@@ -1394,7 +1447,7 @@ async fn run() -> Result<(), String> {
                 )
                 .await
                 {
-                    eprintln!("{err}");
+                    log_error!("{err}");
                 }
             });
         });
@@ -1425,9 +1478,9 @@ async fn run() -> Result<(), String> {
         Some(header_peer_book.as_ref()),
     )
     .await?;
-    println!("Block peer handshake complete");
-    println!("Block peer height {}", block_peer.remote_height());
-    println!(
+    log_info!("Block peer handshake complete");
+    log_info!("Block peer height {}", block_peer.remote_height());
+    log_info!(
         "Block peer version {} ua {}",
         block_peer.remote_version(),
         block_peer.remote_user_agent()
@@ -1448,18 +1501,18 @@ async fn run() -> Result<(), String> {
         .await?
     };
     if block_peers.is_empty() {
-        eprintln!("no block peers available, falling back to block peer");
+        log_warn!("no block peers available, falling back to block peer");
     }
 
     let header_allow_addr_book = config.header_peer_addrs.is_empty();
     let seed_addrs = if !config.header_peer_addrs.is_empty() {
         match parse_peer_addrs(&config.header_peer_addrs, params.default_port) {
             Ok(addrs) => {
-                println!("Using {} header peer(s) from --header-peer", addrs.len());
+                log_info!("Using {} header peer(s) from --header-peer", addrs.len());
                 addrs
             }
             Err(err) => {
-                eprintln!("header peer override failed: {err}");
+                log_warn!("header peer override failed: {err}");
                 Vec::new()
             }
         }
@@ -1467,7 +1520,7 @@ async fn run() -> Result<(), String> {
         match resolve_seed_addresses(&params).await {
             Ok(addrs) => addrs,
             Err(err) => {
-                eprintln!("seed resolve failed: {err}");
+                log_warn!("seed resolve failed: {err}");
                 Vec::new()
             }
         }
@@ -1487,7 +1540,7 @@ async fn run() -> Result<(), String> {
         )
         .await
         {
-            eprintln!("addr discovery stopped: {err}");
+            log_warn!("addr discovery stopped: {err}");
         }
     });
     let header_cursor = Arc::new(Mutex::new(init_header_cursor(
@@ -1496,7 +1549,7 @@ async fn run() -> Result<(), String> {
     )?));
 
     let header_peers = header_peers_target.max(1);
-    println!(
+    log_info!(
         "Header sync using 1 active worker (peer probe target {})",
         header_peers
     );
@@ -1524,7 +1577,7 @@ async fn run() -> Result<(), String> {
         )
         .await
         {
-            eprintln!("header commit stopped: {err}");
+            log_error!("header commit stopped: {err}");
         }
     });
     let header_sync_metrics = Arc::clone(&header_metrics);
@@ -1545,7 +1598,7 @@ async fn run() -> Result<(), String> {
         )
         .await
         {
-            eprintln!("header sync stopped: {err}");
+            log_error!("header sync stopped: {err}");
         }
     });
 
@@ -1581,7 +1634,7 @@ async fn run() -> Result<(), String> {
             )
             .await
             {
-                eprintln!("tx relay stopped: {err}");
+                log_warn!("tx relay stopped: {err}");
             }
         });
     }
@@ -2377,7 +2430,7 @@ fn open_store(backend: Backend, db_path: &PathBuf, config: &Config) -> Result<St
             {
                 let max_memtables = u64::from(memtable).saturating_mul(partition_count);
                 if write_buffer < max_memtables {
-                    eprintln!(
+                    log_warn!(
                         "Warning: --db-write-buffer-mb ({}) is below partitions ({}) × --db-memtable-mb ({}); expect frequent flushes / L0 stalls",
                         write_buffer / (1024 * 1024),
                         partition_count,
@@ -2391,7 +2444,7 @@ fn open_store(backend: Backend, db_path: &PathBuf, config: &Config) -> Result<St
                     .saturating_mul(partition_count)
                     .saturating_mul(2);
                 if journal < min_journal {
-                    eprintln!(
+                    log_warn!(
                         "Warning: --db-journal-mb ({}) is below 2 × partitions ({}) × --db-memtable-mb ({}); Fjall may halt writes when journals fill",
                         journal / (1024 * 1024),
                         partition_count,
@@ -2578,7 +2631,7 @@ fn persist_peers_loop(addr_book: Arc<AddrBook>, path: PathBuf) {
         }
         let snapshot = addr_book.snapshot();
         if let Err(err) = save_peers_file(&path, &snapshot) {
-            eprintln!("failed to persist {}: {err}", path.display());
+            log_warn!("failed to persist {}: {err}", path.display());
             continue;
         }
         last_revision = revision;
@@ -2594,7 +2647,7 @@ fn persist_banlist_loop(peer_book: Arc<HeaderPeerBook>, path: PathBuf) {
             continue;
         }
         if let Err(err) = peer_book.save_banlist(&path) {
-            eprintln!("failed to persist {}: {err}", path.display());
+            log_warn!("failed to persist {}: {err}", path.display());
             continue;
         }
         last_revision = revision;
@@ -2618,7 +2671,7 @@ fn persist_mempool_loop(
             let guard = match mempool.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
-                    eprintln!("mempool lock poisoned");
+                    log_warn!("mempool lock poisoned");
                     continue;
                 }
             };
@@ -2637,7 +2690,7 @@ fn persist_mempool_loop(
         let persisted = match save_mempool_file(&path, &snapshot) {
             Ok(bytes) => bytes as u64,
             Err(err) => {
-                eprintln!("failed to persist {}: {err}", path.display());
+                log_warn!("failed to persist {}: {err}", path.display());
                 continue;
             }
         };
@@ -2665,7 +2718,7 @@ fn persist_fee_estimates_loop(
             let guard = match fee_estimator.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
-                    eprintln!("fee estimator lock poisoned");
+                    log_warn!("fee estimator lock poisoned");
                     continue;
                 }
             };
@@ -2676,7 +2729,7 @@ fn persist_fee_estimates_loop(
             match guard.save(&path) {
                 Ok(_) => revision,
                 Err(err) => {
-                    eprintln!("failed to persist {}: {err}", path.display());
+                    log_warn!("failed to persist {}: {err}", path.display());
                     continue;
                 }
             }
@@ -2787,7 +2840,7 @@ async fn connect_to_peers(
     if candidates.is_empty() {
         return Err("no peer addresses available".to_string());
     }
-    println!("Peer candidates {}", candidates.len());
+    log_debug!("Peer candidates {}", candidates.len());
 
     let mut peers = Vec::new();
     let mut behind = Vec::new();
@@ -2828,17 +2881,22 @@ async fn connect_to_peers(
                 if min_height > 0 && remote_height >= 0 && remote_height < min_height {
                     behind_peers = behind_peers.saturating_add(1);
                     if behind_logged < MAX_BEHIND_LOGGED {
-                        eprintln!(
+                        log_debug!(
                             "Peer {addr} behind (height {} < {}), skipping (ver {} ua {})",
-                            remote_height, min_height, remote_version, remote_agent
+                            remote_height,
+                            min_height,
+                            remote_version,
+                            remote_agent
                         );
                         behind_logged += 1;
                     }
                     behind.push(peer);
                 } else {
-                    println!(
+                    log_debug!(
                         "Connected to {addr} (height {} ver {} ua {})",
-                        remote_height, remote_version, remote_agent
+                        remote_height,
+                        remote_version,
+                        remote_agent
                     );
                     peers.push(peer);
                 }
@@ -2852,12 +2910,12 @@ async fn connect_to_peers(
                 }
                 failures = failures.saturating_add(1);
                 if failures_logged < MAX_CONNECT_ERRORS_LOGGED {
-                    eprintln!("{err}");
+                    log_debug!("{err}");
                     failures_logged += 1;
                 }
             }
             Err(err) => {
-                eprintln!("peer task failed: {err}");
+                log_warn!("peer task failed: {err}");
             }
         }
 
@@ -2877,13 +2935,13 @@ async fn connect_to_peers(
     }
 
     if failures > failures_logged {
-        eprintln!(
+        log_debug!(
             "peer connect: {} additional failure(s) suppressed",
             failures - failures_logged
         );
     }
     if behind_peers > behind_logged {
-        eprintln!(
+        log_debug!(
             "peer connect: {} additional behind peer(s) suppressed",
             behind_peers - behind_logged
         );
@@ -2894,7 +2952,7 @@ async fn connect_to_peers(
             .into_iter()
             .max_by_key(|peer| peer.remote_height())
             .expect("behind checked to be non-empty");
-        eprintln!(
+        log_warn!(
             "All peers behind target height {}; using highest behind peer at {}",
             min_height,
             fallback.remote_height()
@@ -2970,7 +3028,7 @@ async fn resolve_seed_addresses(params: &ChainParams) -> Result<Vec<SocketAddr>,
                 }
             }
             Err(err) => {
-                eprintln!("failed to resolve fixed seed {seed}: {err}");
+                log_debug!("failed to resolve fixed seed {seed}: {err}");
             }
         }
     }
@@ -2985,7 +3043,7 @@ async fn resolve_seed_addresses(params: &ChainParams) -> Result<Vec<SocketAddr>,
                 }
             }
             Err(err) => {
-                eprintln!("failed to resolve {seed}: {err}");
+                log_debug!("failed to resolve {seed}: {err}");
             }
         }
     }
@@ -3037,7 +3095,7 @@ async fn addr_discovery_loop(
                 )
                 .await
                 {
-                    eprintln!("addr discovery failed for {addr}: {err}");
+                    log_debug!("addr discovery failed for {addr}: {err}");
                 }
             });
         }
@@ -3094,7 +3152,7 @@ async fn discover_addrs_from_peer(
     }
     let added = addr_book.insert_many(new_addrs);
     if added > 0 {
-        println!(
+        log_debug!(
             "Addr discovery: learned {} addrs from {} (book {})",
             added,
             addr,
@@ -3183,7 +3241,7 @@ fn ensure_genesis<S: KeyValueStore>(
     chainstate
         .commit_batch(batch)
         .map_err(|err| err.to_string())?;
-    println!("Inserted genesis block");
+    log_info!("Inserted genesis block");
     Ok(())
 }
 
@@ -3392,7 +3450,7 @@ async fn header_sync_loop<S: KeyValueStore + Send + Sync + 'static>(
         )
         .await
         {
-            eprintln!("header worker stopped: {err}");
+            log_warn!("header worker stopped: {err}");
         }
         tokio::time::sleep(idle_sleep).await;
     }
@@ -3418,7 +3476,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
         let height = match start_height(&chainstate) {
             Ok(height) => height,
             Err(err) => {
-                eprintln!("header sync start height failed: {err}");
+                log_warn!("header sync start height failed: {err}");
                 tokio::time::sleep(idle_sleep).await;
                 continue;
             }
@@ -3443,14 +3501,14 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
         {
             Ok(peer) => peer,
             Err(err) => {
-                eprintln!("header peer connect failed: {err}");
+                log_warn!("header peer connect failed: {err}");
                 tokio::time::sleep(idle_sleep).await;
                 continue;
             }
         };
-        println!("Header peer handshake complete");
-        println!("Header peer height {}", peer.remote_height());
-        println!(
+        log_debug!("Header peer handshake complete");
+        log_debug!("Header peer height {}", peer.remote_height());
+        log_debug!(
             "Header peer version {} ua {}",
             peer.remote_version(),
             peer.remote_user_agent()
@@ -3462,7 +3520,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
 
         loop {
             if peer_ctx.registry.take_disconnect_request(peer_addr) {
-                println!("Disconnect requested for header peer {peer_addr}; reconnecting");
+                log_debug!("Disconnect requested for header peer {peer_addr}; reconnecting");
                 break;
             }
             let remote_height = peer.remote_height();
@@ -3489,9 +3547,10 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                 }
                 peer_book.record_failure(peer_addr);
                 addr_book.record_failure(peer_addr);
-                eprintln!(
+                log_debug!(
                     "header peer behind (remote {} < tip {}), reconnecting",
-                    remote_height, download_state.tip_height
+                    remote_height,
+                    download_state.tip_height
                 );
                 break;
             }
@@ -3504,7 +3563,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
             let locator = match build_download_locator(&chainstate, &params, download_state) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("header locator failed: {err}");
+                    log_warn!("header locator failed: {err}");
                     tokio::time::sleep(idle_sleep).await;
                     continue;
                 }
@@ -3529,13 +3588,13 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                     timeout_failures = 0;
                     if headers.is_empty() {
                         if behind {
-                            eprintln!("header peer returned no headers while behind");
+                            log_warn!("header peer returned no headers while behind");
                             peer_book.record_failure(peer_addr);
                             addr_book.record_failure(peer_addr);
                         } else if last_headers_at.elapsed()
                             > Duration::from_secs(HEADER_IDLE_REPROBE_SECS)
                         {
-                            eprintln!(
+                            log_warn!(
                                 "header peer idle at height {} for {:?}; reconnecting",
                                 download_state.tip_height,
                                 last_headers_at.elapsed()
@@ -3549,7 +3608,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                     }
                     peer_book.record_success(peer_addr);
                     if !headers_are_contiguous(&headers) {
-                        eprintln!("non-continuous headers sequence from peer");
+                        log_warn!("non-continuous headers sequence from peer");
                         peer_book.record_bad_chain(peer_addr, HEADER_BAD_CHAIN_BAN_SECS);
                         addr_book.record_failure(peer_addr);
                         break;
@@ -3562,18 +3621,18 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                             .cloned()
                             .or_else(|| chainstate.header_entry(&prev).ok().flatten());
                         if let Some(entry) = prev_entry {
-                            eprintln!(
-                                "header batch forks from tip {}; switching to ancestor {} at height {}",
-                                hash256_to_hex(&download_state.tip_hash),
-                                hash256_to_hex(&prev),
-                                entry.height
-                            );
+                            log_debug!(
+                            "header batch forks from tip {}; switching to ancestor {} at height {}",
+                            hash256_to_hex(&download_state.tip_hash),
+                            hash256_to_hex(&prev),
+                            entry.height
+                        );
                             download_state.tip_hash = prev;
                             download_state.tip_height = entry.height;
                             download_state.pending.clear();
                             download_state.cache = HeaderValidationCache::default();
                         } else {
-                            eprintln!(
+                            log_warn!(
                                 "header batch does not connect to known header {}; resetting",
                                 hash256_to_hex(&prev)
                             );
@@ -3591,7 +3650,7 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                         false, // skip PoW here; commit loop validates in parallel
                         &mut download_state.cache,
                     ) {
-                        eprintln!("header validation failed: {err}");
+                        log_warn!("header validation failed: {err}");
                         download_state.reset(chainstate.as_ref(), &params)?;
                         peer_book.record_failure(peer_addr);
                         addr_book.record_failure(peer_addr);
@@ -3609,14 +3668,14 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                     addr_book.record_success(peer_addr, &peer);
                     probing = false;
                     last_headers_at = Instant::now();
-                    println!("Received {} headers", headers.len());
+                    log_debug!("Received {} headers", headers.len());
                     if header_tx.send(headers).await.is_err() {
                         return Ok(());
                     }
                 }
                 Ok(Err(err)) => {
                     if behind {
-                        eprintln!("header request failed: {err}");
+                        log_debug!("header request failed: {err}");
                     }
                     peer_book.record_failure(peer_addr);
                     addr_book.record_failure(peer_addr);
@@ -3624,20 +3683,20 @@ async fn header_peer_loop<S: KeyValueStore + Send + Sync + 'static>(
                 }
                 Err(_) => {
                     if behind {
-                        eprintln!("header request timed out");
+                        log_debug!("header request timed out");
                     }
                     peer_book.record_failure(peer_addr);
                     addr_book.record_failure(peer_addr);
                     timeout_failures = timeout_failures.saturating_add(1);
                     if behind && timeout_failures >= HEADER_TIMEOUT_RETRIES_BEHIND {
-                        eprintln!("header peer timed out while behind; reconnecting");
+                        log_warn!("header peer timed out while behind; reconnecting");
                         break;
                     }
                     let stall_limit = HEADER_STALL_SECS_IDLE;
                     if timeout_failures >= HEADER_TIMEOUT_RETRIES_IDLE
                         && last_headers_at.elapsed() > Duration::from_secs(stall_limit)
                     {
-                        eprintln!(
+                        log_warn!(
                             "header peer stalled ({} timeouts, last headers {:?} ago), reconnecting",
                             timeout_failures,
                             last_headers_at.elapsed()
@@ -3766,11 +3825,11 @@ async fn connect_to_candidates(
                 }
                 failures = failures.saturating_add(1);
                 if failures_logged < MAX_CONNECT_ERRORS_LOGGED {
-                    eprintln!("{err}");
+                    log_debug!("{err}");
                     failures_logged += 1;
                 }
             }
-            Err(err) => eprintln!("peer task failed: {err}"),
+            Err(err) => log_warn!("peer task failed: {err}"),
         }
 
         if next_index < attempt_target {
@@ -3788,7 +3847,7 @@ async fn connect_to_candidates(
     }
 
     if failures > failures_logged {
-        eprintln!(
+        log_debug!(
             "peer connect: {} additional failure(s) suppressed",
             failures - failures_logged
         );
@@ -3939,9 +3998,10 @@ fn cap_header_gap<S: KeyValueStore>(
                 cursor.tip_height = Some(entry.height);
                 cursor.generation = cursor.generation.saturating_add(1);
             }
-            println!(
+            log_info!(
                 "Capped header lead at height {} (gap {})",
-                entry.height, header_lead
+                entry.height,
+                header_lead
             );
             break;
         }
@@ -3990,7 +4050,7 @@ fn commit_headers_batch<S: KeyValueStore>(
         .commit_batch(batch)
         .map_err(|err| err.to_string())?;
     header_metrics.record_commit(headers.len() as u64, commit_start.elapsed());
-    println!("Committed {} headers", headers.len());
+    log_debug!("Committed {} headers", headers.len());
     if let Some((_, last_entry)) = entries.last() {
         if let Ok(Some(best)) = chainstate.best_header() {
             if last_entry.height > best.height {
@@ -4000,7 +4060,7 @@ fn commit_headers_batch<S: KeyValueStore>(
                     Ordering::Equal => "eq",
                     Ordering::Less => "lt",
                 };
-                eprintln!(
+                log_warn!(
                     "header chainwork behind: last {} {} bits {:#x} work {} ({}) best {} {} work {}",
                     last_entry.height,
                     last_hash
@@ -4186,7 +4246,7 @@ fn queue_or_commit_headers<S: KeyValueStore>(
     };
     if !prev_exists {
         if pending.is_empty() {
-            eprintln!("header batch queued (prev missing)");
+            log_debug!("header batch queued (prev missing)");
         }
         pending.entry(prev).or_insert(headers);
         return Ok(());
@@ -4195,7 +4255,7 @@ fn queue_or_commit_headers<S: KeyValueStore>(
     let (commit_headers, remainder) =
         split_headers_by_lead(chainstate, params, header_lead, prev, headers)?;
     if commit_headers.is_empty() {
-        eprintln!("header lead clamp: nothing committed");
+        log_debug!("header lead clamp: nothing committed");
         if let Some(queued) = remainder {
             pending.entry(prev).or_insert(queued);
         }
@@ -4347,7 +4407,7 @@ fn refresh_header_cursor<S: KeyValueStore>(
     cursor.tip_hash = Some(best.hash);
     cursor.tip_height = Some(best.height);
     cursor.generation = cursor.generation.saturating_add(1);
-    println!("Header tip advanced to {}", best.height);
+    log_debug!("Header tip advanced to {}", best.height);
     Ok(())
 }
 
@@ -4384,7 +4444,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
     let mut last_peer_refill_at = Instant::now() - Duration::from_secs(BLOCK_PEER_REFILL_SECS);
     loop {
         if *shutdown.borrow() {
-            println!("Shutdown requested; stopping sync loop.");
+            log_info!("Shutdown requested; stopping sync loop.");
             break;
         }
         cap_header_gap(
@@ -4407,7 +4467,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
 
         if peer_ctx.registry.take_disconnect_request(block_peer.addr()) {
             let addr = block_peer.addr();
-            println!("Disconnect requested for block peer {addr}; reconnecting");
+            log_info!("Disconnect requested for block peer {addr}; reconnecting");
             match connect_to_peer(
                 params.as_ref(),
                 best_block_height,
@@ -4422,7 +4482,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                     *block_peer = new_peer;
                 }
                 Err(err) => {
-                    eprintln!("disconnect reconnect failed for block peer {addr}: {err}");
+                    log_warn!("disconnect reconnect failed for block peer {addr}: {err}");
                 }
             }
         }
@@ -4438,7 +4498,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
             }
         });
         if !disconnected_block_peers.is_empty() {
-            println!(
+            log_info!(
                 "Disconnect requested for {} additional block peer(s)",
                 disconnected_block_peers.len()
             );
@@ -4468,12 +4528,12 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                 Ok(mut new_peers) => {
                     new_peers.retain(|peer| existing.insert(peer.addr()));
                     if !new_peers.is_empty() {
-                        println!("Connected {} additional block peer(s)", new_peers.len());
+                        log_info!("Connected {} additional block peer(s)", new_peers.len());
                         block_peers.extend(new_peers);
                     }
                 }
                 Err(err) => {
-                    eprintln!("refill block peers failed: {err}");
+                    log_warn!("refill block peers failed: {err}");
                 }
             }
             last_peer_refill_at = Instant::now();
@@ -4486,7 +4546,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
         let missing = collect_missing_blocks(chainstate.as_ref(), max_fetch)?;
         if !missing.is_empty() {
             if gap > 0 && last_progress_at.elapsed() > Duration::from_secs(BLOCK_STALL_SECS) {
-                eprintln!(
+                log_warn!(
                     "no block progress for {}s; reconnecting block peers",
                     last_progress_at.elapsed().as_secs()
                 );
@@ -4510,7 +4570,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                         *block_peer = new_peer;
                     }
                     Err(err) => {
-                        eprintln!("reconnect block peer failed: {err}");
+                        log_warn!("reconnect block peer failed: {err}");
                     }
                 }
                 if block_peers_target > 0 {
@@ -4529,7 +4589,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                             *block_peers = new_peers;
                         }
                         Err(err) => {
-                            eprintln!("reconnect block peers failed: {err}");
+                            log_warn!("reconnect block peers failed: {err}");
                         }
                     }
                 }
@@ -4554,14 +4614,14 @@ async fn sync_chain<S: KeyValueStore + 'static>(
             );
             let fetch_result = tokio::select! {
                 _ = shutdown.changed() => {
-                    println!("Shutdown requested; aborting block fetch.");
+                    log_info!("Shutdown requested; aborting block fetch.");
                     break;
                 }
                 result = fetch_result => result,
             };
             if let Err(err) = fetch_result {
                 if is_transient_block_error(&err) {
-                    eprintln!("block fetch failed: {err}");
+                    log_debug!("block fetch failed: {err}");
                     let best_header_height = chainstate
                         .best_header()
                         .map_err(|err| err.to_string())?
@@ -4582,7 +4642,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                             *block_peer = new_peer;
                         }
                         Err(err) => {
-                            eprintln!("reconnect block peer failed: {err}");
+                            log_warn!("reconnect block peer failed: {err}");
                         }
                     }
                     if block_peers_target > 0 {
@@ -4601,7 +4661,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                                 *block_peers = new_peers;
                             }
                             Err(err) => {
-                                eprintln!("reconnect block peers failed: {err}");
+                                log_warn!("reconnect block peers failed: {err}");
                             }
                         }
                     }
@@ -4712,7 +4772,7 @@ fn spawn_status_logger<S: KeyValueStore + Send + Sync + 'static>(
                         validation_ms_from_last(&stats, last.as_ref());
                     let (utxo_ms, index_ms, anchor_ms, flat_ms) =
                         connect_ms_from_last(&stats, last.as_ref());
-                    println!(
+                    log_info!(
                         "Status: headers {} blocks {} gap {} h/s {} b/s {} dl_ms {} ver_ms {} db_ms {} hdr_req_ms {} hdr_val_ms {} hdr_commit_ms {} hdr_pow_ms {} val_ms {} script_ms {} shield_ms {} utxo_ms {} idx_ms {} anchor_ms {} flat_ms {} header {} block {} uptime {}s",
                         stats.best_header_height,
                         stats.best_block_height,
@@ -4740,7 +4800,7 @@ fn spawn_status_logger<S: KeyValueStore + Send + Sync + 'static>(
                     last = Some(stats);
                 }
                 Err(err) => {
-                    eprintln!("status snapshot failed: {err}");
+                    log_warn!("status snapshot failed: {err}");
                 }
             }
         }
@@ -5204,7 +5264,7 @@ fn reorg_to_best_header<S: KeyValueStore>(
     }
 
     if disconnected > 0 {
-        println!(
+        log_info!(
             "Reorg: disconnected {} block(s) to height {} ({})",
             disconnected,
             ancestor_height,
@@ -5426,7 +5486,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
             while let Some(result) = join_set.join_next().await {
                 match result {
                     Ok(entry) => out.push(entry),
-                    Err(err) => eprintln!("block peer join failed: {err}"),
+                    Err(err) => log_warn!("block peer join failed: {err}"),
                 }
             }
             out
@@ -5442,7 +5502,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
             }
         }
         if let Some(err) = block_peer_outcome.error {
-            eprintln!("block peer fetch failed: {err}");
+            log_debug!("block peer fetch failed: {err}");
             if let Some(peer_book) = peer_book {
                 peer_book.record_failure(block_peer_addr);
                 if let Some(secs) = block_peer_ban_secs(&err) {
@@ -5461,7 +5521,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
                 }
             }
             if let Some(err) = outcome.error {
-                eprintln!("block peer fetch failed: {err}");
+                log_debug!("block peer fetch failed: {err}");
                 if let Some(peer_book) = peer_book {
                     peer_book.record_failure(addr);
                     if let Some(secs) = block_peer_ban_secs(&err) {
@@ -5957,7 +6017,7 @@ fn connect_pending<S: KeyValueStore>(
                 | Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(
                     "block height does not match header index",
                 )) => {
-                    eprintln!(
+                    log_warn!(
                         "block connect mismatch at height {} ({}); attempting reorg",
                         verified_block.height,
                         hash256_to_hex(&hash)
@@ -5991,7 +6051,7 @@ fn connect_pending<S: KeyValueStore>(
                 }
             };
             if should_reorg {
-                eprintln!(
+                log_warn!(
                     "block commit tip moved at height {} ({}); attempting reorg",
                     verified_block.height,
                     hash256_to_hex(&hash)
@@ -6153,7 +6213,7 @@ async fn read_message_with_timeout_opts(
                 return Err("peer read timed out".to_string());
             }
             Err(_) => {
-                eprintln!("peer read timed out (attempt {}/{})", attempt + 1, retries);
+                log_debug!("peer read timed out (attempt {}/{})", attempt + 1, retries);
             }
         }
     }
@@ -6186,6 +6246,12 @@ fn parse_args() -> Result<Config, String> {
     let mut debug_fluxnode_payout_height: Option<i32> = None;
     let mut debug_fluxnode_payee_candidates: Option<DebugFluxnodePayeeCandidates> = None;
     let mut check_script = true;
+    let mut log_level = logging::Level::Info;
+    let mut log_level_set = false;
+    let mut log_format = logging::Format::Text;
+    let mut log_format_set = false;
+    let mut log_timestamps = true;
+    let mut log_timestamps_set = false;
     let mut rpc_addr: Option<SocketAddr> = None;
     let mut rpc_addr_set = false;
     let mut rpc_user: Option<String> = None;
@@ -6355,6 +6421,30 @@ fn parse_args() -> Result<Config, String> {
                     height,
                     limit: 50,
                 });
+            }
+            "--log-level" | "--loglevel" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --log-level\n{}", usage()))?;
+                log_level = logging::Level::parse(&value)
+                    .ok_or_else(|| format!("invalid log level '{value}'\n{}", usage()))?;
+                log_level_set = true;
+            }
+            "--log-format" | "--logformat" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --log-format\n{}", usage()))?;
+                log_format = logging::Format::parse(&value)
+                    .ok_or_else(|| format!("invalid log format '{value}'\n{}", usage()))?;
+                log_format_set = true;
+            }
+            "--log-timestamps" | "--logtimestamps" => {
+                log_timestamps = true;
+                log_timestamps_set = true;
+            }
+            "--no-log-timestamps" | "--no-logtimestamps" => {
+                log_timestamps = false;
+                log_timestamps_set = true;
             }
             "--skip-script" => {
                 check_script = false;
@@ -6686,6 +6776,7 @@ fn parse_args() -> Result<Config, String> {
 
     let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
     let conf_file = conf_path.unwrap_or_else(|| data_dir.join("flux.conf"));
+    let mut unsupported_conf_keys: Vec<String> = Vec::new();
     if let Some(conf) = load_flux_conf(&conf_file)? {
         if !network_set {
             if let Some(values) = conf.get("regtest") {
@@ -6785,6 +6876,42 @@ fn parse_args() -> Result<Config, String> {
             }
         }
 
+        if !log_level_set {
+            if let Some(values) = conf.get("loglevel") {
+                if let Some(raw) = values.last() {
+                    log_level = logging::Level::parse(raw).ok_or_else(|| {
+                        format!("invalid loglevel '{raw}' in {}", conf_file.display())
+                    })?;
+                }
+            }
+        }
+
+        if !log_format_set {
+            if let Some(values) = conf.get("logformat") {
+                if let Some(raw) = values.last() {
+                    log_format = logging::Format::parse(raw).ok_or_else(|| {
+                        format!("invalid logformat '{raw}' in {}", conf_file.display())
+                    })?;
+                }
+            }
+        }
+
+        if !log_timestamps_set {
+            if let Some(values) = conf.get("logtimestamps") {
+                if let Some(raw) = values.last() {
+                    match parse_conf_bool(raw) {
+                        Some(value) => log_timestamps = value,
+                        None => {
+                            return Err(format!(
+                                "invalid logtimestamps value '{raw}' in {}",
+                                conf_file.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(values) = conf.get("addnode") {
             let mut seen = HashSet::new();
             for raw in values {
@@ -6798,6 +6925,9 @@ fn parse_args() -> Result<Config, String> {
 
         let supported_keys = [
             "addnode",
+            "logformat",
+            "loglevel",
+            "logtimestamps",
             "mineraddress",
             "rpcallowip",
             "rpcbind",
@@ -6813,13 +6943,20 @@ fn parse_args() -> Result<Config, String> {
             .cloned()
             .collect();
         unsupported.sort();
-        if !unsupported.is_empty() {
-            eprintln!(
-                "Warning: ignoring unsupported keys in {}: {}",
-                conf_file.display(),
-                unsupported.join(", ")
-            );
-        }
+        unsupported_conf_keys = unsupported;
+    }
+
+    logging::init(logging::LogConfig {
+        level: log_level,
+        format: log_format,
+        timestamps: log_timestamps,
+    });
+    if !unsupported_conf_keys.is_empty() {
+        log_warn!(
+            "Warning: ignoring unsupported keys in {}: {}",
+            conf_file.display(),
+            unsupported_conf_keys.join(", ")
+        );
     }
 
     if let Some(profile) = profile {
@@ -6891,7 +7028,7 @@ fn parse_args() -> Result<Config, String> {
         }
 
         if profile != RunProfile::Default {
-            println!("Using profile {}", profile.as_str());
+            log_info!("Using profile {}", profile.as_str());
         }
     }
 
@@ -6930,7 +7067,7 @@ fn parse_args() -> Result<Config, String> {
     let min_journal_mb = min_write_buffer_mb.saturating_mul(2);
     if db_write_buffer_mb < min_write_buffer_mb {
         if db_write_buffer_set {
-            eprintln!(
+            log_warn!(
                 "Warning: --db-write-buffer-mb ({}) is below partitions ({}) × --db-memtable-mb ({}); clamping to {}",
                 db_write_buffer_mb,
                 partition_count,
@@ -6944,7 +7081,7 @@ fn parse_args() -> Result<Config, String> {
     }
     if db_journal_mb < min_journal_mb {
         if db_journal_set {
-            eprintln!(
+            log_warn!(
                 "Warning: --db-journal-mb ({}) is below 2 × partitions ({}) × --db-memtable-mb ({}); clamping to {}",
                 db_journal_mb,
                 partition_count,
@@ -6980,6 +7117,9 @@ fn parse_args() -> Result<Config, String> {
         debug_fluxnode_payout_height,
         debug_fluxnode_payee_candidates,
         check_script,
+        log_level,
+        log_format,
+        log_timestamps,
         rpc_addr,
         rpc_user,
         rpc_pass,
@@ -7245,7 +7385,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -7253,6 +7393,10 @@ fn usage() -> String {
         "  --conf  Config file path (default: <data-dir>/flux.conf)",
         "  --params-dir    Shielded params directory (default: ~/.zcash-params)",
         "  --profile  Apply a preset for sync/DB/worker tuning (low|default|high)",
+        "  --log-level  Log verbosity (error|warn|info|debug|trace) (default: info)",
+        "  --log-format  Log output format (text|json) (default: text)",
+        "  --log-timestamps  Enable timestamps in text logs (default: on)",
+        "  --no-log-timestamps  Disable timestamps in text logs",
         "  --fetch-params  Download shielded params into --params-dir",
         "  --reindex  Wipe db/blocks for --data-dir and restart from genesis",
         "  --db-info  Print DB/flatfile size breakdown and fjall telemetry, then exit",

@@ -83,14 +83,14 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
                             )
                             .await;
                             if let Err(err) = &result {
-                                eprintln!("tx relay peer {addr} stopped: {err}");
+                                log_warn!("tx relay peer {addr} stopped: {err}");
                             }
                             result
                         });
                     }
                 }
                 Err(err) => {
-                    eprintln!("tx relay connect failed: {err}");
+                    log_warn!("tx relay connect failed: {err}");
                     tokio::time::sleep(Duration::from_secs(TX_RECONNECT_DELAY_SECS)).await;
                     break;
                 }
@@ -100,7 +100,7 @@ pub async fn tx_relay_loop<S: KeyValueStore + 'static>(
         match join_set.join_next().await {
             Some(Ok(_)) => {}
             Some(Err(err)) => {
-                eprintln!("tx relay join failed: {err}");
+                log_warn!("tx relay join failed: {err}");
             }
             None => {
                 tokio::time::sleep(Duration::from_secs(TX_RECONNECT_DELAY_SECS)).await;
@@ -135,7 +135,7 @@ async fn tx_relay_peer<S: KeyValueStore>(
     loop {
         if peer.take_disconnect_request() {
             let addr = peer.addr();
-            println!("Disconnect requested for tx relay peer {addr}");
+            log_info!("Disconnect requested for tx relay peer {addr}");
             return Ok(());
         }
         tokio::select! {
@@ -252,7 +252,7 @@ async fn handle_peer_message<S: KeyValueStore>(
                         let _ = requested.remove(&txid);
                     }
                     if err.kind == mempool::MempoolErrorKind::Internal {
-                        eprintln!(
+                        log_warn!(
                             "mempool reject {}: {}",
                             crate::stats::hash256_to_hex(&txid),
                             err
@@ -289,7 +289,7 @@ async fn handle_peer_message<S: KeyValueStore>(
                     }
                     Err(err) => {
                         if err.kind == mempool::MempoolErrorKind::Internal {
-                            eprintln!(
+                            log_warn!(
                                 "mempool insert failed {}: {}",
                                 crate::stats::hash256_to_hex(&txid),
                                 err
@@ -542,7 +542,7 @@ impl TxRejectStats {
             return;
         }
 
-        eprintln!(
+        log_warn!(
             "tx relay peer {addr}: rejected {total} tx(s) (peer_notfound {} peer_reject {} build_missing_input {} build_conflict {} build_insufficient_fee {} build_nonstandard {} build_invalid_tx {} build_invalid_script {} build_invalid_shielded {} build_internal {} insert_dupe {} insert_conflict {} insert_other {})",
             self.peer_notfound,
             self.peer_reject,
