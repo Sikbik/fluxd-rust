@@ -19,7 +19,7 @@ use fluxd_script::message::signed_message_hash;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 6;
+pub const WALLET_FILE_VERSION: u32 = 7;
 
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
 
@@ -104,9 +104,13 @@ impl WalletKey {
         }
     }
 
-    fn p2pkh_script_pubkey(&self) -> Result<Vec<u8>, WalletError> {
+    fn p2pkh_key_hash(&self) -> Result<[u8; 20], WalletError> {
         let pubkey_bytes = self.pubkey_bytes()?;
-        let key_hash = hash160(&pubkey_bytes);
+        Ok(hash160(&pubkey_bytes))
+    }
+
+    fn p2pkh_script_pubkey(&self) -> Result<Vec<u8>, WalletError> {
+        let key_hash = self.p2pkh_key_hash()?;
         Ok(p2pkh_script(&key_hash))
     }
 
@@ -130,6 +134,7 @@ pub struct Wallet {
     keypool: VecDeque<KeyPoolEntry>,
     sapling_keys: Vec<SaplingKeyEntry>,
     sapling_viewing_keys: Vec<SaplingViewingKeyEntry>,
+    change_key_hashes: BTreeSet<[u8; 20]>,
     revision: u64,
     locked_outpoints: HashSet<OutPoint>,
     pay_tx_fee_per_kb: i64,
@@ -152,6 +157,7 @@ impl Wallet {
                 keypool: VecDeque::new(),
                 sapling_keys: Vec::new(),
                 sapling_viewing_keys: Vec::new(),
+                change_key_hashes: BTreeSet::new(),
                 revision: 0,
                 locked_outpoints: HashSet::new(),
                 pay_tx_fee_per_kb: 0,
@@ -183,10 +189,12 @@ impl Wallet {
         self.keypool.len()
     }
 
+    #[cfg(test)]
     pub fn sapling_key_count(&self) -> usize {
         self.sapling_keys.len()
     }
 
+    #[cfg(test)]
     pub fn sapling_viewing_key_count(&self) -> usize {
         self.sapling_viewing_keys.len()
     }
@@ -314,7 +322,23 @@ impl Wallet {
     }
 
     pub fn generate_new_address(&mut self, compressed: bool) -> Result<String, WalletError> {
-        self.reserve_from_keypool_or_generate(compressed)
+        self.reserve_from_keypool_or_generate(compressed, false)
+    }
+
+    pub fn generate_new_change_address(&mut self, compressed: bool) -> Result<String, WalletError> {
+        self.reserve_from_keypool_or_generate(compressed, true)
+    }
+
+    #[cfg(test)]
+    pub fn is_change_script_pubkey(&self, script_pubkey: &[u8]) -> bool {
+        let Some(key_hash) = extract_p2pkh_hash(script_pubkey) else {
+            return false;
+        };
+        self.change_key_hashes.contains(&key_hash)
+    }
+
+    pub fn change_key_hashes(&self) -> Vec<[u8; 20]> {
+        self.change_key_hashes.iter().copied().collect()
     }
 
     pub fn generate_new_sapling_address_bytes(&mut self) -> Result<[u8; 43], WalletError> {
@@ -613,8 +637,10 @@ impl Wallet {
     fn reserve_from_keypool_or_generate(
         &mut self,
         compressed: bool,
+        is_change: bool,
     ) -> Result<String, WalletError> {
         let prev_key_len = self.keys.len();
+        let mut change_added = None;
 
         let popped = if compressed {
             self.keypool.pop_front()
@@ -629,6 +655,12 @@ impl Wallet {
         let added_keypool = self.ensure_keypool_minimum(DEFAULT_KEYPOOL_SIZE)?;
 
         let address = reserved.address(self.network)?;
+        if is_change {
+            let key_hash = reserved.p2pkh_key_hash()?;
+            if self.change_key_hashes.insert(key_hash) {
+                change_added = Some(key_hash);
+            }
+        }
         self.keys.push(reserved);
         if let Err(err) = self.save() {
             self.keys.truncate(prev_key_len);
@@ -637,6 +669,9 @@ impl Wallet {
             }
             if let Some(entry) = popped {
                 self.keypool.push_front(entry);
+            }
+            if let Some(key_hash) = change_added {
+                self.change_key_hashes.remove(&key_hash);
             }
             return Err(err);
         }
@@ -775,13 +810,7 @@ impl Wallet {
     fn decode(path: &Path, expected_network: Network, bytes: &[u8]) -> Result<Self, WalletError> {
         let mut decoder = Decoder::new(bytes);
         let version = decoder.read_u32_le()?;
-        if version != 1
-            && version != 2
-            && version != 3
-            && version != 4
-            && version != 5
-            && version != WALLET_FILE_VERSION
-        {
+        if version == 0 || version > WALLET_FILE_VERSION {
             return Err(WalletError::InvalidData("unsupported wallet file version"));
         }
         let network = decode_network(decoder.read_u8()?)?;
@@ -880,6 +909,17 @@ impl Wallet {
             }
         }
 
+        let mut change_key_hashes = BTreeSet::new();
+        if version >= 7 {
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("change key hash count too large"))?;
+            for _ in 0..count {
+                let key_hash = decoder.read_fixed::<20>()?;
+                change_key_hashes.insert(key_hash);
+            }
+        }
+
         if !decoder.is_empty() {
             return Err(WalletError::InvalidData("wallet file has trailing bytes"));
         }
@@ -892,6 +932,7 @@ impl Wallet {
             keypool,
             sapling_keys,
             sapling_viewing_keys,
+            change_key_hashes,
             revision: 0,
             locked_outpoints: HashSet::new(),
             pay_tx_fee_per_kb,
@@ -937,10 +978,31 @@ impl Wallet {
             encoder.write_bytes(&entry.extfvk);
             encoder.write_bytes(&entry.next_diversifier_index);
         }
+
+        encoder.write_varint(self.change_key_hashes.len() as u64);
+        for key_hash in &self.change_key_hashes {
+            encoder.write_bytes(key_hash);
+        }
         let bytes = encoder.into_inner();
         write_file_atomic(&self.path, &bytes)?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn extract_p2pkh_hash(script_pubkey: &[u8]) -> Option<[u8; 20]> {
+    if script_pubkey.len() != 25
+        || script_pubkey[0] != 0x76
+        || script_pubkey[1] != 0xa9
+        || script_pubkey[2] != 0x14
+        || script_pubkey[23] != 0x88
+        || script_pubkey[24] != 0xac
+    {
+        return None;
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&script_pubkey[3..23]);
+    Some(hash)
 }
 
 fn current_unix_seconds() -> u64 {
@@ -1038,6 +1100,7 @@ mod tests {
         fs::create_dir_all(&data_dir).expect("create data dir");
 
         let mut wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet");
+        assert_eq!(wallet.sapling_viewing_key_count(), 0);
         let addr1 = wallet
             .generate_new_sapling_address_bytes()
             .expect("generate sapling address");
@@ -1048,10 +1111,45 @@ mod tests {
         let mut wallet =
             Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet reload");
         assert_eq!(wallet.sapling_key_count(), 1);
+        assert_eq!(wallet.sapling_viewing_key_count(), 0);
         assert_eq!(wallet.sapling_keys[0].extsk, key_bytes);
         let addr2 = wallet
             .generate_new_sapling_address_bytes()
             .expect("generate sapling address");
         assert_ne!(addr1, addr2);
+    }
+
+    #[test]
+    fn change_address_tracked_and_persists_across_restart() {
+        let data_dir = temp_data_dir("fluxd-wallet-change-test");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+
+        let mut wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet");
+        let receive = wallet.generate_new_address(true).expect("receive address");
+        let change = wallet
+            .generate_new_change_address(true)
+            .expect("change address");
+        assert_ne!(receive, change);
+
+        let scripts = wallet.all_script_pubkeys().expect("scripts");
+        let change_script = scripts
+            .iter()
+            .find(|spk| script_pubkey_to_address(spk, Network::Regtest).as_deref() == Some(&change))
+            .expect("change script");
+        assert!(wallet.is_change_script_pubkey(change_script));
+
+        let receive_script = scripts
+            .iter()
+            .find(|spk| {
+                script_pubkey_to_address(spk, Network::Regtest).as_deref() == Some(&receive)
+            })
+            .expect("receive script");
+        assert!(!wallet.is_change_script_pubkey(receive_script));
+
+        drop(wallet);
+
+        let wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet reload");
+        assert!(wallet.is_change_script_pubkey(change_script));
+        assert!(!wallet.is_change_script_pubkey(receive_script));
     }
 }

@@ -136,7 +136,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `keypoolrefill [newsize]` (partial)
 - `settxfee <amount>` (partial)
 - `getnewaddress [label]` (label ignored)
-- `getrawchangeaddress [address_type]` (partial; address_type ignored)
+- `getrawchangeaddress [address_type]` (partial; address_type ignored; marks address as internal change)
 - `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
 - `dumpprivkey <address>`
 - `backupwallet <destination>`
@@ -301,7 +301,7 @@ Notes:
 ### getrawchangeaddress
 
 - Params: optional `address_type` (string; currently ignored).
-- Result: new transparent P2PKH address (persisted to `wallet.dat`).
+- Result: new transparent P2PKH address (persisted to `wallet.dat`, marked as internal change).
 
 ### importprivkey
 
@@ -354,6 +354,7 @@ Notes:
 Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
 - If the wallet spends inputs, the response includes `fee` / `fee_zat` (negative) and `amount` / `amount_zat` excludes the fee (matches `fluxd` behavior).
+- Change outputs (to addresses reserved via `getrawchangeaddress` / `fundrawtransaction`) are omitted from `details` on outgoing transactions (closer to C++ wallet RPC behavior).
 
 ### listtransactions
 

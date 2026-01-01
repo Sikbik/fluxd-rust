@@ -1969,7 +1969,9 @@ fn rpc_getrawchangeaddress(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-    let address = guard.generate_new_address(true).map_err(map_wallet_error)?;
+    let address = guard
+        .generate_new_change_address(true)
+        .map_err(map_wallet_error)?;
     Ok(Value::String(address))
 }
 
@@ -2368,19 +2370,20 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         Some(value) => parse_bool(value)?,
     };
 
-    let (wallet_scripts, owned_set) = {
+    let (wallet_scripts, owned_set, change_key_hashes) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
         let owned_scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
+        let change_key_hashes = guard.change_key_hashes();
         if include_watchonly {
             let scripts = guard
                 .all_script_pubkeys_including_watchonly()
                 .map_err(map_wallet_error)?;
             let owned_set = owned_scripts.into_iter().collect::<HashSet<_>>();
-            (scripts, Some(owned_set))
+            (scripts, Some(owned_set), change_key_hashes)
         } else {
-            (owned_scripts, None)
+            (owned_scripts, None, change_key_hashes)
         }
     };
     if wallet_scripts.is_empty() {
@@ -2396,6 +2399,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
     };
 
     let wallet_script_set: HashSet<Vec<u8>> = wallet_scripts.iter().cloned().collect();
+    let change_key_hash_set: HashSet<[u8; 20]> = change_key_hashes.into_iter().collect();
     let owned_spent_keys: HashSet<(u32, [u8; 20])> = match &owned_set {
         Some(set) => set
             .iter()
@@ -2486,6 +2490,13 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
             let mut details = Vec::new();
             for (vout, output) in entry.tx.vout.iter().enumerate() {
                 if wallet_script_set.contains(output.script_pubkey.as_slice()) {
+                    if debit_zat > 0 {
+                        if let Some(hash) = extract_p2pkh_hash(&output.script_pubkey) {
+                            if change_key_hash_set.contains(&hash) {
+                                continue;
+                            }
+                        }
+                    }
                     let address =
                         script_pubkey_to_address(&output.script_pubkey, chain_params.network)
                             .ok_or(RpcError::new(
@@ -2694,6 +2705,13 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
     let mut details = Vec::new();
     for (vout, output) in tx.vout.iter().enumerate() {
         if wallet_script_set.contains(output.script_pubkey.as_slice()) {
+            if debit_zat > 0 {
+                if let Some(hash) = extract_p2pkh_hash(&output.script_pubkey) {
+                    if change_key_hash_set.contains(&hash) {
+                        continue;
+                    }
+                }
+            }
             let address =
                 script_pubkey_to_address(&output.script_pubkey, chain_params.network).ok_or(
                     RpcError::new(RPC_INTERNAL_ERROR, "invalid wallet script_pubkey"),
@@ -5886,7 +5904,9 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         }
         let pay_tx_fee_per_kb = guard.pay_tx_fee_per_kb();
         let scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
-        let change_address = guard.generate_new_address(true).map_err(map_wallet_error)?;
+        let change_address = guard
+            .generate_new_change_address(true)
+            .map_err(map_wallet_error)?;
         let change_script = address_to_script_pubkey(&change_address, chain_params.network)
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid change address"))?;
         let locked_outpoints = guard.locked_outpoints();
@@ -14930,6 +14950,128 @@ mod tests {
             Some(-sent_value)
         );
         assert_eq!(obj.get("fee_zat").and_then(Value::as_i64), Some(-100));
+    }
+
+    #[test]
+    fn gettransaction_suppresses_change_output_details_for_mempool_send_tx() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let wallet_script_pubkey =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let change_address = rpc_getrawchangeaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("change address string")
+            .to_string();
+        let change_script_pubkey =
+            address_to_script_pubkey(&change_address, params.network).expect("change script");
+
+        let prevout = OutPoint {
+            hash: [0x77u8; 32],
+            index: 0,
+        };
+        let input_value = 10_000i64;
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: input_value,
+            script_pubkey: wallet_script_pubkey.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&prevout);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let sent_value = 9_000i64;
+        let change_value = 900i64;
+        let other_script = p2pkh_script([0x66u8; 20]);
+        let spend_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![
+                TxOut {
+                    value: sent_value,
+                    script_pubkey: other_script,
+                },
+                TxOut {
+                    value: change_value,
+                    script_pubkey: change_script_pubkey,
+                },
+            ],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let txid = spend_tx.txid().expect("txid");
+        let raw = spend_tx.consensus_encode().expect("encode tx");
+
+        let entry = MempoolEntry {
+            txid,
+            tx: spend_tx,
+            raw,
+            time: 123,
+            height: 0,
+            fee: 100,
+            fee_delta: 0,
+            priority_delta: 0.0,
+            spent_outpoints: vec![prevout],
+            parents: Vec::new(),
+        };
+        let mut inner = Mempool::new(0);
+        inner.insert(entry).expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let txid_hex = hash256_to_hex(&txid);
+        let value = rpc_gettransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(txid_hex.clone())],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("confirmations").and_then(Value::as_i64), Some(0));
+        assert_eq!(
+            obj.get("amount_zat").and_then(Value::as_i64),
+            Some(-sent_value)
+        );
+
+        let details = obj
+            .get("details")
+            .and_then(Value::as_array)
+            .expect("details");
+        assert!(details
+            .iter()
+            .filter_map(Value::as_object)
+            .any(|row| { row.get("category").and_then(Value::as_str) == Some("send") }));
+        assert!(!details
+            .iter()
+            .filter_map(Value::as_object)
+            .any(|row| { row.get("category").and_then(Value::as_str) == Some("receive") }));
+        assert!(!details.iter().filter_map(Value::as_object).any(|row| {
+            row.get("address").and_then(Value::as_str) == Some(change_address.as_str())
+        }));
     }
 
     #[test]

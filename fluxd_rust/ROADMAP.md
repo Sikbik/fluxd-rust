@@ -185,6 +185,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag
     - [x] `fee` output and amount excludes fee (C++ parity)
+    - [x] Omit change outputs from `details` on send txs (wallet.dat v7 change tracking)
   - [x] `listtransactions` (partial)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag

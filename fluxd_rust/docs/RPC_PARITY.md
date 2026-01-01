@@ -75,7 +75,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Extra queries
 
-- gettransaction - Partial (wallet-only view; amount/fee match `fluxd` semantics; detail parity + change detection WIP)
+- gettransaction - Partial (wallet-only view; amount/fee match `fluxd` semantics; change outputs are omitted from `details` on outgoing txs; remaining detail parity WIP)
 - zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; Sapling `ismine` checks wallet spending keys; `iswatchonly` checks imported Sapling viewing keys)
 - getbenchmarks - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
 - getbenchstatus - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
@@ -121,7 +121,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - dumpprivkey - Implemented (P2PKH only)
 - getbalance - Partial (minconf supported; `minconf=0` includes spendable mempool outputs; `include_watchonly` supported; accounts ignored)
 - getnewaddress - Implemented (P2PKH only; label ignored; keypool-backed)
-- getrawchangeaddress - Partial (P2PKH only; address_type param ignored)
+- getrawchangeaddress - Partial (P2PKH only; address_type param ignored; reserves change addresses tracked in wallet.dat)
 - getreceivedbyaddress - Partial (P2PKH only; uses address deltas for confirmed receives, plus mempool outputs when `minconf=0`)
 - getunconfirmedbalance - Partial (derived from spendable mempool outputs paying to the wallet)
 - getwalletinfo - Partial (balances derived from the address index; `txcount` and keypool fields are persisted)
