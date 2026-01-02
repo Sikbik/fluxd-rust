@@ -49,6 +49,7 @@ mod peer_book;
 mod rpc;
 mod stats;
 mod tx_relay;
+mod verify_chain;
 mod wallet;
 
 use std::cmp::Ordering;
@@ -246,6 +247,8 @@ struct Config {
     fetch_params: bool,
     reindex: bool,
     db_info: bool,
+    db_info_keys: bool,
+    db_integrity: bool,
     miner_address: Option<String>,
     scan_flatfiles: bool,
     scan_supply: bool,
@@ -1005,8 +1008,14 @@ async fn run() -> Result<(), String> {
     ));
 
     if config.db_info {
-        let info =
-            db_info::collect_db_info(chainstate.as_ref(), store.as_ref(), data_dir, backend, true)?;
+        let info = db_info::collect_db_info(
+            chainstate.as_ref(),
+            store.as_ref(),
+            data_dir,
+            backend,
+            true,
+            config.db_info_keys,
+        )?;
         let json = serde_json::to_string_pretty(&info).map_err(|err| err.to_string())?;
         println!("{json}");
         return Ok(());
@@ -1066,6 +1075,56 @@ async fn run() -> Result<(), String> {
         config.network,
         config.backend
     );
+
+    if config.db_integrity {
+        const CHECKLEVEL: u32 = 3;
+        const NUMBLOCKS: u32 = 288;
+
+        let verify = crate::verify_chain::verify_chain(chainstate.as_ref(), CHECKLEVEL, NUMBLOCKS);
+        let verify_json = match verify.as_ref() {
+            Ok(()) => serde_json::json!({
+                "ok": true,
+                "checklevel": CHECKLEVEL,
+                "numblocks": NUMBLOCKS,
+            }),
+            Err(err) => serde_json::json!({
+                "ok": false,
+                "checklevel": CHECKLEVEL,
+                "numblocks": NUMBLOCKS,
+                "error": err,
+            }),
+        };
+
+        let mut info = db_info::collect_db_info(
+            chainstate.as_ref(),
+            store.as_ref(),
+            data_dir,
+            backend,
+            false,
+            false,
+        )?;
+        if let Some(obj) = info.as_object_mut() {
+            obj.insert("verifychain".to_string(), verify_json);
+        } else {
+            info = serde_json::json!({
+                "verifychain": verify_json,
+                "db_info": info,
+            });
+        }
+        let output = serde_json::to_string_pretty(&info).map_err(|err| err.to_string())?;
+        println!("{output}");
+
+        let flatfiles_ok = info
+            .as_object()
+            .and_then(|obj| obj.get("integrity"))
+            .and_then(|value| value.get("ok"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if verify.is_err() || !flatfiles_ok {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     if config.scan_flatfiles {
         scan_flatfiles(chainstate.as_ref(), &blocks_path)?;
@@ -6345,6 +6404,8 @@ fn parse_args() -> Result<Config, String> {
     let mut fetch_params = false;
     let mut reindex = false;
     let mut db_info = false;
+    let mut db_info_keys = false;
+    let mut db_integrity = false;
     let mut scan_flatfiles = false;
     let mut scan_supply = false;
     let mut scan_fluxnodes = false;
@@ -6472,6 +6533,13 @@ fn parse_args() -> Result<Config, String> {
             }
             "--db-info" => {
                 db_info = true;
+            }
+            "--db-info-keys" => {
+                db_info = true;
+                db_info_keys = true;
+            }
+            "--db-integrity" => {
+                db_integrity = true;
             }
             "--scan-flatfiles" => {
                 scan_flatfiles = true;
@@ -7334,6 +7402,8 @@ fn parse_args() -> Result<Config, String> {
         fetch_params,
         reindex,
         db_info,
+        db_info_keys,
+        db_integrity,
         miner_address,
         scan_flatfiles,
         scan_supply,
@@ -7621,7 +7691,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--db-info] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--maxconnections N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--db-info] [--db-info-keys] [--db-integrity] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--maxconnections N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -7636,6 +7706,8 @@ fn usage() -> String {
         "  --fetch-params  Download shielded params into --params-dir",
         "  --reindex  Wipe db/blocks for --data-dir and restart from genesis",
         "  --db-info  Print DB/flatfile size breakdown and fjall telemetry, then exit",
+        "  --db-info-keys  Like --db-info, but also counts keys/bytes in each DB partition (slow)",
+        "  --db-integrity  Print DB/flatfile sanity + verify last 288 blocks, then exit nonzero on failure",
         "  --scan-flatfiles  Scan flatfiles for block index mismatches, then exit",
         "  --scan-supply  Scan blocks in the local DB and print coinbase totals, then exit",
         "  --scan-fluxnodes  Scan fluxnode records in the local DB and print summary stats, then exit",

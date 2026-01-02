@@ -20,6 +20,9 @@ and how they affect behavior.
     - `rpc.cookie` - RPC auth cookie when not using `--rpc-user`/`--rpc-pass`.
 - `--conf PATH`
   - Config file path (default: `<data-dir>/flux.conf`).
+- `--db-info`, `--db-info-keys`, `--db-integrity`
+  - Print JSON diagnostics and exit.
+  - `--db-info-keys` scans every key in the DB and can be slow on mainnet.
 
 ## Logging
 
@@ -28,7 +31,7 @@ and how they affect behavior.
 - `--log-timestamps` / `--no-log-timestamps` (text logs only; default: timestamps enabled)
 
 Logs are written to stderr by default. CLI commands that return machine-readable output (like
-`--db-info`) print to stdout.
+`--db-info`, `--db-info-keys`, and `--db-integrity`) print to stdout.
 
 When `--log-format json` is enabled, each line is a JSON object with keys like `ts_ms`, `level`,
 `target`, `file`, `line`, and `msg`.

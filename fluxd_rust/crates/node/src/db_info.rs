@@ -28,8 +28,12 @@ struct FlatfileMetaSummary {
 struct FlatfileFsSummary {
     data_files: u64,
     data_bytes: u64,
+    data_max_file_id: Option<u32>,
+    data_max_file_len: Option<u64>,
     undo_files: u64,
     undo_bytes: u64,
+    undo_max_file_id: Option<u32>,
+    undo_max_file_len: Option<u64>,
     other_files: u64,
     other_bytes: u64,
 }
@@ -40,6 +44,7 @@ pub(crate) fn collect_db_info<S: KeyValueStore>(
     data_dir: &Path,
     backend: Backend,
     compute_stats: bool,
+    compute_key_counts: bool,
 ) -> Result<Value, String> {
     let best_header = chainstate.best_header().map_err(|err| err.to_string())?;
     let best_block = chainstate.best_block().map_err(|err| err.to_string())?;
@@ -68,10 +73,19 @@ pub(crate) fn collect_db_info<S: KeyValueStore>(
         let path = partitions_dir.join(column.as_str());
         let size_bytes = dir_size_cached(&path, Duration::from_secs(30))?;
         partitions_total_bytes = partitions_total_bytes.saturating_add(size_bytes);
-        partitions.push(json!({
+        let mut entry = json!({
             "column": column.as_str(),
             "size_bytes": size_bytes,
-        }));
+        });
+        if compute_key_counts {
+            let stats = column_key_stats(store, column)?;
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("key_count".to_string(), json!(stats.key_count));
+                obj.insert("key_bytes".to_string(), json!(stats.key_bytes));
+                obj.insert("value_bytes".to_string(), json!(stats.value_bytes));
+            }
+        }
+        partitions.push(entry);
     }
     let journals_size_bytes = dir_size_cached(&db_dir.join("journals"), Duration::from_secs(30))?;
 
@@ -163,6 +177,9 @@ pub(crate) fn collect_db_info<S: KeyValueStore>(
         .saturating_add(undo_meta.total_bytes)
         .saturating_add(files.values().copied().sum::<u64>());
 
+    let (integrity_ok, integrity_issues, integrity_warnings) =
+        flatfile_integrity_summary(&block_meta, &undo_meta, &blocks_fs);
+
     Ok(json!({
         "backend": match backend {
             Backend::Fjall => "fjall",
@@ -212,7 +229,101 @@ pub(crate) fn collect_db_info<S: KeyValueStore>(
         "db_partitions": partitions,
         "files": files,
         "fjall": fjall,
+        "integrity": {
+            "ok": integrity_ok,
+            "issues": integrity_issues,
+            "warnings": integrity_warnings,
+        },
     }))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ColumnKeyStats {
+    key_count: u64,
+    key_bytes: u64,
+    value_bytes: u64,
+}
+
+fn column_key_stats<S: KeyValueStore>(store: &S, column: Column) -> Result<ColumnKeyStats, String> {
+    let mut stats = ColumnKeyStats::default();
+    let mut visitor = |key: &[u8], value: &[u8]| {
+        stats.key_count = stats.key_count.saturating_add(1);
+        stats.key_bytes = stats.key_bytes.saturating_add(key.len() as u64);
+        stats.value_bytes = stats.value_bytes.saturating_add(value.len() as u64);
+        Ok(())
+    };
+    store
+        .for_each_prefix(column, &[], &mut visitor)
+        .map_err(|err| err.to_string())?;
+    Ok(stats)
+}
+
+fn flatfile_integrity_summary(
+    blocks: &FlatfileMetaSummary,
+    undo: &FlatfileMetaSummary,
+    fs: &FlatfileFsSummary,
+) -> (bool, Vec<String>, Vec<String>) {
+    let mut issues = Vec::new();
+    let mut warnings = Vec::new();
+
+    if blocks.file_count != fs.data_files {
+        issues.push(format!(
+            "flatfiles meta mismatch: blocks files {} != fs data_files {}",
+            blocks.file_count, fs.data_files
+        ));
+    }
+    if blocks.total_bytes != fs.data_bytes {
+        issues.push(format!(
+            "flatfiles meta mismatch: blocks bytes {} != fs data_bytes {}",
+            blocks.total_bytes, fs.data_bytes
+        ));
+    }
+    if blocks.last_file_id != fs.data_max_file_id {
+        issues.push(format!(
+            "flatfiles meta mismatch: blocks last_file_id {:?} != fs data_last_file_id {:?}",
+            blocks.last_file_id, fs.data_max_file_id
+        ));
+    }
+    if blocks.last_file_len != fs.data_max_file_len {
+        issues.push(format!(
+            "flatfiles meta mismatch: blocks last_file_len {:?} != fs data_last_file_len {:?}",
+            blocks.last_file_len, fs.data_max_file_len
+        ));
+    }
+
+    if undo.file_count != fs.undo_files {
+        issues.push(format!(
+            "flatfiles meta mismatch: undo files {} != fs undo_files {}",
+            undo.file_count, fs.undo_files
+        ));
+    }
+    if undo.total_bytes != fs.undo_bytes {
+        issues.push(format!(
+            "flatfiles meta mismatch: undo bytes {} != fs undo_bytes {}",
+            undo.total_bytes, fs.undo_bytes
+        ));
+    }
+    if undo.last_file_id != fs.undo_max_file_id {
+        issues.push(format!(
+            "flatfiles meta mismatch: undo last_file_id {:?} != fs undo_last_file_id {:?}",
+            undo.last_file_id, fs.undo_max_file_id
+        ));
+    }
+    if undo.last_file_len != fs.undo_max_file_len {
+        issues.push(format!(
+            "flatfiles meta mismatch: undo last_file_len {:?} != fs undo_last_file_len {:?}",
+            undo.last_file_len, fs.undo_max_file_len
+        ));
+    }
+
+    if fs.other_files > 0 {
+        warnings.push(format!(
+            "flatfiles directory contains {} extra file(s) ({} bytes)",
+            fs.other_files, fs.other_bytes
+        ));
+    }
+
+    (issues.is_empty(), issues, warnings)
 }
 
 fn scan_flatfile_meta_blocks(store: &Store) -> Result<FlatfileMetaSummary, String> {
@@ -289,9 +400,29 @@ fn scan_blocks_dir_fs(blocks_dir: &Path) -> Result<FlatfileFsSummary, String> {
         if name.starts_with("data") && name.ends_with(".dat") {
             summary.data_files = summary.data_files.saturating_add(1);
             summary.data_bytes = summary.data_bytes.saturating_add(len);
+            if let Some(file_id) = parse_flatfile_id(name.as_ref(), "data") {
+                if summary
+                    .data_max_file_id
+                    .map(|current| file_id > current)
+                    .unwrap_or(true)
+                {
+                    summary.data_max_file_id = Some(file_id);
+                    summary.data_max_file_len = Some(len);
+                }
+            }
         } else if name.starts_with("undo") && name.ends_with(".dat") {
             summary.undo_files = summary.undo_files.saturating_add(1);
             summary.undo_bytes = summary.undo_bytes.saturating_add(len);
+            if let Some(file_id) = parse_flatfile_id(name.as_ref(), "undo") {
+                if summary
+                    .undo_max_file_id
+                    .map(|current| file_id > current)
+                    .unwrap_or(true)
+                {
+                    summary.undo_max_file_id = Some(file_id);
+                    summary.undo_max_file_len = Some(len);
+                }
+            }
         } else {
             summary.other_files = summary.other_files.saturating_add(1);
             summary.other_bytes = summary.other_bytes.saturating_add(len);
@@ -299,6 +430,15 @@ fn scan_blocks_dir_fs(blocks_dir: &Path) -> Result<FlatfileFsSummary, String> {
     }
 
     Ok(summary)
+}
+
+fn parse_flatfile_id(name: &str, prefix: &str) -> Option<u32> {
+    let suffix = ".dat";
+    if !name.starts_with(prefix) || !name.ends_with(suffix) {
+        return None;
+    }
+    let numeric = name.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
+    numeric.parse::<u32>().ok()
 }
 
 pub(crate) fn dir_size_cached(path: &Path, ttl: Duration) -> Result<u64, String> {

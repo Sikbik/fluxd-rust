@@ -113,11 +113,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `rescanblockchain` RPC (scans address delta index; populates wallet tx history)
   - [ ] Reindex from existing flatfiles (no network)
   - [ ] Selective index rebuild (txindex/address/spent only)
-- [ ] [P2] DB inspection tools (index stats, supply, integrity) (owner: TBD)
+- [x] [P2] DB inspection tools (index stats, supply, integrity) (owner: TBD)
   - [x] `getdbinfo` RPC (disk usage breakdown + fjall telemetry + flatfiles meta/fs cross-check)
   - [x] `--db-info` CLI (same JSON as `getdbinfo`, then exit)
-  - [ ] Optional: key count sampling per partition (slow)
-  - [ ] Optional: integrity summary mode (runs `verifychain` + flatfile/meta sanity)
+  - [x] `--db-info-keys` CLI (also counts keys/bytes per partition; slow)
+  - [x] `--db-integrity` CLI (runs `verifychain` + flatfile/meta sanity)
 
 ## Networking state and P2P parity
 
@@ -184,7 +184,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Persist `paytxfee` in `wallet.dat` (v2; `settxfee`)
   - [x] Keypool/change-address management parity
   - [x] Wallet tx history / persistence (txid set in `wallet.dat` v3; updated by `rescanblockchain` + wallet send RPCs)
-- [ ] [P1] Transparent wallet RPCs (owner: TBD)
+- [x] [P1] Transparent wallet RPCs (owner: TBD)
   - [x] `importaddress` (watch-only; rescan is a no-op due to address index)
   - [x] `importwallet` (best-effort WIF import from dump file)
   - [x] `getnewaddress`, `importprivkey`, `dumpprivkey`
@@ -225,7 +225,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `sendmany` (P2PKH only; supports `subtractfeefrom`)
   - [x] `sendfrom` (fromaccount ignored; minconf supported)
   - [x] `rescanblockchain` (scans address delta index; populates wallet tx history)
-- [ ] [P1] Shielded wallet RPCs (owner: TBD)
+- [x] [P1] Shielded wallet RPCs (owner: TBD)
   - [x] `zgetnewaddress` (Sapling only; wallet persistence)
   - [x] `zlistaddresses` (Sapling only; supports watch-only via `includeWatchonly`)
   - [x] `zvalidateaddress` `ismine=true` for Sapling addresses owned by wallet
