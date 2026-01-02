@@ -118,6 +118,14 @@ rpc_get() {
   curl -g -sS -u "$COOKIE" "http://127.0.0.1:${RPC_PORT}/daemon/${method}"
 }
 
+rpc_post() {
+  local method="$1"
+  local body="$2"
+  curl -g -sS -u "$COOKIE" -H 'content-type: application/json' \
+    -d "$body" \
+    "http://127.0.0.1:${RPC_PORT}/daemon/${method}"
+}
+
 url_encode() {
   python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$1"
 }
@@ -263,6 +271,51 @@ echo "Checking shielded operation RPCs return empty lists ..."
 rpc_get "zlistoperationids" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
 rpc_get "zgetoperationstatus" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
 rpc_get "zgetoperationresult" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
+
+echo "Checking zsendmany async op flow ..."
+taddr="$(rpc_get "getnewaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
+if [[ -z "$taddr" ]]; then
+  echo "getnewaddress returned empty result (zsendmany dest)" >&2
+  exit 1
+fi
+
+zsend_body="$(python3 -c 'import json,sys; from_addr=sys.argv[1]; taddr=sys.argv[2]; print(json.dumps([from_addr,[{"address":taddr,"amount":"0.01"}]]))' "$zaddr1" "$taddr")"
+opid="$(rpc_post "zsendmany" "$zsend_body" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error"); assert err is None, obj; res=obj.get("result"); assert isinstance(res,str) and res.startswith("opid-"), res; print(res)')"
+
+op_filter="$(python3 -c 'import json,sys; print(json.dumps([[sys.argv[1]]]))' "$opid")"
+
+status_ready=0
+for _ in $(seq 1 40); do
+  status="$(rpc_post "zgetoperationstatus" "$op_filter" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error"); assert err is None, obj; res=obj.get("result") or []; assert isinstance(res,list), res; assert len(res)==1, res; entry=res[0]; assert entry.get("operationid")==sys.argv[1]; assert entry.get("method")=="z_sendmany"; print(entry.get("status",""))' "$opid")"
+  if [[ -n "$status" ]]; then
+    status_ready=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$status_ready" != "1" ]]; then
+  echo "zsendmany operation did not become visible via zgetoperationstatus" >&2
+  exit 1
+fi
+
+finished=0
+for _ in $(seq 1 120); do
+  status="$(rpc_post "zgetoperationstatus" "$op_filter" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error"); assert err is None, obj; res=obj.get("result") or []; assert isinstance(res,list), res; assert len(res)==1, res; entry=res[0]; assert entry.get("operationid")==sys.argv[1]; print(entry.get("status",""))' "$opid")"
+  if [[ "$status" == "failed" || "$status" == "success" ]]; then
+    finished=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$finished" != "1" ]]; then
+  echo "zsendmany operation did not finish within timeout" >&2
+  exit 1
+fi
+
+rpc_post "zgetoperationresult" "$op_filter" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error"); assert err is None, obj; res=obj.get("result") or []; assert isinstance(res,list) and len(res)==1, res; entry=res[0]; assert entry.get("operationid")==sys.argv[1]; assert entry.get("status")=="failed", entry; e=entry.get("error") or {}; code=e.get("code"); msg=(e.get("message") or ""); assert code in (-4, -26), entry; assert ("insufficient funds" in msg) or ("sapling is not active" in msg), entry' "$opid"
+
+echo "Checking zlistoperationids is empty after zgetoperationresult ..."
+rpc_get "zlistoperationids" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or []; assert isinstance(res, list), res; assert len(res) == 0, res'
 
 echo "Checking zgetmigrationstatus schema ..."
 rpc_get "zgetmigrationstatus" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result") or {}; assert isinstance(res, dict), res; assert isinstance(res.get("enabled"), bool), res; keys=("unmigrated_amount","unfinalized_migrated_amount","finalized_migrated_amount"); assert all(isinstance(res.get(k), str) for k in keys), res; assert isinstance(res.get("finalized_migration_transactions"), int), res; assert isinstance(res.get("migration_txids"), list), res'

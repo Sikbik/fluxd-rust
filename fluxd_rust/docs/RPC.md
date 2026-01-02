@@ -159,8 +159,9 @@ Sapling shielded note tracking is implemented for read-only wallet queries via i
 advances it during these RPCs; imports reset the scan cursor so historical notes can be discovered (which may require
 a full rescan and can be slow on large chains).
 
-Async operation-tracking RPCs currently return empty lists (until shielded send/shield ops are implemented):
-`zlistoperationids`, `zgetoperationstatus`, and `zgetoperationresult`.
+Async operation-tracking RPCs expose long-running shielded operations. `z_sendmany` runs asynchronously and is
+reported via `zlistoperationids`, `zgetoperationstatus`, and `zgetoperationresult` (lists are empty when no
+operations are in-flight or finished).
 
 Migration/coinbase shielding RPCs are deprecated on the Flux fork:
 `zsetmigration` and `zshieldcoinbase` return a misc error, and `zgetmigrationstatus` reports migration as disabled.

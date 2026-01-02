@@ -160,7 +160,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zlistoperationids - Implemented (async op manager; optional filter)
 - zlistreceivedbyaddress - Partial (Sapling only; lists received Sapling notes for a zaddr; supports watch-only via includeWatchonly; memo is placeholder)
 - zlistunspent - Partial (Sapling only; lists unspent Sapling notes; excludes notes spent by mempool nullifiers; supports watch-only via includeWatchonly)
-- zsendmany - Partial (Sapling only; async op; tx construction + mempool submission; uses cached Sapling note rseed when available; has ignored end-to-end spend harness test)
+- zsendmany - Implemented (Sapling only; async op; tx construction + mempool submission; uses cached Sapling note rseed when available; has RPC smoke + ignored end-to-end spend harness)
 - zsetmigration - Implemented (deprecated on Flux fork; returns misc error)
 - zshieldcoinbase - Implemented (deprecated on Flux fork; returns misc error)
 

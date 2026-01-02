@@ -247,7 +247,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `zgetmigrationstatus` (returns disabled migration status; migration not supported)
   - [x] `zsetmigration` (deprecated on Flux fork; returns misc error)
   - [x] `zshieldcoinbase` (deprecated on Flux fork; returns misc error)
-- [ ] `zsendmany` (Sapling only; async op; tx construction + mempool submission; still needs more integration coverage)
+- [x] `zsendmany` (Sapling only; async op; tx construction + mempool submission)
   - [x] Persist Sapling note rseed in `wallet.dat` (speeds spends; avoids txindex decrypt)
   - [x] End-to-end spend harness (`cargo test -p fluxd zsendmany_spends_sapling_note_to_transparent_output -- --ignored`)
   - [x] Regtest/testnet RPC smoke harness (`scripts/shielded_wallet_smoke_test.sh`)

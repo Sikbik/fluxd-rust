@@ -14668,6 +14668,132 @@ mod tests {
     }
 
     #[test]
+    fn zsendmany_recipients_rejects_memo_for_transparent_address() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let taddr = script_pubkey_to_address(&p2pkh_script([0x11u8; 20]), params.network)
+            .expect("p2pkh address");
+        let recipients = json!([{
+            "address": taddr,
+            "amount": "0.01",
+            "memo": "00",
+        }]);
+        let err = match parse_zsendmany_recipients(&recipients, &params) {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("memo is only supported"));
+    }
+
+    #[test]
+    fn zsendmany_recipients_rejects_duplicate_addresses() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let taddr = script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network)
+            .expect("p2pkh address");
+        let recipients = json!([
+            {"address": taddr, "amount": "0.01"},
+            {"address": taddr, "amount": "0.02"},
+        ]);
+        let err = match parse_zsendmany_recipients(&recipients, &params) {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("duplicated address"));
+    }
+
+    #[test]
+    fn zsendmany_recipients_accepts_sapling_memo_hex() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let zaddr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params)
+            .expect("rpc")
+            .as_str()
+            .expect("zaddr")
+            .to_string();
+
+        let recipients = json!([{
+            "address": zaddr,
+            "amount": "0.01",
+            "memo": "00",
+        }]);
+        parse_zsendmany_recipients(&recipients, &params).expect("recipients");
+    }
+
+    #[test]
+    fn zsendmany_recipients_rejects_memo_larger_than_512_bytes() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let zaddr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params)
+            .expect("rpc")
+            .as_str()
+            .expect("zaddr")
+            .to_string();
+
+        let memo = "00".repeat(513);
+        let recipients = json!([{
+            "address": zaddr,
+            "amount": "0.01",
+            "memo": memo,
+        }]);
+        let err = match parse_zsendmany_recipients(&recipients, &params) {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("Memo size is larger"));
+    }
+
+    #[test]
+    fn zsendmany_execute_rejects_insufficient_funds_after_sapling_activation() {
+        let (chainstate, params, data_dir, _taddr, _coinbase_txid, _coinbase_vout) =
+            setup_testnet_chain_with_p2pkh_utxo();
+        let sapling_height =
+            params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height;
+        extend_regtest_chain_to_height(&chainstate, &params, sapling_height.max(1));
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let from_bytes = {
+            let mut guard = wallet.lock().expect("wallet lock");
+            guard
+                .generate_new_sapling_address_bytes()
+                .expect("sapling address bytes")
+        };
+
+        let recipients = vec![ZSendRecipient {
+            dest: ZSendDest::Transparent(TransparentAddress::PublicKeyHash([0x22u8; 20])),
+            amount: 1_000_000,
+        }];
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(1024));
+        let flags = ValidationFlags::default();
+        let (tx_announce, _rx) = tokio::sync::broadcast::channel(16);
+        let params_dir = fluxd_shielded::default_params_dir();
+
+        let err = zsendmany_execute(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &flags,
+            &params,
+            &params_dir,
+            &tx_announce,
+            &wallet,
+            from_bytes,
+            &recipients,
+            1,
+            10_000,
+        )
+        .expect_err("err");
+        assert_eq!(err.code, RPC_WALLET_ERROR);
+        assert!(err.message.contains("insufficient funds"));
+    }
+
+    #[test]
     #[ignore]
     fn zsendmany_spends_sapling_note_to_transparent_output() {
         let (chainstate, params, data_dir, _taddr, coinbase_txid, coinbase_vout) =
