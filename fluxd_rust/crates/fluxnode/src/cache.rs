@@ -187,7 +187,7 @@ fn load_fluxnode_record<S: KeyValueStore>(
 
 fn store_key(batch: &mut WriteBatch, bytes: &[u8]) -> KeyId {
     let key = dedupe_key(bytes);
-    batch.put(Column::FluxnodeKey, key.0.to_vec(), bytes.to_vec());
+    batch.put(Column::FluxnodeKey, key.0, bytes);
     key
 }
 

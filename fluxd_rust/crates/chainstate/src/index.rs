@@ -66,11 +66,11 @@ impl<S: KeyValueStore> ChainIndex<S> {
     }
 
     pub fn set_best_header(&self, batch: &mut WriteBatch, hash: &Hash256) {
-        batch.put(Column::Meta, META_BEST_HEADER_KEY, hash.to_vec());
+        batch.put(Column::Meta, META_BEST_HEADER_KEY, *hash);
     }
 
     pub fn set_best_block(&self, batch: &mut WriteBatch, hash: &Hash256) {
-        batch.put(Column::Meta, META_BEST_BLOCK_KEY, hash.to_vec());
+        batch.put(Column::Meta, META_BEST_BLOCK_KEY, *hash);
     }
 
     pub fn best_header(&self) -> Result<Option<ChainTip>, StoreError> {
@@ -127,7 +127,7 @@ impl<S: KeyValueStore> ChainIndex<S> {
 
     pub fn set_height_hash(&self, batch: &mut WriteBatch, height: i32, hash: &Hash256) {
         let key = height_key(height);
-        batch.put(Column::HeightIndex, key, hash.to_vec());
+        batch.put(Column::HeightIndex, key, *hash);
     }
 
     pub fn clear_height_hash(&self, batch: &mut WriteBatch, height: i32) {
