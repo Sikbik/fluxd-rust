@@ -49,7 +49,8 @@ Currently supported keys:
 - `dbcache` (MiB; maps to `--db-cache-mb`)
 - `maxconnections` (max peer connections; maps to `--maxconnections`)
 - `maxmempool` (MiB; maps to `--mempool-max-mb`)
-- `minrelaytxfee` (FLUX/kB; maps to `--minrelaytxfee`)
+- `minrelaytxfee` (fee rate; maps to `--minrelaytxfee`)
+- `limitfreerelay` (thousand-bytes-per-minute; maps to `--limitfreerelay`)
 - `listen` (`1|0`; enables/disables inbound P2P listener)
 - `bind` (IP or IP:PORT; binds inbound P2P listener; defaults to network P2P port)
 - `rpcuser`, `rpcpassword`
@@ -182,11 +183,15 @@ RPC defaults:
   - Persist mempool to `mempool.dat` every N seconds (default: `60`).
   - Set to `0` to disable mempool persistence (no load and no save).
 - `--minrelaytxfee <rate>` (alias: `--min-relay-tx-fee`)
-  - Minimum relay fee-rate for non-fluxnode transactions, expressed as zatoshis/kB.
+  - Minimum relay fee-rate used for standardness (dust), fee filtering, and free-tx rate limiting.
+  - Matches C++ behavior: most small transactions can still relay with 0 fee ("free area"), but are rate-limited via `--limitfreerelay`.
   - Accepts either:
     - an integer zatoshi-per-kB value (example: `100`), or
     - a decimal FLUX-per-kB value (example: `0.00000100`).
   - Default: `100` (0.00000100 FLUX/kB).
+- `--limitfreerelay N`
+  - Continuously rate-limit free (very-low-fee) transactions to `N*1000` bytes per minute (default: `500`).
+  - Set to `0` to reject free transactions entirely.
 - `--accept-non-standard`
   - Disable standardness checks (script template policy, dust, scriptSig push-only, etc.).
   - Default: standardness is required on mainnet/testnet and disabled on regtest.

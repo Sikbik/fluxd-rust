@@ -65,8 +65,14 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Capture throughput stats (8-core mainnet: default worker auto-split yields ~120–150 b/s typical; shielded proof verification is the primary limiter)
 - [ ] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)
   - [x] `getrawmempool(true)` populates `depends` (mempool parents)
-  - [ ] Remaining RPC stubs parity (`estimatepriority`, `getbench*`, `zcraw*`, `zcbenchmark`, `startbenchmark`/`stopbenchmark`)
-  - [ ] Improve partial RPCs (`sendrawtransaction`/`submitblock` return-code parity, fluxnode RPC field parity, wallet/multisig parity)
+  - [x] `estimatepriority` (returns -1.0)
+  - [x] `getbenchmarks`/`getbenchstatus` + `startbenchmark`/`stopbenchmark` (fluxbenchd proxy)
+  - [x] `zcbenchmark sleep` (other benchmark types TBD)
+  - [ ] `zcrawjoinsplit`/`zcrawreceive`
+  - [x] `sendrawtransaction` reject-code parity + `allowhighfees` handling
+  - [x] `submitblock` BIP22-ish return codes
+  - [ ] Fluxnode RPC field parity
+  - [ ] Wallet/multisig field parity
 
 ## Consensus and chainstate parity
 
@@ -273,7 +279,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Remaining `flux.conf` keys parity
     - [x] Enforce RPC allowlist via `rpcallowip` (localhost-only default)
     - [x] Support `testnet`/`regtest` toggles and warn on unsupported keys
-    - [x] Support `dbcache`, `maxmempool`, `minrelaytxfee`
+    - [x] Support `dbcache`, `maxmempool`, `minrelaytxfee`, `limitfreerelay`
 - [x] [P2] Structured CLI help output and subcommands (owner: TBD)
 - [x] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
   - [x] `--db-info`
@@ -353,7 +359,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `sendrawtransaction` (relays; confirmed inputs only)<br>`fundrawtransaction` (P2PKH only)<br>`signrawtransaction` (P2PKH only)<br>`estimatepriority` (returns -1.0) | - |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `sendrawtransaction` (relays; spends mempool parents; C++-style reject reasons for common failures)<br>`fundrawtransaction` (P2PKH only)<br>`signrawtransaction` (P2PKH only)<br>`estimatepriority` (returns -1.0) | - |
 
 ### Mempool and relay
 
@@ -377,7 +383,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | `getbenchmarks` (stub)<br>`getbenchstatus` (stub)<br>`startbenchmark` (stub; alias: `startfluxbenchd`/`startzelbenchd`)<br>`stopbenchmark` (stub; alias: `stopfluxbenchd`/`stopzelbenchd`)<br>`zcbenchmark` (stub; returns error) | - |
+| - | `getbenchmarks` (Fluxnode-only; proxies to `fluxbench-cli` when online)<br>`getbenchstatus` (Fluxnode-only; proxies to `fluxbench-cli` when online)<br>`startbenchmark` (alias: `startfluxbenchd`/`startzelbenchd`; starts `fluxbenchd`/`zelbenchd` if present next to `fluxd`)<br>`stopbenchmark` (alias: `stopfluxbenchd`/`stopzelbenchd`; calls `fluxbench-cli stop` when online)<br>`zcbenchmark` (supports `sleep`; other types not implemented yet) | - |
 
 ### Address and insight-style indexes
 
