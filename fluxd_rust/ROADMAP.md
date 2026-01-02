@@ -38,7 +38,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Active focus
 
-- [ ] [P1] Block indexing throughput parity (I/O batching, memtable tuning, UTXO cache policy) (owner: TBD)
+- [x] [P1] Block indexing throughput parity (I/O batching, memtable tuning, UTXO cache policy) (owner: TBD)
   - [x] Cache Sprout/Sapling trees in memory and only write tree bytes when the tree root changes
   - [x] Store Sapling anchors as root keys only (empty values) to reduce DB write amplification
   - [x] Run block connect on blocking threads to keep RPC/dashboard responsive under high throughput
