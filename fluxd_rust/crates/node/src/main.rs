@@ -163,6 +163,12 @@ const REINDEX_REQUEST_FILE_NAME: &str = "reindex.flag";
 const DATA_DIR_LOCK_FILE_NAME: &str = ".lock";
 pub(crate) const DB_SCHEMA_VERSION_KEY: &[u8] = b"db_schema_version";
 pub(crate) const DB_SCHEMA_VERSION: u32 = 1;
+pub(crate) const TXINDEX_VERSION_KEY: &[u8] = b"txindex_version";
+pub(crate) const TXINDEX_VERSION: u32 = 1;
+pub(crate) const SPENTINDEX_VERSION_KEY: &[u8] = b"spentindex_version";
+pub(crate) const SPENTINDEX_VERSION: u32 = 1;
+pub(crate) const ADDRESSINDEX_VERSION_KEY: &[u8] = b"addressindex_version";
+pub(crate) const ADDRESSINDEX_VERSION: u32 = 1;
 const PEERS_FILE_VERSION: u32 = 2;
 const PEERS_FILE_VERSION_V1: u32 = 1;
 const MEMPOOL_FILE_VERSION: u32 = 1;
@@ -1067,6 +1073,7 @@ async fn run() -> Result<(), String> {
     let store = open_store(config.backend, &db_path, &config)?;
     let store = Arc::new(store);
     let _db_schema_version = ensure_db_schema_version(store.as_ref())?;
+    ensure_secondary_index_versions(store.as_ref())?;
 
     let blocks = FlatFileStore::new(&blocks_path, DEFAULT_MAX_FLATFILE_SIZE)
         .map_err(|err| err.to_string())?;
@@ -2748,6 +2755,83 @@ fn ensure_db_schema_version(store: &Store) -> Result<u32, String> {
     Ok(version)
 }
 
+fn meta_u32(store: &Store, key: &[u8]) -> Result<Option<u32>, String> {
+    match store
+        .get(fluxd_storage::Column::Meta, key)
+        .map_err(|err| err.to_string())?
+    {
+        Some(bytes) => {
+            let bytes: [u8; 4] = bytes.as_slice().try_into().map_err(|_| {
+                format!(
+                    "invalid u32 meta key length {} for {}",
+                    bytes.len(),
+                    String::from_utf8_lossy(key)
+                )
+            })?;
+            Ok(Some(u32::from_le_bytes(bytes)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn set_meta_u32(store: &Store, key: &[u8], value: u32) -> Result<(), String> {
+    let bytes = value.to_le_bytes();
+    store
+        .put(fluxd_storage::Column::Meta, key, &bytes)
+        .map_err(|err| err.to_string())
+}
+
+fn ensure_index_schema_version(
+    store: &Store,
+    name: &str,
+    key: &[u8],
+    expected: u32,
+    rebuild_hint: &str,
+) -> Result<u32, String> {
+    match meta_u32(store, key)? {
+        Some(found) => {
+            if found != expected {
+                return Err(format!(
+                    "{name} schema version mismatch (found {found}, expected {expected}); rebuild with {rebuild_hint}",
+                ));
+            }
+            Ok(found)
+        }
+        None => {
+            log_warn!(
+                "{name} schema version not found; assuming current version {expected} (consider {rebuild_hint} if upgrading from an older build)"
+            );
+            set_meta_u32(store, key, expected)?;
+            Ok(expected)
+        }
+    }
+}
+
+fn ensure_secondary_index_versions(store: &Store) -> Result<(), String> {
+    let _ = ensure_index_schema_version(
+        store,
+        "txindex",
+        TXINDEX_VERSION_KEY,
+        TXINDEX_VERSION,
+        "--reindex-txindex",
+    )?;
+    let _ = ensure_index_schema_version(
+        store,
+        "spentindex",
+        SPENTINDEX_VERSION_KEY,
+        SPENTINDEX_VERSION,
+        "--reindex-spentindex",
+    )?;
+    let _ = ensure_index_schema_version(
+        store,
+        "addressindex",
+        ADDRESSINDEX_VERSION_KEY,
+        ADDRESSINDEX_VERSION,
+        "--reindex-addressindex",
+    )?;
+    Ok(())
+}
+
 fn load_peers_file(path: &Path) -> Result<Vec<(SocketAddr, AddrBookEntry)>, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -3766,6 +3850,19 @@ fn rebuild_txindex<S: KeyValueStore>(
         }
     }
 
+    let mut version_batch = WriteBatch::new();
+    version_batch.put(
+        fluxd_storage::Column::Meta,
+        TXINDEX_VERSION_KEY,
+        TXINDEX_VERSION.to_le_bytes(),
+    );
+    let _guard = write_lock
+        .lock()
+        .map_err(|_| "write lock poisoned".to_string())?;
+    chainstate
+        .commit_batch(version_batch)
+        .map_err(|err| err.to_string())?;
+
     log_info!("Tx index rebuild complete at height {}", best.height);
     Ok(())
 }
@@ -3897,6 +3994,19 @@ fn rebuild_spentindex<S: KeyValueStore>(
             last_progress = Instant::now();
         }
     }
+
+    let mut version_batch = WriteBatch::new();
+    version_batch.put(
+        fluxd_storage::Column::Meta,
+        SPENTINDEX_VERSION_KEY,
+        SPENTINDEX_VERSION.to_le_bytes(),
+    );
+    let _guard = write_lock
+        .lock()
+        .map_err(|_| "write lock poisoned".to_string())?;
+    chainstate
+        .commit_batch(version_batch)
+        .map_err(|err| err.to_string())?;
 
     log_info!("Spent index rebuild complete at height {}", best.height);
     Ok(())
@@ -4177,6 +4287,19 @@ fn rebuild_addressindex<S: KeyValueStore>(
             last_progress = Instant::now();
         }
     }
+
+    let mut version_batch = WriteBatch::new();
+    version_batch.put(
+        fluxd_storage::Column::Meta,
+        ADDRESSINDEX_VERSION_KEY,
+        ADDRESSINDEX_VERSION.to_le_bytes(),
+    );
+    let _guard = write_lock
+        .lock()
+        .map_err(|_| "write lock poisoned".to_string())?;
+    chainstate
+        .commit_batch(version_batch)
+        .map_err(|err| err.to_string())?;
 
     log_info!("Address index rebuild complete at height {}", best.height);
     Ok(())

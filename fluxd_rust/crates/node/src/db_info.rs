@@ -48,11 +48,17 @@ pub(crate) fn collect_db_info<S: KeyValueStore>(
 ) -> Result<Value, String> {
     let best_header = chainstate.best_header().map_err(|err| err.to_string())?;
     let best_block = chainstate.best_block().map_err(|err| err.to_string())?;
-    let db_schema_version = match store.get(Column::Meta, crate::DB_SCHEMA_VERSION_KEY) {
-        Ok(Some(bytes)) => bytes.as_slice().try_into().ok().map(u32::from_le_bytes),
-        Ok(None) => None,
-        Err(err) => return Err(err.to_string()),
+    let meta_u32 = |key: &[u8]| -> Result<Option<u32>, String> {
+        match store.get(Column::Meta, key) {
+            Ok(Some(bytes)) => Ok(bytes.as_slice().try_into().ok().map(u32::from_le_bytes)),
+            Ok(None) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
     };
+    let db_schema_version = meta_u32(crate::DB_SCHEMA_VERSION_KEY)?;
+    let txindex_version = meta_u32(crate::TXINDEX_VERSION_KEY)?;
+    let spentindex_version = meta_u32(crate::SPENTINDEX_VERSION_KEY)?;
+    let addressindex_version = meta_u32(crate::ADDRESSINDEX_VERSION_KEY)?;
 
     let db_dir = data_dir.join("db");
     let blocks_dir = data_dir.join("blocks");
@@ -193,6 +199,12 @@ pub(crate) fn collect_db_info<S: KeyValueStore>(
         "schema": {
             "db_schema_version": db_schema_version,
             "expected_db_schema_version": crate::DB_SCHEMA_VERSION,
+            "txindex_version": txindex_version,
+            "expected_txindex_version": crate::TXINDEX_VERSION,
+            "spentindex_version": spentindex_version,
+            "expected_spentindex_version": crate::SPENTINDEX_VERSION,
+            "addressindex_version": addressindex_version,
+            "expected_addressindex_version": crate::ADDRESSINDEX_VERSION,
         },
         "paths": {
             "data_dir": data_dir.display().to_string(),
