@@ -123,6 +123,10 @@ const RPC_METHODS: &[&str] = &[
     "listlockunspent",
     "listaddressgroupings",
     "getwalletinfo",
+    "encryptwallet",
+    "walletpassphrase",
+    "walletpassphrasechange",
+    "walletlock",
     "signmessage",
     "backupwallet",
     "dumpwallet",
@@ -1268,6 +1272,10 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "importaddress" => rpc_importaddress(wallet, params, chain_params),
         "importwallet" => rpc_importwallet(wallet, params),
         "getwalletinfo" => rpc_getwalletinfo(chainstate, mempool, wallet, params),
+        "encryptwallet" => rpc_encryptwallet(wallet, params),
+        "walletpassphrase" => rpc_walletpassphrase(&ctx.wallet, params),
+        "walletpassphrasechange" => rpc_walletpassphrasechange(wallet, params),
+        "walletlock" => rpc_walletlock(wallet, params),
         "getnewaddress" => rpc_getnewaddress(wallet, params),
         "getrawchangeaddress" => rpc_getrawchangeaddress(wallet, params),
         "importprivkey" => rpc_importprivkey(wallet, params),
@@ -1902,6 +1910,121 @@ fn rpc_importwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value,
     Ok(Value::Null)
 }
 
+fn rpc_encryptwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "encryptwallet expects 1 parameter",
+        ));
+    }
+    let passphrase = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "passphrase must be a string"))?;
+    if passphrase.is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "passphrase is empty"));
+    }
+
+    wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .encryptwallet(passphrase)
+        .map_err(map_wallet_error)?;
+
+    Ok(Value::Null)
+}
+
+fn rpc_walletpassphrase(
+    wallet: &Arc<Mutex<Wallet>>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
+    if params.len() != 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "walletpassphrase expects 2 parameters",
+        ));
+    }
+    let passphrase = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "passphrase must be a string"))?;
+    let timeout = params[1]
+        .as_i64()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "timeout must be an integer"))?;
+    if timeout <= 0 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "timeout must be positive",
+        ));
+    }
+    let timeout_u64 = u64::try_from(timeout)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "timeout out of range"))?;
+
+    let generation = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let (_unlocked_until, generation) = guard
+            .walletpassphrase(passphrase, timeout_u64)
+            .map_err(map_wallet_error)?;
+        generation
+    };
+
+    let wallet_ref = Arc::clone(wallet);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(timeout_u64)).await;
+        let mut guard = match wallet_ref.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if guard.unlock_generation() != generation {
+            return;
+        }
+        let _ = guard.walletlock();
+    });
+
+    Ok(Value::Null)
+}
+
+fn rpc_walletpassphrasechange(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
+    if params.len() != 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "walletpassphrasechange expects 2 parameters",
+        ));
+    }
+    let old_passphrase = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "old passphrase must be a string"))?;
+    let new_passphrase = params[1]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "new passphrase must be a string"))?;
+    if new_passphrase.is_empty() {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "new passphrase is empty",
+        ));
+    }
+    wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .walletpassphrasechange(old_passphrase, new_passphrase)
+        .map_err(map_wallet_error)?;
+
+    Ok(Value::Null)
+}
+
+fn rpc_walletlock(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .walletlock()
+        .map_err(map_wallet_error)?;
+    Ok(Value::Null)
+}
+
 fn parse_outpoint_list(value: &Value) -> Result<Vec<OutPoint>, RpcError> {
     let outputs = value.as_array().ok_or_else(|| {
         RpcError::new(
@@ -2272,7 +2395,7 @@ fn rpc_backupwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value,
     if destination.trim().is_empty() {
         return Err(RpcError::new(RPC_INVALID_PARAMETER, "destination is empty"));
     }
-    let guard = wallet
+    let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
     let path = Path::new(destination);
@@ -4092,16 +4215,22 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
     }
 
-    let (key_count, pay_tx_fee_per_kb, tx_count, keypool_oldest, keypool_size) = {
-        let guard = wallet
+    let (key_count, pay_tx_fee_per_kb, tx_count, keypool_oldest, keypool_size, unlocked_until) = {
+        let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let unlocked_until = if guard.is_encrypted() {
+            guard.unlocked_until()
+        } else {
+            0
+        };
         (
             guard.key_count(),
             guard.pay_tx_fee_per_kb(),
             guard.tx_count(),
             guard.keypool_oldest(),
             guard.keypool_size(),
+            unlocked_until,
         )
     };
 
@@ -4117,6 +4246,7 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
         "txcount": tx_count,
         "keypoololdest": keypool_oldest,
         "keypoolsize": keypool_size,
+        "unlocked_until": unlocked_until,
         "paytxfee": amount_to_value(pay_tx_fee_per_kb),
         "paytxfee_zat": pay_tx_fee_per_kb,
         "private_keys_enabled": true,

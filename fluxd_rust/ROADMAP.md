@@ -254,7 +254,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P2] Rescan, backup, and export/import tooling (owner: TBD)
   - [x] `dumpwallet` (taddr keys; no overwrite)
   - [x] `z_exportwallet` (taddr + Sapling keys; no overwrite)
-- [ ] [P2] Wallet encryption and key management parity (owner: TBD)
+- [x] [P2] Wallet encryption and key management parity (owner: TBD)
+  - [x] `encryptwallet`, `walletpassphrase`, `walletlock`, `walletpassphrasechange`
+  - [x] Encrypted wallet secrets in `wallet.dat`; locked-by-default semantics + auto-lock timer
+  - [x] RPC smoke coverage (`scripts/remote_smoke_test.sh`)
 
 ## UX, ops, and tooling
 

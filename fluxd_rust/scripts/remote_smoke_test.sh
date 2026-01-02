@@ -185,6 +185,14 @@ rpc_get() {
   curl -sS --fail -u "$COOKIE" "http://127.0.0.1:${RPC_PORT}/daemon/${method}"
 }
 
+rpc_post() {
+  local method="$1"
+  local body="$2"
+  curl -sS --fail -u "$COOKIE" -H 'content-type: application/json' \
+    -d "$body" \
+    "http://127.0.0.1:${RPC_PORT}/daemon/${method}"
+}
+
 json_len() {
   python3 -c 'import json,sys; obj=json.load(sys.stdin); value=obj.get("result", []) or []; print(len(value) if isinstance(value, list) else 0)'
 }
@@ -224,6 +232,14 @@ if [[ -z "$taddr" ]]; then
 fi
 rpc_get "validateaddress?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("isvalid","address","scriptPubKey","ismine","iswatchonly","isscript"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"; assert res.get("isvalid") is True; assert res.get("ismine") is True; assert res.get("iswatchonly") is False'
 rpc_get "validateaddress?address=notanaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is False, res'
+
+echo "Checking wallet encryption/locking ..."
+rpc_post "encryptwallet" '["test-passphrase"]' | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
+rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
+rpc_post "walletpassphrase" '["test-passphrase", 15]' | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
+rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result"); assert isinstance(res,str) and len(res)>0, res'
+rpc_get "walletlock" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
+rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
 
 echo "Checking gettxoutsetinfo ..."
 rpc_get "gettxoutsetinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("transactions","txouts","bytes_serialized","hash_serialized","total_amount"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"'

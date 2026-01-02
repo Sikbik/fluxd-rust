@@ -1,11 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use argon2::{
+    Algorithm as Argon2Algorithm, Argon2, Params as Argon2Params, Version as Argon2Version,
+};
 use bech32::{Bech32, Hrp};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 use fluxd_chainstate::state::ChainState;
 use rand::RngCore;
 use sapling_crypto::keys::{NullifierDerivingKey, PreparedIncomingViewingKey};
@@ -34,13 +39,33 @@ use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::{script_pubkey_to_address, secret_key_to_wif, wif_to_secret_key};
 use fluxd_script::message::signed_message_hash;
 use fluxd_storage::KeyValueStore;
+use zeroize::Zeroize;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 10;
+pub const WALLET_FILE_VERSION: u32 = 11;
 
 const WALLET_DUMP_EPOCH: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
+const WALLET_SECRETS_VERSION: u32 = 1;
+const WALLET_ENCRYPTION_VERSION: u8 = 1;
+const WALLET_ENCRYPTION_SALT_BYTES: usize = 16;
+const WALLET_ENCRYPTION_NONCE_BYTES: usize = 12;
+
+#[derive(Clone)]
+struct WalletKdfParams {
+    mem_kib: u32,
+    iters: u32,
+    parallelism: u32,
+    salt: [u8; WALLET_ENCRYPTION_SALT_BYTES],
+}
+
+#[derive(Clone)]
+struct WalletEncryptedSecrets {
+    kdf: WalletKdfParams,
+    nonce: [u8; WALLET_ENCRYPTION_NONCE_BYTES],
+    ciphertext: Vec<u8>,
+}
 
 #[derive(Clone)]
 struct KeyPoolEntry {
@@ -50,7 +75,8 @@ struct KeyPoolEntry {
 
 #[derive(Clone)]
 struct SaplingKeyEntry {
-    extsk: [u8; 169],
+    extfvk: [u8; 169],
+    extsk: Option<[u8; 169]>,
     next_diversifier_index: [u8; 11],
 }
 
@@ -104,6 +130,10 @@ pub enum WalletError {
     ChainState(String),
     NetworkMismatch { expected: Network, found: Network },
     InvalidSecretKey,
+    WalletLocked,
+    WalletNotEncrypted,
+    WalletAlreadyEncrypted,
+    IncorrectPassphrase,
 }
 
 impl std::fmt::Display for WalletError {
@@ -118,6 +148,10 @@ impl std::fmt::Display for WalletError {
                 "wallet network mismatch (expected {expected:?}, found {found:?})"
             ),
             WalletError::InvalidSecretKey => write!(f, "invalid secret key"),
+            WalletError::WalletLocked => write!(f, "wallet is locked"),
+            WalletError::WalletNotEncrypted => write!(f, "wallet is not encrypted"),
+            WalletError::WalletAlreadyEncrypted => write!(f, "wallet is already encrypted"),
+            WalletError::IncorrectPassphrase => write!(f, "incorrect wallet passphrase"),
         }
     }
 }
@@ -138,13 +172,31 @@ impl From<DecodeError> for WalletError {
 
 #[derive(Clone)]
 struct WalletKey {
-    secret: [u8; 32],
+    key_hash: [u8; 20],
+    secret: Option<[u8; 32]>,
     compressed: bool,
 }
 
 impl WalletKey {
+    fn from_secret(secret: [u8; 32], compressed: bool) -> Result<Self, WalletError> {
+        let secret_key =
+            SecretKey::from_slice(&secret).map_err(|_| WalletError::InvalidSecretKey)?;
+        let pubkey = PublicKey::from_secret_key(secp(), &secret_key);
+        let pubkey_bytes = if compressed {
+            pubkey.serialize().to_vec()
+        } else {
+            pubkey.serialize_uncompressed().to_vec()
+        };
+        Ok(Self {
+            key_hash: hash160(&pubkey_bytes),
+            secret: Some(secret),
+            compressed,
+        })
+    }
+
     fn secret_key(&self) -> Result<SecretKey, WalletError> {
-        SecretKey::from_slice(&self.secret).map_err(|_| WalletError::InvalidSecretKey)
+        let secret = self.secret.ok_or(WalletError::WalletLocked)?;
+        SecretKey::from_slice(&secret).map_err(|_| WalletError::InvalidSecretKey)
     }
 
     fn pubkey(&self) -> Result<PublicKey, WalletError> {
@@ -162,13 +214,11 @@ impl WalletKey {
     }
 
     fn p2pkh_key_hash(&self) -> Result<[u8; 20], WalletError> {
-        let pubkey_bytes = self.pubkey_bytes()?;
-        Ok(hash160(&pubkey_bytes))
+        Ok(self.key_hash)
     }
 
     fn p2pkh_script_pubkey(&self) -> Result<Vec<u8>, WalletError> {
-        let key_hash = self.p2pkh_key_hash()?;
-        Ok(p2pkh_script(&key_hash))
+        Ok(p2pkh_script(&self.key_hash))
     }
 
     fn address(&self, network: Network) -> Result<String, WalletError> {
@@ -177,8 +227,9 @@ impl WalletKey {
             .ok_or(WalletError::InvalidData("failed to encode address"))
     }
 
-    fn wif(&self, network: Network) -> String {
-        secret_key_to_wif(&self.secret, network, self.compressed)
+    fn wif(&self, network: Network) -> Result<String, WalletError> {
+        let secret = self.secret.ok_or(WalletError::WalletLocked)?;
+        Ok(secret_key_to_wif(&secret, network, self.compressed))
     }
 }
 
@@ -201,6 +252,10 @@ pub struct Wallet {
     revision: u64,
     locked_outpoints: HashSet<OutPoint>,
     pay_tx_fee_per_kb: i64,
+    encrypted_secrets: Option<WalletEncryptedSecrets>,
+    unlocked_key: Option<[u8; 32]>,
+    unlocked_until: u64,
+    unlock_generation: u64,
 }
 
 impl Wallet {
@@ -230,6 +285,10 @@ impl Wallet {
                 revision: 0,
                 locked_outpoints: HashSet::new(),
                 pay_tx_fee_per_kb: 0,
+                encrypted_secrets: None,
+                unlocked_key: None,
+                unlocked_until: 0,
+                unlock_generation: 0,
             }),
             Err(err) => Err(WalletError::Io(err)),
         }
@@ -237,6 +296,186 @@ impl Wallet {
 
     pub fn pay_tx_fee_per_kb(&self) -> i64 {
         self.pay_tx_fee_per_kb
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted_secrets.is_some()
+    }
+
+    pub fn unlocked_until(&mut self) -> u64 {
+        self.lock_if_expired();
+        self.unlocked_until
+    }
+
+    pub(crate) fn unlock_generation(&self) -> u64 {
+        self.unlock_generation
+    }
+
+    fn can_generate_keys(&mut self) -> bool {
+        self.lock_if_expired();
+        !self.is_encrypted() || self.unlocked_key.is_some()
+    }
+
+    fn require_unlocked(&mut self) -> Result<(), WalletError> {
+        self.lock_if_expired();
+        if !self.is_encrypted() {
+            return Ok(());
+        }
+        if self.unlocked_key.is_none() || self.unlocked_until == 0 {
+            return Err(WalletError::WalletLocked);
+        }
+        Ok(())
+    }
+
+    fn lock_if_expired(&mut self) {
+        if !self.is_encrypted() || self.unlocked_until == 0 {
+            return;
+        }
+        if current_unix_seconds() >= self.unlocked_until {
+            self.lock_inner();
+        }
+    }
+
+    fn lock_inner(&mut self) {
+        self.unlocked_until = 0;
+        self.unlock_generation = self.unlock_generation.saturating_add(1);
+        if let Some(key) = self.unlocked_key.as_mut() {
+            key.zeroize();
+        }
+        self.unlocked_key = None;
+        for key in &mut self.keys {
+            if let Some(secret) = key.secret.as_mut() {
+                secret.zeroize();
+            }
+            key.secret = None;
+        }
+        for entry in &mut self.keypool {
+            if let Some(secret) = entry.key.secret.as_mut() {
+                secret.zeroize();
+            }
+            entry.key.secret = None;
+        }
+        for entry in &mut self.sapling_keys {
+            if let Some(extsk) = entry.extsk.as_mut() {
+                extsk.zeroize();
+            }
+            entry.extsk = None;
+        }
+    }
+
+    pub fn walletlock(&mut self) -> Result<(), WalletError> {
+        if !self.is_encrypted() {
+            return Err(WalletError::WalletNotEncrypted);
+        }
+        self.lock_inner();
+        Ok(())
+    }
+
+    pub fn encryptwallet(&mut self, passphrase: &str) -> Result<(), WalletError> {
+        if self.is_encrypted() {
+            return Err(WalletError::WalletAlreadyEncrypted);
+        }
+        let mut secrets = self.encode_secrets_blob()?;
+
+        let (kdf, key) = new_wallet_kdf(passphrase)?;
+        let mut nonce = [0u8; WALLET_ENCRYPTION_NONCE_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ciphertext = encrypt_wallet_secrets(self.network, &key, &nonce, &secrets)?;
+
+        self.encrypted_secrets = Some(WalletEncryptedSecrets {
+            kdf,
+            nonce,
+            ciphertext,
+        });
+        self.lock_inner();
+        if let Err(err) = self.save() {
+            self.encrypted_secrets = None;
+            self.apply_secrets_blob(&secrets)?;
+            secrets.zeroize();
+            let mut key = key;
+            key.zeroize();
+            return Err(err);
+        }
+        secrets.zeroize();
+        let mut key = key;
+        key.zeroize();
+        Ok(())
+    }
+
+    pub fn walletpassphrase(
+        &mut self,
+        passphrase: &str,
+        timeout: u64,
+    ) -> Result<(u64, u64), WalletError> {
+        if !self.is_encrypted() {
+            return Err(WalletError::WalletNotEncrypted);
+        }
+        self.lock_if_expired();
+        let encrypted = self
+            .encrypted_secrets
+            .as_ref()
+            .ok_or(WalletError::WalletNotEncrypted)?;
+        let key = derive_wallet_key(passphrase, &encrypted.kdf)?;
+        let mut plaintext =
+            decrypt_wallet_secrets(self.network, &key, &encrypted.nonce, &encrypted.ciphertext)?;
+        self.apply_secrets_blob(&plaintext)?;
+        plaintext.zeroize();
+
+        let unlocked_until = current_unix_seconds().saturating_add(timeout);
+        self.unlocked_until = unlocked_until;
+        self.unlock_generation = self.unlock_generation.saturating_add(1);
+        if let Some(existing) = self.unlocked_key.as_mut() {
+            existing.zeroize();
+        }
+        self.unlocked_key = Some(key);
+        let mut key = key;
+        key.zeroize();
+        Ok((unlocked_until, self.unlock_generation))
+    }
+
+    pub fn walletpassphrasechange(
+        &mut self,
+        old_passphrase: &str,
+        new_passphrase: &str,
+    ) -> Result<(), WalletError> {
+        if !self.is_encrypted() {
+            return Err(WalletError::WalletNotEncrypted);
+        }
+        let prev = self
+            .encrypted_secrets
+            .clone()
+            .ok_or(WalletError::WalletNotEncrypted)?;
+        let old_key = derive_wallet_key(old_passphrase, &prev.kdf)?;
+        let mut plaintext =
+            decrypt_wallet_secrets(self.network, &old_key, &prev.nonce, &prev.ciphertext)?;
+
+        let (kdf, new_key) = new_wallet_kdf(new_passphrase)?;
+        let mut nonce = [0u8; WALLET_ENCRYPTION_NONCE_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ciphertext = encrypt_wallet_secrets(self.network, &new_key, &nonce, &plaintext)?;
+        plaintext.zeroize();
+
+        self.encrypted_secrets = Some(WalletEncryptedSecrets {
+            kdf,
+            nonce,
+            ciphertext,
+        });
+        if self.unlocked_key.is_some() {
+            if let Some(key) = self.unlocked_key.as_mut() {
+                key.zeroize();
+            }
+            self.unlocked_key = Some(new_key);
+        }
+
+        if let Err(err) = self.save() {
+            self.encrypted_secrets = Some(prev);
+            return Err(err);
+        }
+        let mut old_key = old_key;
+        old_key.zeroize();
+        let mut new_key = new_key;
+        new_key.zeroize();
+        Ok(())
     }
 
     pub fn set_pay_tx_fee_per_kb(&mut self, fee: i64) -> Result<(), WalletError> {
@@ -343,15 +582,25 @@ impl Wallet {
     }
 
     pub fn import_wif(&mut self, wif: &str) -> Result<(), WalletError> {
+        self.require_unlocked()?;
         let (secret, compressed) = wif_to_secret_key(wif, self.network)
             .map_err(|_| WalletError::InvalidData("invalid wif"))?;
-        if self.keys.iter().any(|key| key.secret == secret) {
+        let key = WalletKey::from_secret(secret, compressed)?;
+        if self
+            .keys
+            .iter()
+            .any(|existing| existing.key_hash == key.key_hash)
+            || self
+                .keypool
+                .iter()
+                .any(|entry| entry.key.key_hash == key.key_hash)
+        {
             return Ok(());
         }
-        let key = WalletKey { secret, compressed };
+        let prev_len = self.keys.len();
         self.keys.push(key);
         if let Err(err) = self.save() {
-            self.keys.retain(|k| k.secret != secret);
+            self.keys.truncate(prev_len);
             return Err(err);
         }
         self.revision = self.revision.saturating_add(1);
@@ -388,7 +637,7 @@ impl Wallet {
     pub fn dump_wif_for_address(&self, address: &str) -> Result<Option<String>, WalletError> {
         for key in &self.keys {
             if key.address(self.network)? == address {
-                return Ok(Some(key.wif(self.network)));
+                return Ok(Some(key.wif(self.network)?));
             }
         }
         Ok(None)
@@ -417,7 +666,7 @@ impl Wallet {
 
         for key in &self.keys {
             let address = key.address(self.network)?;
-            let wif = key.wif(self.network);
+            let wif = key.wif(self.network)?;
             let key_hash = key.p2pkh_key_hash()?;
             let flag = if self.change_key_hashes.contains(&key_hash) {
                 TransparentDumpFlag::Change
@@ -429,7 +678,7 @@ impl Wallet {
 
         for entry in &self.keypool {
             let address = entry.key.address(self.network)?;
-            let wif = entry.key.wif(self.network);
+            let wif = entry.key.wif(self.network)?;
             transparent.push(TransparentDumpEntry {
                 address,
                 wif,
@@ -474,7 +723,8 @@ impl Wallet {
 
             let mut sapling_lines = BTreeSet::new();
             for entry in &self.sapling_keys {
-                let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk).map_err(|_| {
+                let extsk_bytes = entry.extsk.ok_or(WalletError::WalletLocked)?;
+                let extsk = ExtendedSpendingKey::from_bytes(&extsk_bytes).map_err(|_| {
                     WalletError::InvalidData("invalid sapling spending key encoding")
                 })?;
                 let dfvk = extsk.to_diversifiable_full_viewing_key();
@@ -485,7 +735,7 @@ impl Wallet {
                 let zaddr = bech32::encode::<Bech32>(addr_hrp, addr_bytes.as_slice())
                     .map_err(|_| WalletError::InvalidData("failed to encode sapling address"))?;
                 let zkey =
-                    bech32::encode::<Bech32>(sk_hrp, entry.extsk.as_slice()).map_err(|_| {
+                    bech32::encode::<Bech32>(sk_hrp, extsk_bytes.as_slice()).map_err(|_| {
                         WalletError::InvalidData("failed to encode sapling spending key")
                     })?;
                 sapling_lines.insert((zkey, zaddr));
@@ -784,12 +1034,16 @@ impl Wallet {
     pub fn generate_new_sapling_address_bytes(&mut self) -> Result<[u8; 43], WalletError> {
         let mut added_key = false;
         if self.sapling_keys.is_empty() {
+            self.require_unlocked()?;
             let mut rng = rand::rngs::OsRng;
             let mut seed = [0u8; 32];
             rng.fill_bytes(&mut seed);
             let extsk = ExtendedSpendingKey::master(&seed);
+            let extsk_bytes = extsk.to_bytes();
+            let extfvk = sapling_extfvk_from_extsk(&extsk_bytes)?;
             self.sapling_keys.push(SaplingKeyEntry {
-                extsk: extsk.to_bytes(),
+                extfvk,
+                extsk: Some(extsk_bytes),
                 next_diversifier_index: [0u8; 11],
             });
             added_key = true;
@@ -801,9 +1055,10 @@ impl Wallet {
             .ok_or(WalletError::InvalidData("sapling key state missing"))?;
         let prev_entry = entry.clone();
 
-        let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk)
-            .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
-        let dfvk = extsk.to_diversifiable_full_viewing_key();
+        let extfvk =
+            sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                .map_err(|_| WalletError::InvalidData("invalid sapling viewing key encoding"))?;
+        let dfvk = extfvk.to_diversifiable_full_viewing_key();
 
         let start_index = DiversifierIndex::from(entry.next_diversifier_index);
         let (found_index, address) =
@@ -835,9 +1090,12 @@ impl Wallet {
         let mut out = Vec::new();
 
         for entry in &self.sapling_keys {
-            let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk)
-                .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
-            let dfvk = extsk.to_diversifiable_full_viewing_key();
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let dfvk = extfvk.to_diversifiable_full_viewing_key();
 
             let mut index = DiversifierIndex::from([0u8; 11]);
             let stop = DiversifierIndex::from(entry.next_diversifier_index);
@@ -905,11 +1163,15 @@ impl Wallet {
         };
 
         for entry in &self.sapling_keys {
-            let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk)
-                .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
-            let dfvk = extsk.to_diversifiable_full_viewing_key();
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let dfvk = extfvk.to_diversifiable_full_viewing_key();
             if dfvk.decrypt_diversifier(&addr).is_some() {
-                return Ok(Some(entry.extsk));
+                let extsk = entry.extsk.ok_or(WalletError::WalletLocked)?;
+                return Ok(Some(extsk));
             }
         }
 
@@ -920,27 +1182,21 @@ impl Wallet {
         &self,
         bytes: &[u8; 43],
     ) -> Result<Option<[u8; 169]>, WalletError> {
-        if let Some(extsk_bytes) = self.sapling_extsk_for_address(bytes)? {
-            let extsk = ExtendedSpendingKey::from_bytes(&extsk_bytes)
-                .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
-            #[allow(deprecated)]
-            let extfvk = extsk.to_extended_full_viewing_key();
-
-            let mut buf = Vec::with_capacity(169);
-            extfvk
-                .write(&mut buf)
-                .map_err(|_| WalletError::InvalidData("invalid sapling viewing key encoding"))?;
-
-            let extfvk_bytes: [u8; 169] = buf
-                .as_slice()
-                .try_into()
-                .map_err(|_| WalletError::InvalidData("invalid sapling viewing key encoding"))?;
-            return Ok(Some(extfvk_bytes));
-        }
-
         let Some(addr) = PaymentAddress::from_bytes(bytes) else {
             return Ok(None);
         };
+
+        for entry in &self.sapling_keys {
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let dfvk = extfvk.to_diversifiable_full_viewing_key();
+            if dfvk.decrypt_diversifier(&addr).is_some() {
+                return Ok(Some(entry.extfvk));
+            }
+        }
 
         for entry in &self.sapling_viewing_keys {
             let extfvk =
@@ -958,16 +1214,19 @@ impl Wallet {
     }
 
     pub fn import_sapling_extsk(&mut self, extsk: [u8; 169]) -> Result<bool, WalletError> {
+        self.require_unlocked()?;
         let _ = ExtendedSpendingKey::from_bytes(&extsk)
             .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
+        let extfvk = sapling_extfvk_from_extsk(&extsk)?;
 
-        if self.sapling_keys.iter().any(|entry| entry.extsk == extsk) {
+        if self.sapling_keys.iter().any(|entry| entry.extfvk == extfvk) {
             return Ok(false);
         }
 
         let prev_len = self.sapling_keys.len();
         self.sapling_keys.push(SaplingKeyEntry {
-            extsk,
+            extfvk,
+            extsk: Some(extsk),
             next_diversifier_index: [0u8; 11],
         });
 
@@ -1020,9 +1279,12 @@ impl Wallet {
         };
 
         for entry in &self.sapling_keys {
-            let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk)
-                .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
-            let dfvk = extsk.to_diversifiable_full_viewing_key();
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let dfvk = extfvk.to_diversifiable_full_viewing_key();
             if dfvk.decrypt_diversifier(&addr).is_some() {
                 return Ok(true);
             }
@@ -1031,7 +1293,7 @@ impl Wallet {
     }
 
     pub fn sapling_address_is_watchonly(&self, bytes: &[u8; 43]) -> Result<bool, WalletError> {
-        if self.sapling_extsk_for_address(bytes)?.is_some() {
+        if self.sapling_address_is_mine(bytes)? {
             return Ok(false);
         }
 
@@ -1055,6 +1317,7 @@ impl Wallet {
     }
 
     pub fn refill_keypool(&mut self, newsize: usize) -> Result<(), WalletError> {
+        self.require_unlocked()?;
         if self.keypool.len() >= newsize {
             return Ok(());
         }
@@ -1089,10 +1352,17 @@ impl Wallet {
         };
         let reserved = match popped.as_ref() {
             Some(entry) => entry.key.clone(),
-            None => self.generate_unique_key(compressed)?,
+            None => {
+                self.require_unlocked()?;
+                self.generate_unique_key(compressed)?
+            }
         };
 
-        let added_keypool = self.ensure_keypool_minimum(DEFAULT_KEYPOOL_SIZE)?;
+        let added_keypool = if self.can_generate_keys() {
+            self.ensure_keypool_minimum(DEFAULT_KEYPOOL_SIZE)?
+        } else {
+            0
+        };
 
         let address = reserved.address(self.network)?;
         if is_change {
@@ -1137,27 +1407,26 @@ impl Wallet {
         let mut seed = [0u8; 32];
         for _ in 0..100 {
             rng.fill_bytes(&mut seed);
-            if SecretKey::from_slice(&seed).is_err() {
-                continue;
-            }
+            let key = match WalletKey::from_secret(seed, compressed) {
+                Ok(key) => key,
+                Err(WalletError::InvalidSecretKey) => continue,
+                Err(err) => return Err(err),
+            };
             if self
                 .keys
                 .iter()
-                .any(|key| key.secret.as_slice() == seed.as_slice())
+                .any(|existing| existing.key_hash == key.key_hash)
             {
                 continue;
             }
             if self
                 .keypool
                 .iter()
-                .any(|entry| entry.key.secret.as_slice() == seed.as_slice())
+                .any(|entry| entry.key.key_hash == key.key_hash)
             {
                 continue;
             }
-            return Ok(WalletKey {
-                secret: seed,
-                compressed,
-            });
+            return Ok(key);
         }
         Err(WalletError::InvalidData("failed to generate secret key"))
     }
@@ -1225,7 +1494,7 @@ impl Wallet {
         Ok(None)
     }
 
-    pub fn backup_to(&self, destination: &Path) -> Result<(), WalletError> {
+    pub fn backup_to(&mut self, destination: &Path) -> Result<(), WalletError> {
         if destination == self.path.as_path() {
             return Err(WalletError::InvalidData(
                 "backup destination must differ from wallet.dat",
@@ -1244,6 +1513,112 @@ impl Wallet {
         }
         let bytes = fs::read(&self.path)?;
         write_file_atomic(destination, &bytes)?;
+        Ok(())
+    }
+
+    fn encode_secrets_blob(&self) -> Result<Vec<u8>, WalletError> {
+        let mut transparent: Vec<([u8; 32], bool)> = Vec::new();
+        for key in &self.keys {
+            let secret = key.secret.ok_or(WalletError::WalletLocked)?;
+            transparent.push((secret, key.compressed));
+        }
+        for entry in &self.keypool {
+            let secret = entry.key.secret.ok_or(WalletError::WalletLocked)?;
+            transparent.push((secret, entry.key.compressed));
+        }
+        transparent.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        transparent.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+        let mut sapling: Vec<[u8; 169]> = Vec::new();
+        for entry in &self.sapling_keys {
+            let extsk = entry.extsk.ok_or(WalletError::WalletLocked)?;
+            sapling.push(extsk);
+        }
+        sapling.sort();
+        sapling.dedup();
+
+        let mut encoder = Encoder::new();
+        encoder.write_u32_le(WALLET_SECRETS_VERSION);
+        encoder.write_varint(transparent.len() as u64);
+        for (secret, compressed) in transparent {
+            encoder.write_bytes(&secret);
+            encoder.write_u8(if compressed { 1 } else { 0 });
+        }
+        encoder.write_varint(sapling.len() as u64);
+        for extsk in sapling {
+            encoder.write_bytes(&extsk);
+        }
+        Ok(encoder.into_inner())
+    }
+
+    fn apply_secrets_blob(&mut self, blob: &[u8]) -> Result<(), WalletError> {
+        let mut decoder = Decoder::new(blob);
+        let version = decoder.read_u32_le()?;
+        if version != WALLET_SECRETS_VERSION {
+            return Err(WalletError::InvalidData(
+                "unsupported wallet secrets version",
+            ));
+        }
+
+        let transparent_count = decoder.read_varint()?;
+        let transparent_count = usize::try_from(transparent_count)
+            .map_err(|_| WalletError::InvalidData("wallet secrets key count too large"))?;
+        let mut transparent =
+            HashMap::<[u8; 20], ([u8; 32], bool)>::with_capacity(transparent_count.min(8192));
+        for _ in 0..transparent_count {
+            let secret = decoder.read_fixed::<32>()?;
+            let compressed = decoder.read_bool()?;
+            let key = WalletKey::from_secret(secret, compressed)?;
+            transparent.insert(key.key_hash, (secret, compressed));
+        }
+
+        let sapling_count = decoder.read_varint()?;
+        let sapling_count = usize::try_from(sapling_count)
+            .map_err(|_| WalletError::InvalidData("wallet secrets sapling count too large"))?;
+        let mut sapling = HashMap::<[u8; 169], [u8; 169]>::with_capacity(sapling_count.min(64));
+        for _ in 0..sapling_count {
+            let extsk_bytes = decoder.read_fixed::<169>()?;
+            let extfvk = sapling_extfvk_from_extsk(&extsk_bytes)?;
+            sapling.insert(extfvk, extsk_bytes);
+        }
+
+        if !decoder.is_empty() {
+            return Err(WalletError::InvalidData(
+                "wallet secrets blob has trailing bytes",
+            ));
+        }
+
+        for key in &mut self.keys {
+            let Some((secret, compressed)) = transparent.get(&key.key_hash) else {
+                return Err(WalletError::InvalidData("missing wallet secret key"));
+            };
+            if key.compressed != *compressed {
+                return Err(WalletError::InvalidData(
+                    "wallet secret compression mismatch",
+                ));
+            }
+            key.secret = Some(*secret);
+        }
+
+        for entry in &mut self.keypool {
+            let Some((secret, compressed)) = transparent.get(&entry.key.key_hash) else {
+                return Err(WalletError::InvalidData("missing keypool secret key"));
+            };
+            if entry.key.compressed != *compressed {
+                return Err(WalletError::InvalidData(
+                    "wallet keypool compression mismatch",
+                ));
+            }
+            entry.key.secret = Some(*secret);
+        }
+
+        for entry in &mut self.sapling_keys {
+            let Some(extsk) = sapling.get(&entry.extfvk) else {
+                return Err(WalletError::InvalidData("missing sapling spending key"));
+            };
+            entry.extsk = Some(*extsk);
+        }
+
         Ok(())
     }
 
@@ -1266,176 +1641,385 @@ impl Wallet {
             0
         };
 
+        if version <= 10 {
+            let key_count = decoder.read_varint()?;
+            let key_count = usize::try_from(key_count)
+                .map_err(|_| WalletError::InvalidData("wallet key count too large"))?;
+            let mut keys = Vec::with_capacity(key_count.min(4096));
+            for _ in 0..key_count {
+                let secret = decoder.read_fixed::<32>()?;
+                let compressed = decoder.read_bool()?;
+                keys.push(WalletKey::from_secret(secret, compressed)?);
+            }
+
+            let watch_scripts = if version >= 2 {
+                let count = decoder.read_varint()?;
+                let count = usize::try_from(count)
+                    .map_err(|_| WalletError::InvalidData("watch script count too large"))?;
+                let mut out = Vec::with_capacity(count.min(4096));
+                for _ in 0..count {
+                    let script = decoder.read_var_bytes()?;
+                    out.push(script);
+                }
+                out
+            } else {
+                Vec::new()
+            };
+
+            let mut tx_history = BTreeSet::new();
+            if version >= 3 {
+                let count = decoder.read_varint()?;
+                let count = usize::try_from(count)
+                    .map_err(|_| WalletError::InvalidData("tx history count too large"))?;
+                for _ in 0..count {
+                    let txid = decoder.read_fixed::<32>()?;
+                    tx_history.insert(txid);
+                }
+            }
+
+            let mut keypool = VecDeque::new();
+            if version >= 4 {
+                let count = decoder.read_varint()?;
+                let count = usize::try_from(count)
+                    .map_err(|_| WalletError::InvalidData("keypool count too large"))?;
+                for _ in 0..count {
+                    let secret = decoder.read_fixed::<32>()?;
+                    let compressed = decoder.read_bool()?;
+                    let created_at = decoder.read_u64_le()?;
+                    keypool.push_back(KeyPoolEntry {
+                        key: WalletKey::from_secret(secret, compressed)?,
+                        created_at,
+                    });
+                }
+            }
+
+            let mut sapling_keys = Vec::new();
+            if version >= 5 {
+                let count = decoder.read_varint()?;
+                let count = usize::try_from(count)
+                    .map_err(|_| WalletError::InvalidData("sapling key count too large"))?;
+                sapling_keys = Vec::with_capacity(count.min(16));
+                for _ in 0..count {
+                    let extsk = decoder.read_fixed::<169>()?;
+                    let next_diversifier_index = decoder.read_fixed::<11>()?;
+                    let extfvk = sapling_extfvk_from_extsk(&extsk)?;
+                    sapling_keys.push(SaplingKeyEntry {
+                        extfvk,
+                        extsk: Some(extsk),
+                        next_diversifier_index,
+                    });
+                }
+            }
+
+            let mut sapling_viewing_keys = Vec::new();
+            if version >= 6 {
+                let count = decoder.read_varint()?;
+                let count = usize::try_from(count)
+                    .map_err(|_| WalletError::InvalidData("sapling viewing key count too large"))?;
+                sapling_viewing_keys = Vec::with_capacity(count.min(16));
+                for _ in 0..count {
+                    let extfvk = decoder.read_fixed::<169>()?;
+                    let next_diversifier_index = decoder.read_fixed::<11>()?;
+                    sapling_viewing_keys.push(SaplingViewingKeyEntry {
+                        extfvk,
+                        next_diversifier_index,
+                    });
+                }
+            }
+
+            let mut change_key_hashes = BTreeSet::new();
+            if version >= 7 {
+                let count = decoder.read_varint()?;
+                let count = usize::try_from(count)
+                    .map_err(|_| WalletError::InvalidData("change key hash count too large"))?;
+                for _ in 0..count {
+                    let key_hash = decoder.read_fixed::<20>()?;
+                    change_key_hashes.insert(key_hash);
+                }
+            }
+
+            let mut sapling_scan_height = -1i32;
+            let mut sapling_scan_hash = [0u8; 32];
+            let mut sapling_next_position = 0u64;
+            let mut sapling_notes: BTreeMap<SaplingNoteKey, SaplingNoteRecord> = BTreeMap::new();
+            if version >= 8 {
+                sapling_scan_height = decoder.read_i32_le()?;
+                sapling_scan_hash = decoder.read_fixed::<32>()?;
+                sapling_next_position = decoder.read_u64_le()?;
+                let count = decoder.read_varint()?;
+                let count = usize::try_from(count)
+                    .map_err(|_| WalletError::InvalidData("sapling note count too large"))?;
+                sapling_notes = BTreeMap::new();
+                for _ in 0..count {
+                    let txid = decoder.read_fixed::<32>()?;
+                    let out_index = decoder.read_u32_le()?;
+                    let height = decoder.read_i32_le()?;
+                    let position = decoder.read_u64_le()?;
+                    let value = decoder.read_i64_le()?;
+                    let address = decoder.read_fixed::<43>()?;
+                    let nullifier = decoder.read_fixed::<32>()?;
+                    let rseed = if version >= 10 {
+                        match decoder.read_u8()? {
+                            0 => None,
+                            1 => Some(SaplingRseedBytes::BeforeZip212(decoder.read_fixed::<32>()?)),
+                            2 => Some(SaplingRseedBytes::AfterZip212(decoder.read_fixed::<32>()?)),
+                            _ => {
+                                return Err(WalletError::InvalidData(
+                                    "invalid sapling note rseed encoding",
+                                ))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    sapling_notes.insert(
+                        (txid, out_index),
+                        SaplingNoteRecord {
+                            address,
+                            value,
+                            height,
+                            position,
+                            nullifier,
+                            rseed,
+                        },
+                    );
+                }
+            }
+
+            let mut sapling_tree = SaplingCommitmentTree::empty();
+            let mut sapling_witnesses: BTreeMap<SaplingNoteKey, SaplingIncrementalWitness> =
+                BTreeMap::new();
+            if version >= 9 {
+                let tree_bytes = decoder.read_var_bytes()?;
+                if !tree_bytes.is_empty() {
+                    sapling_tree = read_commitment_tree(Cursor::new(tree_bytes))
+                        .map_err(|_| WalletError::InvalidData("invalid sapling tree encoding"))?;
+                }
+
+                let count = decoder.read_varint()?;
+                let count = usize::try_from(count)
+                    .map_err(|_| WalletError::InvalidData("sapling witness count too large"))?;
+                sapling_witnesses = BTreeMap::new();
+                for _ in 0..count {
+                    let txid = decoder.read_fixed::<32>()?;
+                    let out_index = decoder.read_u32_le()?;
+                    let witness_bytes = decoder.read_var_bytes()?;
+                    let witness =
+                        read_incremental_witness(Cursor::new(witness_bytes)).map_err(|_| {
+                            WalletError::InvalidData("invalid sapling witness encoding")
+                        })?;
+                    sapling_witnesses.insert((txid, out_index), witness);
+                }
+            }
+
+            if !decoder.is_empty() {
+                return Err(WalletError::InvalidData("wallet file has trailing bytes"));
+            }
+
+            return Ok(Self {
+                path: path.to_path_buf(),
+                network,
+                keys,
+                watch_scripts,
+                tx_history,
+                keypool,
+                sapling_keys,
+                sapling_viewing_keys,
+                change_key_hashes,
+                sapling_scan_height,
+                sapling_scan_hash,
+                sapling_next_position,
+                sapling_notes,
+                sapling_tree,
+                sapling_witnesses,
+                revision: 0,
+                locked_outpoints: HashSet::new(),
+                pay_tx_fee_per_kb,
+                encrypted_secrets: None,
+                unlocked_key: None,
+                unlocked_until: 0,
+                unlock_generation: 0,
+            });
+        }
+
+        let encrypted_flag = decoder.read_bool()?;
+        let mut encrypted_secrets = None;
+        if encrypted_flag {
+            let enc_version = decoder.read_u8()?;
+            if enc_version != WALLET_ENCRYPTION_VERSION {
+                return Err(WalletError::InvalidData(
+                    "unsupported wallet encryption version",
+                ));
+            }
+            let mem_kib = decoder.read_u32_le()?;
+            let iters = decoder.read_u32_le()?;
+            let parallelism = decoder.read_u32_le()?;
+            let salt = decoder.read_fixed::<WALLET_ENCRYPTION_SALT_BYTES>()?;
+            let nonce = decoder.read_fixed::<WALLET_ENCRYPTION_NONCE_BYTES>()?;
+            encrypted_secrets = Some(WalletEncryptedSecrets {
+                kdf: WalletKdfParams {
+                    mem_kib,
+                    iters,
+                    parallelism,
+                    salt,
+                },
+                nonce,
+                ciphertext: Vec::new(),
+            });
+        }
+
         let key_count = decoder.read_varint()?;
         let key_count = usize::try_from(key_count)
             .map_err(|_| WalletError::InvalidData("wallet key count too large"))?;
         let mut keys = Vec::with_capacity(key_count.min(4096));
         for _ in 0..key_count {
-            let secret = decoder.read_fixed::<32>()?;
+            let key_hash = decoder.read_fixed::<20>()?;
             let compressed = decoder.read_bool()?;
-            keys.push(WalletKey { secret, compressed });
+            keys.push(WalletKey {
+                key_hash,
+                secret: None,
+                compressed,
+            });
         }
 
-        let watch_scripts = if version >= 2 {
-            let count = decoder.read_varint()?;
-            let count = usize::try_from(count)
-                .map_err(|_| WalletError::InvalidData("watch script count too large"))?;
-            let mut out = Vec::with_capacity(count.min(4096));
-            for _ in 0..count {
-                let script = decoder.read_var_bytes()?;
-                out.push(script);
-            }
-            out
-        } else {
-            Vec::new()
-        };
+        let watch_count = decoder.read_varint()?;
+        let watch_count = usize::try_from(watch_count)
+            .map_err(|_| WalletError::InvalidData("watch script count too large"))?;
+        let mut watch_scripts = Vec::with_capacity(watch_count.min(4096));
+        for _ in 0..watch_count {
+            let script = decoder.read_var_bytes()?;
+            watch_scripts.push(script);
+        }
 
+        let tx_count = decoder.read_varint()?;
+        let tx_count = usize::try_from(tx_count)
+            .map_err(|_| WalletError::InvalidData("tx history count too large"))?;
         let mut tx_history = BTreeSet::new();
-        if version >= 3 {
-            let count = decoder.read_varint()?;
-            let count = usize::try_from(count)
-                .map_err(|_| WalletError::InvalidData("tx history count too large"))?;
-            for _ in 0..count {
-                let txid = decoder.read_fixed::<32>()?;
-                tx_history.insert(txid);
-            }
+        for _ in 0..tx_count {
+            let txid = decoder.read_fixed::<32>()?;
+            tx_history.insert(txid);
         }
 
+        let keypool_count = decoder.read_varint()?;
+        let keypool_count = usize::try_from(keypool_count)
+            .map_err(|_| WalletError::InvalidData("keypool count too large"))?;
         let mut keypool = VecDeque::new();
-        if version >= 4 {
-            let count = decoder.read_varint()?;
-            let count = usize::try_from(count)
-                .map_err(|_| WalletError::InvalidData("keypool count too large"))?;
-            for _ in 0..count {
-                let secret = decoder.read_fixed::<32>()?;
-                let compressed = decoder.read_bool()?;
-                let created_at = decoder.read_u64_le()?;
-                keypool.push_back(KeyPoolEntry {
-                    key: WalletKey { secret, compressed },
-                    created_at,
-                });
-            }
+        for _ in 0..keypool_count {
+            let key_hash = decoder.read_fixed::<20>()?;
+            let compressed = decoder.read_bool()?;
+            let created_at = decoder.read_u64_le()?;
+            keypool.push_back(KeyPoolEntry {
+                key: WalletKey {
+                    key_hash,
+                    secret: None,
+                    compressed,
+                },
+                created_at,
+            });
         }
 
-        let mut sapling_keys = Vec::new();
-        if version >= 5 {
-            let count = decoder.read_varint()?;
-            let count = usize::try_from(count)
-                .map_err(|_| WalletError::InvalidData("sapling key count too large"))?;
-            sapling_keys = Vec::with_capacity(count.min(16));
-            for _ in 0..count {
-                let extsk = decoder.read_fixed::<169>()?;
-                let next_diversifier_index = decoder.read_fixed::<11>()?;
-                sapling_keys.push(SaplingKeyEntry {
-                    extsk,
-                    next_diversifier_index,
-                });
-            }
+        let sapling_count = decoder.read_varint()?;
+        let sapling_count = usize::try_from(sapling_count)
+            .map_err(|_| WalletError::InvalidData("sapling key count too large"))?;
+        let mut sapling_keys = Vec::with_capacity(sapling_count.min(16));
+        for _ in 0..sapling_count {
+            let extfvk = decoder.read_fixed::<169>()?;
+            let next_diversifier_index = decoder.read_fixed::<11>()?;
+            sapling_keys.push(SaplingKeyEntry {
+                extfvk,
+                extsk: None,
+                next_diversifier_index,
+            });
         }
 
-        let mut sapling_viewing_keys = Vec::new();
-        if version >= 6 {
-            let count = decoder.read_varint()?;
-            let count = usize::try_from(count)
-                .map_err(|_| WalletError::InvalidData("sapling viewing key count too large"))?;
-            sapling_viewing_keys = Vec::with_capacity(count.min(16));
-            for _ in 0..count {
-                let extfvk = decoder.read_fixed::<169>()?;
-                let next_diversifier_index = decoder.read_fixed::<11>()?;
-                sapling_viewing_keys.push(SaplingViewingKeyEntry {
-                    extfvk,
-                    next_diversifier_index,
-                });
-            }
+        let viewing_count = decoder.read_varint()?;
+        let viewing_count = usize::try_from(viewing_count)
+            .map_err(|_| WalletError::InvalidData("sapling viewing key count too large"))?;
+        let mut sapling_viewing_keys = Vec::with_capacity(viewing_count.min(16));
+        for _ in 0..viewing_count {
+            let extfvk = decoder.read_fixed::<169>()?;
+            let next_diversifier_index = decoder.read_fixed::<11>()?;
+            sapling_viewing_keys.push(SaplingViewingKeyEntry {
+                extfvk,
+                next_diversifier_index,
+            });
         }
 
+        let change_count = decoder.read_varint()?;
+        let change_count = usize::try_from(change_count)
+            .map_err(|_| WalletError::InvalidData("change key hash count too large"))?;
         let mut change_key_hashes = BTreeSet::new();
-        if version >= 7 {
-            let count = decoder.read_varint()?;
-            let count = usize::try_from(count)
-                .map_err(|_| WalletError::InvalidData("change key hash count too large"))?;
-            for _ in 0..count {
-                let key_hash = decoder.read_fixed::<20>()?;
-                change_key_hashes.insert(key_hash);
-            }
+        for _ in 0..change_count {
+            let key_hash = decoder.read_fixed::<20>()?;
+            change_key_hashes.insert(key_hash);
         }
 
-        let mut sapling_scan_height = -1i32;
-        let mut sapling_scan_hash = [0u8; 32];
-        let mut sapling_next_position = 0u64;
+        let sapling_scan_height = decoder.read_i32_le()?;
+        let sapling_scan_hash = decoder.read_fixed::<32>()?;
+        let sapling_next_position = decoder.read_u64_le()?;
+        let note_count = decoder.read_varint()?;
+        let note_count = usize::try_from(note_count)
+            .map_err(|_| WalletError::InvalidData("sapling note count too large"))?;
         let mut sapling_notes: BTreeMap<SaplingNoteKey, SaplingNoteRecord> = BTreeMap::new();
-        if version >= 8 {
-            sapling_scan_height = decoder.read_i32_le()?;
-            sapling_scan_hash = decoder.read_fixed::<32>()?;
-            sapling_next_position = decoder.read_u64_le()?;
-            let count = decoder.read_varint()?;
-            let count = usize::try_from(count)
-                .map_err(|_| WalletError::InvalidData("sapling note count too large"))?;
-            sapling_notes = BTreeMap::new();
-            for _ in 0..count {
-                let txid = decoder.read_fixed::<32>()?;
-                let out_index = decoder.read_u32_le()?;
-                let height = decoder.read_i32_le()?;
-                let position = decoder.read_u64_le()?;
-                let value = decoder.read_i64_le()?;
-                let address = decoder.read_fixed::<43>()?;
-                let nullifier = decoder.read_fixed::<32>()?;
-                let rseed = if version >= 10 {
-                    match decoder.read_u8()? {
-                        0 => None,
-                        1 => Some(SaplingRseedBytes::BeforeZip212(decoder.read_fixed::<32>()?)),
-                        2 => Some(SaplingRseedBytes::AfterZip212(decoder.read_fixed::<32>()?)),
-                        _ => {
-                            return Err(WalletError::InvalidData(
-                                "invalid sapling note rseed encoding",
-                            ))
-                        }
-                    }
-                } else {
-                    None
-                };
-                sapling_notes.insert(
-                    (txid, out_index),
-                    SaplingNoteRecord {
-                        address,
-                        value,
-                        height,
-                        position,
-                        nullifier,
-                        rseed,
-                    },
-                );
-            }
+        for _ in 0..note_count {
+            let txid = decoder.read_fixed::<32>()?;
+            let out_index = decoder.read_u32_le()?;
+            let height = decoder.read_i32_le()?;
+            let position = decoder.read_u64_le()?;
+            let value = decoder.read_i64_le()?;
+            let address = decoder.read_fixed::<43>()?;
+            let nullifier = decoder.read_fixed::<32>()?;
+            let rseed = match decoder.read_u8()? {
+                0 => None,
+                1 => Some(SaplingRseedBytes::BeforeZip212(decoder.read_fixed::<32>()?)),
+                2 => Some(SaplingRseedBytes::AfterZip212(decoder.read_fixed::<32>()?)),
+                _ => {
+                    return Err(WalletError::InvalidData(
+                        "invalid sapling note rseed encoding",
+                    ))
+                }
+            };
+            sapling_notes.insert(
+                (txid, out_index),
+                SaplingNoteRecord {
+                    address,
+                    value,
+                    height,
+                    position,
+                    nullifier,
+                    rseed,
+                },
+            );
         }
 
+        let tree_bytes = decoder.read_var_bytes()?;
         let mut sapling_tree = SaplingCommitmentTree::empty();
+        if !tree_bytes.is_empty() {
+            sapling_tree = read_commitment_tree(Cursor::new(tree_bytes))
+                .map_err(|_| WalletError::InvalidData("invalid sapling tree encoding"))?;
+        }
+
+        let witness_count = decoder.read_varint()?;
+        let witness_count = usize::try_from(witness_count)
+            .map_err(|_| WalletError::InvalidData("sapling witness count too large"))?;
         let mut sapling_witnesses: BTreeMap<SaplingNoteKey, SaplingIncrementalWitness> =
             BTreeMap::new();
-        if version >= 9 {
-            let tree_bytes = decoder.read_var_bytes()?;
-            if !tree_bytes.is_empty() {
-                sapling_tree = read_commitment_tree(Cursor::new(tree_bytes))
-                    .map_err(|_| WalletError::InvalidData("invalid sapling tree encoding"))?;
-            }
-
-            let count = decoder.read_varint()?;
-            let count = usize::try_from(count)
-                .map_err(|_| WalletError::InvalidData("sapling witness count too large"))?;
-            sapling_witnesses = BTreeMap::new();
-            for _ in 0..count {
-                let txid = decoder.read_fixed::<32>()?;
-                let out_index = decoder.read_u32_le()?;
-                let witness_bytes = decoder.read_var_bytes()?;
-                let witness = read_incremental_witness(Cursor::new(witness_bytes))
-                    .map_err(|_| WalletError::InvalidData("invalid sapling witness encoding"))?;
-                sapling_witnesses.insert((txid, out_index), witness);
-            }
+        for _ in 0..witness_count {
+            let txid = decoder.read_fixed::<32>()?;
+            let out_index = decoder.read_u32_le()?;
+            let witness_bytes = decoder.read_var_bytes()?;
+            let witness = read_incremental_witness(Cursor::new(witness_bytes))
+                .map_err(|_| WalletError::InvalidData("invalid sapling witness encoding"))?;
+            sapling_witnesses.insert((txid, out_index), witness);
         }
+
+        let secrets_payload = decoder.read_var_bytes()?;
 
         if !decoder.is_empty() {
             return Err(WalletError::InvalidData("wallet file has trailing bytes"));
         }
-        Ok(Self {
+
+        let mut wallet = Self {
             path: path.to_path_buf(),
             network,
             keys,
@@ -1454,20 +2038,44 @@ impl Wallet {
             revision: 0,
             locked_outpoints: HashSet::new(),
             pay_tx_fee_per_kb,
-        })
+            encrypted_secrets,
+            unlocked_key: None,
+            unlocked_until: 0,
+            unlock_generation: 0,
+        };
+
+        if let Some(enc) = wallet.encrypted_secrets.as_mut() {
+            enc.ciphertext = secrets_payload;
+        } else {
+            wallet.apply_secrets_blob(&secrets_payload)?;
+        }
+
+        Ok(wallet)
     }
 
-    fn save(&self) -> Result<(), WalletError> {
+    fn save(&mut self) -> Result<(), WalletError> {
         let mut encoder = Encoder::new();
         encoder.write_u32_le(WALLET_FILE_VERSION);
         encoder.write_u8(encode_network(self.network));
         encoder.write_i64_le(self.pay_tx_fee_per_kb);
 
+        let encrypted_flag = self.encrypted_secrets.is_some();
+        encoder.write_u8(if encrypted_flag { 1 } else { 0 });
+        if let Some(enc) = self.encrypted_secrets.as_mut() {
+            encoder.write_u8(WALLET_ENCRYPTION_VERSION);
+            encoder.write_u32_le(enc.kdf.mem_kib);
+            encoder.write_u32_le(enc.kdf.iters);
+            encoder.write_u32_le(enc.kdf.parallelism);
+            encoder.write_bytes(&enc.kdf.salt);
+            encoder.write_bytes(&enc.nonce);
+        }
+
         encoder.write_varint(self.keys.len() as u64);
         for key in &self.keys {
-            encoder.write_bytes(&key.secret);
+            encoder.write_bytes(&key.key_hash);
             encoder.write_u8(if key.compressed { 1 } else { 0 });
         }
+
         encoder.write_varint(self.watch_scripts.len() as u64);
         for script in &self.watch_scripts {
             encoder.write_var_bytes(script);
@@ -1480,14 +2088,14 @@ impl Wallet {
 
         encoder.write_varint(self.keypool.len() as u64);
         for entry in &self.keypool {
-            encoder.write_bytes(&entry.key.secret);
+            encoder.write_bytes(&entry.key.key_hash);
             encoder.write_u8(if entry.key.compressed { 1 } else { 0 });
             encoder.write_u64_le(entry.created_at);
         }
 
         encoder.write_varint(self.sapling_keys.len() as u64);
         for entry in &self.sapling_keys {
-            encoder.write_bytes(&entry.extsk);
+            encoder.write_bytes(&entry.extfvk);
             encoder.write_bytes(&entry.next_diversifier_index);
         }
 
@@ -1540,6 +2148,30 @@ impl Wallet {
                 .map_err(|_| WalletError::InvalidData("invalid sapling witness state"))?;
             encoder.write_var_bytes(&bytes);
         }
+
+        let mut secrets_payload = if encrypted_flag {
+            if let Some(key) = self.unlocked_key.as_ref() {
+                let mut plaintext = self.encode_secrets_blob()?;
+                let mut nonce = [0u8; WALLET_ENCRYPTION_NONCE_BYTES];
+                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                let ciphertext = encrypt_wallet_secrets(self.network, key, &nonce, &plaintext)?;
+                plaintext.zeroize();
+                if let Some(enc) = self.encrypted_secrets.as_mut() {
+                    enc.nonce = nonce;
+                    enc.ciphertext = ciphertext;
+                }
+            }
+            self.encrypted_secrets
+                .as_ref()
+                .map(|enc| enc.ciphertext.clone())
+                .unwrap_or_default()
+        } else {
+            self.encode_secrets_blob()?
+        };
+
+        encoder.write_var_bytes(&secrets_payload);
+        secrets_payload.zeroize();
+
         let bytes = encoder.into_inner();
         write_file_atomic(&self.path, &bytes)?;
         Ok(())
@@ -1557,14 +2189,15 @@ impl Wallet {
             Vec::with_capacity(self.sapling_keys.len() + self.sapling_viewing_keys.len());
 
         for entry in &self.sapling_keys {
-            let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk)
-                .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
-            let dfvk = extsk.to_diversifiable_full_viewing_key();
-            let fvk = dfvk.fvk().clone();
-            let ivk = fvk.vk.ivk();
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(entry.extfvk.as_slice())
+                    .map_err(|_| {
+                        WalletError::InvalidData("invalid sapling viewing key encoding")
+                    })?;
+            let ivk = extfvk.fvk.vk.ivk();
             keys.push(SaplingScanKey {
                 ivk: PreparedIncomingViewingKey::new(&ivk),
-                nk: fvk.vk.nk,
+                nk: extfvk.fvk.vk.nk,
             });
         }
 
@@ -1714,6 +2347,97 @@ fn p2pkh_script(key_hash: &[u8; 20]) -> Vec<u8> {
     script
 }
 
+fn sapling_extfvk_from_extsk(extsk: &[u8; 169]) -> Result<[u8; 169], WalletError> {
+    let extsk = ExtendedSpendingKey::from_bytes(extsk)
+        .map_err(|_| WalletError::InvalidData("invalid sapling spending key encoding"))?;
+    #[allow(deprecated)]
+    let extfvk = extsk.to_extended_full_viewing_key();
+
+    let mut buf = Vec::with_capacity(169);
+    extfvk
+        .write(&mut buf)
+        .map_err(|_| WalletError::InvalidData("invalid sapling viewing key encoding"))?;
+    buf.as_slice()
+        .try_into()
+        .map_err(|_| WalletError::InvalidData("invalid sapling viewing key encoding"))
+}
+
+fn wallet_secrets_aad(network: Network) -> Vec<u8> {
+    const PREFIX: &[u8] = b"fluxd-wallet-secrets-v1:";
+    let mut out = Vec::with_capacity(PREFIX.len() + 1);
+    out.extend_from_slice(PREFIX);
+    out.push(encode_network(network));
+    out
+}
+
+fn derive_wallet_key(passphrase: &str, kdf: &WalletKdfParams) -> Result<[u8; 32], WalletError> {
+    let params = Argon2Params::new(kdf.mem_kib, kdf.iters, kdf.parallelism, Some(32))
+        .map_err(|_| WalletError::InvalidData("invalid wallet kdf parameters"))?;
+    let argon2 = Argon2::new(Argon2Algorithm::Argon2id, Argon2Version::V0x13, params);
+    let mut out = [0u8; 32];
+    argon2
+        .hash_password_into(passphrase.as_bytes(), &kdf.salt, &mut out)
+        .map_err(|_| WalletError::InvalidData("wallet key derivation failed"))?;
+    Ok(out)
+}
+
+fn new_wallet_kdf(passphrase: &str) -> Result<(WalletKdfParams, [u8; 32]), WalletError> {
+    const MEM_KIB: u32 = 64 * 1024;
+    const ITERS: u32 = 3;
+    const PAR: u32 = 1;
+
+    let mut salt = [0u8; WALLET_ENCRYPTION_SALT_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let kdf = WalletKdfParams {
+        mem_kib: MEM_KIB,
+        iters: ITERS,
+        parallelism: PAR,
+        salt,
+    };
+    let key = derive_wallet_key(passphrase, &kdf)?;
+    Ok((kdf, key))
+}
+
+fn encrypt_wallet_secrets(
+    network: Network,
+    key: &[u8; 32],
+    nonce: &[u8; WALLET_ENCRYPTION_NONCE_BYTES],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, WalletError> {
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let nonce = chacha20poly1305::Nonce::from_slice(nonce);
+    let aad = wallet_secrets_aad(network);
+    cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| WalletError::InvalidData("wallet encryption failed"))
+}
+
+fn decrypt_wallet_secrets(
+    network: Network,
+    key: &[u8; 32],
+    nonce: &[u8; WALLET_ENCRYPTION_NONCE_BYTES],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, WalletError> {
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key));
+    let nonce = chacha20poly1305::Nonce::from_slice(nonce);
+    let aad = wallet_secrets_aad(network);
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| WalletError::IncorrectPassphrase)
+}
+
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), WalletError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1774,18 +2498,78 @@ mod tests {
             .generate_new_sapling_address_bytes()
             .expect("generate sapling address");
         assert_eq!(wallet.sapling_key_count(), 1);
-        let key_bytes = wallet.sapling_keys[0].extsk;
+        let key_bytes = wallet.sapling_keys[0].extsk.expect("sapling spending key");
+        let fvk_bytes = wallet.sapling_keys[0].extfvk;
         drop(wallet);
 
         let mut wallet =
             Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet reload");
         assert_eq!(wallet.sapling_key_count(), 1);
         assert_eq!(wallet.sapling_viewing_key_count(), 0);
-        assert_eq!(wallet.sapling_keys[0].extsk, key_bytes);
+        assert_eq!(
+            wallet.sapling_keys[0].extsk.expect("sapling spending key"),
+            key_bytes
+        );
+        assert_eq!(wallet.sapling_keys[0].extfvk, fvk_bytes);
         let addr2 = wallet
             .generate_new_sapling_address_bytes()
             .expect("generate sapling address");
         assert_ne!(addr1, addr2);
+    }
+
+    #[test]
+    fn encrypted_wallet_roundtrips_and_locks() {
+        let data_dir = temp_data_dir("fluxd-wallet-encrypt-test");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+
+        let mut wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet");
+        let wif_a = secret_key_to_wif(&[9u8; 32], Network::Regtest, true);
+        wallet.import_wif(&wif_a).expect("import wif");
+        wallet
+            .generate_new_sapling_address_bytes()
+            .expect("generate sapling address");
+
+        let address = wallet
+            .default_address()
+            .expect("default address")
+            .expect("address");
+
+        wallet
+            .encryptwallet("test-passphrase")
+            .expect("encryptwallet");
+        assert!(wallet.is_encrypted());
+        assert!(matches!(
+            wallet.dump_wif_for_address(&address),
+            Err(WalletError::WalletLocked)
+        ));
+
+        drop(wallet);
+
+        let mut wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("reload");
+        assert!(wallet.is_encrypted());
+        let address2 = wallet
+            .default_address()
+            .expect("default address")
+            .expect("address");
+        assert_eq!(address, address2);
+        assert!(matches!(
+            wallet.dump_wif_for_address(&address),
+            Err(WalletError::WalletLocked)
+        ));
+
+        wallet
+            .walletpassphrase("test-passphrase", 60)
+            .expect("walletpassphrase");
+        assert!(wallet
+            .dump_wif_for_address(&address)
+            .expect("dump wif")
+            .is_some());
+
+        wallet.walletlock().expect("walletlock");
+        assert!(matches!(
+            wallet.dump_wif_for_address(&address),
+            Err(WalletError::WalletLocked)
+        ));
     }
 
     #[test]

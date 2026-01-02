@@ -143,6 +143,10 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `dumpprivkey <address>`
 - `backupwallet <destination>`
 - `dumpwallet <filename>` (exports transparent keys; refuses to overwrite an existing file)
+- `encryptwallet <passphrase>` (encrypts `wallet.dat` private keys; wallet starts locked)
+- `walletpassphrase <passphrase> <timeout>` (temporarily unlocks an encrypted wallet)
+- `walletpassphrasechange <oldpassphrase> <newpassphrase>`
+- `walletlock`
 - `signmessage <address> <message>`
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
 - `getunconfirmedbalance`
@@ -308,6 +312,7 @@ Notes:
 Notes:
 - `unconfirmed_balance` is derived from spendable mempool outputs paying to the wallet.
 - `txcount` is backed by persisted wallet txids (populated by `rescanblockchain` and wallet send RPCs).
+- `unlocked_until` is a unix epoch seconds timestamp for encrypted wallets (0 when unencrypted or locked).
 
 ### getnewaddress
 
@@ -344,6 +349,29 @@ Notes:
 Notes:
 - Writes a wallet dump compatible with the legacy `dumpwallet` format (transparent keys only).
 - Refuses to overwrite an existing file.
+
+### encryptwallet
+
+- Params: `<passphrase>` (string).
+- Result: `null`
+
+Notes:
+- Encrypts wallet private keys in `wallet.dat` and locks the wallet.
+- Unlock the wallet via `walletpassphrase` before calling RPCs that require private keys (e.g. `dumpprivkey`, `signmessage`, and `send*`).
+
+### walletpassphrase
+
+- Params: `<passphrase> <timeout>` (timeout in seconds).
+- Result: `null`
+
+### walletlock
+
+- Result: `null`
+
+### walletpassphrasechange
+
+- Params: `<oldpassphrase> <newpassphrase>`.
+- Result: `null`
 
 ### signmessage
 

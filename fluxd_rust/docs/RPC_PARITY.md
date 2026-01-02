@@ -119,6 +119,10 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - addmultisigaddress - Partial (adds a watch-only P2SH script; spending multisig outputs is not yet supported)
 - backupwallet - Implemented
 - dumpwallet - Implemented (exports transparent keys; refuses to overwrite an existing file)
+- encryptwallet - Implemented (encrypts wallet private keys in wallet.dat; wallet starts locked)
+- walletpassphrase - Implemented (temporarily unlocks an encrypted wallet)
+- walletpassphrasechange - Implemented
+- walletlock - Implemented
 - dumpprivkey - Implemented (P2PKH only)
 - getbalance - Partial (minconf supported; `minconf=0` includes spendable mempool outputs; `include_watchonly` supported; accounts ignored)
 - getnewaddress - Implemented (P2PKH only; label ignored; keypool-backed)
