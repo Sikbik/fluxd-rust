@@ -110,7 +110,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Block deltas index (`getblockdeltas`) (owner: TBD)
 - [ ] [P2] Reindex/rescan support for secondary indexes (owner: TBD)
   - [x] `reindex` RPC + `--reindex` startup flag (wipe `db/` + `blocks/`, then resync)
-  - [x] `rescanblockchain` RPC stub (wallet not implemented)
+  - [x] `rescanblockchain` RPC (scans address delta index; populates wallet tx history)
   - [ ] Reindex from existing flatfiles (no network)
   - [ ] Selective index rebuild (txindex/address/spent only)
 - [ ] [P2] DB inspection tools (index stats, supply, integrity) (owner: TBD)
@@ -256,14 +256,14 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P2] Sync/run profiles (`--profile low|default|high`) for worker + DB presets (owner: TBD)
 - [x] [P1] Data-dir lock file (`--data-dir/.lock`) to prevent multi-instance corruption (owner: TBD)
 - [x] [P2] Graceful shutdown on SIGINT/SIGTERM (owner: TBD)
-- [ ] [P2] Config file support (`flux.conf` parity) (owner: TBD)
+- [x] [P2] Config file support (`flux.conf` parity) (owner: TBD)
   - [x] Basic `flux.conf` parsing (`rpcuser`, `rpcpassword`, `rpcbind`, `rpcport`, `rpcallowip`, `addnode`, `mineraddress`)
-  - [ ] Remaining `flux.conf` keys parity
+  - [x] Remaining `flux.conf` keys parity
     - [x] Enforce RPC allowlist via `rpcallowip` (localhost-only default)
     - [x] Support `testnet`/`regtest` toggles and warn on unsupported keys
     - [x] Support `dbcache`, `maxmempool`, `minrelaytxfee`
 - [ ] [P2] Structured CLI help output and subcommands (owner: TBD)
-- [ ] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
+- [x] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
   - [x] `--db-info`
   - [x] `--scan-flatfiles`
   - [x] `--scan-supply`
