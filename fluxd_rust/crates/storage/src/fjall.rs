@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -25,7 +24,7 @@ static LAST_JOURNAL_RELIEF_LOG_SECS: AtomicU64 = AtomicU64::new(0);
 
 pub struct FjallStore {
     keyspace: Keyspace,
-    partitions: HashMap<Column, PartitionHandle>,
+    partitions: Vec<PartitionHandle>,
     max_write_buffer_bytes: Option<u64>,
     max_journal_bytes: Option<u64>,
     last_pressure_relief_secs: AtomicU64,
@@ -129,12 +128,12 @@ impl FjallStore {
         max_journal_bytes: Option<u64>,
     ) -> Result<Self, StoreError> {
         let keyspace = config.open().map_err(map_err)?;
-        let mut partitions = HashMap::new();
+        let mut partitions = Vec::with_capacity(Column::ALL.len());
         for column in Column::ALL {
             let handle = keyspace
                 .open_partition(column.as_str(), partition_options.clone())
                 .map_err(map_err)?;
-            partitions.insert(column, handle);
+            partitions.push(handle);
         }
         let store = Self {
             keyspace,
@@ -149,7 +148,7 @@ impl FjallStore {
 
     fn partition(&self, column: Column) -> Result<&PartitionHandle, StoreError> {
         self.partitions
-            .get(&column)
+            .get(column.index())
             .ok_or_else(|| StoreError::Backend(format!("missing partition {}", column.as_str())))
     }
 
@@ -255,7 +254,7 @@ impl FjallStore {
         if !did_rotate {
             let mut candidates: Vec<(u32, &PartitionHandle)> = self
                 .partitions
-                .values()
+                .iter()
                 .map(|partition| (partition.tree.active_memtable_size(), partition))
                 .collect();
             candidates.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
@@ -294,7 +293,7 @@ impl FjallStore {
             return;
         }
         let keyspace = self.keyspace.clone();
-        let partitions: Vec<PartitionHandle> = self.partitions.values().cloned().collect();
+        let partitions: Vec<PartitionHandle> = self.partitions.iter().cloned().collect();
         let _ = thread::Builder::new()
             .name("fjall-journal-watchdog".to_string())
             .spawn(move || {

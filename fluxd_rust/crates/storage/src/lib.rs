@@ -93,6 +93,10 @@ impl Column {
         }
     }
 
+    pub const fn index(self) -> usize {
+        self.bit().trailing_zeros() as usize
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Column::BlockIndex => "block_index",
