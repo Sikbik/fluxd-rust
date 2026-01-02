@@ -9626,6 +9626,9 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     };
 
     fn legacy_sigops(script: &[u8]) -> u32 {
+        const OP_0: u8 = 0x00;
+        const OP_1: u8 = 0x51;
+        const OP_16: u8 = 0x60;
         const OP_CHECKSIG: u8 = 0xac;
         const OP_CHECKSIGVERIFY: u8 = 0xad;
         const OP_CHECKMULTISIG: u8 = 0xae;
@@ -9636,12 +9639,22 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
 
         let mut count = 0u32;
         let mut cursor = 0usize;
+        let mut prev_opcode: Option<u8> = None;
         while cursor < script.len() {
             let opcode = script[cursor];
             cursor = cursor.saturating_add(1);
             match opcode {
                 OP_CHECKSIG | OP_CHECKSIGVERIFY => count = count.saturating_add(1),
-                OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => count = count.saturating_add(20),
+                OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
+                    let sigops = match prev_opcode {
+                        Some(OP_0) => 0,
+                        Some(opcode) if (OP_1..=OP_16).contains(&opcode) => {
+                            u32::from(opcode.saturating_sub(OP_1).saturating_add(1))
+                        }
+                        _ => 20,
+                    };
+                    count = count.saturating_add(sigops);
+                }
                 0x01..=0x4b => cursor = cursor.saturating_add(opcode as usize),
                 OP_PUSHDATA1 => {
                     if let Some(len) = script.get(cursor).copied() {
@@ -9671,6 +9684,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                 }
                 _ => {}
             }
+            prev_opcode = Some(opcode);
             if cursor > script.len() {
                 break;
             }

@@ -164,7 +164,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
 - [x] [P1] Basic P2P tx relay (inv/getdata/tx + `mempool`) (owner: TBD)
 - [x] [P1] `getmininginfo`, `submitblock` (owner: TBD)
-- [ ] [P1] `getblocktemplate` (coinbase + deterministic payouts; tx selection/assembly WIP) (owner: TBD)
+- [x] [P1] `getblocktemplate` (coinbase + deterministic payouts; tx selection/assembly) (owner: TBD)
   - [x] Basic mempool tx selection + dependency ordering
   - [x] Template field parity (BIP22-ish keys + Flux deterministic payout fields)
   - [x] Longpoll wait behavior (honor request `longpollid`) (owner: TBD)
@@ -350,7 +350,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getmininginfo`<br>`submitblock`<br>`prioritisetransaction` | `getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps` | - |
+| `getmininginfo`<br>`submitblock`<br>`prioritisetransaction`<br>`getblocktemplate` | `getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps` | - |
 
 ### Fluxnode
 
