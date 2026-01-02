@@ -8482,6 +8482,11 @@ fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
     tx_announce: &broadcast::Sender<Hash256>,
     raw: Vec<u8>,
 ) -> Result<Hash256, RpcError> {
+    const REJECT_INVALID: u8 = 0x10;
+    const REJECT_DUPLICATE: u8 = 0x12;
+    const REJECT_NONSTANDARD: u8 = 0x40;
+    const REJECT_INSUFFICIENTFEE: u8 = 0x42;
+
     let tx = Transaction::consensus_decode(&raw)
         .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
     let txid = tx
@@ -8508,34 +8513,28 @@ fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
             return Ok(txid);
         }
         for input in &tx.vin {
-            if let Some(spender) = guard.spender(&input.prevout) {
+            if guard.spender(&input.prevout).is_some() {
                 return Err(RpcError::new(
                     RPC_TRANSACTION_REJECTED,
-                    format!("input already spent by {}", hash256_to_hex(&spender)),
+                    format!("{REJECT_DUPLICATE}: bad-txns-inputs-spent"),
                 ));
             }
         }
         for joinsplit in &tx.join_splits {
             for nullifier in &joinsplit.nullifiers {
-                if let Some(spender) = guard.sprout_nullifier_spender(nullifier) {
+                if guard.sprout_nullifier_spender(nullifier).is_some() {
                     return Err(RpcError::new(
                         RPC_TRANSACTION_REJECTED,
-                        format!(
-                            "sprout nullifier already spent by {}",
-                            hash256_to_hex(&spender)
-                        ),
+                        format!("{REJECT_DUPLICATE}: bad-txns-shielded-requirements-not-met"),
                     ));
                 }
             }
         }
         for spend in &tx.shielded_spends {
-            if let Some(spender) = guard.sapling_nullifier_spender(&spend.nullifier) {
+            if guard.sapling_nullifier_spender(&spend.nullifier).is_some() {
                 return Err(RpcError::new(
                     RPC_TRANSACTION_REJECTED,
-                    format!(
-                        "sapling nullifier already spent by {}",
-                        hash256_to_hex(&spender)
-                    ),
+                    format!("{REJECT_DUPLICATE}: bad-txns-shielded-requirements-not-met"),
                 ));
             }
         }
@@ -8553,13 +8552,30 @@ fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
     )
     .map_err(|err| match err.kind {
         MempoolErrorKind::MissingInput => RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs"),
-        MempoolErrorKind::ConflictingInput => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
-        MempoolErrorKind::InsufficientFee => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
-        MempoolErrorKind::MempoolFull => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
-        MempoolErrorKind::NonStandard => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+        MempoolErrorKind::ConflictingInput => RpcError::new(
+            RPC_TRANSACTION_REJECTED,
+            format!("{REJECT_DUPLICATE}: bad-txns-inputs-spent"),
+        ),
+        MempoolErrorKind::InsufficientFee | MempoolErrorKind::MempoolFull => RpcError::new(
+            RPC_TRANSACTION_REJECTED,
+            format!("{REJECT_INSUFFICIENTFEE}: {}", err.message),
+        ),
+        MempoolErrorKind::NonStandard => RpcError::new(
+            RPC_TRANSACTION_REJECTED,
+            format!("{REJECT_NONSTANDARD}: {}", err.message),
+        ),
         MempoolErrorKind::InvalidTransaction
         | MempoolErrorKind::InvalidScript
-        | MempoolErrorKind::InvalidShielded => RpcError::new(RPC_TRANSACTION_REJECTED, err.message),
+        | MempoolErrorKind::InvalidShielded => {
+            if err.message.starts_with("tx-expiring-soon:") {
+                RpcError::new(RPC_TRANSACTION_REJECTED, err.message)
+            } else {
+                RpcError::new(
+                    RPC_TRANSACTION_REJECTED,
+                    format!("{REJECT_INVALID}: {}", err.message),
+                )
+            }
+        }
         MempoolErrorKind::AlreadyInMempool => {
             RpcError::new(RPC_INTERNAL_ERROR, "unexpected mempool duplicate")
         }
@@ -8587,7 +8603,23 @@ fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
         }
         Err(err) => {
             if err.kind != MempoolErrorKind::AlreadyInMempool {
-                return Err(RpcError::new(RPC_TRANSACTION_REJECTED, err.message));
+                let message = match err.kind {
+                    MempoolErrorKind::ConflictingInput => {
+                        if err.message.contains("nullifier") {
+                            format!("{REJECT_DUPLICATE}: bad-txns-shielded-requirements-not-met")
+                        } else {
+                            format!("{REJECT_DUPLICATE}: bad-txns-inputs-spent")
+                        }
+                    }
+                    MempoolErrorKind::InsufficientFee | MempoolErrorKind::MempoolFull => {
+                        format!("{REJECT_INSUFFICIENTFEE}: {}", err.message)
+                    }
+                    MempoolErrorKind::NonStandard => {
+                        format!("{REJECT_NONSTANDARD}: {}", err.message)
+                    }
+                    _ => format!("{REJECT_INVALID}: {}", err.message),
+                };
+                return Err(RpcError::new(RPC_TRANSACTION_REJECTED, message));
             }
         }
     }
@@ -16041,6 +16073,93 @@ mod tests {
 
         let txid = value.as_str().expect("txid string");
         assert!(is_hex_64(txid));
+    }
+
+    #[test]
+    fn sendrawtransaction_conflicting_input_returns_cpp_reject_reason() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let prevout = OutPoint {
+            hash: [0x66u8; 32],
+            index: 0,
+        };
+        let prev_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 10_000,
+            script_pubkey: vec![0x51],
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&prevout);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), prev_entry.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let tx1 = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: 10_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex1 = hex_bytes(&tx1.consensus_encode().expect("encode tx"));
+        rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex1)],
+            &params,
+            &tx_announce,
+        )
+        .expect("tx1 accepted");
+
+        let tx2 = Transaction {
+            vout: vec![TxOut {
+                value: 9_999,
+                script_pubkey: vec![0x51],
+            }],
+            ..tx1
+        };
+        let raw_hex2 = hex_bytes(&tx2.consensus_encode().expect("encode tx"));
+        let err = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex2)],
+            &params,
+            &tx_announce,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_TRANSACTION_REJECTED);
+        assert_eq!(err.message, "18: bad-txns-inputs-spent");
     }
 
     #[test]
