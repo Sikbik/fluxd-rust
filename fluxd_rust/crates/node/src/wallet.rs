@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bech32::{Bech32, Hrp};
 use fluxd_chainstate::state::ChainState;
 use rand::RngCore;
 use sapling_crypto::keys::{NullifierDerivingKey, PreparedIncomingViewingKey};
@@ -38,6 +39,7 @@ pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
 pub const WALLET_FILE_VERSION: u32 = 10;
 
+const WALLET_DUMP_EPOCH: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
 
 #[derive(Clone)]
@@ -390,6 +392,117 @@ impl Wallet {
             }
         }
         Ok(None)
+    }
+
+    pub fn export_wallet_dump(&self, include_sapling_keys: bool) -> Result<String, WalletError> {
+        #[derive(Clone, Copy)]
+        enum TransparentDumpFlag {
+            Default,
+            Change,
+            Reserve,
+        }
+
+        struct TransparentDumpEntry {
+            address: String,
+            wif: String,
+            flag: TransparentDumpFlag,
+        }
+
+        let mut out = String::new();
+        out.push_str("# Wallet dump created by fluxd-rust\n");
+        out.push_str(&format!("# * Created on {WALLET_DUMP_EPOCH}\n"));
+        out.push('\n');
+
+        let mut transparent = Vec::new();
+
+        for key in &self.keys {
+            let address = key.address(self.network)?;
+            let wif = key.wif(self.network);
+            let key_hash = key.p2pkh_key_hash()?;
+            let flag = if self.change_key_hashes.contains(&key_hash) {
+                TransparentDumpFlag::Change
+            } else {
+                TransparentDumpFlag::Default
+            };
+            transparent.push(TransparentDumpEntry { address, wif, flag });
+        }
+
+        for entry in &self.keypool {
+            let address = entry.key.address(self.network)?;
+            let wif = entry.key.wif(self.network);
+            transparent.push(TransparentDumpEntry {
+                address,
+                wif,
+                flag: TransparentDumpFlag::Reserve,
+            });
+        }
+
+        transparent.sort_by(|a, b| a.address.cmp(&b.address).then_with(|| a.wif.cmp(&b.wif)));
+
+        for entry in transparent {
+            let flag = match entry.flag {
+                TransparentDumpFlag::Reserve => "reserve=1",
+                TransparentDumpFlag::Change => "change=1",
+                TransparentDumpFlag::Default => "label=",
+            };
+            out.push_str(&format!(
+                "{} {} {} # addr={}\n",
+                entry.wif, WALLET_DUMP_EPOCH, flag, entry.address
+            ));
+        }
+
+        if include_sapling_keys {
+            out.push('\n');
+            out.push_str("# Sapling keys\n");
+            out.push('\n');
+
+            let addr_hrp = match self.network {
+                Network::Mainnet => "za",
+                Network::Testnet => "ztestacadia",
+                Network::Regtest => "zregtestsapling",
+            };
+            let addr_hrp = Hrp::parse(addr_hrp)
+                .map_err(|_| WalletError::InvalidData("invalid sapling address hrp"))?;
+
+            let sk_hrp = match self.network {
+                Network::Mainnet => "secret-extended-key-main",
+                Network::Testnet => "secret-extended-key-test",
+                Network::Regtest => "secret-extended-key-regtest",
+            };
+            let sk_hrp = Hrp::parse(sk_hrp)
+                .map_err(|_| WalletError::InvalidData("invalid sapling spending key hrp"))?;
+
+            let mut sapling_lines = BTreeSet::new();
+            for entry in &self.sapling_keys {
+                let extsk = ExtendedSpendingKey::from_bytes(&entry.extsk).map_err(|_| {
+                    WalletError::InvalidData("invalid sapling spending key encoding")
+                })?;
+                let dfvk = extsk.to_diversifiable_full_viewing_key();
+                let (_, addr) = dfvk.find_address(DiversifierIndex::from([0u8; 11])).ok_or(
+                    WalletError::InvalidData("sapling diversifier space exhausted"),
+                )?;
+                let addr_bytes = addr.to_bytes();
+                let zaddr = bech32::encode::<Bech32>(addr_hrp, addr_bytes.as_slice())
+                    .map_err(|_| WalletError::InvalidData("failed to encode sapling address"))?;
+                let zkey =
+                    bech32::encode::<Bech32>(sk_hrp, entry.extsk.as_slice()).map_err(|_| {
+                        WalletError::InvalidData("failed to encode sapling spending key")
+                    })?;
+                sapling_lines.insert((zkey, zaddr));
+            }
+
+            for (zkey, zaddr) in sapling_lines {
+                out.push_str(&format!(
+                    "{} {} # zaddr={}\n",
+                    zkey, WALLET_DUMP_EPOCH, zaddr
+                ));
+            }
+
+            out.push('\n');
+        }
+
+        out.push_str("# End of dump\n");
+        Ok(out)
     }
 
     pub fn generate_new_address(&mut self, compressed: bool) -> Result<String, WalletError> {

@@ -25,6 +25,7 @@
 *.cookie
 *.tmp
 *.swp
+.ssh_known_hosts
 .DS_Store
 
 # IDE/editor

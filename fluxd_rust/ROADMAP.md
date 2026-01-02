@@ -251,7 +251,9 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Persist Sapling note rseed in `wallet.dat` (speeds spends; avoids txindex decrypt)
   - [x] End-to-end spend harness (`cargo test -p fluxd zsendmany_spends_sapling_note_to_transparent_output -- --ignored`)
   - [x] Regtest/testnet RPC smoke harness (`scripts/shielded_wallet_smoke_test.sh`)
-- [ ] [P2] Rescan, backup, and export/import tooling (owner: TBD)
+- [x] [P2] Rescan, backup, and export/import tooling (owner: TBD)
+  - [x] `dumpwallet` (taddr keys; no overwrite)
+  - [x] `z_exportwallet` (taddr + Sapling keys; no overwrite)
 - [ ] [P2] Wallet encryption and key management parity (owner: TBD)
 
 ## UX, ops, and tooling

@@ -118,6 +118,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - signrawtransaction - Partial (P2PKH only; supports wallet keys and optional WIF override list)
 - addmultisigaddress - Partial (adds a watch-only P2SH script; spending multisig outputs is not yet supported)
 - backupwallet - Implemented
+- dumpwallet - Implemented (exports transparent keys; refuses to overwrite an existing file)
 - dumpprivkey - Implemented (P2PKH only)
 - getbalance - Partial (minconf supported; `minconf=0` includes spendable mempool outputs; `include_watchonly` supported; accounts ignored)
 - getnewaddress - Implemented (P2PKH only; label ignored; keypool-backed)
@@ -156,6 +157,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zimportkey - Partial (Sapling only; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
 - zimportviewingkey - Partial (Sapling only; stores watch-only viewing keys; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
 - zimportwallet - Partial (imports Sapling spending keys and WIFs from file; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
+- z_exportwallet - Implemented (exports transparent keys + Sapling spending keys; refuses to overwrite an existing file)
 - zlistaddresses - Partial (Sapling only; `includeWatchonly=true` includes watch-only addresses)
 - zlistoperationids - Implemented (async op manager; optional filter)
 - zlistreceivedbyaddress - Partial (Sapling only; lists received Sapling notes for a zaddr; supports watch-only via includeWatchonly; memo is placeholder)

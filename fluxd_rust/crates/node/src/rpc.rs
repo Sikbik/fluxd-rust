@@ -125,6 +125,9 @@ const RPC_METHODS: &[&str] = &[
     "getwalletinfo",
     "signmessage",
     "backupwallet",
+    "dumpwallet",
+    "z_exportwallet",
+    "zexportwallet",
     "getdbinfo",
     "getblockcount",
     "getbestblockhash",
@@ -1271,6 +1274,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "dumpprivkey" => rpc_dumpprivkey(wallet, params, chain_params),
         "signmessage" => rpc_signmessage(wallet, params, chain_params),
         "backupwallet" => rpc_backupwallet(wallet, params),
+        "dumpwallet" => rpc_dumpwallet(wallet, params, data_dir),
+        "z_exportwallet" | "zexportwallet" => rpc_zexportwallet(wallet, params, data_dir),
         "addmultisigaddress" => rpc_addmultisigaddress(wallet, params, chain_params),
         "getbalance" => rpc_getbalance(chainstate, mempool, wallet, params),
         "getunconfirmedbalance" => rpc_getunconfirmedbalance(chainstate, mempool, wallet, params),
@@ -2273,6 +2278,97 @@ fn rpc_backupwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value,
     let path = Path::new(destination);
     guard.backup_to(path).map_err(map_wallet_error)?;
     Ok(Value::Null)
+}
+
+fn resolve_wallet_dump_path(data_dir: &Path, filename: &str) -> PathBuf {
+    let path = Path::new(filename);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        data_dir.join(path)
+    }
+}
+
+fn write_wallet_dump_file(path: &Path, contents: &str) -> Result<(), RpcError> {
+    if std::fs::metadata(path).is_ok() {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            format!("Cannot overwrite existing file {}", path.display()),
+        ));
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "Cannot open wallet dump file"))?;
+
+    use std::io::Write;
+    file.write_all(contents.as_bytes())
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "Cannot open wallet dump file"))?;
+    file.flush()
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "Cannot open wallet dump file"))?;
+    Ok(())
+}
+
+fn rpc_dumpwallet(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    data_dir: &Path,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "dumpwallet expects 1 parameter",
+        ));
+    }
+    let filename = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "filename must be a string"))?;
+    if filename.trim().is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "filename is empty"));
+    }
+
+    let path = resolve_wallet_dump_path(data_dir, filename);
+
+    let contents = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .export_wallet_dump(false)
+        .map_err(map_wallet_error)?;
+
+    write_wallet_dump_file(&path, &contents)?;
+    Ok(Value::String(path.to_string_lossy().to_string()))
+}
+
+fn rpc_zexportwallet(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    data_dir: &Path,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "z_exportwallet expects 1 parameter",
+        ));
+    }
+    let filename = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "filename must be a string"))?;
+    if filename.trim().is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "filename is empty"));
+    }
+
+    let path = resolve_wallet_dump_path(data_dir, filename);
+
+    let contents = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .export_wallet_dump(true)
+        .map_err(map_wallet_error)?;
+
+    write_wallet_dump_file(&path, &contents)?;
+    Ok(Value::String(path.to_string_lossy().to_string()))
 }
 
 fn rpc_keypoolrefill(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
@@ -16008,6 +16104,81 @@ mod tests {
             std::fs::read(data_dir.join(crate::wallet::WALLET_FILE_NAME)).expect("read wallet.dat");
         let backup = std::fs::read(&backup_path).expect("read backup");
         assert_eq!(backup, original);
+    }
+
+    #[test]
+    fn dumpwallet_exports_keypool_and_roundtrips_importwallet() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        rpc_keypoolrefill(&wallet, vec![json!(2)]).expect("rpc");
+
+        let dump_dir = temp_data_dir("fluxd-rpc-test-dumpwallet");
+        std::fs::create_dir_all(&dump_dir).expect("create dump dir");
+        let dump_path = dump_dir.join("dumpwallet.txt");
+        let dump_string = dump_path.to_string_lossy().to_string();
+
+        let value = rpc_dumpwallet(&wallet, vec![json!(dump_string.clone())], &data_dir)
+            .expect("rpc")
+            .as_str()
+            .expect("path string")
+            .to_string();
+        assert_eq!(value, dump_string);
+
+        let contents = std::fs::read_to_string(&dump_path).expect("read dump");
+        let key_lines: Vec<&str> = contents
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !(trimmed.is_empty() || trimmed.starts_with('#'))
+            })
+            .collect();
+        assert_eq!(key_lines.len(), 2);
+        assert!(key_lines.iter().all(|line| line.contains("reserve=1")));
+
+        let other_dir = temp_data_dir("fluxd-rpc-test-dumpwallet-import");
+        std::fs::create_dir_all(&other_dir).expect("create import dir");
+        let wallet_b =
+            Mutex::new(Wallet::load_or_create(&other_dir, params.network).expect("wallet"));
+        rpc_importwallet(&wallet_b, vec![json!(dump_string)]).expect("rpc");
+        assert_eq!(wallet_b.lock().expect("wallet lock").key_count(), 2);
+
+        let err = rpc_dumpwallet(&wallet, vec![json!(dump_path.to_string_lossy())], &data_dir)
+            .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("Cannot overwrite existing file"));
+    }
+
+    #[test]
+    fn z_exportwallet_exports_sapling_spending_key_and_disallows_overwrite() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let zaddr = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params)
+            .expect("rpc")
+            .as_str()
+            .expect("zaddr")
+            .to_string();
+
+        let dump_dir = temp_data_dir("fluxd-rpc-test-zexportwallet");
+        std::fs::create_dir_all(&dump_dir).expect("create dump dir");
+        let dump_path = dump_dir.join("z_exportwallet.txt");
+        let dump_string = dump_path.to_string_lossy().to_string();
+
+        let value = rpc_zexportwallet(&wallet, vec![json!(dump_string.clone())], &data_dir)
+            .expect("rpc")
+            .as_str()
+            .expect("path string")
+            .to_string();
+        assert_eq!(value, dump_string);
+
+        let contents = std::fs::read_to_string(&dump_path).expect("read dump");
+        assert!(contents.contains("secret-extended-key-regtest1"));
+        assert!(contents.contains(&zaddr));
+
+        let err = rpc_zexportwallet(&wallet, vec![json!(dump_string)], &data_dir).unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("Cannot overwrite existing file"));
     }
 
     #[test]

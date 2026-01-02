@@ -279,6 +279,26 @@ if [[ -z "$taddr" ]]; then
   exit 1
 fi
 
+echo "Checking dumpwallet creates a dump file ..."
+dump_path="${DATA_DIR}/dumpwallet.txt"
+dump_path_enc="$(url_encode "$dump_path")"
+rpc_get "dumpwallet?filename=${dump_path_enc}" | python3 -c 'import json,sys; expected=sys.argv[1]; obj=json.load(sys.stdin); err=obj.get("error"); assert err is None, obj; res=obj.get("result"); assert isinstance(res,str) and res==expected, res' "$dump_path"
+if [[ ! -f "${dump_path}" ]]; then
+  echo "dumpwallet did not create file at ${dump_path}" >&2
+  exit 1
+fi
+
+echo "Checking z_exportwallet creates a dump file ..."
+zexport_path="${DATA_DIR}/z_exportwallet.txt"
+zexport_path_enc="$(url_encode "$zexport_path")"
+rpc_get "z_exportwallet?filename=${zexport_path_enc}" | python3 -c 'import json,sys; expected=sys.argv[1]; obj=json.load(sys.stdin); err=obj.get("error"); assert err is None, obj; res=obj.get("result"); assert isinstance(res,str) and res==expected, res' "$zexport_path"
+if [[ ! -f "${zexport_path}" ]]; then
+  echo "z_exportwallet did not create file at ${zexport_path}" >&2
+  exit 1
+fi
+grep -q "$zaddr1" "$zexport_path" || { echo "z_exportwallet dump missing zaddr1" >&2; exit 1; }
+grep -q "$zkey1" "$zexport_path" || { echo "z_exportwallet dump missing zexportkey result" >&2; exit 1; }
+
 zsend_body="$(python3 -c 'import json,sys; from_addr=sys.argv[1]; taddr=sys.argv[2]; print(json.dumps([from_addr,[{"address":taddr,"amount":"0.01"}]]))' "$zaddr1" "$taddr")"
 opid="$(rpc_post "zsendmany" "$zsend_body" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error"); assert err is None, obj; res=obj.get("result"); assert isinstance(res,str) and res.startswith("opid-"), res; print(res)')"
 

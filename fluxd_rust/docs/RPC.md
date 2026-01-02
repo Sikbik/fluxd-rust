@@ -139,8 +139,10 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `getnewaddress [label]` (label ignored)
 - `getrawchangeaddress [address_type]` (partial; address_type ignored; marks address as internal change)
 - `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
+- `importwallet <filename>` (best-effort WIF import from dump file)
 - `dumpprivkey <address>`
 - `backupwallet <destination>`
+- `dumpwallet <filename>` (exports transparent keys; refuses to overwrite an existing file)
 - `signmessage <address> <message>`
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
 - `getunconfirmedbalance`
@@ -153,7 +155,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 
 Shielded wallet RPCs are registered for parity. The initial Sapling wallet surface is implemented:
 `zgetnewaddress`, `zlistaddresses` (supports watch-only via `includeWatchonly=true`), `zexportkey`, `zexportviewingkey`,
-`zimportkey`, `zimportviewingkey`, `zimportwallet`, and Sapling ownership detection in `zvalidateaddress`.
+`zexportwallet`, `zimportkey`, `zimportviewingkey`, `zimportwallet`, and Sapling ownership detection in `zvalidateaddress`.
 Sapling shielded note tracking is implemented for read-only wallet queries via incremental (on-demand) scanning:
 `zgetbalance`, `zgettotalbalance`, `zlistunspent`, and `zlistreceivedbyaddress`. The wallet persists a Sapling scan cursor in `wallet.dat` and
 advances it during these RPCs; imports reset the scan cursor so historical notes can be discovered (which may require
@@ -184,6 +186,7 @@ still be spent out of the pool (z→t) and moved within the pool (z→z).
 - `zimportkey` / `z_importkey` (Sapling only; resets Sapling scan cursor so historical notes can be discovered)
 - `zimportviewingkey` / `z_importviewingkey` (resets Sapling scan cursor so historical notes can be discovered)
 - `zimportwallet` / `z_importwallet` (Sapling only; resets Sapling scan cursor so historical notes can be discovered)
+- `zexportwallet` / `z_exportwallet` (exports transparent keys + Sapling spending keys; refuses to overwrite an existing file)
 - `zgetoperationstatus` / `z_getoperationstatus`
 - `zgetoperationresult` / `z_getoperationresult`
 - `zlistoperationids` / `z_listoperationids`
@@ -332,6 +335,15 @@ Notes:
 
 Notes:
 - Writes a copy of `wallet.dat` to the destination path.
+
+### dumpwallet
+
+- Params: `<filename>` (string path; relative paths are resolved under `--data-dir`).
+- Result: string (the full path of the destination file).
+
+Notes:
+- Writes a wallet dump compatible with the legacy `dumpwallet` format (transparent keys only).
+- Refuses to overwrite an existing file.
 
 ### signmessage
 
