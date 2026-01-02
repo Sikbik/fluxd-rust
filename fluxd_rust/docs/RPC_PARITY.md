@@ -77,8 +77,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - gettransaction - Partial (wallet-only view; amount/fee match `fluxd` semantics; change outputs are omitted from `details` on outgoing txs; `details` ordering + coinbase categories match `fluxd`; remaining field parity WIP)
 - zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; Sapling `ismine` checks wallet spending keys; `iswatchonly` checks imported Sapling viewing keys)
-- getbenchmarks - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
-- getbenchstatus - Stub (Fluxnode-only; returns `"Benchmark not running"` until fluxbenchd integration exists)
+- getbenchmarks - Partial (Fluxnode-only; proxies to `fluxbench-cli getbenchmarks` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
+- getbenchstatus - Partial (Fluxnode-only; proxies to `fluxbench-cli getstatus` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
 - getblockhashes - Implemented
 
 ## Address index (insight)
@@ -176,8 +176,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - restart - Implemented
 - ping - Implemented
 - zcbenchmark - Partial (supports `sleep` and returns running times; other benchmark types not implemented yet)
-- startbenchmark - Stub (alias: `startfluxbenchd`/`startzelbenchd`; control not implemented)
-- stopbenchmark - Stub (alias: `stopfluxbenchd`/`stopzelbenchd`; control not implemented)
+- startbenchmark - Partial (alias: `startfluxbenchd`/`startzelbenchd`; starts `fluxbenchd`/`zelbenchd` if present next to `fluxd`)
+- stopbenchmark - Partial (alias: `stopfluxbenchd`/`stopzelbenchd`; calls `fluxbench-cli stop` when online)
 
 ## fluxd-rust extensions
 
