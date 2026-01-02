@@ -1526,25 +1526,24 @@ fn rpc_zlistoperationids(params: Vec<Value>) -> Result<Value, RpcError> {
             "zlistoperationids expects 0 or 1 parameters",
         ));
     }
-    let filter =
-        match params.first() {
-            None | Some(Value::Null) => None,
-            Some(value) => {
-                let status = value.as_str().ok_or_else(|| {
-                    RpcError::new(RPC_INVALID_PARAMETER, "status must be a string")
-                })?;
-                if status == "all" {
-                    None
-                } else {
-                    if status == "cancelled" {
-                        return Ok(Value::Array(Vec::new()));
-                    }
-                    Some(AsyncOpState::parse_filter(status).ok_or_else(|| {
-                        RpcError::new(RPC_INVALID_PARAMETER, "invalid operation status")
-                    })?)
+    let filter = match params.first() {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let status = value
+                .as_str()
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "status must be a string"))?;
+            if status == "all" {
+                None
+            } else {
+                if status == "cancelled" {
+                    return Ok(Value::Array(Vec::new()));
                 }
+                Some(AsyncOpState::parse_filter(status).ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "invalid operation status")
+                })?)
             }
-        };
+        }
+    };
 
     let guard = async_ops()
         .lock()
@@ -5056,6 +5055,417 @@ fn read_sapling_output_by_key<S: fluxd_storage::KeyValueStore>(
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "sapling output not found"))
 }
 
+#[derive(Clone)]
+enum ZSendDest {
+    Transparent(TransparentAddress),
+    Sapling([u8; 43], MemoBytes),
+}
+
+#[derive(Clone)]
+struct ZSendRecipient {
+    dest: ZSendDest,
+    amount: i64,
+}
+
+fn parse_zsendmany_recipients(
+    value: &Value,
+    chain_params: &ChainParams,
+) -> Result<Vec<ZSendRecipient>, RpcError> {
+    let recipients = value
+        .as_array()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "amounts must be an array"))?;
+    if recipients.is_empty() {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "amounts array is empty",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(recipients.len());
+    let mut seen_addresses = HashSet::new();
+    for recipient in recipients {
+        let obj = recipient.as_object().ok_or_else(|| {
+            RpcError::new(RPC_INVALID_PARAMETER, "Invalid parameter, expected object")
+        })?;
+        for key in obj.keys() {
+            if key != "address" && key != "amount" && key != "memo" {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    format!("Invalid parameter, unknown key: {key}"),
+                ));
+            }
+        }
+        let address = obj
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing address"))?;
+        if !seen_addresses.insert(address.to_string()) {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "Invalid parameter, duplicated address",
+            ));
+        }
+        let amount_value = obj
+            .get("amount")
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing amount"))?;
+        let amount = parse_amount(amount_value)?;
+        if amount <= 0 {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "Invalid parameter, amount must be positive",
+            ));
+        }
+
+        let memo = obj.get("memo");
+        if address_to_script_pubkey(address, chain_params.network).is_ok() {
+            if memo.is_some_and(|v| !v.is_null()) {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "memo is only supported for zaddrs",
+                ));
+            }
+            let dest = transparent_address_from_flux_address(address, chain_params.network)?;
+            out.push(ZSendRecipient {
+                dest: ZSendDest::Transparent(dest),
+                amount,
+            });
+            continue;
+        }
+
+        let sapling_bytes = parse_sapling_zaddr_bytes(address, chain_params)?;
+        if PaymentAddress::from_bytes(&sapling_bytes).is_none() {
+            return Err(RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"));
+        }
+
+        let memo_bytes = match memo {
+            None | Some(Value::Null) => MemoBytes::empty(),
+            Some(Value::String(raw)) => {
+                let bytes = bytes_from_hex(raw).ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "Memo must be in hexadecimal format")
+                })?;
+                MemoBytes::from_bytes(&bytes).map_err(|_| {
+                    RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "Memo size is larger than maximum allowed 512",
+                    )
+                })?
+            }
+            Some(_) => {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "memo must be a string",
+                ))
+            }
+        };
+
+        out.push(ZSendRecipient {
+            dest: ZSendDest::Sapling(sapling_bytes, memo_bytes),
+            amount,
+        });
+    }
+    Ok(out)
+}
+
+fn zsendmany_execute<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    chain_params: &ChainParams,
+    params_dir: &Path,
+    tx_announce: &broadcast::Sender<Hash256>,
+    wallet: &Mutex<Wallet>,
+    from_bytes: [u8; 43],
+    recipients: &[ZSendRecipient],
+    minconf: i32,
+    fee: i64,
+) -> Result<Hash256, RpcError> {
+    let tip_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+    let target_height_i32 = tip_height.saturating_add(1);
+    if !network_upgrade_active(
+        target_height_i32,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Acadia,
+    ) {
+        return Err(RpcError::new(
+            RPC_TRANSACTION_REJECTED,
+            "sapling is not active",
+        ));
+    }
+
+    let best_height = tip_height;
+    let required_amount = recipients
+        .iter()
+        .try_fold(0i64, |acc, recipient| {
+            acc.checked_add(recipient.amount)
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))
+        })?
+        .checked_add(fee)
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+
+    #[derive(Clone)]
+    struct Candidate {
+        key: crate::wallet::SaplingNoteKey,
+        note: crate::wallet::SaplingNoteRecord,
+        witness: SaplingIncrementalWitness,
+    }
+
+    let (extsk_bytes, fvk, ivk, candidates): (
+        [u8; 169],
+        SaplingFullViewingKey,
+        PreparedIncomingViewingKey,
+        Vec<Candidate>,
+    ) = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        guard
+            .sync_sapling_notes(chainstate)
+            .map_err(map_wallet_error)?;
+        let extsk_bytes = guard
+            .sapling_extsk_for_address(&from_bytes)
+            .map_err(map_wallet_error)?
+            .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "zaddr spending key not found"))?;
+
+        let extsk = sapling_crypto::zip32::ExtendedSpendingKey::from_bytes(&extsk_bytes)
+            .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "invalid sapling spending key"))?;
+        let dfvk = extsk.to_diversifiable_full_viewing_key();
+        let fvk = dfvk.fvk().clone();
+        let ivk = PreparedIncomingViewingKey::new(&fvk.vk.ivk());
+
+        let mut out = Vec::new();
+        for (&key, note) in guard.sapling_note_map() {
+            if note.address != from_bytes {
+                continue;
+            }
+            let confirmations = best_height.saturating_sub(note.height).saturating_add(1);
+            if confirmations < minconf {
+                continue;
+            }
+            if chainstate
+                .sapling_nullifier_spent(&note.nullifier)
+                .map_err(map_internal)?
+            {
+                continue;
+            }
+            let witness = guard
+                .sapling_witness_map()
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "missing sapling witness"))?;
+            out.push(Candidate {
+                key,
+                note: note.clone(),
+                witness,
+            });
+        }
+        (extsk_bytes, fvk, ivk, out)
+    };
+
+    let mut available: Vec<Candidate> = Vec::new();
+    {
+        let guard = mempool
+            .lock()
+            .map_err(|_| map_internal("mempool lock poisoned"))?;
+        for candidate in candidates {
+            if guard
+                .sapling_nullifier_spender(&candidate.note.nullifier)
+                .is_some()
+            {
+                continue;
+            }
+            available.push(candidate);
+        }
+    }
+
+    available.sort_by(|a, b| {
+        b.note
+            .value
+            .cmp(&a.note.value)
+            .then_with(|| a.note.height.cmp(&b.note.height))
+            .then_with(|| a.key.0.cmp(&b.key.0))
+            .then_with(|| a.key.1.cmp(&b.key.1))
+    });
+
+    let mut selected: Vec<Candidate> = Vec::new();
+    let mut selected_value: i64 = 0;
+    for candidate in available {
+        selected_value = selected_value
+            .checked_add(candidate.note.value)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+        selected.push(candidate);
+        if selected_value >= required_amount {
+            break;
+        }
+    }
+    if selected_value < required_amount {
+        return Err(RpcError::new(RPC_WALLET_ERROR, "insufficient funds"));
+    }
+
+    let change = selected_value
+        .checked_sub(required_amount)
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+
+    let anchor = selected
+        .first()
+        .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "no notes to spend"))?
+        .witness
+        .root()
+        .into();
+
+    let sapling_activation = sapling_activation_height(chain_params);
+    let params = FluxZcashParams {
+        network: chain_params.network,
+        sapling_activation,
+    };
+    let target_height = BlockHeight::from_u32(u32::try_from(target_height_i32).unwrap_or(0));
+    let build_config = BuildConfig::Standard {
+        sapling_anchor: Some(anchor),
+        orchard_anchor: None,
+    };
+    let mut builder = ZcashTxBuilder::new(params, target_height, build_config);
+
+    for candidate in &selected {
+        let cached_note = candidate
+            .note
+            .rseed
+            .and_then(|rseed| rseed.to_rseed())
+            .and_then(|rseed| {
+                let recipient = PaymentAddress::from_bytes(&candidate.note.address)?;
+                let value_u64 = u64::try_from(candidate.note.value).ok()?;
+                let note_value = sapling_crypto::value::NoteValue::from_raw(value_u64);
+                Some(recipient.create_note(note_value, rseed))
+            });
+
+        let (note, rseed_backfill) = if let Some(note) = cached_note {
+            (note, None)
+        } else {
+            let output = read_sapling_output_by_key(chainstate, &candidate.key.0, candidate.key.1)?;
+            let output_ref = SaplingOutputRef { output: &output };
+            let (note, recipient, _memo) =
+                try_sapling_note_decryption(&ivk, &output_ref, Zip212Enforcement::GracePeriod)
+                    .ok_or_else(|| {
+                        RpcError::new(RPC_WALLET_ERROR, "failed to decrypt sapling note")
+                    })?;
+            if recipient.to_bytes() != candidate.note.address {
+                return Err(RpcError::new(
+                    RPC_WALLET_ERROR,
+                    "sapling note recipient mismatch",
+                ));
+            }
+            let rseed = crate::wallet::SaplingRseedBytes::from_rseed(note.rseed());
+            (note, Some(rseed))
+        };
+
+        if candidate.note.rseed.is_none() {
+            if let Some(rseed) = rseed_backfill {
+                if let Ok(mut guard) = wallet.lock() {
+                    let _ = guard.backfill_sapling_note_rseed(candidate.key, rseed);
+                }
+            }
+        }
+
+        let witness_path: SaplingMerklePath = candidate
+            .witness
+            .path()
+            .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "invalid sapling witness"))?;
+        builder
+            .add_sapling_spend::<core::convert::Infallible>(fvk.clone(), note, witness_path)
+            .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
+    }
+
+    let extsk = sapling_crypto::zip32::ExtendedSpendingKey::from_bytes(&extsk_bytes)
+        .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "invalid sapling spending key"))?;
+    let ovk = Some(extsk.expsk.ovk);
+
+    for recipient in recipients {
+        let amount_u64 = u64::try_from(recipient.amount)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+        let value = Zatoshis::from_u64(amount_u64)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+        match &recipient.dest {
+            ZSendDest::Transparent(addr) => builder
+                .add_transparent_output(addr, value)
+                .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?,
+            ZSendDest::Sapling(addr_bytes, memo) => {
+                let addr = PaymentAddress::from_bytes(addr_bytes)
+                    .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"))?;
+                builder
+                    .add_sapling_output::<core::convert::Infallible>(ovk, addr, value, memo.clone())
+                    .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?
+            }
+        }
+    }
+
+    if change > 0 {
+        let change_u64 = u64::try_from(change)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+        let change_value = Zatoshis::from_u64(change_u64)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+        let to = PaymentAddress::from_bytes(&from_bytes)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"))?;
+        builder
+            .add_sapling_output::<core::convert::Infallible>(
+                ovk,
+                to,
+                change_value,
+                MemoBytes::empty(),
+            )
+            .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
+    }
+
+    let prover = local_tx_prover(params_dir, chain_params.network)?;
+    let fee_u64 =
+        u64::try_from(fee).map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "fee out of range"))?;
+    let fee_value = Zatoshis::from_u64(fee_u64)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "fee out of range"))?;
+    let fee_rule = zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_value);
+    let transparent_signing_set = transparent::builder::TransparentSigningSet::new();
+    let sapling_extsks = [extsk];
+    let build = builder
+        .build(
+            &transparent_signing_set,
+            &sapling_extsks,
+            &[],
+            rand::rngs::OsRng,
+            prover.as_ref(),
+            prover.as_ref(),
+            &fee_rule,
+        )
+        .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
+
+    let ztx = build.transaction();
+    let mut raw = Vec::new();
+    ztx.write(&mut raw)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "tx encode failed"))?;
+
+    let txid = submit_raw_transaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        mempool_metrics,
+        fee_estimator,
+        mempool_flags,
+        chain_params,
+        tx_announce,
+        raw,
+    )?;
+
+    mempool_metrics.note_rpc_accept();
+
+    if let Ok(mut guard) = wallet.lock() {
+        let _ = guard.record_txids([txid]);
+    }
+
+    Ok(txid)
+}
+
 fn rpc_zsendmany<S: fluxd_storage::KeyValueStore + 'static>(
     ctx: &RpcContext<S>,
     params: Vec<Value>,
@@ -5086,118 +5496,7 @@ fn rpc_zsendmany<S: fluxd_storage::KeyValueStore + 'static>(
         _ => 10_000, // 0.0001 FLUX
     };
 
-    #[derive(Clone)]
-    enum ZSendDest {
-        Transparent(TransparentAddress),
-        Sapling([u8; 43], MemoBytes),
-    }
-
-    #[derive(Clone)]
-    struct ZSendRecipient {
-        dest: ZSendDest,
-        amount: i64,
-    }
-
-    fn parse_recipients(
-        value: &Value,
-        chain_params: &ChainParams,
-    ) -> Result<Vec<ZSendRecipient>, RpcError> {
-        let recipients = value
-            .as_array()
-            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "amounts must be an array"))?;
-        if recipients.is_empty() {
-            return Err(RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "amounts array is empty",
-            ));
-        }
-
-        let mut out = Vec::with_capacity(recipients.len());
-        let mut seen_addresses = HashSet::new();
-        for recipient in recipients {
-            let obj = recipient.as_object().ok_or_else(|| {
-                RpcError::new(RPC_INVALID_PARAMETER, "Invalid parameter, expected object")
-            })?;
-            for key in obj.keys() {
-                if key != "address" && key != "amount" && key != "memo" {
-                    return Err(RpcError::new(
-                        RPC_INVALID_PARAMETER,
-                        format!("Invalid parameter, unknown key: {key}"),
-                    ));
-                }
-            }
-            let address = obj
-                .get("address")
-                .and_then(Value::as_str)
-                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing address"))?;
-            if !seen_addresses.insert(address.to_string()) {
-                return Err(RpcError::new(
-                    RPC_INVALID_PARAMETER,
-                    "Invalid parameter, duplicated address",
-                ));
-            }
-            let amount_value = obj
-                .get("amount")
-                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing amount"))?;
-            let amount = parse_amount(amount_value)?;
-            if amount <= 0 {
-                return Err(RpcError::new(
-                    RPC_INVALID_PARAMETER,
-                    "Invalid parameter, amount must be positive",
-                ));
-            }
-
-            let memo = obj.get("memo");
-            if address_to_script_pubkey(address, chain_params.network).is_ok() {
-                if memo.is_some_and(|v| !v.is_null()) {
-                    return Err(RpcError::new(
-                        RPC_INVALID_PARAMETER,
-                        "memo is only supported for zaddrs",
-                    ));
-                }
-                let dest = transparent_address_from_flux_address(address, chain_params.network)?;
-                out.push(ZSendRecipient {
-                    dest: ZSendDest::Transparent(dest),
-                    amount,
-                });
-                continue;
-            }
-
-            let sapling_bytes = parse_sapling_zaddr_bytes(address, chain_params)?;
-            if PaymentAddress::from_bytes(&sapling_bytes).is_none() {
-                return Err(RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"));
-            }
-
-            let memo_bytes = match memo {
-                None | Some(Value::Null) => MemoBytes::empty(),
-                Some(Value::String(raw)) => {
-                    let bytes = bytes_from_hex(raw).ok_or_else(|| {
-                        RpcError::new(RPC_INVALID_PARAMETER, "Memo must be in hexadecimal format")
-                    })?;
-                    MemoBytes::from_bytes(&bytes).map_err(|_| {
-                        RpcError::new(
-                            RPC_INVALID_PARAMETER,
-                            "Memo size is larger than maximum allowed 512",
-                        )
-                    })?
-                }
-                Some(_) => {
-                    return Err(RpcError::new(
-                        RPC_INVALID_PARAMETER,
-                        "memo must be a string",
-                    ))
-                }
-            };
-
-            out.push(ZSendRecipient {
-                dest: ZSendDest::Sapling(sapling_bytes, memo_bytes),
-                amount,
-            });
-        }
-        Ok(out)
-    }
-
-    let recipients = parse_recipients(&recipients_value, &ctx.chain_params)?;
+    let recipients = parse_zsendmany_recipients(&recipients_value, &ctx.chain_params)?;
 
     let from_bytes = parse_sapling_zaddr_bytes(from_address, &ctx.chain_params)?;
     {
@@ -5261,291 +5560,7 @@ fn rpc_zsendmany<S: fluxd_storage::KeyValueStore + 'static>(
         }
 
         let outcome: Result<String, RpcError> = (|| {
-            let tip_height = chainstate
-                .best_block()
-                .map_err(map_internal)?
-                .map(|tip| tip.height)
-                .unwrap_or(0);
-            let target_height_i32 = tip_height.saturating_add(1);
-            if !network_upgrade_active(
-                target_height_i32,
-                &chain_params.consensus.upgrades,
-                UpgradeIndex::Acadia,
-            ) {
-                return Err(RpcError::new(
-                    RPC_TRANSACTION_REJECTED,
-                    "sapling is not active",
-                ));
-            }
-
-            let best_height = tip_height;
-            let required_amount = recipients
-                .iter()
-                .try_fold(0i64, |acc, recipient| {
-                    acc.checked_add(recipient.amount)
-                        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))
-                })?
-                .checked_add(fee)
-                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
-
-            #[derive(Clone)]
-            struct Candidate {
-                key: crate::wallet::SaplingNoteKey,
-                note: crate::wallet::SaplingNoteRecord,
-                witness: SaplingIncrementalWitness,
-            }
-
-            let (extsk_bytes, fvk, ivk, candidates): (
-                [u8; 169],
-                SaplingFullViewingKey,
-                PreparedIncomingViewingKey,
-                Vec<Candidate>,
-            ) = {
-                let mut guard = wallet
-                    .lock()
-                    .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-                guard
-                    .sync_sapling_notes(chainstate.as_ref())
-                    .map_err(map_wallet_error)?;
-                let extsk_bytes = guard
-                    .sapling_extsk_for_address(&from_bytes)
-                    .map_err(map_wallet_error)?
-                    .ok_or_else(|| {
-                        RpcError::new(RPC_WALLET_ERROR, "zaddr spending key not found")
-                    })?;
-
-                let extsk = sapling_crypto::zip32::ExtendedSpendingKey::from_bytes(&extsk_bytes)
-                    .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "invalid sapling spending key"))?;
-                let dfvk = extsk.to_diversifiable_full_viewing_key();
-                let fvk = dfvk.fvk().clone();
-                let ivk = PreparedIncomingViewingKey::new(&fvk.vk.ivk());
-
-                let mut out = Vec::new();
-                for (&key, note) in guard.sapling_note_map() {
-                    if note.address != from_bytes {
-                        continue;
-                    }
-                    let confirmations = best_height.saturating_sub(note.height).saturating_add(1);
-                    if confirmations < minconf {
-                        continue;
-                    }
-                    if chainstate
-                        .sapling_nullifier_spent(&note.nullifier)
-                        .map_err(map_internal)?
-                    {
-                        continue;
-                    }
-                    let witness =
-                        guard
-                            .sapling_witness_map()
-                            .get(&key)
-                            .cloned()
-                            .ok_or_else(|| {
-                                RpcError::new(RPC_WALLET_ERROR, "missing sapling witness")
-                            })?;
-                    out.push(Candidate {
-                        key,
-                        note: note.clone(),
-                        witness,
-                    });
-                }
-                (extsk_bytes, fvk, ivk, out)
-            };
-
-            let mut available: Vec<Candidate> = Vec::new();
-            {
-                let guard = mempool
-                    .lock()
-                    .map_err(|_| map_internal("mempool lock poisoned"))?;
-                for candidate in candidates {
-                    if guard
-                        .sapling_nullifier_spender(&candidate.note.nullifier)
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    available.push(candidate);
-                }
-            }
-
-            available.sort_by(|a, b| {
-                b.note
-                    .value
-                    .cmp(&a.note.value)
-                    .then_with(|| a.note.height.cmp(&b.note.height))
-                    .then_with(|| a.key.0.cmp(&b.key.0))
-                    .then_with(|| a.key.1.cmp(&b.key.1))
-            });
-
-            let mut selected: Vec<Candidate> = Vec::new();
-            let mut selected_value: i64 = 0;
-            for candidate in available {
-                selected_value = selected_value
-                    .checked_add(candidate.note.value)
-                    .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
-                selected.push(candidate);
-                if selected_value >= required_amount {
-                    break;
-                }
-            }
-            if selected_value < required_amount {
-                return Err(RpcError::new(RPC_WALLET_ERROR, "insufficient funds"));
-            }
-
-            let change = selected_value
-                .checked_sub(required_amount)
-                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
-
-            let anchor = selected
-                .first()
-                .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "no notes to spend"))?
-                .witness
-                .root()
-                .into();
-
-            let sapling_activation = sapling_activation_height(&chain_params);
-            let params = FluxZcashParams {
-                network: chain_params.network,
-                sapling_activation,
-            };
-            let target_height =
-                BlockHeight::from_u32(u32::try_from(target_height_i32).unwrap_or(0));
-            let build_config = BuildConfig::Standard {
-                sapling_anchor: Some(anchor),
-                orchard_anchor: None,
-            };
-            let mut builder = ZcashTxBuilder::new(params, target_height, build_config);
-
-            for candidate in &selected {
-                let cached_note = candidate
-                    .note
-                    .rseed
-                    .and_then(|rseed| rseed.to_rseed())
-                    .and_then(|rseed| {
-                        let recipient = PaymentAddress::from_bytes(&candidate.note.address)?;
-                        let value_u64 = u64::try_from(candidate.note.value).ok()?;
-                        let note_value = sapling_crypto::value::NoteValue::from_raw(value_u64);
-                        Some(recipient.create_note(note_value, rseed))
-                    });
-
-                let (note, rseed_backfill) = if let Some(note) = cached_note {
-                    (note, None)
-                } else {
-                    let output = read_sapling_output_by_key(
-                        chainstate.as_ref(),
-                        &candidate.key.0,
-                        candidate.key.1,
-                    )?;
-                    let output_ref = SaplingOutputRef { output: &output };
-                    let (note, recipient, _memo) = try_sapling_note_decryption(
-                        &ivk,
-                        &output_ref,
-                        Zip212Enforcement::GracePeriod,
-                    )
-                    .ok_or_else(|| {
-                        RpcError::new(RPC_WALLET_ERROR, "failed to decrypt sapling note")
-                    })?;
-                    if recipient.to_bytes() != candidate.note.address {
-                        return Err(RpcError::new(
-                            RPC_WALLET_ERROR,
-                            "sapling note recipient mismatch",
-                        ));
-                    }
-                    let rseed = crate::wallet::SaplingRseedBytes::from_rseed(note.rseed());
-                    (note, Some(rseed))
-                };
-
-                if candidate.note.rseed.is_none() {
-                    if let Some(rseed) = rseed_backfill {
-                        if let Ok(mut guard) = wallet.lock() {
-                            let _ = guard.backfill_sapling_note_rseed(candidate.key, rseed);
-                        }
-                    }
-                }
-                let witness_path: SaplingMerklePath = candidate
-                    .witness
-                    .path()
-                    .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "invalid sapling witness"))?;
-                builder
-                    .add_sapling_spend::<core::convert::Infallible>(fvk.clone(), note, witness_path)
-                    .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
-            }
-
-            let extsk = sapling_crypto::zip32::ExtendedSpendingKey::from_bytes(&extsk_bytes)
-                .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "invalid sapling spending key"))?;
-            let ovk = Some(extsk.expsk.ovk);
-
-            for recipient in &recipients {
-                let amount_u64 = u64::try_from(recipient.amount)
-                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
-                let value = Zatoshis::from_u64(amount_u64)
-                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
-                match &recipient.dest {
-                    ZSendDest::Transparent(addr) => builder
-                        .add_transparent_output(addr, value)
-                        .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?,
-                    ZSendDest::Sapling(addr_bytes, memo) => {
-                        let addr = PaymentAddress::from_bytes(addr_bytes).ok_or_else(|| {
-                            RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr")
-                        })?;
-                        builder
-                            .add_sapling_output::<core::convert::Infallible>(
-                                ovk,
-                                addr,
-                                value,
-                                memo.clone(),
-                            )
-                            .map_err(|err| {
-                                RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string())
-                            })?
-                    }
-                }
-            }
-
-            if change > 0 {
-                let change_u64 = u64::try_from(change)
-                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
-                let change_value = Zatoshis::from_u64(change_u64)
-                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
-                let to = PaymentAddress::from_bytes(&from_bytes)
-                    .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid zaddr"))?;
-                builder
-                    .add_sapling_output::<core::convert::Infallible>(
-                        ovk,
-                        to,
-                        change_value,
-                        MemoBytes::empty(),
-                    )
-                    .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
-            }
-
-            let prover = local_tx_prover(&params_dir, chain_params.network)?;
-            let fee_u64 = u64::try_from(fee)
-                .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "fee out of range"))?;
-            let fee_value = Zatoshis::from_u64(fee_u64)
-                .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "fee out of range"))?;
-            let fee_rule =
-                zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_value);
-            let transparent_signing_set = transparent::builder::TransparentSigningSet::new();
-            let sapling_extsks = [extsk];
-            let build = builder
-                .build(
-                    &transparent_signing_set,
-                    &sapling_extsks,
-                    &[],
-                    rand::rngs::OsRng,
-                    prover.as_ref(),
-                    prover.as_ref(),
-                    &fee_rule,
-                )
-                .map_err(|err| RpcError::new(RPC_TRANSACTION_REJECTED, err.to_string()))?;
-
-            let ztx = build.transaction();
-            let mut raw = Vec::new();
-            ztx.write(&mut raw)
-                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "tx encode failed"))?;
-
-            let txid = submit_raw_transaction(
+            let txid = zsendmany_execute(
                 chainstate.as_ref(),
                 mempool.as_ref(),
                 mempool_policy.as_ref(),
@@ -5553,16 +5568,14 @@ fn rpc_zsendmany<S: fluxd_storage::KeyValueStore + 'static>(
                 fee_estimator.as_ref(),
                 &mempool_flags,
                 &chain_params,
+                &params_dir,
                 &tx_announce,
-                raw,
+                wallet.as_ref(),
+                from_bytes,
+                &recipients,
+                minconf,
+                fee,
             )?;
-
-            mempool_metrics.note_rpc_accept();
-
-            if let Ok(mut guard) = wallet.lock() {
-                let _ = guard.record_txids([txid]);
-            }
-
             Ok(hash256_to_hex(&txid))
         })();
 
@@ -12754,6 +12767,29 @@ mod tests {
         (chainstate, params, data_dir)
     }
 
+    fn setup_testnet_chainstate() -> (
+        ChainState<MemoryStore>,
+        fluxd_consensus::params::ChainParams,
+        PathBuf,
+    ) {
+        let data_dir = temp_data_dir("fluxd-rpc-test-testnet");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let blocks_dir = data_dir.join("blocks");
+        let blocks = FlatFileStore::new(&blocks_dir, 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(&blocks_dir, "undo", 10_000_000).expect("flatfiles");
+        let store = Arc::new(MemoryStore::new());
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let params = chain_params(Network::Testnet);
+        let flags = ValidationFlags::default();
+        let write_lock = Mutex::new(());
+        crate::ensure_genesis(&chainstate, &params, &flags, None, &write_lock)
+            .expect("insert genesis");
+
+        (chainstate, params, data_dir)
+    }
+
     fn setup_regtest_chainstate_store() -> (
         ChainState<Store>,
         fluxd_consensus::params::ChainParams,
@@ -12862,11 +12898,12 @@ mod tests {
             };
 
             let coinbase_txid = coinbase.txid().expect("coinbase txid");
+            let final_sapling_root = chainstate.sapling_root().expect("sapling root");
             let header = BlockHeader {
                 version: CURRENT_VERSION,
                 prev_block: tip.hash,
                 merkle_root: coinbase_txid,
-                final_sapling_root: [0u8; 32],
+                final_sapling_root,
                 time,
                 bits,
                 nonce: [0u8; 32],
@@ -12974,11 +13011,119 @@ mod tests {
         };
 
         let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
         let header = BlockHeader {
             version: CURRENT_VERSION,
             prev_block: tip.hash,
             merkle_root: coinbase_txid,
-            final_sapling_root: [0u8; 32],
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase],
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                &params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+
+        (chainstate, params, data_dir, address, coinbase_txid, 0)
+    }
+
+    fn setup_testnet_chain_with_p2pkh_utxo() -> (
+        ChainState<MemoryStore>,
+        fluxd_consensus::params::ChainParams,
+        PathBuf,
+        String,
+        Hash256,
+        u32,
+    ) {
+        let (chainstate, params, data_dir) = setup_testnet_chainstate();
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let pubkey_hash = [0x11u8; 20];
+        let script_pubkey = p2pkh_script(pubkey_hash);
+        let address =
+            script_pubkey_to_address(&script_pubkey, params.network).expect("p2pkh address");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: miner_value,
+                script_pubkey: script_pubkey.clone(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root,
             time,
             bits,
             nonce: [0u8; 32],
@@ -13100,11 +13245,12 @@ mod tests {
             fluxnode: None,
         };
         let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
         let header = BlockHeader {
             version: CURRENT_VERSION,
             prev_block: tip.hash,
             merkle_root: coinbase_txid,
-            final_sapling_root: [0u8; 32],
+            final_sapling_root,
             time,
             bits,
             nonce: [0u8; 32],
@@ -14576,9 +14722,8 @@ mod tests {
         chainstate.commit_batch(batch).expect("commit block");
 
         let mempool = Mutex::new(Mempool::new(0));
-        let balance =
-            rpc_zgetbalance(&chainstate, &mempool, &wallet, vec![json!(zaddr)], &params)
-                .expect("rpc");
+        let balance = rpc_zgetbalance(&chainstate, &mempool, &wallet, vec![json!(zaddr)], &params)
+            .expect("rpc");
         assert_eq!(balance, amount_to_value(value));
 
         let total =
@@ -14634,6 +14779,235 @@ mod tests {
             note.rseed,
             Some(crate::wallet::SaplingRseedBytes::AfterZip212(rseed))
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn zsendmany_spends_sapling_note_to_transparent_output() {
+        let (chainstate, params, data_dir, _taddr, coinbase_txid, coinbase_vout) =
+            setup_testnet_chain_with_p2pkh_utxo();
+        let sapling_height =
+            params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height;
+        extend_regtest_chain_to_height(&chainstate, &params, sapling_height.max(COINBASE_MATURITY));
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let from_bytes = {
+            let mut guard = wallet.lock().expect("wallet lock");
+            guard
+                .generate_new_sapling_address_bytes()
+                .expect("sapling address bytes")
+        };
+        let to = PaymentAddress::from_bytes(&from_bytes).expect("payment address");
+
+        let value = block_subsidy(1, &params.consensus);
+        let note_value = NoteValue::from_raw(u64::try_from(value).expect("note value"));
+        let mut rng = rand::rngs::OsRng;
+        let mut rseed = [0u8; 32];
+        rng.fill_bytes(&mut rseed);
+        let note = to.create_note(note_value, Rseed::AfterZip212(rseed));
+
+        let enc = sapling_note_encryption(None, note.clone(), [0u8; 512], &mut rng);
+        let epk_bytes = <SaplingDomain as Domain>::epk_bytes(enc.epk()).0;
+
+        let output = fluxd_primitives::transaction::OutputDescription {
+            cv: [0u8; 32],
+            cm: note.cmu().to_bytes(),
+            ephemeral_key: epk_bytes,
+            enc_ciphertext: enc.encrypt_note_plaintext(),
+            out_ciphertext: [0u8; fluxd_primitives::transaction::SAPLING_OUT_CIPHERTEXT_SIZE],
+            zkproof: [0u8; fluxd_primitives::transaction::GROTH_PROOF_SIZE],
+        };
+
+        let shield_tx = Transaction {
+            f_overwintered: true,
+            version: 4,
+            version_group_id: fluxd_primitives::transaction::SAPLING_VERSION_GROUP_ID,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: coinbase_txid,
+                    index: coinbase_vout,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: -value,
+            shielded_spends: Vec::new(),
+            shielded_outputs: vec![output.clone()],
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let shield_txid = shield_tx.txid().expect("txid");
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let exchange_amount = exchange_fund_amount(height, &params.funding);
+        let foundation_amount = foundation_fund_amount(height, &params.funding);
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+        let mut vout = Vec::new();
+        vout.push(TxOut {
+            value: miner_value,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout.push(TxOut {
+                value: exchange_amount,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout.push(TxOut {
+                value: foundation_amount,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout.push(TxOut {
+                value: swap_amount,
+                script_pubkey: script,
+            });
+        }
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate
+            .sapling_root_after_commitments(&[output.cm])
+            .expect("sapling root");
+
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase, shield_tx],
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                &params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(1024));
+        let (tx_announce, _rx) = tokio::sync::broadcast::channel(16);
+        let params_dir = fluxd_shielded::default_params_dir();
+
+        let script_pubkey = p2pkh_script([0x22u8; 20]);
+        let address =
+            script_pubkey_to_address(&script_pubkey, params.network).expect("p2pkh address");
+        let dest = transparent_address_from_flux_address(&address, params.network)
+            .expect("transparent addr");
+
+        let fee = 10_000;
+        let recipients = vec![ZSendRecipient {
+            dest: ZSendDest::Transparent(dest),
+            amount: value - fee,
+        }];
+
+        let txid = zsendmany_execute(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &flags,
+            &params,
+            &params_dir,
+            &tx_announce,
+            &wallet,
+            from_bytes,
+            &recipients,
+            1,
+            fee,
+        )
+        .expect("zsendmany execute");
+
+        assert!(mempool.lock().expect("mempool lock").contains(&txid));
+        assert!(chainstate
+            .tx_location(&shield_txid)
+            .expect("tx index read")
+            .is_some());
     }
 
     #[test]
@@ -16737,12 +17111,13 @@ mod tests {
         };
         let coinbase_txid = coinbase.txid().expect("coinbase txid");
         let merkle_root = compute_merkle_root(&[coinbase_txid, spend_txid]);
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
 
         let header = BlockHeader {
             version: CURRENT_VERSION,
             prev_block: tip.hash,
             merkle_root,
-            final_sapling_root: [0u8; 32],
+            final_sapling_root,
             time,
             bits,
             nonce: [0u8; 32],
