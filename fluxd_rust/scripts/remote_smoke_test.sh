@@ -254,6 +254,9 @@ rpc_get "getnetworkhashps" | python3 -c 'import json,sys; obj=json.load(sys.stdi
 echo "Checking getlocalsolps ..."
 rpc_get "getlocalsolps" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, (int,float)), res; assert res >= 0'
 
+echo "Checking getmininginfo ..."
+rpc_get "getmininginfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert isinstance(res, dict), res; assert isinstance(res.get("localsolps"), (int,float)), res; assert res.get("localsolps") >= 0'
+
 echo "Checking zvalidateaddress ..."
 rpc_get "zvalidateaddress?zaddr=notanaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is False'
 

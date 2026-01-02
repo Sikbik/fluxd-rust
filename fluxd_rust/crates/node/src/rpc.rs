@@ -1399,7 +1399,9 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "getaddressdeltas" => rpc_getaddressdeltas(chainstate, params, chain_params),
         "getaddresstxids" => rpc_getaddresstxids(chainstate, params, chain_params),
         "getaddressmempool" => rpc_getaddressmempool(chainstate, mempool, params, chain_params),
-        "getmininginfo" => rpc_getmininginfo(chainstate, mempool, params, chain_params),
+        "getmininginfo" => {
+            rpc_getmininginfo(chainstate, mempool, params, chain_params, header_metrics)
+        }
         "getblocktemplate" => {
             let wallet_default = default_miner_address_from_wallet_for_blocktemplate(
                 miner_address,
@@ -10287,6 +10289,7 @@ fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
     mempool: &Mutex<Mempool>,
     params: Vec<Value>,
     chain_params: &ChainParams,
+    header_metrics: &HeaderMetrics,
 ) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
 
@@ -10316,6 +10319,7 @@ fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
         .map_err(|_| map_internal("mempool lock poisoned"))?
         .size();
 
+    let localsolps = local_solps(header_metrics)?;
     let network_solps = network_hashps(chainstate, chain_params, 120, -1).unwrap_or(0);
 
     Ok(json!({
@@ -10326,7 +10330,7 @@ fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
         "errors": "",
         "generate": false,
         "genproclimit": -1,
-        "localsolps": 0.0,
+        "localsolps": localsolps,
         "networksolps": network_solps,
         "networkhashps": network_solps,
         "pooledtx": pooledtx,
@@ -12034,11 +12038,7 @@ struct LocalSolpsState {
     last_seen_at: Option<Instant>,
 }
 
-fn rpc_getlocalsolps(
-    params: Vec<Value>,
-    header_metrics: &HeaderMetrics,
-) -> Result<Value, RpcError> {
-    ensure_no_params(&params)?;
+fn local_solps(header_metrics: &HeaderMetrics) -> Result<f64, RpcError> {
     static STATE: OnceLock<Mutex<LocalSolpsState>> = OnceLock::new();
 
     let pow_headers = header_metrics.snapshot().pow_headers;
@@ -12070,7 +12070,15 @@ fn rpc_getlocalsolps(
     guard.last_pow_headers = pow_headers;
     guard.last_seen_at = Some(now);
 
-    Ok(json!(solps))
+    Ok(solps)
+}
+
+fn rpc_getlocalsolps(
+    params: Vec<Value>,
+    header_metrics: &HeaderMetrics,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+    Ok(json!(local_solps(header_metrics)?))
 }
 
 fn rpc_estimatefee(
@@ -14330,7 +14338,9 @@ mod tests {
     fn getmininginfo_has_cpp_schema_keys() {
         let (chainstate, params, _data_dir) = setup_regtest_chainstate();
         let mempool = Mutex::new(Mempool::new(0));
-        let value = rpc_getmininginfo(&chainstate, &mempool, Vec::new(), &params).expect("rpc");
+        let header_metrics = HeaderMetrics::default();
+        let value = rpc_getmininginfo(&chainstate, &mempool, Vec::new(), &params, &header_metrics)
+            .expect("rpc");
         let obj = value.as_object().expect("object");
         for key in [
             "blocks",
