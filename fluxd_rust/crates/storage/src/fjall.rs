@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fjall::{AbstractTree, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
+use fjall::PersistMode;
+use fjall::{AbstractTree, Batch, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 
 use crate::{Column, KeyValueStore, PrefixVisitor, StoreError, WriteBatch, WriteOp};
 
@@ -200,7 +201,7 @@ impl FjallStore {
         }
     }
 
-    fn maybe_relieve_write_buffer_pressure(&self, touched: &HashSet<Column>) {
+    fn maybe_relieve_write_buffer_pressure(&self, touched: u32) {
         let Some(limit) = self.max_write_buffer_bytes else {
             return;
         };
@@ -234,7 +235,10 @@ impl FjallStore {
 
         let mut did_rotate = false;
 
-        for column in touched.iter().copied() {
+        for column in Column::ALL {
+            if touched & column.bit() == 0 {
+                continue;
+            }
             let Ok(partition) = self.partition(column) else {
                 continue;
             };
@@ -400,24 +404,29 @@ impl KeyValueStore for FjallStore {
     }
 
     fn write_batch(&self, batch: &WriteBatch) -> Result<(), StoreError> {
-        let mut touched: HashSet<Column> = HashSet::new();
-        let mut fjall_batch = self.keyspace.batch();
+        if batch.len() == 0 {
+            return Ok(());
+        }
+
+        let mut touched: u32 = 0;
+        let mut fjall_batch = Batch::with_capacity(self.keyspace.clone(), batch.len())
+            .durability(Some(PersistMode::Buffer));
         for op in batch.iter() {
             match op {
                 WriteOp::Put { column, key, value } => {
-                    touched.insert(*column);
+                    touched |= (*column).bit();
                     let partition = self.partition(*column)?;
                     fjall_batch.insert(partition, key.as_slice(), value.as_slice());
                 }
                 WriteOp::Delete { column, key } => {
-                    touched.insert(*column);
+                    touched |= (*column).bit();
                     let partition = self.partition(*column)?;
                     fjall_batch.remove(partition, key.as_slice());
                 }
             }
         }
-        if !touched.is_empty() {
-            self.maybe_relieve_write_buffer_pressure(&touched);
+        if touched != 0 {
+            self.maybe_relieve_write_buffer_pressure(touched);
         }
         let commit_start = Instant::now();
         fjall_batch.commit().map_err(map_err)?;

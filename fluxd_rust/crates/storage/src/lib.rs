@@ -69,6 +69,30 @@ impl Column {
         Column::Meta,
     ];
 
+    pub const fn bit(self) -> u32 {
+        match self {
+            Column::BlockIndex => 1 << 0,
+            Column::HeaderIndex => 1 << 1,
+            Column::HeightIndex => 1 << 2,
+            Column::BlockHeader => 1 << 3,
+            Column::TxIndex => 1 << 4,
+            Column::SpentIndex => 1 << 5,
+            Column::Utxo => 1 << 6,
+            Column::AnchorSprout => 1 << 7,
+            Column::AnchorSapling => 1 << 8,
+            Column::NullifierSprout => 1 << 9,
+            Column::NullifierSapling => 1 << 10,
+            Column::Fluxnode => 1 << 11,
+            Column::FluxnodeKey => 1 << 12,
+            Column::AddressOutpoint => 1 << 13,
+            Column::AddressDelta => 1 << 14,
+            Column::TimestampIndex => 1 << 15,
+            Column::BlockTimestamp => 1 << 16,
+            Column::BlockUndo => 1 << 17,
+            Column::Meta => 1 << 18,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Column::BlockIndex => "block_index",
@@ -95,7 +119,7 @@ impl Column {
 }
 
 #[derive(Clone, Debug)]
-pub struct WriteKey(SmallVec<[u8; 72]>);
+pub struct WriteKey(SmallVec<[u8; 80]>);
 
 impl WriteKey {
     pub fn as_slice(&self) -> &[u8] {
