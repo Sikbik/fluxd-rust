@@ -8,5 +8,6 @@
 - `INDEXES.md` - on-disk schema and index behavior.
 - `OPERATIONS.md` - VPS runbook, deployment, logs, and maintenance.
 - `TROUBLESHOOTING.md` - common sync and ops issues.
+- `FAST_SYNC.md` - design notes for snapshot/fast-sync options (WIP).
 
 When changing consensus-critical behavior, update the internal parity tracker.

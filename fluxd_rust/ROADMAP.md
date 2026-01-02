@@ -322,7 +322,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] VPS watchdog loop (`scripts/longrun_watchdog.sh`) to combine stall detection + fatal log pattern checks
 - [x] [P1] Shielded wallet RPC smoke test (`scripts/shielded_wallet_smoke_test.sh`) (owner: TBD)
 - [x] [P1] Reorg and fork simulation tests (owner: TBD)
-- [ ] [P2] Snapshot/fast-sync evaluation (optional) (owner: TBD)
+- [x] [P2] Snapshot/fast-sync evaluation (optional) (owner: TBD)
 - [x] [P2] Performance profiling harness (owner: TBD)
   - [x] `/stats` delta sampler (`scripts/stats_delta.sh`)
 
