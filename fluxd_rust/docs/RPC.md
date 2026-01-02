@@ -1039,7 +1039,12 @@ Starts fluxnodes from `fluxnode.conf`.
 
 ### getfluxnodecount
 
-Returns basic counts of entries in the fluxnode index.
+Returns counts of confirmed fluxnodes by tier (Cumulus/Nimbus/Stratus) using the same keys as C++:
+
+- `total`, `stable`
+- `basic-enabled`, `super-enabled`, `bamf-enabled`
+- `cumulus-enabled`, `nimbus-enabled`, `stratus-enabled` (aliases)
+- `ipv4`, `ipv6`, `onion` (currently always `0` until node IP tracking is added)
 
 ### listfluxnodes / viewdeterministicfluxnodelist
 

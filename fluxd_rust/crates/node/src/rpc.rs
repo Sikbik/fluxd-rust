@@ -10518,12 +10518,36 @@ fn rpc_getfluxnodecount<S: fluxd_storage::KeyValueStore>(
 ) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
     let records = chainstate.fluxnode_records().map_err(map_internal)?;
-    let total = records.len() as i64;
+    let mut cumulus_enabled = 0i64;
+    let mut nimbus_enabled = 0i64;
+    let mut stratus_enabled = 0i64;
+
+    for record in records {
+        if record.confirmed_height == 0 {
+            continue;
+        }
+        match record.tier {
+            0 | 1 => cumulus_enabled += 1,
+            2 => nimbus_enabled += 1,
+            3 => stratus_enabled += 1,
+            _ => {}
+        }
+    }
+
+    let total = cumulus_enabled + nimbus_enabled + stratus_enabled;
+
     Ok(json!({
         "total": total,
         "stable": total,
-        "enabled": total,
-        "inqueue": 0,
+        "basic-enabled": cumulus_enabled,
+        "super-enabled": nimbus_enabled,
+        "bamf-enabled": stratus_enabled,
+        "cumulus-enabled": cumulus_enabled,
+        "nimbus-enabled": nimbus_enabled,
+        "stratus-enabled": stratus_enabled,
+        "ipv4": 0,
+        "ipv6": 0,
+        "onion": 0,
     }))
 }
 
@@ -13690,6 +13714,7 @@ mod tests {
         outpoint: OutPoint,
         tier: u8,
         start_height: u32,
+        confirmed_height: u32,
         operator_pubkey: Vec<u8>,
         collateral_pubkey: Vec<u8>,
         collateral_value: i64,
@@ -13708,7 +13733,7 @@ mod tests {
             collateral: outpoint.clone(),
             tier,
             start_height,
-            confirmed_height: 0,
+            confirmed_height,
             last_confirmed_height: start_height,
             last_paid_height: 0,
             collateral_value,
@@ -16675,6 +16700,7 @@ mod tests {
             },
             1,
             1,
+            0,
             vec![0x02u8; 33],
             vec![0x03u8; 33],
             100_000,
@@ -16687,6 +16713,7 @@ mod tests {
             },
             2,
             69,
+            0,
             vec![0x02u8; 33],
             vec![0x03u8; 33],
             100_000,
@@ -16699,6 +16726,7 @@ mod tests {
             },
             3,
             69,
+            0,
             vec![0x02u8; 33],
             vec![0x03u8; 33],
             100_000,
@@ -16707,7 +16735,19 @@ mod tests {
 
         let value = rpc_getfluxnodecount(&chainstate, Vec::new()).expect("rpc");
         let obj = value.as_object().expect("object");
-        for key in ["total", "stable", "enabled", "inqueue"] {
+        for key in [
+            "total",
+            "stable",
+            "basic-enabled",
+            "super-enabled",
+            "bamf-enabled",
+            "cumulus-enabled",
+            "nimbus-enabled",
+            "stratus-enabled",
+            "ipv4",
+            "ipv6",
+            "onion",
+        ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }
 
@@ -16804,6 +16844,82 @@ mod tests {
         ] {
             assert!(first.contains_key(key), "missing key {key}");
         }
+    }
+
+    #[test]
+    fn getfluxnodecount_counts_confirmed_nodes_by_tier() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        extend_regtest_chain_to_height(&chainstate, &params, 100);
+
+        let mut batch = WriteBatch::new();
+        add_fluxnode_record_to_batch(
+            &mut batch,
+            OutPoint {
+                hash: [0x21u8; 32],
+                index: 0,
+            },
+            1,
+            1,
+            1,
+            vec![0x02u8; 33],
+            vec![0x03u8; 33],
+            100_000,
+        );
+        add_fluxnode_record_to_batch(
+            &mut batch,
+            OutPoint {
+                hash: [0x22u8; 32],
+                index: 0,
+            },
+            2,
+            10,
+            10,
+            vec![0x02u8; 33],
+            vec![0x03u8; 33],
+            100_000,
+        );
+        add_fluxnode_record_to_batch(
+            &mut batch,
+            OutPoint {
+                hash: [0x23u8; 32],
+                index: 0,
+            },
+            3,
+            20,
+            20,
+            vec![0x02u8; 33],
+            vec![0x03u8; 33],
+            100_000,
+        );
+        add_fluxnode_record_to_batch(
+            &mut batch,
+            OutPoint {
+                hash: [0x24u8; 32],
+                index: 0,
+            },
+            3,
+            21,
+            21,
+            vec![0x02u8; 33],
+            vec![0x03u8; 33],
+            100_000,
+        );
+        chainstate.commit_batch(batch).expect("insert fluxnodes");
+
+        let value = rpc_getfluxnodecount(&chainstate, Vec::new()).expect("rpc");
+        let obj = value.as_object().expect("object");
+
+        assert_eq!(obj.get("total").and_then(Value::as_i64), Some(4));
+        assert_eq!(obj.get("stable").and_then(Value::as_i64), Some(4));
+        assert_eq!(obj.get("basic-enabled").and_then(Value::as_i64), Some(1));
+        assert_eq!(obj.get("super-enabled").and_then(Value::as_i64), Some(1));
+        assert_eq!(obj.get("bamf-enabled").and_then(Value::as_i64), Some(2));
+        assert_eq!(obj.get("cumulus-enabled").and_then(Value::as_i64), Some(1));
+        assert_eq!(obj.get("nimbus-enabled").and_then(Value::as_i64), Some(1));
+        assert_eq!(obj.get("stratus-enabled").and_then(Value::as_i64), Some(2));
+        assert_eq!(obj.get("ipv4").and_then(Value::as_i64), Some(0));
+        assert_eq!(obj.get("ipv6").and_then(Value::as_i64), Some(0));
+        assert_eq!(obj.get("onion").and_then(Value::as_i64), Some(0));
     }
 
     #[test]
