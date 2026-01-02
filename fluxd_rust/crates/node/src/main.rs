@@ -308,6 +308,12 @@ struct Config {
     shielded_workers: usize,
 }
 
+enum CliAction {
+    Run(Config),
+    PrintHelp,
+    PrintVersion,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DebugFluxnodePayeeCandidates {
     tier: u8,
@@ -952,8 +958,24 @@ fn lock_data_dir(data_dir: &Path) -> Result<DataDirLock, String> {
 }
 
 async fn run() -> Result<(), String> {
-    let start_time = Instant::now();
-    let config = parse_args()?;
+    let cli = parse_args()?;
+    match cli {
+        CliAction::PrintHelp => {
+            println!("{}", usage());
+            return Ok(());
+        }
+        CliAction::PrintVersion => {
+            println!("fluxd-rust {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliAction::Run(config) => {
+            let start_time = Instant::now();
+            return run_with_config(start_time, config).await;
+        }
+    }
+}
+
+async fn run_with_config(start_time: Instant, config: Config) -> Result<(), String> {
     logging::init(logging::LogConfig {
         level: config.log_level,
         format: config.log_format,
@@ -7452,7 +7474,14 @@ async fn handle_aux_message(peer: &mut Peer, command: &str, payload: &[u8]) -> R
     Ok(())
 }
 
-fn parse_args() -> Result<Config, String> {
+fn parse_args() -> Result<CliAction, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I>(raw_args: I) -> Result<CliAction, String>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut backend = Backend::Fjall;
     let mut profile: Option<RunProfile> = None;
     let mut data_dir: Option<PathBuf> = None;
@@ -7547,7 +7576,40 @@ fn parse_args() -> Result<Config, String> {
     let mut verify_queue_set = false;
     let mut shielded_workers: usize = 0;
     let mut shielded_workers_set = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = raw_args.into_iter().peekable();
+
+    if let Some(first) = args.peek().map(|value| value.as_str()) {
+        match first {
+            "help" => return Ok(CliAction::PrintHelp),
+            "version" => return Ok(CliAction::PrintVersion),
+            "db-info" => {
+                db_info = true;
+                let _ = args.next();
+            }
+            "db-info-keys" => {
+                db_info = true;
+                db_info_keys = true;
+                let _ = args.next();
+            }
+            "db-integrity" => {
+                db_integrity = true;
+                let _ = args.next();
+            }
+            "scan-flatfiles" => {
+                scan_flatfiles = true;
+                let _ = args.next();
+            }
+            "scan-supply" => {
+                scan_supply = true;
+                let _ = args.next();
+            }
+            "scan-fluxnodes" => {
+                scan_fluxnodes = true;
+                let _ = args.next();
+            }
+            _ => {}
+        }
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--backend" => {
@@ -8046,9 +8108,8 @@ fn parse_args() -> Result<Config, String> {
                         .map_err(|_| format!("invalid dashboard addr '{value}'\n{}", usage()))?,
                 );
             }
-            "--help" | "-h" => {
-                return Err(usage());
-            }
+            "--help" | "-h" => return Ok(CliAction::PrintHelp),
+            "--version" | "-V" => return Ok(CliAction::PrintVersion),
             other => {
                 return Err(format!("unknown argument '{other}'\n{}", usage()));
             }
@@ -8467,7 +8528,7 @@ fn parse_args() -> Result<Config, String> {
     let db_flush_workers = Some(db_flush_workers);
     let db_compaction_workers = Some(db_compaction_workers);
 
-    Ok(Config {
+    Ok(CliAction::Run(Config {
         backend,
         data_dir,
         network,
@@ -8526,7 +8587,7 @@ fn parse_args() -> Result<Config, String> {
         verify_workers,
         verify_queue,
         shielded_workers,
-    })
+    }))
 }
 
 fn load_flux_conf(path: &Path) -> Result<Option<HashMap<String, Vec<String>>>, String> {
@@ -8768,9 +8829,23 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--resync] [--reindex-txindex] [--reindex-spentindex] [--reindex-addressindex] [--db-info] [--db-info-keys] [--db-integrity] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--maxconnections N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage:",
+        "  fluxd [options]",
+        "  fluxd <command> [options]",
+        "",
+        "Commands:",
+        "  help            Print this help and exit",
+        "  version         Print version and exit",
+        "  db-info         Alias for --db-info",
+        "  db-info-keys    Alias for --db-info-keys",
+        "  db-integrity    Alias for --db-integrity",
+        "  scan-flatfiles  Alias for --scan-flatfiles",
+        "  scan-supply     Alias for --scan-supply",
+        "  scan-fluxnodes  Alias for --scan-fluxnodes",
         "",
         "Options:",
+        "  --help, -h  Print this help and exit",
+        "  --version, -V  Print version and exit",
         "  --backend   Storage backend to use (default: fjall)",
         "  --data-dir  Base data directory (default: ./data)",
         "  --conf  Config file path (default: <data-dir>/flux.conf)",

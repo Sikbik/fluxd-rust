@@ -267,7 +267,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] Enforce RPC allowlist via `rpcallowip` (localhost-only default)
     - [x] Support `testnet`/`regtest` toggles and warn on unsupported keys
     - [x] Support `dbcache`, `maxmempool`, `minrelaytxfee`
-- [ ] [P2] Structured CLI help output and subcommands (owner: TBD)
+- [x] [P2] Structured CLI help output and subcommands (owner: TBD)
 - [x] [P2] DB inspection CLI (index stats, supply, integrity) (owner: TBD)
   - [x] `--db-info`
   - [x] `--scan-flatfiles`
