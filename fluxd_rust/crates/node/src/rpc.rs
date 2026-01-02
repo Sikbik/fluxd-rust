@@ -8684,6 +8684,11 @@ fn rpc_getrawmempool(params: Vec<Value>, mempool: &Mutex<Mempool>) -> Result<Val
     }
     let mut out = serde_json::Map::new();
     for entry in guard.entries() {
+        let depends: Vec<Value> = entry
+            .parents
+            .iter()
+            .map(|txid| Value::String(hash256_to_hex(txid)))
+            .collect();
         out.insert(
             hash256_to_hex(&entry.txid),
             json!({
@@ -8693,7 +8698,7 @@ fn rpc_getrawmempool(params: Vec<Value>, mempool: &Mutex<Mempool>) -> Result<Val
                 "height": entry.height.max(0),
                 "startingpriority": 0,
                 "currentpriority": 0,
-                "depends": [],
+                "depends": depends,
             }),
         );
     }
@@ -13996,6 +14001,121 @@ mod tests {
         let mempool = Mutex::new(Mempool::new(0));
         let value = rpc_getrawmempool(vec![json!(true)], &mempool).expect("rpc");
         assert!(value.as_object().is_some());
+    }
+
+    #[test]
+    fn getrawmempool_verbose_includes_depends() {
+        let script_pubkey = p2pkh_script([0x22u8; 20]);
+
+        let parent_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x33u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: 123,
+                script_pubkey: script_pubkey.clone(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let parent_txid = parent_tx.txid().expect("txid");
+        let parent_raw = parent_tx.consensus_encode().expect("encode tx");
+
+        let child_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: parent_txid,
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: 123,
+                script_pubkey,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let child_txid = child_tx.txid().expect("txid");
+        let child_raw = child_tx.consensus_encode().expect("encode tx");
+
+        let mut inner = Mempool::new(0);
+        inner
+            .insert(MempoolEntry {
+                txid: parent_txid,
+                tx: parent_tx,
+                raw: parent_raw,
+                time: 0,
+                height: 0,
+                fee: 0,
+                fee_delta: 0,
+                priority_delta: 0.0,
+                spent_outpoints: Vec::new(),
+                parents: Vec::new(),
+            })
+            .expect("insert parent");
+        inner
+            .insert(MempoolEntry {
+                txid: child_txid,
+                tx: child_tx,
+                raw: child_raw,
+                time: 0,
+                height: 0,
+                fee: 0,
+                fee_delta: 0,
+                priority_delta: 0.0,
+                spent_outpoints: Vec::new(),
+                parents: vec![parent_txid],
+            })
+            .expect("insert child");
+        let mempool = Mutex::new(inner);
+
+        let value = rpc_getrawmempool(vec![json!(true)], &mempool).expect("rpc");
+        let obj = value.as_object().expect("object");
+        let child = obj
+            .get(&hash256_to_hex(&child_txid))
+            .and_then(Value::as_object)
+            .expect("child object");
+        let depends = child
+            .get("depends")
+            .and_then(Value::as_array)
+            .expect("depends array");
+        assert_eq!(
+            depends
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            vec![hash256_to_hex(&parent_txid)]
+        );
     }
 
     #[test]

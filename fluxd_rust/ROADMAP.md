@@ -64,6 +64,9 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Reserve `WriteBatch` capacity per block (reduce allocator churn)
   - [x] Capture throughput stats (8-core mainnet: default worker auto-split yields ~120–150 b/s typical; shielded proof verification is the primary limiter)
 - [ ] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)
+  - [x] `getrawmempool(true)` populates `depends` (mempool parents)
+  - [ ] Remaining RPC stubs parity (`estimatepriority`, `getbench*`, `zcraw*`, `zcbenchmark`, `startbenchmark`/`stopbenchmark`)
+  - [ ] Improve partial RPCs (`sendrawtransaction`/`submitblock` return-code parity, fluxnode RPC field parity, wallet/multisig parity)
 
 ## Consensus and chainstate parity
 
