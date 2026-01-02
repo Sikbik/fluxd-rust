@@ -92,7 +92,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Node control
 
 - sendfrom - Implemented (fromaccount ignored; minconf supported)
-- submitblock - Partial (accepts blocks; return codes are simplified)
+- submitblock - Partial (BIP22 return values; returns `duplicate` when the header is already known; side-chain acceptance is still simplified vs C++)
 - zcrawjoinsplit - Stub (returns error; joinsplit tooling not implemented)
 - zcrawreceive - Stub (returns error; joinsplit tooling not implemented)
 - prioritisetransaction - Implemented (stores fee/priority deltas for mining selection)

@@ -31,7 +31,7 @@ use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
 
 use fluxd_chainstate::index::HeaderEntry;
-use fluxd_chainstate::state::ChainState;
+use fluxd_chainstate::state::{ChainState, ChainStateError};
 use fluxd_chainstate::validation::ValidationFlags;
 use fluxd_consensus::constants::{
     COINBASE_MATURITY, FLUXNODE_DOS_REMOVE_AMOUNT, FLUXNODE_DOS_REMOVE_AMOUNT_V2,
@@ -10368,11 +10368,15 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "Block decode failed"))?;
     let hash = block.header.hash();
 
-    if let Some(entry) = chainstate.header_entry(&hash).map_err(map_internal)? {
-        if entry.has_block() {
-            return Ok(Value::String("duplicate".to_string()));
+    let header_present = match chainstate.header_entry(&hash).map_err(map_internal)? {
+        Some(entry) => {
+            if entry.has_block() {
+                return Ok(Value::String("duplicate".to_string()));
+            }
+            true
         }
-    }
+        None => false,
+    };
 
     let prev_hash = block.header.prev_block;
     let best = chainstate.best_block().map_err(map_internal)?;
@@ -10407,14 +10411,29 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         None,
     ) {
         Ok(batch) => batch,
-        Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(
-            "block does not extend best block tip",
-        ))
-        | Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(
-            "block height does not match header index",
-        )) => return Ok(Value::String("inconclusive".to_string())),
-        Err(fluxd_chainstate::state::ChainStateError::Validation(err)) => {
-            return Ok(Value::String(err.to_string()))
+        Err(ChainStateError::InvalidHeader("block does not extend best block tip"))
+        | Err(ChainStateError::InvalidHeader("block height does not match header index")) => {
+            return Ok(Value::String("inconclusive".to_string()))
+        }
+        Err(ChainStateError::InvalidHeader(message)) => {
+            return Ok(Value::String(message.to_string()))
+        }
+        Err(ChainStateError::Validation(err)) => {
+            let reason = err.to_string();
+            return Ok(Value::String(if reason.is_empty() {
+                "rejected".to_string()
+            } else {
+                reason
+            }));
+        }
+        Err(ChainStateError::MissingInput) => {
+            return Ok(Value::String("missing input".to_string()))
+        }
+        Err(ChainStateError::MissingHeader) => {
+            return Ok(Value::String("missing header".to_string()))
+        }
+        Err(ChainStateError::ValueOutOfRange) => {
+            return Ok(Value::String("value out of range".to_string()))
         }
         Err(err) => return Err(map_internal(err.to_string())),
     };
@@ -10432,7 +10451,11 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         }
     }
     chainstate.commit_batch(batch).map_err(map_internal)?;
-    Ok(Value::Null)
+    if header_present {
+        Ok(Value::String("duplicate".to_string()))
+    } else {
+        Ok(Value::Null)
+    }
 }
 
 fn rpc_getfluxnodecount<S: fluxd_storage::KeyValueStore>(
@@ -14507,6 +14530,202 @@ mod tests {
         )
         .expect("rpc");
         assert_eq!(value.as_str(), Some("duplicate"));
+    }
+
+    #[test]
+    fn submitblock_header_present_returns_duplicate() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let exchange_amount = exchange_fund_amount(height, &params.funding);
+        let foundation_amount = foundation_fund_amount(height, &params.funding);
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+        let mut vout = Vec::new();
+        vout.push(TxOut {
+            value: miner_value,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout.push(TxOut {
+                value: exchange_amount,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout.push(TxOut {
+                value: foundation_amount,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout.push(TxOut {
+                value: swap_amount,
+                script_pubkey: script,
+            });
+        }
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: vec![0u8; 2],
+                sequence: u32::MAX,
+            }],
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let block = Block {
+            header: header.clone(),
+            transactions: vec![coinbase],
+        };
+        let block_hex = hex_bytes(&block.consensus_encode().expect("encode block"));
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(&[header], &params.consensus, &mut header_batch, false)
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let write_lock = Mutex::new(());
+        let flags = ValidationFlags::default();
+        let value = rpc_submitblock(
+            &chainstate,
+            &write_lock,
+            vec![Value::String(block_hex)],
+            &params,
+            &flags,
+        )
+        .expect("rpc");
+        assert_eq!(value.as_str(), Some("duplicate"));
+    }
+
+    #[test]
+    fn submitblock_invalid_header_returns_reason_string() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: vec![0u8; 2],
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: block_subsidy(height, &params.consensus),
+                script_pubkey: Vec::new(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
+        let header = BlockHeader {
+            version: 0,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase],
+        };
+        let block_hex = hex_bytes(&block.consensus_encode().expect("encode block"));
+
+        let write_lock = Mutex::new(());
+        let flags = ValidationFlags::default();
+        let value = rpc_submitblock(
+            &chainstate,
+            &write_lock,
+            vec![Value::String(block_hex)],
+            &params,
+            &flags,
+        )
+        .expect("rpc");
+        assert_eq!(value.as_str(), Some("block version too low"));
     }
 
     #[test]
