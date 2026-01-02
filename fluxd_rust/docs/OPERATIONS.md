@@ -162,10 +162,10 @@ ssh <vps-user>@<vps-host> "pkill -x fluxd"
 ssh <vps-user>@<vps-host> "<remote-fluxd-bin> --data-dir <remote-data-dir> --reindex"
 ```
 
-If the daemon reports a `database schema version mismatch`, reindex is the supported upgrade path:
+If the daemon reports a `database schema version mismatch` or `database schema version missing`, reindex is the supported upgrade path:
 it will rebuild `db/` from the existing flatfiles under `blocks/`.
 
-If the daemon reports an index schema version mismatch (`txindex`, `spentindex`, `addressindex`),
+If the daemon reports an index schema version mismatch or missing version (`txindex`, `spentindex`, `addressindex`),
 use the selective rebuild flags instead of a full reindex.
 
 For selective rebuilds (avoid touching other state), use:

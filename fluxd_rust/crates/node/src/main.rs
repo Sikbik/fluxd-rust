@@ -2735,6 +2735,12 @@ fn ensure_db_schema_version(store: &Store) -> Result<u32, String> {
             u32::from_le_bytes(bytes)
         }
         None => {
+            let has_any_data = store_has_any_data(store)?;
+            if has_any_data {
+                return Err(format!(
+                    "database schema version missing (expected {DB_SCHEMA_VERSION}); this data dir was created by an older build; run with --reindex to rebuild"
+                ));
+            }
             store
                 .put(
                     fluxd_storage::Column::Meta,
@@ -2753,6 +2759,30 @@ fn ensure_db_schema_version(store: &Store) -> Result<u32, String> {
     }
 
     Ok(version)
+}
+
+const SCAN_EARLY_EXIT_SENTINEL: &str = "__fluxd_scan_early_exit__";
+
+fn store_column_has_any(store: &Store, column: fluxd_storage::Column) -> Result<bool, String> {
+    let mut found = false;
+    let mut visitor = |_: &[u8], _: &[u8]| {
+        found = true;
+        Err(StoreError::Backend(SCAN_EARLY_EXIT_SENTINEL.to_string()))
+    };
+    match store.for_each_prefix(column, &[], &mut visitor) {
+        Ok(()) => Ok(found),
+        Err(StoreError::Backend(message)) if message == SCAN_EARLY_EXIT_SENTINEL => Ok(found),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn store_has_any_data(store: &Store) -> Result<bool, String> {
+    for column in fluxd_storage::Column::ALL {
+        if store_column_has_any(store, column)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn meta_u32(store: &Store, key: &[u8]) -> Result<Option<u32>, String> {
@@ -2787,6 +2817,7 @@ fn ensure_index_schema_version(
     key: &[u8],
     expected: u32,
     rebuild_hint: &str,
+    columns: &[fluxd_storage::Column],
 ) -> Result<u32, String> {
     match meta_u32(store, key)? {
         Some(found) => {
@@ -2798,9 +2829,23 @@ fn ensure_index_schema_version(
             Ok(found)
         }
         None => {
-            log_warn!(
-                "{name} schema version not found; assuming current version {expected} (consider {rebuild_hint} if upgrading from an older build)"
-            );
+            let mut has_data = false;
+            for column in columns {
+                if *column == fluxd_storage::Column::Meta {
+                    continue;
+                }
+                if store_column_has_any(store, *column)? {
+                    has_data = true;
+                    break;
+                }
+            }
+
+            if has_data {
+                return Err(format!(
+                    "{name} schema version missing (expected {expected}); rebuild with {rebuild_hint}",
+                ));
+            }
+
             set_meta_u32(store, key, expected)?;
             Ok(expected)
         }
@@ -2814,6 +2859,7 @@ fn ensure_secondary_index_versions(store: &Store) -> Result<(), String> {
         TXINDEX_VERSION_KEY,
         TXINDEX_VERSION,
         "--reindex-txindex",
+        &[fluxd_storage::Column::TxIndex],
     )?;
     let _ = ensure_index_schema_version(
         store,
@@ -2821,6 +2867,7 @@ fn ensure_secondary_index_versions(store: &Store) -> Result<(), String> {
         SPENTINDEX_VERSION_KEY,
         SPENTINDEX_VERSION,
         "--reindex-spentindex",
+        &[fluxd_storage::Column::SpentIndex],
     )?;
     let _ = ensure_index_schema_version(
         store,
@@ -2828,6 +2875,10 @@ fn ensure_secondary_index_versions(store: &Store) -> Result<(), String> {
         ADDRESSINDEX_VERSION_KEY,
         ADDRESSINDEX_VERSION,
         "--reindex-addressindex",
+        &[
+            fluxd_storage::Column::AddressOutpoint,
+            fluxd_storage::Column::AddressDelta,
+        ],
     )?;
     Ok(())
 }
@@ -8993,6 +9044,66 @@ mod tests {
             let coinbase = build_coinbase_tx(height, params, Vec::new());
             connect_regtest_block(chainstate, params, height, vec![coinbase]);
         }
+    }
+
+    #[test]
+    fn db_schema_version_missing_on_empty_db_is_initialized() {
+        let store = Store::Memory(MemoryStore::new());
+        let version = ensure_db_schema_version(&store).expect("db schema version");
+        assert_eq!(version, DB_SCHEMA_VERSION);
+        assert_eq!(
+            meta_u32(&store, DB_SCHEMA_VERSION_KEY).expect("meta"),
+            Some(DB_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn db_schema_version_missing_on_nonempty_db_errors() {
+        let store = Store::Memory(MemoryStore::new());
+        store
+            .put(fluxd_storage::Column::HeaderIndex, b"header", b"entry")
+            .expect("put header");
+        let err = ensure_db_schema_version(&store).unwrap_err();
+        assert!(err.contains("schema version missing"), "{err}");
+        assert_eq!(meta_u32(&store, DB_SCHEMA_VERSION_KEY).expect("meta"), None);
+    }
+
+    #[test]
+    fn index_schema_version_missing_on_empty_column_is_initialized() {
+        let store = Store::Memory(MemoryStore::new());
+        let key = b"test_index_schema_version";
+        let expected = 42u32;
+        let version = ensure_index_schema_version(
+            &store,
+            "txindex",
+            key,
+            expected,
+            "--reindex-txindex",
+            &[fluxd_storage::Column::TxIndex],
+        )
+        .expect("index version");
+        assert_eq!(version, expected);
+        assert_eq!(meta_u32(&store, key).expect("meta"), Some(expected));
+    }
+
+    #[test]
+    fn index_schema_version_missing_on_nonempty_column_errors() {
+        let store = Store::Memory(MemoryStore::new());
+        store
+            .put(fluxd_storage::Column::TxIndex, b"txid", b"entry")
+            .expect("put txindex entry");
+        let key = b"test_index_schema_version_nonempty";
+        let err = ensure_index_schema_version(
+            &store,
+            "txindex",
+            key,
+            1,
+            "--reindex-txindex",
+            &[fluxd_storage::Column::TxIndex],
+        )
+        .unwrap_err();
+        assert!(err.contains("schema version missing"), "{err}");
+        assert_eq!(meta_u32(&store, key).expect("meta"), None);
     }
 
     #[test]

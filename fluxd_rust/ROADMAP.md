@@ -278,10 +278,10 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `--log-format text|json` + `flux.conf` `logformat`
   - [x] `--log-timestamps`/`--no-log-timestamps` + `flux.conf` `logtimestamps`
   - [x] Workspace-wide logging via `fluxd-log` (no `println!`/`eprintln!` in hot paths)
-- [ ] [P2] Database migrations and upgrade path (owner: TBD)
+- [x] [P2] Database migrations and upgrade path (owner: TBD)
   - [x] Store DB schema version in `meta` (`db_schema_version`)
   - [x] Version secondary indexes (`txindex_version`, `spentindex_version`, `addressindex_version`)
-  - [ ] Add per-version migrations and compatibility checks
+  - [x] Add per-version migrations and compatibility checks
 
 ## Testing and release hardening
 
