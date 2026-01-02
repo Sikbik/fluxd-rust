@@ -167,6 +167,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Size cap + fee-rate eviction (`--mempool-max-mb` / `--maxmempool`)
 - [x] [P1] Fee estimator persistence (owner: TBD)
 - [x] [P1] Standardness policy parity (mempool accept rules) (owner: TBD)
+  - [x] Reject transactions expiring soon after Acadia (`tx-expiring-soon`)
 - [x] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
 - [x] [P1] Basic P2P tx relay (inv/getdata/tx + `mempool`) (owner: TBD)
 - [x] [P1] `getmininginfo`, `submitblock` (owner: TBD)

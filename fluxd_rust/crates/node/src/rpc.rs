@@ -4757,7 +4757,6 @@ fn rpc_createrawtransaction<S: fluxd_storage::KeyValueStore>(
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
     const DEFAULT_TX_EXPIRY_DELTA: u32 = 20;
-    const TX_EXPIRING_SOON_THRESHOLD: u32 = 3;
 
     if params.len() < 2 || params.len() > 4 {
         return Err(RpcError::new(
@@ -4827,7 +4826,9 @@ fn rpc_createrawtransaction<S: fluxd_storage::KeyValueStore>(
             ));
         }
         if expiry_height != 0
-            && (next_height as u32).saturating_add(TX_EXPIRING_SOON_THRESHOLD) > expiry_height
+            && (next_height as u32)
+                .saturating_add(fluxd_consensus::constants::TX_EXPIRING_SOON_THRESHOLD)
+                > expiry_height
         {
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
@@ -12873,6 +12874,8 @@ fn parse_amount(value: &Value) -> Result<i64, RpcError> {
 
 #[cfg(test)]
 mod tests {
+    use fluxd_primitives::transaction::OVERWINTER_VERSION_GROUP_ID;
+
     use super::*;
     use crate::mempool::MempoolEntry;
     use fluxd_chainstate::flatfiles::FlatFileStore;
@@ -15677,6 +15680,79 @@ mod tests {
 
         let txid = value.as_str().expect("txid string");
         assert!(is_hex_64(txid));
+    }
+
+    #[test]
+    fn sendrawtransaction_rejects_expiring_soon_after_acadia() {
+        let (chainstate, mut params, _data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let prevout = OutPoint {
+            hash: [0x56u8; 32],
+            index: 0,
+        };
+        let prev_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 10_000,
+            script_pubkey: vec![0x51],
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&prevout);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), prev_entry.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let tx = Transaction {
+            f_overwintered: true,
+            version: 3,
+            version_group_id: OVERWINTER_VERSION_GROUP_ID,
+            vin: vec![TxIn {
+                prevout: prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: 9_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+            expiry_height: 3,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let err = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex)],
+            &params,
+            &tx_announce,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_TRANSACTION_REJECTED);
+        assert!(
+            err.message.starts_with("tx-expiring-soon:"),
+            "unexpected message: {}",
+            err.message
+        );
     }
 
     #[test]

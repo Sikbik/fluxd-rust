@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::{validate_mempool_transaction, ValidationFlags};
-use fluxd_consensus::constants::{COINBASE_MATURITY, MAX_BLOCK_SIGOPS};
+use fluxd_consensus::constants::{COINBASE_MATURITY, MAX_BLOCK_SIGOPS, TX_EXPIRING_SOON_THRESHOLD};
 use fluxd_consensus::money::{money_range, MAX_MONEY};
 use fluxd_consensus::params::ChainParams;
 use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
@@ -498,6 +498,26 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
     let next_height = best_height.saturating_add(1);
     let now = now_secs();
     let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+
+    if tx.expiry_height > 0
+        && network_upgrade_active(
+            next_height,
+            &chain_params.consensus.upgrades,
+            UpgradeIndex::Acadia,
+        )
+    {
+        let next_height_u32 = u32::try_from(next_height).unwrap_or(0);
+        let min_expiry = next_height_u32.saturating_add(TX_EXPIRING_SOON_THRESHOLD);
+        if min_expiry > tx.expiry_height {
+            return Err(MempoolError::new(
+                MempoolErrorKind::InvalidTransaction,
+                format!(
+                    "tx-expiring-soon: expiryheight is {} but should be at least {} to avoid transaction expiring soon",
+                    tx.expiry_height, min_expiry
+                ),
+            ));
+        }
+    }
     let branch_id = current_epoch_branch_id(next_height, &chain_params.consensus.upgrades);
 
     let mut tx_flags = flags.clone();

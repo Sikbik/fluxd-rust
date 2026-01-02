@@ -53,6 +53,8 @@ pub const FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V3: i32 = 160;
 pub const FLUXNODE_CONFIRM_UPDATE_EXPIRATION_HEIGHT_V4: i32 = 640; // PON activation (targeting 30s blocks)
 /// The minimum value which is invalid for expiry height.
 pub const TX_EXPIRY_HEIGHT_THRESHOLD: u32 = 500_000_000;
+/// The number of blocks within expiry height when a tx is considered to be expiring soon.
+pub const TX_EXPIRING_SOON_THRESHOLD: u32 = 3;
 
 /// Use GetMedianTimePast() instead of nTime for end point timestamp.
 pub const LOCKTIME_MEDIAN_TIME_PAST: u32 = 1 << 1;
