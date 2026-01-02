@@ -3738,6 +3738,8 @@ fn rebuild_spentindex<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     write_lock: &Mutex<()>,
 ) -> Result<(), String> {
+    const TX_CACHE_CAPACITY: usize = 50_000;
+
     let Some(best) = chainstate.best_block().map_err(|err| err.to_string())? else {
         log_info!("Spent index rebuild requested but no blocks are present");
         return Ok(());
@@ -3745,6 +3747,7 @@ fn rebuild_spentindex<S: KeyValueStore>(
 
     log_info!("Rebuilding spent index up to height {}", best.height);
     let mut last_progress = Instant::now();
+    let mut tx_cache = TxOutCache::new(TX_CACHE_CAPACITY);
 
     for height in 0..=best.height {
         let hash = chainstate
@@ -3762,25 +3765,84 @@ fn rebuild_spentindex<S: KeyValueStore>(
             Block::consensus_decode(&bytes).map_err(|_| "invalid block encoding".to_string())?;
 
         let mut batch = WriteBatch::new();
+        let estimated_inputs = block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|tx| tx.vin.len())
+            .sum::<usize>();
+        let estimated_outputs = block
+            .transactions
+            .iter()
+            .map(|tx| tx.vout.len())
+            .sum::<usize>();
+        batch.reserve(estimated_inputs.saturating_add(4));
+
+        let mut created: HashMap<fluxd_chainstate::utxo::OutPointKey, CachedTxOut> =
+            HashMap::with_capacity(estimated_outputs);
+        let mut spent_outpoints: HashSet<fluxd_chainstate::utxo::OutPointKey> =
+            HashSet::with_capacity(estimated_inputs);
+
         for (tx_index, tx) in block.transactions.iter().enumerate() {
-            if tx_index == 0 {
-                continue;
-            }
             let txid = tx.txid().map_err(|err| err.to_string())?;
-            for (input_index, input) in tx.vin.iter().enumerate() {
-                let key = fluxd_chainstate::utxo::outpoint_key_bytes(&input.prevout);
-                let value = fluxd_chainstate::spentindex::SpentIndexValue {
-                    txid,
-                    input_index: input_index as u32,
-                    block_height: height as u32,
-                    details: None,
-                };
-                batch.put(
-                    fluxd_storage::Column::SpentIndex,
-                    key.as_bytes(),
-                    value.encode(),
-                );
+
+            if tx_index != 0 {
+                for (input_index, input) in tx.vin.iter().enumerate() {
+                    let outpoint_key = fluxd_chainstate::utxo::outpoint_key_bytes(&input.prevout);
+                    if !spent_outpoints.insert(outpoint_key) {
+                        return Err(format!(
+                            "duplicate prevout {}:{} at height {} (tx {})",
+                            hash256_to_hex(&input.prevout.hash),
+                            input.prevout.index,
+                            height,
+                            hash256_to_hex(&txid)
+                        ));
+                    }
+
+                    let prevout = match created.remove(&outpoint_key) {
+                        Some(prevout) => prevout,
+                        None => resolve_prevout_txout(chainstate, &mut tx_cache, &input.prevout)?,
+                    };
+                    let details = fluxd_chainstate::spentindex::SpentIndexDetails {
+                        satoshis: prevout.value,
+                        address_type: prevout.address_type,
+                        address_hash: prevout.address_hash,
+                    };
+                    let value = fluxd_chainstate::spentindex::SpentIndexValue {
+                        txid,
+                        input_index: input_index as u32,
+                        block_height: height as u32,
+                        details: Some(details),
+                    };
+                    batch.put(
+                        fluxd_storage::Column::SpentIndex,
+                        outpoint_key.as_bytes(),
+                        value.encode(),
+                    );
+                }
             }
+
+            let mut outputs = Vec::with_capacity(tx.vout.len());
+            for (out_index, output) in tx.vout.iter().enumerate() {
+                let script_hash =
+                    fluxd_chainstate::address_index::script_hash(&output.script_pubkey);
+                let (address_type, address_hash) = spent_address_info(&output.script_pubkey);
+                let out = CachedTxOut {
+                    value: output.value,
+                    script_hash,
+                    address_type,
+                    address_hash,
+                };
+                outputs.push(out);
+
+                let outpoint = OutPoint {
+                    hash: txid,
+                    index: out_index as u32,
+                };
+                created.insert(fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint), out);
+            }
+
+            tx_cache.insert(txid, outputs);
         }
 
         let _guard = write_lock
@@ -3808,6 +3870,32 @@ fn rebuild_spentindex<S: KeyValueStore>(
 struct CachedTxOut {
     value: i64,
     script_hash: Option<Hash256>,
+    address_type: u32,
+    address_hash: [u8; 20],
+}
+
+fn spent_address_info(script_pubkey: &[u8]) -> (u32, [u8; 20]) {
+    if script_pubkey.len() == 25
+        && script_pubkey[0] == 0x76
+        && script_pubkey[1] == 0xa9
+        && script_pubkey[2] == 0x14
+        && script_pubkey[23] == 0x88
+        && script_pubkey[24] == 0xac
+    {
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&script_pubkey[3..23]);
+        return (1, hash);
+    }
+    if script_pubkey.len() == 23
+        && script_pubkey[0] == 0xa9
+        && script_pubkey[1] == 0x14
+        && script_pubkey[22] == 0x87
+    {
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&script_pubkey[2..22]);
+        return (2, hash);
+    }
+    (0, [0u8; 20])
 }
 
 struct TxOutCache {
@@ -3948,7 +4036,7 @@ fn rebuild_addressindex<S: KeyValueStore>(
                     let (prev, was_created_in_block) = match created_in_block {
                         Some(created) => (created.out, true),
                         None => (
-                            resolve_prevout_for_addressindex(chainstate, &mut tx_cache, input)?,
+                            resolve_prevout_txout(chainstate, &mut tx_cache, &input.prevout)?,
                             false,
                         ),
                     };
@@ -3988,9 +4076,12 @@ fn rebuild_addressindex<S: KeyValueStore>(
             for (out_index, output) in tx.vout.iter().enumerate() {
                 let script_hash =
                     fluxd_chainstate::address_index::script_hash(&output.script_pubkey);
+                let (address_type, address_hash) = spent_address_info(&output.script_pubkey);
                 let out = CachedTxOut {
                     value: output.value,
                     script_hash,
+                    address_type,
+                    address_hash,
                 };
                 outputs.push(out);
 
@@ -4055,23 +4146,23 @@ fn rebuild_addressindex<S: KeyValueStore>(
     Ok(())
 }
 
-fn resolve_prevout_for_addressindex<S: KeyValueStore>(
+fn resolve_prevout_txout<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     tx_cache: &mut TxOutCache,
-    input: &TxIn,
+    prevout: &OutPoint,
 ) -> Result<CachedTxOut, String> {
-    if let Some(cached) = tx_cache.output(&input.prevout.hash, input.prevout.index) {
+    if let Some(cached) = tx_cache.output(&prevout.hash, prevout.index) {
         return Ok(cached);
     }
 
     let location = chainstate
-        .tx_location(&input.prevout.hash)
+        .tx_location(&prevout.hash)
         .map_err(|err| err.to_string())?
         .ok_or_else(|| {
             format!(
                 "missing tx index entry for prevout {}:{}",
-                hash256_to_hex(&input.prevout.hash),
-                input.prevout.index
+                hash256_to_hex(&prevout.hash),
+                prevout.index
             )
         })?;
     let bytes = chainstate
@@ -4085,34 +4176,37 @@ fn resolve_prevout_for_addressindex<S: KeyValueStore>(
         .ok_or_else(|| {
             format!(
                 "tx index points beyond block tx list (prevout {})",
-                hash256_to_hex(&input.prevout.hash)
+                hash256_to_hex(&prevout.hash)
             )
         })?;
     let txid = tx.txid().map_err(|err| err.to_string())?;
-    if txid != input.prevout.hash {
+    if txid != prevout.hash {
         return Err(format!(
             "tx index mismatch for prevout {}: got txid {}",
-            hash256_to_hex(&input.prevout.hash),
+            hash256_to_hex(&prevout.hash),
             hash256_to_hex(&txid)
         ));
     }
 
     let mut outputs = Vec::with_capacity(tx.vout.len());
     for output in &tx.vout {
+        let (address_type, address_hash) = spent_address_info(&output.script_pubkey);
         outputs.push(CachedTxOut {
             value: output.value,
             script_hash: fluxd_chainstate::address_index::script_hash(&output.script_pubkey),
+            address_type,
+            address_hash,
         });
     }
 
     let out = outputs
-        .get(input.prevout.index as usize)
+        .get(prevout.index as usize)
         .copied()
         .ok_or_else(|| {
             format!(
                 "prevout {}:{} refers to missing vout",
-                hash256_to_hex(&input.prevout.hash),
-                input.prevout.index
+                hash256_to_hex(&prevout.hash),
+                prevout.index
             )
         })?;
     tx_cache.insert(txid, outputs);
@@ -8535,6 +8629,10 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxd_consensus::constants::COINBASE_MATURITY;
+    use fluxd_primitives::hash::sha256d;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn genesis_pow_validation_is_allowed() {
@@ -8544,5 +8642,302 @@ mod tests {
             pow_validation::validate_pow_header(&block.header, 0, &params.consensus)
                 .expect("genesis pow validation");
         }
+    }
+
+    fn merkle_hash_pair(left: &Hash256, right: &Hash256) -> Hash256 {
+        let mut buf = [0u8; 64];
+        buf[0..32].copy_from_slice(left);
+        buf[32..64].copy_from_slice(right);
+        sha256d(&buf)
+    }
+
+    fn merkle_root(txids: &[Hash256]) -> Hash256 {
+        if txids.is_empty() {
+            return [0u8; 32];
+        }
+        let mut layer = txids.to_vec();
+        while layer.len() > 1 {
+            if layer.len() % 2 == 1 {
+                let last = *layer.last().expect("non-empty");
+                layer.push(last);
+            }
+            let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+            for pair in layer.chunks(2) {
+                next.push(merkle_hash_pair(&pair[0], &pair[1]));
+            }
+            layer = next;
+        }
+        layer[0]
+    }
+
+    fn p2pkh_script(pubkey_hash: [u8; 20]) -> Vec<u8> {
+        let mut script = Vec::with_capacity(25);
+        script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        script.extend_from_slice(&pubkey_hash);
+        script.extend_from_slice(&[0x88, 0xac]);
+        script
+    }
+
+    fn build_coinbase_tx(
+        height: i32,
+        params: &ChainParams,
+        miner_script_pubkey: Vec<u8>,
+    ) -> Transaction {
+        let miner_value = block_subsidy(height, &params.consensus);
+        let exchange_amount = exchange_fund_amount(height, &params.funding);
+        let foundation_amount = foundation_fund_amount(height, &params.funding);
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+        let mut vout = Vec::new();
+        vout.push(TxOut {
+            value: miner_value,
+            script_pubkey: miner_script_pubkey,
+        });
+        if exchange_amount > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout.push(TxOut {
+                value: exchange_amount,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout.push(TxOut {
+                value: foundation_amount,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout.push(TxOut {
+                value: swap_amount,
+                script_pubkey: script,
+            });
+        }
+
+        Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        }
+    }
+
+    fn connect_regtest_block(
+        chainstate: &ChainState<MemoryStore>,
+        params: &ChainParams,
+        height: i32,
+        transactions: Vec<Transaction>,
+    ) -> Hash256 {
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let txids: Vec<Hash256> = transactions
+            .iter()
+            .map(|tx| tx.txid().expect("txid"))
+            .collect();
+        let merkle_root = merkle_root(&txids);
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root,
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = Block {
+            header,
+            transactions,
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+                None,
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+        block.header.hash()
+    }
+
+    fn extend_regtest_chain_to_height(
+        chainstate: &ChainState<MemoryStore>,
+        params: &ChainParams,
+        target_height: i32,
+    ) {
+        loop {
+            let tip = chainstate
+                .best_block()
+                .expect("best block")
+                .expect("best block present");
+            if tip.height >= target_height {
+                break;
+            }
+            let height = tip.height + 1;
+            let coinbase = build_coinbase_tx(height, params, Vec::new());
+            connect_regtest_block(chainstate, params, height, vec![coinbase]);
+        }
+    }
+
+    #[test]
+    fn reindex_spentindex_rebuilds_details_from_txindex() {
+        struct TempDirGuard {
+            path: PathBuf,
+        }
+
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        fn temp_data_dir(prefix: &str) -> PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+        }
+
+        let data_dir = temp_data_dir("fluxd-spentindex-test");
+        let _guard = TempDirGuard {
+            path: data_dir.clone(),
+        };
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let blocks_dir = data_dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir).expect("create blocks dir");
+        let blocks = FlatFileStore::new(&blocks_dir, 10_000_000).expect("flatfiles");
+        let undo =
+            FlatFileStore::new_with_prefix(&blocks_dir, "undo", 10_000_000).expect("flatfiles");
+        let store = Arc::new(MemoryStore::new());
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let params = chain_params(Network::Regtest);
+        let flags = ValidationFlags::default();
+        let write_lock = Mutex::new(());
+        ensure_genesis(&chainstate, &params, &flags, None, &write_lock).expect("genesis");
+
+        let pubkey_hash = [0x11u8; 20];
+        let miner_script_pubkey = p2pkh_script(pubkey_hash);
+        let height = 1;
+        let miner_value = block_subsidy(height, &params.consensus);
+        let coinbase = build_coinbase_tx(height, &params, miner_script_pubkey);
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        connect_regtest_block(&chainstate, &params, height, vec![coinbase]);
+
+        extend_regtest_chain_to_height(&chainstate, &params, COINBASE_MATURITY);
+
+        let spend_height = COINBASE_MATURITY + 1;
+        let spend_value = miner_value.saturating_sub(1000);
+        let spend_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: coinbase_txid,
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: spend_value,
+                script_pubkey: Vec::new(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let coinbase = build_coinbase_tx(spend_height, &params, Vec::new());
+        connect_regtest_block(&chainstate, &params, spend_height, vec![coinbase, spend_tx]);
+
+        let outpoint = OutPoint {
+            hash: coinbase_txid,
+            index: 0,
+        };
+        let spent_before = chainstate
+            .spent_info(&outpoint)
+            .expect("spent info")
+            .expect("spent entry");
+        let details_before = spent_before.details.expect("details");
+        assert_eq!(details_before.satoshis, miner_value);
+        assert_eq!(details_before.address_type, 1);
+        assert_eq!(details_before.address_hash, pubkey_hash);
+
+        rebuild_spentindex(&chainstate, &write_lock).expect("rebuild spent index");
+
+        let spent_after = chainstate
+            .spent_info(&outpoint)
+            .expect("spent info")
+            .expect("spent entry");
+        let details_after = spent_after.details.expect("details");
+        assert_eq!(details_after.satoshis, details_before.satoshis);
+        assert_eq!(details_after.address_type, details_before.address_type);
+        assert_eq!(details_after.address_hash, details_before.address_hash);
     }
 }

@@ -169,6 +169,8 @@ ssh <vps-user>@<vps-host> "pkill -x fluxd"
 ssh <vps-user>@<vps-host> "<remote-fluxd-bin> --data-dir <remote-data-dir> --reindex-txindex --reindex-spentindex --reindex-addressindex"
 ```
 
+`--reindex-spentindex` uses `txindex` to populate satoshis/address metadata; include `--reindex-txindex` if txindex is missing or stale.
+
 To wipe `blocks/` too (clean download + index), use `--resync` or remove `<remote-data-dir>`.
 
 ## Clean resync
