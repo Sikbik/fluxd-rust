@@ -174,9 +174,9 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Proposal mode support (`{"mode":"proposal","data":"..."}`) (owner: TBD)
   - [x] Miner address config (`--miner-address` / `flux.conf` `mineraddress=`) (owner: TBD)
   - [x] Wallet-backed miner script (coinbase script from wallet) (owner: TBD)
-- [ ] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
+- [x] [P2] `getnetworkhashps`, `getnetworksolps`, `getlocalsolps` (real metrics) (owner: TBD)
   - [x] Chainwork/time estimate for `getnetworksolps` and `getnetworkhashps`
-  - [ ] Real `getlocalsolps` (requires mining telemetry; currently returns 0.0)
+  - [x] Real `getlocalsolps` (reports local POW header validation throughput; returns 0.0 when idle)
 
 ## Wallet
 
@@ -361,7 +361,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getmininginfo`<br>`submitblock`<br>`prioritisetransaction`<br>`getblocktemplate` | `getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps` | - |
+| `getblocksubsidy`<br>`getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps`<br>`prioritisetransaction` | `getmininginfo` (placeholders)<br>`submitblock` (simplified return codes) | - |
 
 ### Fluxnode
 

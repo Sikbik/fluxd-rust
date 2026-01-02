@@ -251,6 +251,9 @@ echo "Checking getnetworksolps/getnetworkhashps ..."
 rpc_get "getnetworksolps" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, (int,float)), res; assert res >= 0'
 rpc_get "getnetworkhashps" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, (int,float)), res; assert res >= 0'
 
+echo "Checking getlocalsolps ..."
+rpc_get "getlocalsolps" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, (int,float)), res; assert res >= 0'
+
 echo "Checking zvalidateaddress ..."
 rpc_get "zvalidateaddress?zaddr=notanaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is False'
 

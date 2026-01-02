@@ -1367,6 +1367,8 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
     let wallet =
         wallet::Wallet::load_or_create(data_dir, config.network).map_err(|err| err.to_string())?;
     let wallet = Arc::new(Mutex::new(wallet));
+    let sync_metrics = Arc::new(SyncMetrics::default());
+    let header_metrics = Arc::new(HeaderMetrics::default());
     {
         let chainstate = Arc::clone(&chainstate);
         let store = Arc::clone(&store);
@@ -1374,6 +1376,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         let mempool = Arc::clone(&mempool);
         let mempool_policy = Arc::clone(&mempool_policy);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let header_metrics = Arc::clone(&header_metrics);
         let fee_estimator = Arc::clone(&fee_estimator);
         let mempool_flags = flags.clone();
         let miner_address = config.miner_address.clone();
@@ -1404,6 +1407,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                     mempool,
                     mempool_policy,
                     mempool_metrics,
+                    header_metrics,
                     fee_estimator,
                     mempool_flags,
                     miner_address,
@@ -1619,8 +1623,6 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         });
     }
 
-    let sync_metrics = Arc::new(SyncMetrics::default());
-    let header_metrics = Arc::new(HeaderMetrics::default());
     spawn_status_logger(
         Arc::clone(&chainstate),
         Arc::clone(&store),

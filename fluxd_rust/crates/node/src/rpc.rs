@@ -4,7 +4,7 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use bech32::primitives::decode::CheckedHrpstring;
@@ -77,7 +77,7 @@ use crate::fee_estimator::FeeEstimator;
 use crate::mempool::{build_mempool_entry, Mempool, MempoolErrorKind, MempoolPolicy};
 use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::peer_book::HeaderPeerBook;
-use crate::stats::{hash256_to_hex, MempoolMetrics};
+use crate::stats::{hash256_to_hex, HeaderMetrics, MempoolMetrics};
 use crate::wallet::{Wallet, WalletError, WALLET_FILE_VERSION};
 use crate::AddrBook;
 use crate::{db_info, Backend, Store};
@@ -282,6 +282,7 @@ struct RpcContext<S> {
     mempool: Arc<Mutex<Mempool>>,
     mempool_policy: Arc<MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
+    header_metrics: Arc<HeaderMetrics>,
     fee_estimator: Arc<Mutex<FeeEstimator>>,
     mempool_flags: ValidationFlags,
     miner_address: Option<String>,
@@ -672,6 +673,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     mempool: Arc<Mutex<Mempool>>,
     mempool_policy: Arc<MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
+    header_metrics: Arc<HeaderMetrics>,
     fee_estimator: Arc<Mutex<FeeEstimator>>,
     mempool_flags: ValidationFlags,
     miner_address: Option<String>,
@@ -713,6 +715,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let mempool = Arc::clone(&mempool);
         let mempool_policy = Arc::clone(&mempool_policy);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let header_metrics = Arc::clone(&header_metrics);
         let fee_estimator = Arc::clone(&fee_estimator);
         let mempool_flags = mempool_flags.clone();
         let miner_address = miner_address.clone();
@@ -737,6 +740,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 mempool,
                 mempool_policy,
                 mempool_metrics,
+                header_metrics,
                 fee_estimator,
                 mempool_flags,
                 miner_address,
@@ -770,6 +774,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     mempool: Arc<Mutex<Mempool>>,
     mempool_policy: Arc<MempoolPolicy>,
     mempool_metrics: Arc<MempoolMetrics>,
+    header_metrics: Arc<HeaderMetrics>,
     fee_estimator: Arc<Mutex<FeeEstimator>>,
     mempool_flags: ValidationFlags,
     miner_address: Option<String>,
@@ -817,6 +822,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         mempool,
         mempool_policy,
         mempool_metrics,
+        header_metrics,
         fee_estimator,
         mempool_flags,
         miner_address,
@@ -1238,6 +1244,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
     let mempool = ctx.mempool.as_ref();
     let mempool_policy = ctx.mempool_policy.as_ref();
     let mempool_metrics = ctx.mempool_metrics.as_ref();
+    let header_metrics = ctx.header_metrics.as_ref();
     let fee_estimator = ctx.fee_estimator.as_ref();
     let mempool_flags = &ctx.mempool_flags;
     let miner_address = ctx.miner_address.as_deref();
@@ -1413,7 +1420,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         }
         "getnetworkhashps" => rpc_getnetworkhashps(chainstate, params, chain_params),
         "getnetworksolps" => rpc_getnetworksolps(chainstate, params, chain_params),
-        "getlocalsolps" => rpc_getlocalsolps(params),
+        "getlocalsolps" => rpc_getlocalsolps(params, header_metrics),
         "estimatefee" => rpc_estimatefee(params, fee_estimator),
         "estimatepriority" => rpc_estimatepriority(params),
         "prioritisetransaction" => rpc_prioritisetransaction(params, mempool),
@@ -12021,9 +12028,49 @@ fn rpc_getnetworksolps<S: fluxd_storage::KeyValueStore>(
     Ok(json!(rate))
 }
 
-fn rpc_getlocalsolps(params: Vec<Value>) -> Result<Value, RpcError> {
+#[derive(Clone, Copy, Debug)]
+struct LocalSolpsState {
+    last_pow_headers: u64,
+    last_seen_at: Option<Instant>,
+}
+
+fn rpc_getlocalsolps(
+    params: Vec<Value>,
+    header_metrics: &HeaderMetrics,
+) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
-    Ok(json!(0.0))
+    static STATE: OnceLock<Mutex<LocalSolpsState>> = OnceLock::new();
+
+    let pow_headers = header_metrics.snapshot().pow_headers;
+    let now = Instant::now();
+
+    let lock = STATE.get_or_init(|| {
+        Mutex::new(LocalSolpsState {
+            last_pow_headers: pow_headers,
+            last_seen_at: Some(now),
+        })
+    });
+    let mut guard = lock
+        .lock()
+        .map_err(|_| map_internal("localsolps lock poisoned"))?;
+
+    let solps = match guard.last_seen_at {
+        None => 0.0,
+        Some(prev) => {
+            let dt = now.duration_since(prev).as_secs_f64();
+            if dt <= 0.0 {
+                0.0
+            } else {
+                let delta = pow_headers.saturating_sub(guard.last_pow_headers) as f64;
+                delta / dt
+            }
+        }
+    };
+
+    guard.last_pow_headers = pow_headers;
+    guard.last_seen_at = Some(now);
+
+    Ok(json!(solps))
 }
 
 fn rpc_estimatefee(
@@ -18871,7 +18918,8 @@ mod tests {
         assert!(value.as_i64().is_some());
         let value = rpc_getnetworksolps(&chainstate, Vec::new(), &params).expect("rpc");
         assert!(value.as_i64().is_some());
-        let value = rpc_getlocalsolps(Vec::new()).expect("rpc");
+        let header_metrics = HeaderMetrics::default();
+        let value = rpc_getlocalsolps(Vec::new(), &header_metrics).expect("rpc");
         assert!(value.as_f64().is_some());
     }
 
