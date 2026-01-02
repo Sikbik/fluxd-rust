@@ -44,6 +44,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Run block connect on blocking threads to keep RPC/dashboard responsive under high throughput
   - [x] Reduce per-input allocation overhead (outpoint key handling + per-block UTXO cache)
   - [x] Inline small keys in `WriteBatch` (UTXO/address keys stored without heap allocs)
+  - [x] Inline small values in `WriteBatch` (common index values stored without heap allocs)
   - [x] Reduce Fjall write-path overhead (preallocate write batches; avoid per-op hashset/hashmap work)
   - [x] Avoid heap allocs for common index keys (txindex/header/block index keys)
   - [x] LRU UTXO read cache for sequential block spends (`--utxo-cache-entries`)

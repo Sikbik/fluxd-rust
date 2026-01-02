@@ -162,11 +162,54 @@ impl<const N: usize> From<&[u8; N]> for WriteKey {
 }
 
 #[derive(Clone, Debug)]
+pub struct WriteValue(SmallVec<[u8; 32]>);
+
+impl WriteValue {
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0.into_vec()
+    }
+}
+
+impl AsRef<[u8]> for WriteValue {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for WriteValue {
+    fn from(value: Vec<u8>) -> Self {
+        Self(SmallVec::from_vec(value))
+    }
+}
+
+impl From<&[u8]> for WriteValue {
+    fn from(value: &[u8]) -> Self {
+        Self(SmallVec::from_slice(value))
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for WriteValue {
+    fn from(value: [u8; N]) -> Self {
+        Self(SmallVec::from_slice(&value))
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for WriteValue {
+    fn from(value: &[u8; N]) -> Self {
+        Self(SmallVec::from_slice(value))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum WriteOp {
     Put {
         column: Column,
         key: WriteKey,
-        value: Vec<u8>,
+        value: WriteValue,
     },
     Delete {
         column: Column,
@@ -188,7 +231,7 @@ impl WriteBatch {
         self.ops.reserve(additional);
     }
 
-    pub fn put(&mut self, column: Column, key: impl Into<WriteKey>, value: impl Into<Vec<u8>>) {
+    pub fn put(&mut self, column: Column, key: impl Into<WriteKey>, value: impl Into<WriteValue>) {
         self.ops.push(WriteOp::Put {
             column,
             key: key.into(),

@@ -3313,28 +3313,29 @@ impl<S: KeyValueStore> ChainState<S> {
     }
 
     pub fn commit_batch(&self, batch: WriteBatch) -> Result<(), ChainStateError> {
-        let mut sprout_bytes = None;
-        let mut sapling_bytes = None;
+        let mut sprout_bytes: Option<Vec<u8>> = None;
+        let mut sapling_bytes: Option<Vec<u8>> = None;
         let mut header_cache_updates: Vec<(Hash256, HeaderEntry)> = Vec::new();
         for op in batch.iter() {
             if let WriteOp::Put { column, key, value } = op {
                 match *column {
                     Column::Meta => {
                         if key.as_slice() == SPROUT_TREE_KEY {
-                            sprout_bytes = Some(value.clone());
+                            sprout_bytes = Some(value.as_slice().to_vec());
                         } else if key.as_slice() == SAPLING_TREE_KEY {
-                            sapling_bytes = Some(value.clone());
+                            sapling_bytes = Some(value.as_slice().to_vec());
                         }
                     }
                     Column::HeaderIndex => {
                         const STATUS_OFFSET: usize = 32 + 4 + 4 + 4 + 32;
+                        let value_bytes = value.as_slice();
                         if key.as_slice().len() == 32
-                            && value.len() > STATUS_OFFSET
-                            && index_has_block(value[STATUS_OFFSET])
+                            && value_bytes.len() > STATUS_OFFSET
+                            && index_has_block(value_bytes[STATUS_OFFSET])
                         {
                             let mut hash = [0u8; 32];
                             hash.copy_from_slice(key.as_slice());
-                            let entry = decode_header_entry(value).map_err(|_| {
+                            let entry = decode_header_entry(value_bytes).map_err(|_| {
                                 ChainStateError::CorruptIndex("invalid header index entry in batch")
                             })?;
                             header_cache_updates.push((hash, entry));
@@ -3361,11 +3362,11 @@ impl<S: KeyValueStore> ChainState<S> {
                 match op {
                     WriteOp::Put { column, key, value } if *column == Column::Meta => {
                         if let Some(file_id) = parse_block_file_info_key(key.as_slice()) {
-                            if let Some(info) = FlatFileInfo::decode(value) {
+                            if let Some(info) = FlatFileInfo::decode(value.as_slice()) {
                                 meta_cache.blocks = Some(TrackedFlatFile { file_id, info });
                             }
                         } else if let Some(file_id) = parse_undo_file_info_key(key.as_slice()) {
-                            if let Some(info) = FlatFileInfo::decode(value) {
+                            if let Some(info) = FlatFileInfo::decode(value.as_slice()) {
                                 meta_cache.undo = Some(TrackedFlatFile { file_id, info });
                             }
                         }
@@ -3401,7 +3402,7 @@ impl<S: KeyValueStore> ChainState<S> {
                                 let mut hash = [0u8; 32];
                                 hash.copy_from_slice(key.as_slice());
                                 fluxnode_key_updates
-                                    .push((hash, Arc::from(value.into_boxed_slice())));
+                                    .push((hash, Arc::from(value.into_vec().into_boxed_slice())));
                             }
                             continue;
                         }
@@ -3411,7 +3412,7 @@ impl<S: KeyValueStore> ChainState<S> {
                         let Some(outpoint_key) = OutPointKey::from_slice(key.as_slice()) else {
                             continue;
                         };
-                        cache.insert(outpoint_key, value);
+                        cache.insert(outpoint_key, value.into_vec());
                     }
                     WriteOp::Delete { column, key } => {
                         if column == Column::Fluxnode {
@@ -3452,7 +3453,7 @@ impl<S: KeyValueStore> ChainState<S> {
                 for update in fluxnode_updates {
                     match update {
                         WriteOp::Put { key: _, value, .. } => {
-                            let Ok(record) = FluxnodeRecord::decode(&value) else {
+                            let Ok(record) = FluxnodeRecord::decode(value.as_slice()) else {
                                 return Err(ChainStateError::CorruptIndex(
                                     "invalid fluxnode record bytes in batch",
                                 ));

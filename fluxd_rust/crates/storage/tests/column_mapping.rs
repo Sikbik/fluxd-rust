@@ -13,4 +13,3 @@ fn column_index_and_bit_are_stable() {
     }
     assert_eq!(seen.count_ones() as usize, Column::ALL.len());
 }
-
