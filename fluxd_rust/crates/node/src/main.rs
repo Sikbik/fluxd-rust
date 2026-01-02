@@ -161,6 +161,8 @@ const MEMPOOL_FILE_NAME: &str = "mempool.dat";
 const FEE_ESTIMATES_FILE_NAME: &str = "fee_estimates.dat";
 const REINDEX_REQUEST_FILE_NAME: &str = "reindex.flag";
 const DATA_DIR_LOCK_FILE_NAME: &str = ".lock";
+pub(crate) const DB_SCHEMA_VERSION_KEY: &[u8] = b"db_schema_version";
+pub(crate) const DB_SCHEMA_VERSION: u32 = 1;
 const PEERS_FILE_VERSION: u32 = 2;
 const PEERS_FILE_VERSION_V1: u32 = 1;
 const MEMPOOL_FILE_VERSION: u32 = 1;
@@ -1064,6 +1066,7 @@ async fn run() -> Result<(), String> {
 
     let store = open_store(config.backend, &db_path, &config)?;
     let store = Arc::new(store);
+    let _db_schema_version = ensure_db_schema_version(store.as_ref())?;
 
     let blocks = FlatFileStore::new(&blocks_path, DEFAULT_MAX_FLATFILE_SIZE)
         .map_err(|err| err.to_string())?;
@@ -2710,6 +2713,39 @@ fn open_store(backend: Backend, db_path: &PathBuf, config: &Config) -> Result<St
             ))
         }
     }
+}
+
+fn ensure_db_schema_version(store: &Store) -> Result<u32, String> {
+    let version = match store
+        .get(fluxd_storage::Column::Meta, DB_SCHEMA_VERSION_KEY)
+        .map_err(|err| err.to_string())?
+    {
+        Some(bytes) => {
+            let bytes: [u8; 4] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("invalid db schema version length {}", bytes.len()))?;
+            u32::from_le_bytes(bytes)
+        }
+        None => {
+            store
+                .put(
+                    fluxd_storage::Column::Meta,
+                    DB_SCHEMA_VERSION_KEY,
+                    &DB_SCHEMA_VERSION.to_le_bytes(),
+                )
+                .map_err(|err| err.to_string())?;
+            DB_SCHEMA_VERSION
+        }
+    };
+
+    if version != DB_SCHEMA_VERSION {
+        return Err(format!(
+            "database schema version mismatch (found {version}, expected {DB_SCHEMA_VERSION}); run with --reindex to rebuild",
+        ));
+    }
+
+    Ok(version)
 }
 
 fn load_peers_file(path: &Path) -> Result<Vec<(SocketAddr, AddrBookEntry)>, String> {

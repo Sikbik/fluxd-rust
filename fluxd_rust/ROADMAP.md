@@ -108,11 +108,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] UTXO set stats (`gettxoutsetinfo`) (owner: TBD)
 - [x] [P1] Shielded value pool totals (Sprout/Sapling) for supply tracking (owner: TBD)
 - [x] [P1] Block deltas index (`getblockdeltas`) (owner: TBD)
-- [ ] [P2] Reindex/rescan support for secondary indexes (owner: TBD)
+- [x] [P2] Reindex/rescan support for secondary indexes (owner: TBD)
   - [x] `reindex` RPC + `--reindex` startup flag (wipe `db/` and rebuild from `blocks/` if present; use `--resync` to wipe blocks too)
   - [x] `rescanblockchain` RPC (scans address delta index; populates wallet tx history)
   - [x] Reindex from existing flatfiles (no network)
-  - [ ] Selective index rebuild (txindex/address/spent only)
+  - [x] Selective index rebuild (txindex/address/spent only)
     - [x] Tx index rebuild (`--reindex-txindex`)
     - [x] Spent index rebuild (`--reindex-spentindex`)
     - [x] Address indexes rebuild (`--reindex-addressindex`)
@@ -277,6 +277,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `--log-timestamps`/`--no-log-timestamps` + `flux.conf` `logtimestamps`
   - [x] Workspace-wide logging via `fluxd-log` (no `println!`/`eprintln!` in hot paths)
 - [ ] [P2] Database migrations and upgrade path (owner: TBD)
+  - [x] Store DB schema version in `meta` (`db_schema_version`)
+  - [ ] Add per-version migrations and compatibility checks
 
 ## Testing and release hardening
 

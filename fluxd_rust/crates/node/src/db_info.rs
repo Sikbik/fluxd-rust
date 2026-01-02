@@ -48,6 +48,11 @@ pub(crate) fn collect_db_info<S: KeyValueStore>(
 ) -> Result<Value, String> {
     let best_header = chainstate.best_header().map_err(|err| err.to_string())?;
     let best_block = chainstate.best_block().map_err(|err| err.to_string())?;
+    let db_schema_version = match store.get(Column::Meta, crate::DB_SCHEMA_VERSION_KEY) {
+        Ok(Some(bytes)) => bytes.as_slice().try_into().ok().map(u32::from_le_bytes),
+        Ok(None) => None,
+        Err(err) => return Err(err.to_string()),
+    };
 
     let db_dir = data_dir.join("db");
     let blocks_dir = data_dir.join("blocks");
@@ -184,6 +189,10 @@ pub(crate) fn collect_db_info<S: KeyValueStore>(
         "backend": match backend {
             Backend::Fjall => "fjall",
             Backend::Memory => "memory",
+        },
+        "schema": {
+            "db_schema_version": db_schema_version,
+            "expected_db_schema_version": crate::DB_SCHEMA_VERSION,
         },
         "paths": {
             "data_dir": data_dir.display().to_string(),
