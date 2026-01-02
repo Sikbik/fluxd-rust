@@ -158,6 +158,7 @@ fn reorg_reverts_utxo_spent_and_address_indexes() {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit block");
@@ -192,7 +193,9 @@ fn reorg_reverts_utxo_spent_and_address_indexes() {
         transactions: vec![coinbase_tx(101), fund_tx],
     };
     let batch = chainstate
-        .connect_block(&block101, 101, &params, &flags, true, None, None, None)
+        .connect_block(
+            &block101, 101, &params, &flags, true, None, None, None, None,
+        )
         .expect("connect block 101");
     chainstate.commit_batch(batch).expect("commit 101");
 
@@ -231,7 +234,9 @@ fn reorg_reverts_utxo_spent_and_address_indexes() {
         transactions: vec![coinbase_tx(102), spend_a],
     };
     let batch = chainstate
-        .connect_block(&block102a, 102, &params, &flags, true, None, None, None)
+        .connect_block(
+            &block102a, 102, &params, &flags, true, None, None, None, None,
+        )
         .expect("connect 102a");
     chainstate.commit_batch(batch).expect("commit 102a");
 
@@ -245,6 +250,7 @@ fn reorg_reverts_utxo_spent_and_address_indexes() {
             &params,
             &flags,
             true,
+            None,
             None,
             None,
             None,
@@ -356,7 +362,9 @@ fn reorg_reverts_utxo_spent_and_address_indexes() {
         transactions: vec![coinbase_tx(102), spend_b],
     };
     let batch = chainstate
-        .connect_block(&block102b, 102, &params, &flags, true, None, None, None)
+        .connect_block(
+            &block102b, 102, &params, &flags, true, None, None, None, None,
+        )
         .expect("connect 102b");
     chainstate.commit_batch(batch).expect("commit 102b");
 
@@ -370,6 +378,7 @@ fn reorg_reverts_utxo_spent_and_address_indexes() {
             &params,
             &flags,
             true,
+            None,
             None,
             None,
             None,

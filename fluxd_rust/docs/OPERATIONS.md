@@ -152,6 +152,18 @@ Example:
 ssh <vps-user>@<vps-host> "tail -f <remote-log-dir>/longrun-public.log"
 ```
 
+## Reindex (keep blocks)
+
+If `blocks/` is present but `db/` needs rebuilding (corruption, index changes), reindex from existing
+flatfiles (no network download):
+
+```bash
+ssh <vps-user>@<vps-host> "pkill -x fluxd"
+ssh <vps-user>@<vps-host> "<remote-fluxd-bin> --data-dir <remote-data-dir> --reindex"
+```
+
+To wipe `blocks/` too (clean download + index), use `--resync` or remove `<remote-data-dir>`.
+
 ## Clean resync
 
 ```bash

@@ -97,7 +97,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zcrawreceive - Stub (returns error; joinsplit tooling not implemented)
 - prioritisetransaction - Implemented (stores fee/priority deltas for mining selection)
 
-- reindex - Partial (requests shutdown + wipes `db/` + `blocks/` on next start; does not rebuild indexes from existing flatfiles)
+- reindex - Implemented (requests shutdown; on next start wipes `db/` and rebuilds indexes from existing flatfiles under `blocks/`; use `--resync` to wipe blocks too)
 - stop - Implemented
 - createfluxnodekey - Implemented (alias: createzelnodekey)
 - createzelnodekey - Implemented (alias of createfluxnodekey)

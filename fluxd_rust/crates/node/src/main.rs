@@ -55,7 +55,7 @@ mod wallet;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -64,7 +64,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded};
-use fluxd_chainstate::flatfiles::FlatFileStore;
+use fluxd_chainstate::flatfiles::{FileLocation, FlatFileStore};
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::metrics::ConnectMetrics;
 use fluxd_chainstate::state::{ChainState, HeaderValidationCache};
@@ -246,6 +246,7 @@ struct Config {
     params_dir: PathBuf,
     fetch_params: bool,
     reindex: bool,
+    resync: bool,
     db_info: bool,
     db_info_keys: bool,
     db_integrity: bool,
@@ -966,14 +967,15 @@ async fn run() -> Result<(), String> {
     fs::create_dir_all(data_dir).map_err(|err| err.to_string())?;
     let _data_dir_lock = lock_data_dir(data_dir)?;
 
-    if config.reindex || reindex_flag_path.exists() {
+    let mut reindex_from_flatfiles = false;
+    if config.resync {
         log_info!(
-            "Reindex requested; removing {} and {}",
+            "Resync requested; removing {} and {}",
             db_path.display(),
             blocks_path.display()
         );
         if let Err(err) = fs::remove_dir_all(&db_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
+            if err.kind() != ErrorKind::NotFound {
                 return Err(format!(
                     "failed to remove db dir {}: {err}",
                     db_path.display()
@@ -981,7 +983,7 @@ async fn run() -> Result<(), String> {
             }
         }
         if let Err(err) = fs::remove_dir_all(&blocks_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
+            if err.kind() != ErrorKind::NotFound {
                 return Err(format!(
                     "failed to remove blocks dir {}: {err}",
                     blocks_path.display()
@@ -991,6 +993,28 @@ async fn run() -> Result<(), String> {
         let _ = fs::remove_file(data_dir.join(MEMPOOL_FILE_NAME));
         let _ = fs::remove_file(data_dir.join(FEE_ESTIMATES_FILE_NAME));
         let _ = fs::remove_file(&reindex_flag_path);
+    } else if config.reindex || reindex_flag_path.exists() {
+        reindex_from_flatfiles = blocks_path.exists();
+        log_info!(
+            "Reindex requested; removing {} (preserving {})",
+            db_path.display(),
+            blocks_path.display()
+        );
+        if let Err(err) = fs::remove_dir_all(&db_path) {
+            if err.kind() != ErrorKind::NotFound {
+                return Err(format!(
+                    "failed to remove db dir {}: {err}",
+                    db_path.display()
+                ));
+            }
+        }
+        let _ = fs::remove_file(data_dir.join(MEMPOOL_FILE_NAME));
+        let _ = fs::remove_file(data_dir.join(FEE_ESTIMATES_FILE_NAME));
+        let _ = fs::remove_file(&reindex_flag_path);
+
+        if reindex_from_flatfiles {
+            remove_undo_flatfiles(&blocks_path)?;
+        }
     }
 
     let store = open_store(config.backend, &db_path, &config)?;
@@ -1218,6 +1242,17 @@ async fn run() -> Result<(), String> {
         config.check_script,
         Some(Arc::clone(&validation_metrics)),
     );
+
+    if reindex_from_flatfiles {
+        reindex_blocks_from_flatfiles(
+            chainstate.as_ref(),
+            &blocks_path,
+            params.as_ref(),
+            &flags,
+            write_lock.as_ref(),
+        )?;
+    }
+
     let mempool = Arc::new(Mutex::new(mempool::Mempool::new(config.mempool_max_bytes)));
     let mempool_policy = Arc::new(mempool::MempoolPolicy::standard(
         config.min_relay_fee_per_kb,
@@ -3368,6 +3403,221 @@ fn block_needs_shielded(block: &Block) -> bool {
     block.transactions.iter().any(tx_needs_shielded)
 }
 
+fn remove_undo_flatfiles(blocks_path: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(blocks_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        if !entry.file_type().map_err(|err| err.to_string())?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("undo") || !name.ends_with(".dat") {
+            continue;
+        }
+        fs::remove_file(entry.path()).map_err(|err| err.to_string())?;
+        removed += 1;
+    }
+
+    if removed > 0 {
+        log_info!(
+            "Removed {removed} undo flatfile(s) under {}",
+            blocks_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn reindex_blocks_from_flatfiles<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    blocks_path: &Path,
+    params: &ChainParams,
+    flags: &ValidationFlags,
+    write_lock: &Mutex<()>,
+) -> Result<(), String> {
+    if chainstate
+        .best_block()
+        .map_err(|err| err.to_string())?
+        .is_some()
+    {
+        return Err("reindex expected empty chainstate (db not wiped?)".to_string());
+    }
+
+    log_info!(
+        "Reindexing from flatfiles under {} (no network)",
+        blocks_path.display()
+    );
+
+    let mut connected_blocks: u64 = 0;
+    let mut last_progress = Instant::now();
+    for file_id in 0u32.. {
+        let path = blocks_path.join(format!("data{file_id:05}.dat"));
+        if !path.exists() {
+            break;
+        }
+        let mut file = File::open(&path).map_err(|err| err.to_string())?;
+        let mut offset: u64 = 0;
+        loop {
+            let mut len_bytes = [0u8; 4];
+            match file.read_exact(&mut len_bytes) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    return Err(format!(
+                        "flatfile read failed for {} at offset {}: {err}",
+                        path.display(),
+                        offset
+                    ));
+                }
+            }
+            let len = u32::from_le_bytes(len_bytes);
+            if len == 0 {
+                return Err(format!(
+                    "flatfile record has invalid length 0 ({} offset {})",
+                    path.display(),
+                    offset
+                ));
+            }
+            if len > fluxd_consensus::constants::MAX_BLOCK_SIZE {
+                return Err(format!(
+                    "flatfile record length {} exceeds MAX_BLOCK_SIZE ({} offset {})",
+                    len,
+                    path.display(),
+                    offset
+                ));
+            }
+
+            let mut bytes = vec![0u8; len as usize];
+            file.read_exact(&mut bytes).map_err(|err| {
+                format!(
+                    "flatfile read failed for {} payload (len {}) at offset {}: {err}",
+                    path.display(),
+                    len,
+                    offset
+                )
+            })?;
+
+            let location = FileLocation {
+                file_id,
+                offset,
+                len,
+            };
+            offset = offset
+                .checked_add(4)
+                .and_then(|value| value.checked_add(u64::from(len)))
+                .ok_or_else(|| "flatfile offset overflow".to_string())?;
+
+            let block = Block::consensus_decode(&bytes).map_err(|_| {
+                format!(
+                    "invalid block encoding in {} at offset {}",
+                    path.display(),
+                    location.offset
+                )
+            })?;
+            let hash = block.header.hash();
+
+            loop {
+                match chainstate.best_block().map_err(|err| err.to_string())? {
+                    Some(tip) => {
+                        if tip.hash == block.header.prev_block {
+                            break;
+                        }
+                        let batch = chainstate
+                            .disconnect_block(&tip.hash)
+                            .map_err(|err| err.to_string())?;
+                        let _guard = write_lock
+                            .lock()
+                            .map_err(|_| "write lock poisoned".to_string())?;
+                        chainstate
+                            .commit_batch(batch)
+                            .map_err(|err| err.to_string())?;
+                    }
+                    None => {
+                        if block.header.prev_block != [0u8; 32] {
+                            return Err(format!(
+                                "orphan block {} (prev {}) in {} at offset {}",
+                                hash256_to_hex(&hash),
+                                hash256_to_hex(&block.header.prev_block),
+                                path.display(),
+                                location.offset
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let height = chainstate
+                .best_block()
+                .map_err(|err| err.to_string())?
+                .map(|tip| tip.height.saturating_add(1))
+                .unwrap_or(0);
+            if height == 0 && hash != params.consensus.hash_genesis_block {
+                return Err(format!(
+                    "genesis hash mismatch in {} at offset {}: got {} expected {}",
+                    path.display(),
+                    location.offset,
+                    hash256_to_hex(&hash),
+                    hash256_to_hex(&params.consensus.hash_genesis_block),
+                ));
+            }
+
+            let batch = chainstate
+                .connect_block(
+                    &block,
+                    height,
+                    params,
+                    flags,
+                    false,
+                    None,
+                    None,
+                    Some(bytes.as_slice()),
+                    Some(location),
+                )
+                .map_err(|err| err.to_string())?;
+            let _guard = write_lock
+                .lock()
+                .map_err(|_| "write lock poisoned".to_string())?;
+            chainstate
+                .commit_batch(batch)
+                .map_err(|err| err.to_string())?;
+
+            connected_blocks = connected_blocks.saturating_add(1);
+            if connected_blocks > 0 && connected_blocks % 100_000 == 0 {
+                let tip = chainstate
+                    .best_block()
+                    .map_err(|err| err.to_string())?
+                    .map(|tip| tip.height)
+                    .unwrap_or(-1);
+                log_info!(
+                    "Reindex progress: connected {} blocks (tip {}, elapsed {:?})",
+                    connected_blocks,
+                    tip,
+                    last_progress.elapsed()
+                );
+                last_progress = Instant::now();
+            }
+        }
+    }
+
+    match chainstate.best_block().map_err(|err| err.to_string())? {
+        Some(tip) => log_info!(
+            "Reindex complete at height {} ({})",
+            tip.height,
+            hash256_to_hex(&tip.hash)
+        ),
+        None => log_info!("Reindex complete (no blocks found in flatfiles)"),
+    }
+
+    Ok(())
+}
+
 fn ensure_genesis<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     params: &ChainParams,
@@ -3393,6 +3643,7 @@ fn ensure_genesis<S: KeyValueStore>(
             false,
             None,
             connect_metrics,
+            None,
             None,
         )
         .map_err(|err| err.to_string())?;
@@ -6174,6 +6425,7 @@ fn connect_pending<S: KeyValueStore>(
                 Some(verified_block.txids.as_slice()),
                 Some(connect_metrics),
                 Some(verified_block.bytes.as_slice()),
+                None,
             ) {
                 Ok(batch) => batch,
                 Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(
@@ -6403,6 +6655,7 @@ fn parse_args() -> Result<Config, String> {
     let mut params_dir: Option<PathBuf> = None;
     let mut fetch_params = false;
     let mut reindex = false;
+    let mut resync = false;
     let mut db_info = false;
     let mut db_info_keys = false;
     let mut db_integrity = false;
@@ -6530,6 +6783,9 @@ fn parse_args() -> Result<Config, String> {
             }
             "--reindex" => {
                 reindex = true;
+            }
+            "--resync" => {
+                resync = true;
             }
             "--db-info" => {
                 db_info = true;
@@ -7401,6 +7657,7 @@ fn parse_args() -> Result<Config, String> {
         params_dir: params_dir.unwrap_or_else(default_params_dir),
         fetch_params,
         reindex,
+        resync,
         db_info,
         db_info_keys,
         db_integrity,
@@ -7691,7 +7948,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--db-info] [--db-info-keys] [--db-integrity] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--maxconnections N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--resync] [--db-info] [--db-info-keys] [--db-integrity] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--maxconnections N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -7704,7 +7961,8 @@ fn usage() -> String {
         "  --log-timestamps  Enable timestamps in text logs (default: on)",
         "  --no-log-timestamps  Disable timestamps in text logs",
         "  --fetch-params  Download shielded params into --params-dir",
-        "  --reindex  Wipe db/blocks for --data-dir and restart from genesis",
+        "  --reindex  Rebuild db/ indexes from existing flatfiles under --data-dir/blocks (no network)",
+        "  --resync  Wipe db/ and blocks/ under --data-dir and restart from genesis",
         "  --db-info  Print DB/flatfile size breakdown and fjall telemetry, then exit",
         "  --db-info-keys  Like --db-info, but also counts keys/bytes in each DB partition (slow)",
         "  --db-integrity  Print DB/flatfile sanity + verify last 288 blocks, then exit nonzero on failure",

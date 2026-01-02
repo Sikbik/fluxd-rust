@@ -9425,6 +9425,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                 None,
                 None,
                 Some(bytes.as_slice()),
+                None,
             ) {
                 Ok(_) => Ok(Value::Null),
                 Err(fluxd_chainstate::state::ChainStateError::Validation(err)) => {
@@ -9449,6 +9450,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                 None,
                 None,
                 Some(bytes.as_slice()),
+                None,
             ) {
                 Ok(_) => Ok(Value::Null),
                 Err(fluxd_chainstate::state::ChainStateError::Validation(err)) => {
@@ -10145,6 +10147,7 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         None,
         None,
         Some(bytes.as_slice()),
+        None,
     ) {
         Ok(batch) => batch,
         Err(fluxd_chainstate::state::ChainStateError::InvalidHeader(
@@ -12804,6 +12807,7 @@ mod tests {
                     None,
                     None,
                     Some(block_bytes.as_slice()),
+                    None,
                 )
                 .expect("connect block");
             chainstate.commit_batch(batch).expect("commit block");
@@ -12918,6 +12922,7 @@ mod tests {
                 None,
                 None,
                 Some(block_bytes.as_slice()),
+                None,
             )
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit block");
@@ -13025,6 +13030,7 @@ mod tests {
                 None,
                 None,
                 Some(block_bytes.as_slice()),
+                None,
             )
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit block");
@@ -13152,6 +13158,7 @@ mod tests {
                 None,
                 None,
                 Some(block_bytes.as_slice()),
+                None,
             )
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit block");
@@ -14581,6 +14588,7 @@ mod tests {
                 None,
                 None,
                 Some(block_bytes.as_slice()),
+                None,
             )
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit block");
@@ -14826,6 +14834,7 @@ mod tests {
                 None,
                 None,
                 Some(block_bytes.as_slice()),
+                None,
             )
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit block");
@@ -17019,6 +17028,7 @@ mod tests {
                 None,
                 None,
                 Some(block_bytes.as_slice()),
+                None,
             )
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit block");

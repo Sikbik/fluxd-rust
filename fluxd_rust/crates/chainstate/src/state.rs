@@ -2178,6 +2178,7 @@ impl<S: KeyValueStore> ChainState<S> {
         txids: Option<&[Hash256]>,
         connect_metrics: Option<&ConnectMetrics>,
         block_bytes: Option<&[u8]>,
+        block_location: Option<FileLocation>,
     ) -> Result<WriteBatch, ChainStateError> {
         let consensus = &params.consensus;
         let mut batch = WriteBatch::new();
@@ -2856,22 +2857,47 @@ impl<S: KeyValueStore> ChainState<S> {
         }
         anchor_time += anchor_finalize_start.elapsed();
 
-        let encoded_block_bytes = if block_bytes.is_none() {
-            Some(block.consensus_encode()?)
-        } else {
-            None
+        let (location, block_file_len) = match block_location {
+            Some(location) => {
+                if location.len == 0 {
+                    return Err(ChainStateError::InvalidHeader(
+                        "invalid block file location",
+                    ));
+                }
+                if let Some(bytes) = block_bytes {
+                    let expected_len = usize::try_from(location.len)
+                        .map_err(|_| ChainStateError::ValueOutOfRange)?;
+                    if bytes.len() != expected_len {
+                        return Err(ChainStateError::CorruptIndex("block bytes length mismatch"));
+                    }
+                }
+                let block_file_len = location
+                    .offset
+                    .checked_add(4)
+                    .and_then(|value| value.checked_add(location.len as u64))
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
+                (location, block_file_len)
+            }
+            None => {
+                let encoded_block_bytes = if block_bytes.is_none() {
+                    Some(block.consensus_encode()?)
+                } else {
+                    None
+                };
+                let block_bytes = block_bytes
+                    .or_else(|| encoded_block_bytes.as_deref())
+                    .ok_or(ChainStateError::CorruptIndex("block bytes missing"))?;
+                let flatfile_start = Instant::now();
+                let location = self.blocks.append(block_bytes)?;
+                flatfile_time += flatfile_start.elapsed();
+                let block_file_len = location
+                    .offset
+                    .checked_add(4)
+                    .and_then(|value| value.checked_add(location.len as u64))
+                    .ok_or(ChainStateError::ValueOutOfRange)?;
+                (location, block_file_len)
+            }
         };
-        let block_bytes = block_bytes
-            .or_else(|| encoded_block_bytes.as_deref())
-            .ok_or(ChainStateError::CorruptIndex("block bytes missing"))?;
-        let flatfile_start = Instant::now();
-        let location = self.blocks.append(block_bytes)?;
-        flatfile_time += flatfile_start.elapsed();
-        let block_file_len = location
-            .offset
-            .checked_add(4)
-            .and_then(|value| value.checked_add(location.len as u64))
-            .ok_or(ChainStateError::ValueOutOfRange)?;
         self.update_flatfile_meta(
             &mut batch,
             FlatFileKind::Blocks,
@@ -5554,7 +5580,7 @@ mod tests {
         };
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block0, 0, &params, &flags, true, None, None, None)
+            .connect_block(&block0, 0, &params, &flags, true, None, None, None, None)
             .expect("connect block 0");
         chainstate.commit_batch(batch).expect("commit block 0");
 
@@ -5590,7 +5616,7 @@ mod tests {
         };
 
         let err = chainstate
-            .connect_block(&block1, 1, &params, &flags, true, None, None, None)
+            .connect_block(&block1, 1, &params, &flags, true, None, None, None, None)
             .expect_err("premature spend rejected");
         match err {
             ChainStateError::Validation(ValidationError::InvalidTransaction(message)) => {
@@ -6106,7 +6132,7 @@ mod tests {
 
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block, 0, &params, &flags, true, None, None, None)
+            .connect_block(&block, 0, &params, &flags, true, None, None, None, None)
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit connect");
         let connected_stats = chainstate.utxo_stats().expect("utxo stats").expect("stats");
@@ -6344,7 +6370,7 @@ mod tests {
 
         let flags = ValidationFlags::default();
         let batch = chainstate
-            .connect_block(&block, 0, &params, &flags, true, None, None, None)
+            .connect_block(&block, 0, &params, &flags, true, None, None, None, None)
             .expect("connect block");
         chainstate.commit_batch(batch).expect("commit connect");
 

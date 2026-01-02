@@ -287,7 +287,7 @@ Not a standard `fluxd` RPC. Provided for compatibility with existing Flux infra.
 ### reindex
 
 - Result: string (`"fluxd reindex requested ..."`).
-- Note: writes `--data-dir/reindex.flag` and requests process exit; on next start the daemon wipes `db/` and `blocks/` and re-syncs from genesis.
+- Note: writes `--data-dir/reindex.flag` and requests process exit; on next start the daemon wipes `db/` and rebuilds indexes from existing flatfiles under `blocks/` (no network). Use `--resync` (or remove `--data-dir`) to wipe `blocks/` too.
 
 ### rescanblockchain
 
