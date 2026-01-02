@@ -249,6 +249,7 @@ struct Config {
     resync: bool,
     reindex_txindex: bool,
     reindex_spentindex: bool,
+    reindex_addressindex: bool,
     db_info: bool,
     db_info_keys: bool,
     db_integrity: bool,
@@ -1020,7 +1021,7 @@ async fn run() -> Result<(), String> {
     }
 
     if matches!(config.backend, Backend::Fjall)
-        && (config.reindex_txindex || config.reindex_spentindex)
+        && (config.reindex_txindex || config.reindex_spentindex || config.reindex_addressindex)
     {
         let partitions_dir = db_path.join("partitions");
         if config.reindex_txindex {
@@ -1041,8 +1042,22 @@ async fn run() -> Result<(), String> {
                 }
             }
         }
+        if config.reindex_addressindex {
+            for column in [
+                fluxd_storage::Column::AddressOutpoint,
+                fluxd_storage::Column::AddressDelta,
+            ] {
+                let dir = partitions_dir.join(column.as_str());
+                log_info!("Selective reindex: removing {}", dir.display());
+                if let Err(err) = fs::remove_dir_all(&dir) {
+                    if err.kind() != ErrorKind::NotFound {
+                        return Err(format!("failed to remove {}: {err}", dir.display()));
+                    }
+                }
+            }
+        }
     } else if matches!(config.backend, Backend::Memory)
-        && (config.reindex_txindex || config.reindex_spentindex)
+        && (config.reindex_txindex || config.reindex_spentindex || config.reindex_addressindex)
     {
         log_warn!("Selective reindex flags are only meaningful for --backend fjall; ignoring for memory backend");
     }
@@ -1289,6 +1304,9 @@ async fn run() -> Result<(), String> {
         }
         if config.reindex_spentindex {
             rebuild_spentindex(chainstate.as_ref(), write_lock.as_ref())?;
+        }
+        if config.reindex_addressindex {
+            rebuild_addressindex(chainstate.as_ref(), write_lock.as_ref())?;
         }
     }
 
@@ -3784,6 +3802,321 @@ fn rebuild_spentindex<S: KeyValueStore>(
 
     log_info!("Spent index rebuild complete at height {}", best.height);
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedTxOut {
+    value: i64,
+    script_hash: Option<Hash256>,
+}
+
+struct TxOutCache {
+    entries: HashMap<Hash256, Vec<CachedTxOut>>,
+    order: VecDeque<Hash256>,
+    capacity: usize,
+}
+
+impl TxOutCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn insert(&mut self, txid: Hash256, outputs: Vec<CachedTxOut>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.contains_key(&txid) {
+            self.entries.insert(txid, outputs);
+            return;
+        }
+        self.entries.insert(txid, outputs);
+        self.order.push_back(txid);
+        while self.entries.len() > self.capacity {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+    }
+
+    fn output(&self, txid: &Hash256, index: u32) -> Option<CachedTxOut> {
+        let outputs = self.entries.get(txid)?;
+        outputs.get(index as usize).copied()
+    }
+}
+
+fn address_delta_key(
+    script_hash: &Hash256,
+    height: u32,
+    tx_index: u32,
+    txid: &Hash256,
+    index: u32,
+    spending: bool,
+) -> [u8; 77] {
+    let mut key = [0u8; 77];
+    key[0..32].copy_from_slice(script_hash);
+    key[32..36].copy_from_slice(&height.to_be_bytes());
+    key[36..40].copy_from_slice(&tx_index.to_be_bytes());
+    key[40..72].copy_from_slice(txid);
+    key[72..76].copy_from_slice(&index.to_le_bytes());
+    key[76] = if spending { 1 } else { 0 };
+    key
+}
+
+fn rebuild_addressindex<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    write_lock: &Mutex<()>,
+) -> Result<(), String> {
+    const TX_CACHE_CAPACITY: usize = 50_000;
+
+    let Some(best) = chainstate.best_block().map_err(|err| err.to_string())? else {
+        log_info!("Address index rebuild requested but no blocks are present");
+        return Ok(());
+    };
+
+    log_info!("Rebuilding address indexes up to height {}", best.height);
+    let mut last_progress = Instant::now();
+    let mut tx_cache = TxOutCache::new(TX_CACHE_CAPACITY);
+
+    #[derive(Clone, Debug)]
+    struct CreatedOutput {
+        outpoint: OutPoint,
+        out: CachedTxOut,
+    }
+
+    for height in 0..=best.height {
+        let hash = chainstate
+            .height_hash(height)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("missing height index for height {height}"))?;
+        let block_location = chainstate
+            .block_location(&hash)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("missing block index entry for height {height}"))?;
+        let bytes = chainstate
+            .read_block(block_location)
+            .map_err(|err| err.to_string())?;
+        let block =
+            Block::consensus_decode(&bytes).map_err(|_| "invalid block encoding".to_string())?;
+
+        let estimated_inputs = block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|tx| tx.vin.len())
+            .sum::<usize>();
+        let estimated_outputs = block
+            .transactions
+            .iter()
+            .map(|tx| tx.vout.len())
+            .sum::<usize>();
+
+        let mut batch = WriteBatch::new();
+        batch.reserve(
+            estimated_inputs
+                .saturating_mul(2)
+                .saturating_add(estimated_outputs.saturating_mul(2))
+                .saturating_add(block.transactions.len()),
+        );
+
+        let mut created: HashMap<fluxd_chainstate::utxo::OutPointKey, CreatedOutput> =
+            HashMap::with_capacity(estimated_outputs);
+        let mut spent_outpoints: HashSet<fluxd_chainstate::utxo::OutPointKey> =
+            HashSet::with_capacity(estimated_inputs);
+
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            let txid = tx.txid().map_err(|err| err.to_string())?;
+
+            if tx_index != 0 {
+                for (input_index, input) in tx.vin.iter().enumerate() {
+                    let outpoint_key = fluxd_chainstate::utxo::outpoint_key_bytes(&input.prevout);
+                    if !spent_outpoints.insert(outpoint_key) {
+                        return Err(format!(
+                            "duplicate prevout {}:{} at height {} (tx {})",
+                            hash256_to_hex(&input.prevout.hash),
+                            input.prevout.index,
+                            height,
+                            hash256_to_hex(&txid)
+                        ));
+                    }
+
+                    let created_in_block = created.remove(&outpoint_key);
+                    let (prev, was_created_in_block) = match created_in_block {
+                        Some(created) => (created.out, true),
+                        None => (
+                            resolve_prevout_for_addressindex(chainstate, &mut tx_cache, input)?,
+                            false,
+                        ),
+                    };
+
+                    let Some(script_hash) = prev.script_hash else {
+                        continue;
+                    };
+                    if !was_created_in_block {
+                        let key =
+                            fluxd_chainstate::address_index::address_outpoint_key_with_script_hash(
+                                &script_hash,
+                                &input.prevout,
+                            );
+                        batch.delete(fluxd_storage::Column::AddressOutpoint, key);
+                    }
+                    let satoshis = prev
+                        .value
+                        .checked_neg()
+                        .ok_or_else(|| "prevout value out of range".to_string())?;
+                    let delta_key = address_delta_key(
+                        &script_hash,
+                        height as u32,
+                        tx_index as u32,
+                        &txid,
+                        input_index as u32,
+                        true,
+                    );
+                    batch.put(
+                        fluxd_storage::Column::AddressDelta,
+                        delta_key,
+                        satoshis.to_le_bytes(),
+                    );
+                }
+            }
+
+            let mut outputs = Vec::with_capacity(tx.vout.len());
+            for (out_index, output) in tx.vout.iter().enumerate() {
+                let script_hash =
+                    fluxd_chainstate::address_index::script_hash(&output.script_pubkey);
+                let out = CachedTxOut {
+                    value: output.value,
+                    script_hash,
+                };
+                outputs.push(out);
+
+                if let Some(script_hash) = script_hash {
+                    let delta_key = address_delta_key(
+                        &script_hash,
+                        height as u32,
+                        tx_index as u32,
+                        &txid,
+                        out_index as u32,
+                        false,
+                    );
+                    batch.put(
+                        fluxd_storage::Column::AddressDelta,
+                        delta_key,
+                        output.value.to_le_bytes(),
+                    );
+                }
+
+                let outpoint = OutPoint {
+                    hash: txid,
+                    index: out_index as u32,
+                };
+                created.insert(
+                    fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint),
+                    CreatedOutput { outpoint, out },
+                );
+            }
+
+            tx_cache.insert(txid, outputs);
+        }
+
+        for created_output in created.values() {
+            let Some(script_hash) = created_output.out.script_hash else {
+                continue;
+            };
+            let key = fluxd_chainstate::address_index::address_outpoint_key_with_script_hash(
+                &script_hash,
+                &created_output.outpoint,
+            );
+            batch.put(fluxd_storage::Column::AddressOutpoint, key, []);
+        }
+
+        let _guard = write_lock
+            .lock()
+            .map_err(|_| "write lock poisoned".to_string())?;
+        chainstate
+            .commit_batch(batch)
+            .map_err(|err| err.to_string())?;
+
+        if height > 0 && height % 100_000 == 0 {
+            log_info!(
+                "Rebuilt address index at height {} (elapsed {:?})",
+                height,
+                last_progress.elapsed()
+            );
+            last_progress = Instant::now();
+        }
+    }
+
+    log_info!("Address index rebuild complete at height {}", best.height);
+    Ok(())
+}
+
+fn resolve_prevout_for_addressindex<S: KeyValueStore>(
+    chainstate: &ChainState<S>,
+    tx_cache: &mut TxOutCache,
+    input: &TxIn,
+) -> Result<CachedTxOut, String> {
+    if let Some(cached) = tx_cache.output(&input.prevout.hash, input.prevout.index) {
+        return Ok(cached);
+    }
+
+    let location = chainstate
+        .tx_location(&input.prevout.hash)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "missing tx index entry for prevout {}:{}",
+                hash256_to_hex(&input.prevout.hash),
+                input.prevout.index
+            )
+        })?;
+    let bytes = chainstate
+        .read_block(location.block)
+        .map_err(|err| err.to_string())?;
+    let block =
+        Block::consensus_decode(&bytes).map_err(|_| "invalid block encoding".to_string())?;
+    let tx = block
+        .transactions
+        .get(location.index as usize)
+        .ok_or_else(|| {
+            format!(
+                "tx index points beyond block tx list (prevout {})",
+                hash256_to_hex(&input.prevout.hash)
+            )
+        })?;
+    let txid = tx.txid().map_err(|err| err.to_string())?;
+    if txid != input.prevout.hash {
+        return Err(format!(
+            "tx index mismatch for prevout {}: got txid {}",
+            hash256_to_hex(&input.prevout.hash),
+            hash256_to_hex(&txid)
+        ));
+    }
+
+    let mut outputs = Vec::with_capacity(tx.vout.len());
+    for output in &tx.vout {
+        outputs.push(CachedTxOut {
+            value: output.value,
+            script_hash: fluxd_chainstate::address_index::script_hash(&output.script_pubkey),
+        });
+    }
+
+    let out = outputs
+        .get(input.prevout.index as usize)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "prevout {}:{} refers to missing vout",
+                hash256_to_hex(&input.prevout.hash),
+                input.prevout.index
+            )
+        })?;
+    tx_cache.insert(txid, outputs);
+    Ok(out)
 }
 
 fn ensure_genesis<S: KeyValueStore>(
@@ -6826,6 +7159,7 @@ fn parse_args() -> Result<Config, String> {
     let mut resync = false;
     let mut reindex_txindex = false;
     let mut reindex_spentindex = false;
+    let mut reindex_addressindex = false;
     let mut db_info = false;
     let mut db_info_keys = false;
     let mut db_integrity = false;
@@ -6962,6 +7296,9 @@ fn parse_args() -> Result<Config, String> {
             }
             "--reindex-spentindex" => {
                 reindex_spentindex = true;
+            }
+            "--reindex-addressindex" => {
+                reindex_addressindex = true;
             }
             "--db-info" => {
                 db_info = true;
@@ -7836,6 +8173,7 @@ fn parse_args() -> Result<Config, String> {
         resync,
         reindex_txindex,
         reindex_spentindex,
+        reindex_addressindex,
         db_info,
         db_info_keys,
         db_integrity,
@@ -8126,7 +8464,7 @@ fn resolve_header_verify_workers(config: &Config) -> usize {
 
 fn usage() -> String {
     [
-        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--resync] [--reindex-txindex] [--reindex-spentindex] [--db-info] [--db-info-keys] [--db-integrity] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--maxconnections N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
+        "Usage: fluxd [--backend fjall|memory] [--data-dir PATH] [--conf PATH] [--params-dir PATH] [--profile low|default|high] [--log-level error|warn|info|debug|trace] [--log-format text|json] [--no-log-timestamps] [--fetch-params] [--reindex] [--resync] [--reindex-txindex] [--reindex-spentindex] [--reindex-addressindex] [--db-info] [--db-info-keys] [--db-integrity] [--scan-flatfiles] [--scan-supply] [--scan-fluxnodes] [--debug-fluxnode-payee-script HEX] [--debug-fluxnode-payouts HEIGHT] [--debug-fluxnode-payee-candidates TIER HEIGHT] [--skip-script] [--network mainnet|testnet|regtest] [--miner-address TADDR] [--p2p-addr IP:PORT] [--no-p2p-listen] [--rpc-addr IP:PORT] [--rpc-user USER] [--rpc-pass PASS] [--rpc-allow-ip IP[/CIDR]] [--getdata-batch N] [--block-peers N] [--maxconnections N] [--header-peers N] [--header-peer IP:PORT] [--header-lead N] [--tx-peers N] [--inflight-per-peer N] [--minrelaytxfee <rate>] [--accept-non-standard] [--require-standard] [--mempool-max-mb N] [--mempool-persist-interval SECS] [--fee-estimates-persist-interval SECS] [--status-interval SECS] [--db-cache-mb N] [--db-write-buffer-mb N] [--db-journal-mb N] [--db-memtable-mb N] [--db-flush-workers N] [--db-compaction-workers N] [--db-fsync-ms N] [--utxo-cache-entries N] [--header-verify-workers N] [--verify-workers N] [--verify-queue N] [--shielded-workers N] [--dashboard-addr IP:PORT]",
         "",
         "Options:",
         "  --backend   Storage backend to use (default: fjall)",
@@ -8143,6 +8481,7 @@ fn usage() -> String {
         "  --resync  Wipe db/ and blocks/ under --data-dir and restart from genesis",
         "  --reindex-txindex  Rebuild txindex from blocks under --data-dir/blocks",
         "  --reindex-spentindex  Rebuild spent index from blocks under --data-dir/blocks",
+        "  --reindex-addressindex  Rebuild address index (outpoints + deltas) from blocks under --data-dir/blocks",
         "  --db-info  Print DB/flatfile size breakdown and fjall telemetry, then exit",
         "  --db-info-keys  Like --db-info, but also counts keys/bytes in each DB partition (slow)",
         "  --db-integrity  Print DB/flatfile sanity + verify last 288 blocks, then exit nonzero on failure",

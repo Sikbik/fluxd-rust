@@ -115,7 +115,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [ ] Selective index rebuild (txindex/address/spent only)
     - [x] Tx index rebuild (`--reindex-txindex`)
     - [x] Spent index rebuild (`--reindex-spentindex`)
-    - [ ] Address indexes rebuild
+    - [x] Address indexes rebuild (`--reindex-addressindex`)
 - [x] [P2] DB inspection tools (index stats, supply, integrity) (owner: TBD)
   - [x] `getdbinfo` RPC (disk usage breakdown + fjall telemetry + flatfiles meta/fs cross-check)
   - [x] `--db-info` CLI (same JSON as `getdbinfo`, then exit)

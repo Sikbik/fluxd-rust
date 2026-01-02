@@ -166,7 +166,7 @@ For selective rebuilds (avoid touching other state), use:
 
 ```bash
 ssh <vps-user>@<vps-host> "pkill -x fluxd"
-ssh <vps-user>@<vps-host> "<remote-fluxd-bin> --data-dir <remote-data-dir> --reindex-txindex --reindex-spentindex"
+ssh <vps-user>@<vps-host> "<remote-fluxd-bin> --data-dir <remote-data-dir> --reindex-txindex --reindex-spentindex --reindex-addressindex"
 ```
 
 To wipe `blocks/` too (clean download + index), use `--resync` or remove `<remote-data-dir>`.
