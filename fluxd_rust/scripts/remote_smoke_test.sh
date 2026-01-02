@@ -12,6 +12,7 @@ Options:
   --bin PATH           Path to fluxd binary (default: ../target/release/fluxd)
   --network NAME       mainnet|testnet|regtest (default: mainnet)
   --profile NAME       low|default|high (default: default)
+  --listen-p2p         Enable inbound P2P listener (default: disabled)
   --rpc-port PORT      RPC port to bind on 127.0.0.1 (default: 16134)
   --params-dir PATH    Shielded params dir (default: ~/.zcash-params)
   --seed-peers-from DIR  Copy peers.dat/banlist.dat from DIR into the temp data dir
@@ -30,6 +31,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT_DIR/target/release/fluxd"
 NETWORK="mainnet"
 PROFILE="default"
+LISTEN_P2P="0"
 RPC_PORT="16134"
 PARAMS_DIR="${HOME}/.zcash-params"
 SEED_PEERS_FROM=""
@@ -53,6 +55,10 @@ while [[ $# -gt 0 ]]; do
     --profile)
       PROFILE="${2:-}"
       shift 2
+      ;;
+    --listen-p2p)
+      LISTEN_P2P="1"
+      shift
       ;;
     --rpc-port)
       RPC_PORT="${2:-}"
@@ -145,6 +151,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+P2P_ARGS=()
+if [[ "$LISTEN_P2P" != "1" ]]; then
+  P2P_ARGS=(--no-p2p-listen)
+fi
+
 nohup "$BIN" \
   --network "$NETWORK" \
   --backend fjall \
@@ -152,6 +163,7 @@ nohup "$BIN" \
   --params-dir "$PARAMS_DIR" \
   --profile "$PROFILE" \
   --rpc-addr "127.0.0.1:${RPC_PORT}" \
+  "${P2P_ARGS[@]}" \
   --status-interval 5 \
   >"$LOG_PATH" 2>&1 &
 PID=$!
