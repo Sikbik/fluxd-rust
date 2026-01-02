@@ -11715,11 +11715,43 @@ fn rpc_stopbenchmark(params: Vec<Value>, data_dir: &Path) -> Result<Value, RpcEr
     ))
 }
 
-fn rpc_zcbenchmark(_params: Vec<Value>) -> Result<Value, RpcError> {
-    Err(RpcError::new(
-        RPC_INTERNAL_ERROR,
-        "zcbenchmark not implemented",
-    ))
+fn rpc_zcbenchmark(params: Vec<Value>) -> Result<Value, RpcError> {
+    if params.len() < 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zcbenchmark expects at least 2 parameters",
+        ));
+    }
+    let benchmark_type = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_TYPE_ERROR, "Invalid benchmarktype"))?;
+    let samplecount = parse_i64(&params[1], "samplecount")?;
+    if samplecount <= 0 {
+        return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid samplecount"));
+    }
+    let samplecount: usize = usize::try_from(samplecount)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "samplecount too large"))?;
+
+    match benchmark_type {
+        "sleep" => {}
+        "parameterloading" => {
+            return Err(RpcError::new(
+                RPC_TYPE_ERROR,
+                "Pre-Sapling Sprout parameters have been removed",
+            ));
+        }
+        _ => return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid benchmarktype")),
+    }
+
+    let mut results = Vec::with_capacity(samplecount);
+    for _ in 0..samplecount {
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_secs(1));
+        results.push(json!({
+            "runningtime": start.elapsed().as_secs_f64(),
+        }));
+    }
+    Ok(Value::Array(results))
 }
 
 fn rpc_getdoslist<S: fluxd_storage::KeyValueStore>(
@@ -16560,10 +16592,39 @@ mod tests {
     }
 
     #[test]
-    fn zcbenchmark_returns_error() {
-        let err = rpc_zcbenchmark(Vec::new()).expect_err("expected error");
-        assert_eq!(err.code, RPC_INTERNAL_ERROR);
-        assert_eq!(err.message, "zcbenchmark not implemented");
+    fn zcbenchmark_sleep_returns_samples() {
+        let value = rpc_zcbenchmark(vec![json!("sleep"), json!(1)]).expect("rpc");
+        let samples = value.as_array().expect("array");
+        assert_eq!(samples.len(), 1);
+        let sample = samples[0].as_object().expect("object");
+        assert!(sample.contains_key("runningtime"));
+        assert!(sample.get("runningtime").and_then(Value::as_f64).is_some());
+    }
+
+    #[test]
+    fn zcbenchmark_rejects_invalid_samplecount() {
+        let err = rpc_zcbenchmark(vec![json!("sleep"), json!(0)]).expect_err("expected error");
+        assert_eq!(err.code, RPC_TYPE_ERROR);
+        assert_eq!(err.message, "Invalid samplecount");
+    }
+
+    #[test]
+    fn zcbenchmark_rejects_unknown_type() {
+        let err =
+            rpc_zcbenchmark(vec![json!("not-a-benchmark"), json!(1)]).expect_err("expected error");
+        assert_eq!(err.code, RPC_TYPE_ERROR);
+        assert_eq!(err.message, "Invalid benchmarktype");
+    }
+
+    #[test]
+    fn zcbenchmark_parameterloading_is_removed() {
+        let err =
+            rpc_zcbenchmark(vec![json!("parameterloading"), json!(1)]).expect_err("expected error");
+        assert_eq!(err.code, RPC_TYPE_ERROR);
+        assert_eq!(
+            err.message,
+            "Pre-Sapling Sprout parameters have been removed"
+        );
     }
 
     #[test]
