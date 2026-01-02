@@ -245,6 +245,7 @@ async fn handle_peer_message<S: KeyValueStore>(
                 mempool_policy,
                 tx,
                 raw,
+                true,
             ) {
                 Ok(entry) => entry,
                 Err(err) => {

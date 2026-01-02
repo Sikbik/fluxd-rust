@@ -289,6 +289,7 @@ struct Config {
     inflight_per_peer: usize,
     require_standard: bool,
     min_relay_fee_per_kb: i64,
+    limit_free_relay_kb_per_minute: u64,
     mempool_max_bytes: usize,
     mempool_persist_interval_secs: u64,
     fee_estimates_persist_interval_secs: u64,
@@ -1343,10 +1344,10 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
     }
 
     let mempool = Arc::new(Mutex::new(mempool::Mempool::new(config.mempool_max_bytes)));
-    let mempool_policy = Arc::new(mempool::MempoolPolicy::standard(
-        config.min_relay_fee_per_kb,
-        config.require_standard,
-    ));
+    let mut mempool_policy =
+        mempool::MempoolPolicy::standard(config.min_relay_fee_per_kb, config.require_standard);
+    mempool_policy.limit_free_relay_kb_per_minute = config.limit_free_relay_kb_per_minute;
+    let mempool_policy = Arc::new(mempool_policy);
     let mempool_metrics = Arc::new(stats::MempoolMetrics::default());
     let fee_estimates_path = data_dir.join(FEE_ESTIMATES_FILE_NAME);
     let fee_estimator = match fee_estimator::FeeEstimator::load(
@@ -1520,6 +1521,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                         mempool_policy.as_ref(),
                         tx,
                         raw,
+                        false,
                     ) {
                         Ok(entry) => entry,
                         Err(_) => {
@@ -7543,6 +7545,8 @@ where
     let mut require_standard: Option<bool> = None;
     let mut min_relay_fee_per_kb: i64 = 100;
     let mut min_relay_fee_per_kb_set = false;
+    let mut limit_free_relay_kb_per_minute: u64 = 500;
+    let mut limit_free_relay_kb_per_minute_set = false;
     let mut miner_address: Option<String> = None;
     let mut miner_address_set = false;
     let mut mempool_max_mb: u64 = DEFAULT_MEMPOOL_MAX_MB;
@@ -7923,6 +7927,15 @@ where
                     parse_fee_rate_per_kb(&value).map_err(|err| format!("{err}\n{}", usage()))?;
                 min_relay_fee_per_kb_set = true;
             }
+            "--limitfreerelay" | "--limit-free-relay" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --limitfreerelay\n{}", usage()))?;
+                limit_free_relay_kb_per_minute = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid limitfreerelay '{value}'\n{}", usage()))?;
+                limit_free_relay_kb_per_minute_set = true;
+            }
             "--accept-non-standard" => {
                 require_standard = Some(false);
             }
@@ -8299,6 +8312,16 @@ where
             }
         }
 
+        if !limit_free_relay_kb_per_minute_set {
+            if let Some(values) = conf.get("limitfreerelay") {
+                if let Some(raw) = values.last() {
+                    limit_free_relay_kb_per_minute = raw.parse::<u64>().map_err(|_| {
+                        format!("invalid limitfreerelay '{raw}' in {}", conf_file.display())
+                    })?;
+                }
+            }
+        }
+
         if !log_level_set {
             if let Some(values) = conf.get("loglevel") {
                 if let Some(raw) = values.last() {
@@ -8350,6 +8373,7 @@ where
             "addnode",
             "bind",
             "dbcache",
+            "limitfreerelay",
             "logformat",
             "loglevel",
             "logtimestamps",
@@ -8572,6 +8596,7 @@ where
         inflight_per_peer,
         require_standard,
         min_relay_fee_per_kb,
+        limit_free_relay_kb_per_minute,
         mempool_max_bytes: mb_to_bytes(mempool_max_mb).try_into().unwrap_or(usize::MAX),
         mempool_persist_interval_secs,
         fee_estimates_persist_interval_secs,
@@ -8890,6 +8915,7 @@ fn usage() -> String {
         "  --tx-peers  Number of relay peers for tx inventory/tx relay (0 disables, default: 2)",
         "  --inflight-per-peer  Concurrent getdata requests per peer (default: 1)",
         "  --minrelaytxfee  Minimum relay fee-rate in zatoshis/kB (default: 100)",
+        "  --limitfreerelay  Rate-limit free transactions to N*1000 bytes/min (default: 500)",
         "  --accept-non-standard  Disable standardness checks (default: off on mainnet/testnet)",
         "  --require-standard  Force standardness checks on regtest (default: off)",
         "  --mempool-max-mb  Mempool max size in MiB (0 disables cap, default: 300)",

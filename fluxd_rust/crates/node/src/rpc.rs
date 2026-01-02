@@ -5693,6 +5693,7 @@ fn zsendmany_execute<S: fluxd_storage::KeyValueStore>(
         mempool_flags,
         chain_params,
         tx_announce,
+        true,
         raw,
     )?;
 
@@ -8480,6 +8481,7 @@ fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
     mempool_flags: &ValidationFlags,
     chain_params: &ChainParams,
     tx_announce: &broadcast::Sender<Hash256>,
+    reject_absurd_fee: bool,
     raw: Vec<u8>,
 ) -> Result<Hash256, RpcError> {
     const REJECT_INVALID: u8 = 0x10;
@@ -8549,6 +8551,7 @@ fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
         mempool_policy,
         tx,
         raw,
+        false,
     )
     .map_err(|err| match err.kind {
         MempoolErrorKind::MissingInput => RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs"),
@@ -8581,6 +8584,20 @@ fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
         }
         MempoolErrorKind::Internal => RpcError::new(RPC_INTERNAL_ERROR, err.message),
     })?;
+
+    if reject_absurd_fee {
+        let min_fee = mempool_policy.min_relay_fee_for_size(entry.size());
+        let absurd_threshold = min_fee.saturating_mul(10_000);
+        if min_fee > 0 && entry.fee > absurd_threshold {
+            let message = format!(
+                "AcceptToMemoryPool: absurdly high fees {}, {} > {}",
+                hash256_to_hex(&entry.txid),
+                entry.fee,
+                absurd_threshold
+            );
+            return Err(RpcError::new(RPC_TRANSACTION_ERROR, message));
+        }
+    }
 
     let should_observe_fee = entry.tx.fluxnode.is_none();
     let entry_fee = entry.fee;
@@ -8649,11 +8666,12 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
         let hex = params[0]
             .as_str()
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
-        let _allow_high_fees = if params.len() > 1 {
+        let allow_high_fees = if params.len() > 1 {
             parse_bool(&params[1])?
         } else {
             false
         };
+        let reject_absurd_fee = !allow_high_fees;
         let raw = bytes_from_hex(hex)
             .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
         let txid = submit_raw_transaction(
@@ -8665,6 +8683,7 @@ fn rpc_sendrawtransaction<S: fluxd_storage::KeyValueStore>(
             mempool_flags,
             chain_params,
             tx_announce,
+            reject_absurd_fee,
             raw,
         )?;
         Ok(Value::String(hash256_to_hex(&txid)))
@@ -16066,6 +16085,162 @@ mod tests {
             &fee_estimator,
             &mempool_flags,
             vec![Value::String(raw_hex)],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+
+        let txid = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid));
+    }
+
+    #[test]
+    fn sendrawtransaction_accepts_zero_fee_with_minrelaytxfee() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(100, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let prevout = OutPoint {
+            hash: [0x5au8; 32],
+            index: 0,
+        };
+        let prev_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 10_000,
+            script_pubkey: vec![0x51],
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&prevout);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), prev_entry.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: 10_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let value = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex)],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+
+        let txid = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid));
+    }
+
+    #[test]
+    fn sendrawtransaction_allowhighfees_toggles_absurd_fee_rejection() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(100, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let prevout = OutPoint {
+            hash: [0x5bu8; 32],
+            index: 0,
+        };
+        let prev_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 2_000_000,
+            script_pubkey: vec![0x51],
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&prevout);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), prev_entry.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: 1,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let err = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex.clone())],
+            &params,
+            &tx_announce,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_TRANSACTION_ERROR);
+        assert!(
+            err.message
+                .starts_with("AcceptToMemoryPool: absurdly high fees"),
+            "unexpected message: {}",
+            err.message
+        );
+
+        let value = rpc_sendrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![Value::String(raw_hex), Value::Bool(true)],
             &params,
             &tx_announce,
         )

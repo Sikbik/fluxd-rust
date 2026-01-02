@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::{validate_mempool_transaction, ValidationFlags};
-use fluxd_consensus::constants::{COINBASE_MATURITY, MAX_BLOCK_SIGOPS, TX_EXPIRING_SOON_THRESHOLD};
+use fluxd_consensus::constants::{
+    COINBASE_MATURITY, MAX_BLOCK_SIGOPS, MAX_BLOCK_SIZE, TX_EXPIRING_SOON_THRESHOLD,
+};
 use fluxd_consensus::money::{money_range, MAX_MONEY};
 use fluxd_consensus::params::ChainParams;
 use fluxd_consensus::upgrades::{current_epoch_branch_id, network_upgrade_active, UpgradeIndex};
@@ -454,6 +457,8 @@ pub struct MempoolPolicy {
     pub require_standard: bool,
     /// Fee rate in zatoshis/KB.
     pub min_relay_fee_per_kb: i64,
+    /// Thousands of bytes per minute.
+    pub limit_free_relay_kb_per_minute: u64,
     pub max_scriptsig_size: usize,
     pub max_op_return_bytes: usize,
     pub max_p2sh_sigops: u32,
@@ -466,6 +471,7 @@ impl MempoolPolicy {
         Self {
             require_standard,
             min_relay_fee_per_kb,
+            limit_free_relay_kb_per_minute: DEFAULT_LIMIT_FREE_RELAY_KB_PER_MINUTE,
             max_scriptsig_size: 1650,
             max_op_return_bytes: 80,
             max_p2sh_sigops: 15,
@@ -486,6 +492,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
     policy: &MempoolPolicy,
     tx: Transaction,
     raw: Vec<u8>,
+    limit_free: bool,
 ) -> Result<MempoolEntry, MempoolError> {
     let txid = tx
         .txid()
@@ -667,13 +674,25 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
     }
     let fee = value_in - value_out;
 
-    if policy.min_relay_fee_per_kb > 0 && tx.fluxnode.is_none() {
-        let required_fee = policy.min_relay_fee_for_size(raw.len());
-        if fee < required_fee {
-            return Err(MempoolError::new(
-                MempoolErrorKind::InsufficientFee,
-                "insufficient fee",
-            ));
+    if limit_free {
+        let size = raw.len();
+        let min_relay_fee = policy.min_relay_fee_for_size(size);
+        let mut tx_min_fee = min_relay_fee;
+        if size < FREE_TX_SIZE_LIMIT {
+            tx_min_fee = 0;
+        }
+
+        if tx.join_splits.is_empty() || fee < ASYNC_RPC_OPERATION_DEFAULT_MINERS_FEE {
+            if fee < tx_min_fee {
+                return Err(MempoolError::new(
+                    MempoolErrorKind::InsufficientFee,
+                    "insufficient fee",
+                ));
+            }
+        }
+
+        if fee < min_relay_fee {
+            apply_free_relay_rate_limit(policy.limit_free_relay_kb_per_minute, size)?;
         }
     }
 
@@ -703,6 +722,45 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
         spent_outpoints,
         parents,
     })
+}
+
+const DEFAULT_LIMIT_FREE_RELAY_KB_PER_MINUTE: u64 = 500;
+const DEFAULT_BLOCK_PRIORITY_SIZE: usize = (MAX_BLOCK_SIZE as usize) / 2;
+const FREE_TX_SIZE_LIMIT: usize = DEFAULT_BLOCK_PRIORITY_SIZE - 1000;
+const ASYNC_RPC_OPERATION_DEFAULT_MINERS_FEE: i64 = 10_000;
+
+#[derive(Debug, Default)]
+struct FreeRelayLimiter {
+    count: f64,
+    last_time: u64,
+}
+
+fn free_relay_limiter() -> &'static Mutex<FreeRelayLimiter> {
+    static LIMITER: OnceLock<Mutex<FreeRelayLimiter>> = OnceLock::new();
+    LIMITER.get_or_init(|| Mutex::new(FreeRelayLimiter::default()))
+}
+
+fn apply_free_relay_rate_limit(limit_kb_per_minute: u64, size: usize) -> Result<(), MempoolError> {
+    let threshold = (limit_kb_per_minute as f64) * 10.0 * 1000.0;
+
+    let now = now_secs();
+    let mut limiter = free_relay_limiter()
+        .lock()
+        .map_err(|_| MempoolError::new(MempoolErrorKind::Internal, "free relay lock poisoned"))?;
+
+    let delta = now.saturating_sub(limiter.last_time);
+    limiter.count *= (1.0_f64 - 1.0_f64 / 600.0_f64).powf(delta as f64);
+    limiter.last_time = now;
+
+    if limiter.count >= threshold {
+        return Err(MempoolError::new(
+            MempoolErrorKind::InsufficientFee,
+            "rate limited free transaction",
+        ));
+    }
+
+    limiter.count += size as f64;
+    Ok(())
 }
 
 fn enforce_standard_outputs(tx: &Transaction, policy: &MempoolPolicy) -> Result<(), MempoolError> {

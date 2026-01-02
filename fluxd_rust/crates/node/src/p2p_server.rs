@@ -449,6 +449,7 @@ fn handle_tx<S: KeyValueStore>(
         mempool_policy,
         tx,
         raw,
+        true,
     ) {
         Ok(entry) => entry,
         Err(err) => {
