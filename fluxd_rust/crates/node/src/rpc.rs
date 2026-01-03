@@ -7729,6 +7729,7 @@ fn rpc_getrawtransaction<S: fluxd_storage::KeyValueStore>(
 struct PrevoutInfo {
     value: i64,
     script_pubkey: Vec<u8>,
+    redeem_script: Option<Vec<u8>>,
 }
 
 fn p2pkh_script_pubkey(key_hash: &[u8; 20]) -> Vec<u8> {
@@ -7826,6 +7827,7 @@ fn parse_prevtxs_map(value: &Value) -> Result<HashMap<OutPoint, PrevoutInfo>, Rp
         let amount_value = obj
             .get("amount")
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing amount"))?;
+        let redeem_script_value = obj.get("redeemScript");
 
         let txid = parse_hash(txid_value)?;
         let vout = parse_u32(vout_value, "vout")?;
@@ -7835,6 +7837,18 @@ fn parse_prevtxs_map(value: &Value) -> Result<HashMap<OutPoint, PrevoutInfo>, Rp
         let script_pubkey = bytes_from_hex(script_hex)
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "scriptPubKey must be hex"))?;
         let value = parse_amount(amount_value)?;
+        let redeem_script = match redeem_script_value {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let hex = value.as_str().ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "redeemScript must be a string")
+                })?;
+                let bytes = bytes_from_hex(hex).ok_or_else(|| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "redeemScript must be hex")
+                })?;
+                Some(bytes)
+            }
+        };
 
         out.insert(
             OutPoint {
@@ -7844,6 +7858,7 @@ fn parse_prevtxs_map(value: &Value) -> Result<HashMap<OutPoint, PrevoutInfo>, Rp
             PrevoutInfo {
                 value,
                 script_pubkey,
+                redeem_script,
             },
         );
     }
@@ -7863,6 +7878,7 @@ fn resolve_prevout_info<S: fluxd_storage::KeyValueStore>(
         return Ok(Some(PrevoutInfo {
             value: entry.value,
             script_pubkey: entry.script_pubkey,
+            redeem_script: None,
         }));
     }
     let guard = mempool
@@ -7871,7 +7887,74 @@ fn resolve_prevout_info<S: fluxd_storage::KeyValueStore>(
     Ok(guard.prevout(outpoint).map(|prev| PrevoutInfo {
         value: prev.value,
         script_pubkey: prev.script_pubkey,
+        redeem_script: None,
     }))
+}
+
+fn decode_small_int_opcode(opcode: u8) -> Option<usize> {
+    match opcode {
+        0x00 => Some(0),
+        0x51..=0x60 => Some((opcode - 0x50) as usize),
+        _ => None,
+    }
+}
+
+fn parse_multisig_redeem_script_with_required(script: &[u8]) -> Option<(usize, Vec<PublicKey>)> {
+    const OP_CHECKMULTISIG: u8 = 0xae;
+    const OP_PUSHDATA1: u8 = 0x4c;
+    const OP_PUSHDATA2: u8 = 0x4d;
+    const OP_PUSHDATA4: u8 = 0x4e;
+
+    if script.len() < 3 {
+        return None;
+    }
+    if script.last().copied() != Some(OP_CHECKMULTISIG) {
+        return None;
+    }
+    let n = decode_small_int_opcode(*script.get(script.len().saturating_sub(2))?)?;
+    let m = decode_small_int_opcode(*script.first()?)?;
+    if m == 0 || n == 0 || m > n || n > 16 {
+        return None;
+    }
+
+    let mut pubkeys = Vec::new();
+    let mut cursor = 1usize;
+    let end = script.len().saturating_sub(2);
+    while cursor < end {
+        let opcode = *script.get(cursor)?;
+        let (len, advance) = match opcode {
+            len @ 1..=75 => (len as usize, 1usize),
+            OP_PUSHDATA1 => (*script.get(cursor + 1)? as usize, 2usize),
+            OP_PUSHDATA2 => {
+                let bytes: [u8; 2] = script.get(cursor + 1..cursor + 3)?.try_into().ok()?;
+                (u16::from_le_bytes(bytes) as usize, 3usize)
+            }
+            OP_PUSHDATA4 => {
+                let bytes: [u8; 4] = script.get(cursor + 1..cursor + 5)?.try_into().ok()?;
+                (u32::from_le_bytes(bytes) as usize, 5usize)
+            }
+            _ => return None,
+        };
+        cursor = cursor.saturating_add(advance);
+        if len != 33 && len != 65 {
+            return None;
+        }
+        let start = cursor;
+        let stop = start.saturating_add(len);
+        if stop > end {
+            return None;
+        }
+        let pubkey = PublicKey::from_slice(script.get(start..stop)?).ok()?;
+        pubkeys.push(pubkey);
+        cursor = stop;
+    }
+    if cursor != end {
+        return None;
+    }
+    if pubkeys.len() != n {
+        return None;
+    }
+    Some((m, pubkeys))
 }
 
 fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
@@ -7912,7 +7995,10 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
         _ => HashMap::new(),
     };
 
+    let secp = Secp256k1::signing_only();
+
     let mut key_overrides: HashMap<Vec<u8>, (SecretKey, Vec<u8>)> = HashMap::new();
+    let mut key_overrides_by_pubkey: HashMap<[u8; 33], SecretKey> = HashMap::new();
     if let Some(value) = params.get(2) {
         if !value.is_null() {
             let keys = value.as_array().ok_or_else(|| {
@@ -7929,6 +8015,8 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                 let pubkey_bytes = secret_key_pubkey_bytes(&secret, compressed);
                 let key_hash = hash160(&pubkey_bytes);
                 let script_pubkey = p2pkh_script_pubkey(&key_hash);
+                let pubkey = PublicKey::from_secret_key(&secp, &secret);
+                key_overrides_by_pubkey.insert(pubkey.serialize(), secret.clone());
                 key_overrides.insert(script_pubkey, (secret, pubkey_bytes));
             }
         }
@@ -7956,7 +8044,6 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
 
-    let secp = Secp256k1::signing_only();
     for input_index in 0..tx.vin.len() {
         let outpoint = tx
             .vin
@@ -7977,88 +8064,278 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
             }
         };
 
-        if classify_script_pubkey(&prevout.script_pubkey) != ScriptType::P2Pkh {
-            errors.push(json!({
-                "txid": hash256_to_hex(&outpoint.hash),
-                "vout": outpoint.index,
-                "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
-                "sequence": tx.vin[input_index].sequence,
-                "error": "Unsupported scriptPubKey type (only P2PKH is supported)",
-            }));
-            continue;
-        }
+        match classify_script_pubkey(&prevout.script_pubkey) {
+            ScriptType::P2Pkh => {
+                let (secret, pubkey_bytes) = match key_overrides.get(&prevout.script_pubkey) {
+                    Some((secret, pubkey)) => (secret.clone(), pubkey.clone()),
+                    None => match wallet_guard
+                        .signing_key_for_script_pubkey(&prevout.script_pubkey)
+                        .map_err(map_wallet_error)?
+                    {
+                        Some((secret, pubkey)) => (secret, pubkey),
+                        None => {
+                            errors.push(json!({
+                                "txid": hash256_to_hex(&outpoint.hash),
+                                "vout": outpoint.index,
+                                "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                                "sequence": tx.vin[input_index].sequence,
+                                "error": "Private key not available for this input",
+                            }));
+                            continue;
+                        }
+                    },
+                };
 
-        let (secret, pubkey_bytes) = match key_overrides.get(&prevout.script_pubkey) {
-            Some((secret, pubkey)) => (secret.clone(), pubkey.clone()),
-            None => match wallet_guard
-                .signing_key_for_script_pubkey(&prevout.script_pubkey)
-                .map_err(map_wallet_error)?
-            {
-                Some((secret, pubkey)) => (secret, pubkey),
-                None => {
+                let sighash = match signature_hash(
+                    &tx,
+                    Some(input_index),
+                    &prevout.script_pubkey,
+                    prevout.value,
+                    sighash_type,
+                    branch_id,
+                ) {
+                    Ok(hash) => hash,
+                    Err(err) => {
+                        errors.push(json!({
+                            "txid": hash256_to_hex(&outpoint.hash),
+                            "vout": outpoint.index,
+                            "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                            "sequence": tx.vin[input_index].sequence,
+                            "error": format!("sighash failed: {err}"),
+                        }));
+                        continue;
+                    }
+                };
+
+                let msg = Message::from_digest_slice(&sighash)
+                    .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "Invalid sighash digest"))?;
+                let mut sig = secp.sign_ecdsa(&msg, &secret);
+                sig.normalize_s();
+                let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
+                sig_bytes.push(sighash_type.0 as u8);
+
+                let mut script_sig = Vec::new();
+                push_script_bytes(&mut script_sig, &sig_bytes)?;
+                push_script_bytes(&mut script_sig, &pubkey_bytes)?;
+                if let Some(input) = tx.vin.get_mut(input_index) {
+                    input.script_sig = script_sig;
+                }
+
+                if let Err(err) = verify_script(
+                    &tx.vin[input_index].script_sig,
+                    &prevout.script_pubkey,
+                    &tx,
+                    input_index,
+                    prevout.value,
+                    STANDARD_SCRIPT_VERIFY_FLAGS,
+                    branch_id,
+                ) {
                     errors.push(json!({
                         "txid": hash256_to_hex(&outpoint.hash),
                         "vout": outpoint.index,
                         "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
                         "sequence": tx.vin[input_index].sequence,
-                        "error": "Private key not available for this input",
+                        "error": format!("script verification failed: {err}"),
+                    }));
+                }
+            }
+            ScriptType::P2Sh => {
+                let redeem_script = prevout.redeem_script.clone().or_else(|| {
+                    wallet_guard.redeem_script_for_p2sh_script_pubkey(&prevout.script_pubkey)
+                });
+                let Some(redeem_script) = redeem_script else {
+                    errors.push(json!({
+                        "txid": hash256_to_hex(&outpoint.hash),
+                        "vout": outpoint.index,
+                        "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                        "sequence": tx.vin[input_index].sequence,
+                        "error": "redeemScript not available for this input",
                     }));
                     continue;
-                }
-            },
-        };
+                };
 
-        let sighash = match signature_hash(
-            &tx,
-            Some(input_index),
-            &prevout.script_pubkey,
-            prevout.value,
-            sighash_type,
-            branch_id,
-        ) {
-            Ok(hash) => hash,
-            Err(err) => {
+                if let Some((required, pubkeys)) =
+                    parse_multisig_redeem_script_with_required(&redeem_script)
+                {
+                    let sighash = match signature_hash(
+                        &tx,
+                        Some(input_index),
+                        &redeem_script,
+                        prevout.value,
+                        sighash_type,
+                        branch_id,
+                    ) {
+                        Ok(hash) => hash,
+                        Err(err) => {
+                            errors.push(json!({
+                                "txid": hash256_to_hex(&outpoint.hash),
+                                "vout": outpoint.index,
+                                "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                                "sequence": tx.vin[input_index].sequence,
+                                "error": format!("sighash failed: {err}"),
+                            }));
+                            continue;
+                        }
+                    };
+                    let msg = Message::from_digest_slice(&sighash)
+                        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "Invalid sighash digest"))?;
+
+                    let mut signatures = Vec::new();
+                    for pubkey in pubkeys {
+                        let secret = match key_overrides_by_pubkey.get(&pubkey.serialize()) {
+                            Some(secret) => Some(secret.clone()),
+                            None => wallet_guard
+                                .signing_key_for_pubkey(&pubkey)
+                                .map_err(map_wallet_error)?,
+                        };
+                        let Some(secret) = secret else {
+                            continue;
+                        };
+                        let mut sig = secp.sign_ecdsa(&msg, &secret);
+                        sig.normalize_s();
+                        let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
+                        sig_bytes.push(sighash_type.0 as u8);
+                        signatures.push(sig_bytes);
+                        if signatures.len() == required {
+                            break;
+                        }
+                    }
+
+                    let mut script_sig = Vec::new();
+                    script_sig.push(0x00);
+                    for sig in &signatures {
+                        push_script_bytes(&mut script_sig, sig)?;
+                    }
+                    push_script_bytes(&mut script_sig, &redeem_script)?;
+                    if let Some(input) = tx.vin.get_mut(input_index) {
+                        input.script_sig = script_sig;
+                    }
+
+                    if signatures.len() != required {
+                        errors.push(json!({
+                            "txid": hash256_to_hex(&outpoint.hash),
+                            "vout": outpoint.index,
+                            "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                            "sequence": tx.vin[input_index].sequence,
+                            "error": format!("Not enough signatures (got {}, need {})", signatures.len(), required),
+                        }));
+                        continue;
+                    }
+
+                    if let Err(err) = verify_script(
+                        &tx.vin[input_index].script_sig,
+                        &prevout.script_pubkey,
+                        &tx,
+                        input_index,
+                        prevout.value,
+                        STANDARD_SCRIPT_VERIFY_FLAGS,
+                        branch_id,
+                    ) {
+                        errors.push(json!({
+                            "txid": hash256_to_hex(&outpoint.hash),
+                            "vout": outpoint.index,
+                            "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                            "sequence": tx.vin[input_index].sequence,
+                            "error": format!("script verification failed: {err}"),
+                        }));
+                    }
+                    continue;
+                }
+
+                if classify_script_pubkey(&redeem_script) == ScriptType::P2Pkh {
+                    let (secret, pubkey_bytes) = match key_overrides.get(redeem_script.as_slice()) {
+                        Some((secret, pubkey)) => (secret.clone(), pubkey.clone()),
+                        None => match wallet_guard
+                            .signing_key_for_script_pubkey(&redeem_script)
+                            .map_err(map_wallet_error)?
+                        {
+                            Some((secret, pubkey)) => (secret, pubkey),
+                            None => {
+                                errors.push(json!({
+                                    "txid": hash256_to_hex(&outpoint.hash),
+                                    "vout": outpoint.index,
+                                    "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                                    "sequence": tx.vin[input_index].sequence,
+                                    "error": "Private key not available for this input",
+                                }));
+                                continue;
+                            }
+                        },
+                    };
+
+                    let sighash = match signature_hash(
+                        &tx,
+                        Some(input_index),
+                        &redeem_script,
+                        prevout.value,
+                        sighash_type,
+                        branch_id,
+                    ) {
+                        Ok(hash) => hash,
+                        Err(err) => {
+                            errors.push(json!({
+                                "txid": hash256_to_hex(&outpoint.hash),
+                                "vout": outpoint.index,
+                                "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                                "sequence": tx.vin[input_index].sequence,
+                                "error": format!("sighash failed: {err}"),
+                            }));
+                            continue;
+                        }
+                    };
+
+                    let msg = Message::from_digest_slice(&sighash)
+                        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "Invalid sighash digest"))?;
+                    let mut sig = secp.sign_ecdsa(&msg, &secret);
+                    sig.normalize_s();
+                    let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
+                    sig_bytes.push(sighash_type.0 as u8);
+
+                    let mut script_sig = Vec::new();
+                    push_script_bytes(&mut script_sig, &sig_bytes)?;
+                    push_script_bytes(&mut script_sig, &pubkey_bytes)?;
+                    push_script_bytes(&mut script_sig, &redeem_script)?;
+                    if let Some(input) = tx.vin.get_mut(input_index) {
+                        input.script_sig = script_sig;
+                    }
+
+                    if let Err(err) = verify_script(
+                        &tx.vin[input_index].script_sig,
+                        &prevout.script_pubkey,
+                        &tx,
+                        input_index,
+                        prevout.value,
+                        STANDARD_SCRIPT_VERIFY_FLAGS,
+                        branch_id,
+                    ) {
+                        errors.push(json!({
+                            "txid": hash256_to_hex(&outpoint.hash),
+                            "vout": outpoint.index,
+                            "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                            "sequence": tx.vin[input_index].sequence,
+                            "error": format!("script verification failed: {err}"),
+                        }));
+                    }
+                    continue;
+                }
+
                 errors.push(json!({
                     "txid": hash256_to_hex(&outpoint.hash),
                     "vout": outpoint.index,
                     "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
                     "sequence": tx.vin[input_index].sequence,
-                    "error": format!("sighash failed: {err}"),
+                    "error": "Unsupported redeemScript type",
                 }));
-                continue;
             }
-        };
-
-        let msg = Message::from_digest_slice(&sighash)
-            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "Invalid sighash digest"))?;
-        let mut sig = secp.sign_ecdsa(&msg, &secret);
-        sig.normalize_s();
-        let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
-        sig_bytes.push(sighash_type.0 as u8);
-
-        let mut script_sig = Vec::new();
-        push_script_bytes(&mut script_sig, &sig_bytes)?;
-        push_script_bytes(&mut script_sig, &pubkey_bytes)?;
-        if let Some(input) = tx.vin.get_mut(input_index) {
-            input.script_sig = script_sig;
-        }
-
-        if let Err(err) = verify_script(
-            &tx.vin[input_index].script_sig,
-            &prevout.script_pubkey,
-            &tx,
-            input_index,
-            prevout.value,
-            STANDARD_SCRIPT_VERIFY_FLAGS,
-            branch_id,
-        ) {
-            errors.push(json!({
-                "txid": hash256_to_hex(&outpoint.hash),
-                "vout": outpoint.index,
-                "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
-                "sequence": tx.vin[input_index].sequence,
-                "error": format!("script verification failed: {err}"),
-            }));
+            _ => {
+                errors.push(json!({
+                    "txid": hash256_to_hex(&outpoint.hash),
+                    "vout": outpoint.index,
+                    "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                    "sequence": tx.vin[input_index].sequence,
+                    "error": "Unsupported scriptPubKey type",
+                }));
+            }
         }
     }
 
@@ -17309,6 +17586,102 @@ mod tests {
             row.get("redeemScript").and_then(Value::as_str).is_some(),
             "P2SH outputs should include redeemScript when known"
         );
+    }
+
+    #[test]
+    fn signrawtransaction_signs_p2sh_multisig_inputs() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let p2sh_address =
+            rpc_addmultisigaddress(&wallet, vec![json!(2), json!([addr_a, addr_b])], &params)
+                .expect("rpc")
+                .as_str()
+                .expect("p2sh address")
+                .to_string();
+
+        let script_pubkey =
+            address_to_script_pubkey(&p2sh_address, params.network).expect("script_pubkey");
+
+        let outpoint = OutPoint {
+            hash: [0x42u8; 32],
+            index: 0,
+        };
+        let prev_value = 2 * COIN;
+
+        let recipient = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let recipient_script =
+            address_to_script_pubkey(&recipient, params.network).expect("recipient spk");
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: outpoint.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey: recipient_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let signed = rpc_signrawtransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![
+                json!(raw_hex),
+                json!([{
+                    "txid": hash256_to_hex(&outpoint.hash),
+                    "vout": outpoint.index,
+                    "scriptPubKey": hex_bytes(&script_pubkey),
+                    "amount": amount_to_value(prev_value),
+                }]),
+            ],
+            &params,
+        )
+        .expect("rpc");
+
+        let obj = signed.as_object().expect("object");
+        assert_eq!(obj.get("complete").and_then(Value::as_bool), Some(true));
+
+        let signed_hex = obj.get("hex").and_then(Value::as_str).expect("hex string");
+        let signed_bytes = bytes_from_hex(signed_hex).expect("hex decode");
+        let signed_tx =
+            Transaction::consensus_decode(&signed_bytes).expect("decode signed transaction");
+        assert_eq!(signed_tx.vin.len(), 1);
+        assert!(!signed_tx.vin[0].script_sig.is_empty());
+        assert_eq!(signed_tx.vin[0].script_sig[0], 0x00);
     }
 
     #[test]

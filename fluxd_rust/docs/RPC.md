@@ -698,13 +698,14 @@ Notes:
 
 - Params:
   - `hexstring` (string)
-  - optional `prevtxs` (array) - `[{"txid":"...","vout":n,"scriptPubKey":"...","amount":<amount>}, ...]`
+  - optional `prevtxs` (array) - `[{"txid":"...","vout":n,"scriptPubKey":"...","amount":<amount>,"redeemScript":"...?"}, ...]`
   - optional `privkeys` (array) - `["<wif>", ...]`
   - optional `sighashtype` (string, default `ALL`)
 - Result: `{ "hex": "<signed_tx_hex>", "complete": <bool>, "errors": [...]? }`
 
 Notes:
-- Only supports signing P2PKH inputs.
+- Supports signing P2PKH inputs and P2SH inputs with either a multisig redeem script or a P2PKH redeem script.
+- For P2SH inputs, the redeem script is loaded from the wallet when known; otherwise provide `prevtxs[].redeemScript`.
 - Uses wallet keys by default; `privkeys` can be provided to sign without importing into the wallet.
 
 ### sendrawtransaction

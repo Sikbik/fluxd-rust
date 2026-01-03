@@ -670,6 +670,27 @@ impl Wallet {
         self.redeem_scripts.get(&script_hash).cloned()
     }
 
+    pub fn signing_key_for_pubkey(
+        &self,
+        pubkey: &PublicKey,
+    ) -> Result<Option<SecretKey>, WalletError> {
+        for key in &self.keys {
+            let secret = key.secret_key()?;
+            let candidate = PublicKey::from_secret_key(secp(), &secret);
+            if &candidate == pubkey {
+                return Ok(Some(secret));
+            }
+        }
+        for entry in &self.keypool {
+            let secret = entry.key.secret_key()?;
+            let candidate = PublicKey::from_secret_key(secp(), &secret);
+            if &candidate == pubkey {
+                return Ok(Some(secret));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn import_wif(&mut self, wif: &str) -> Result<(), WalletError> {
         self.require_unlocked()?;
         let (secret, compressed) = wif_to_secret_key(wif, self.network)

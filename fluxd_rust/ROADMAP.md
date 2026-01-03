@@ -77,7 +77,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `getmininginfo` currentblock metrics (`currentblocksize`, `currentblocktx`)
   - [x] `zcrawkeygen` (Sprout key/address generator; deprecated but useful for tooling/regtest)
   - [x] `fundrawtransaction` fee estimation respects pre-filled `scriptSig` sizes (avoids underfunding partially-signed txs)
-  - [ ] `signrawtransaction` script type parity (P2SH/multisig)
+  - [x] `signrawtransaction` script type parity (P2SH/multisig; supports `prevtxs[].redeemScript`)
 
 ## Consensus and chainstate parity
 

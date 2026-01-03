@@ -242,13 +242,34 @@ echo "Checking wallet encryption/locking ..."
 rpc_post "encryptwallet" '["test-passphrase"]' | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
 rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
 rpc_post "walletpassphrase" '["test-passphrase", 15]' | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
-rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result"); assert isinstance(res,str) and len(res)>0, res'
+wif1="$(rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; print(obj.get("result",""))')"
+if [[ -z "$wif1" ]]; then
+  echo "dumpprivkey returned empty WIF" >&2
+  exit 1
+fi
+wif2="$(rpc_get "dumpprivkey?address=${taddr2}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; print(obj.get("result",""))')"
+if [[ -z "$wif2" ]]; then
+  echo "dumpprivkey returned empty WIF" >&2
+  exit 1
+fi
 rpc_get "walletlock" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
 rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
 
 echo "Checking multisig RPCs while wallet locked ..."
-rpc_post "createmultisig" "[2, [\"${taddr}\", \"${taddr2}\"]]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert "address" in res and "redeemScript" in res, res'
+ms="$(rpc_post "createmultisig" "[2, [\"${taddr}\", \"${taddr2}\"]]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert "address" in res and "redeemScript" in res, res; import json as j; print(j.dumps(res))')"
+ms_addr="$(python3 -c "import json,sys; obj=json.loads(sys.argv[1]); print(obj.get('address',''))" "$ms")"
+ms_redeem="$(python3 -c "import json,sys; obj=json.loads(sys.argv[1]); print(obj.get('redeemScript',''))" "$ms")"
+if [[ -z "$ms_addr" || -z "$ms_redeem" ]]; then
+  echo "createmultisig returned empty fields" >&2
+  exit 1
+fi
 rpc_post "addmultisigaddress" "[2, [\"${taddr}\", \"${taddr2}\"]]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, str) and len(res) > 0, res'
+
+echo "Checking signrawtransaction for P2SH multisig (wallet locked, privkeys provided) ..."
+ms_spk="$(rpc_get "validateaddress?address=${ms_addr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; spk=res.get("scriptPubKey",""); assert isinstance(spk,str) and len(spk)>0, res; print(spk)')"
+fake_txid="$(python3 -c 'import os,binascii; print(binascii.hexlify(os.urandom(32)).decode())')"
+raw_tx="$(rpc_post "createrawtransaction" "[[{\"txid\":\"${fake_txid}\",\"vout\":0}], {\"${taddr}\": 0.1}]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result",""); assert isinstance(res,str) and len(res)>0, obj; print(res)')"
+rpc_post "signrawtransaction" "[\"${raw_tx}\", [{\"txid\":\"${fake_txid}\",\"vout\":0,\"scriptPubKey\":\"${ms_spk}\",\"redeemScript\":\"${ms_redeem}\",\"amount\":1.0}], [\"${wif1}\", \"${wif2}\"]]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("complete") is True, obj; assert isinstance(res.get("hex",""), str) and len(res.get("hex",""))>0, obj'
 
 echo "Checking gettxoutsetinfo ..."
 rpc_get "gettxoutsetinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("transactions","txouts","bytes_serialized","hash_serialized","total_amount"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"'
