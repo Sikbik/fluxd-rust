@@ -202,6 +202,7 @@ still be spent out of the pool (z→t) and moved within the pool (z→z).
 Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux mainnet; useful for tooling/regtest):
 - `zcrawjoinsplit` (splice a Sprout JoinSplit into a raw tx; requires shielded params)
 - `zcrawreceive` (decrypt a Sprout encrypted note and check witness existence; requires shielded params)
+- `zcrawkeygen` (generate a Sprout zcaddr + spending key + viewing key)
 
 ### Mining and mempool
 

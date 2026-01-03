@@ -75,6 +75,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Wallet/multisig field parity
 - [ ] [P1] RPC parity polish (partial -> implemented) (owner: TBD)
   - [x] `getmininginfo` currentblock metrics (`currentblocksize`, `currentblocktx`)
+  - [x] `zcrawkeygen` (Sprout key/address generator; deprecated but useful for tooling/regtest)
 
 ## Consensus and chainstate parity
 

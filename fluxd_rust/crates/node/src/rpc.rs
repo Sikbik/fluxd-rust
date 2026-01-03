@@ -168,6 +168,7 @@ const RPC_METHODS: &[&str] = &[
     "z_validateaddress",
     "zcrawjoinsplit",
     "zcrawreceive",
+    "zcrawkeygen",
     "zexportkey",
     "z_exportkey",
     "zexportviewingkey",
@@ -1496,6 +1497,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "validateaddress" => rpc_validateaddress(wallet, params, chain_params),
         "zcrawjoinsplit" => rpc_zcrawjoinsplit(chainstate, params, chain_params, params_dir),
         "zcrawreceive" => rpc_zcrawreceive(chainstate, params, chain_params),
+        "zcrawkeygen" => rpc_zcrawkeygen(params, chain_params),
         "zexportkey" | "z_exportkey" => rpc_zexportkey(wallet, params, chain_params),
         "zexportviewingkey" | "z_exportviewingkey" => {
             rpc_zexportviewingkey(wallet, params, chain_params)
@@ -4995,6 +4997,20 @@ fn rpc_decodescript(params: Vec<Value>, chain_params: &ChainParams) -> Result<Va
     Ok(Value::Object(map))
 }
 
+fn rpc_zcrawkeygen(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+
+    let key = fluxd_shielded::SproutSpendingKey::random();
+    let address = key.address();
+    let viewing_key = key.viewing_key();
+
+    Ok(json!({
+        "zcaddress": encode_sprout_payment_address(&address, chain_params.network),
+        "zcsecretkey": encode_sprout_spending_key(key, chain_params.network),
+        "zcviewingkey": encode_sprout_viewing_key(&viewing_key.a_pk, &viewing_key.sk_enc, chain_params.network),
+    }))
+}
+
 fn rpc_zcrawreceive<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
@@ -7143,6 +7159,25 @@ fn decode_sprout_payment_address(
     Ok((payingkey, transmissionkey))
 }
 
+fn encode_sprout_payment_address(
+    address: &fluxd_shielded::SproutPaymentAddress,
+    network: Network,
+) -> String {
+    const PREFIX_MAINNET: [u8; 2] = [0x16, 0x9a];
+    const PREFIX_TESTNET: [u8; 2] = [0x16, 0xb6];
+
+    let prefix: &[u8] = match network {
+        Network::Mainnet => &PREFIX_MAINNET,
+        Network::Testnet | Network::Regtest => &PREFIX_TESTNET,
+    };
+
+    let mut payload = Vec::with_capacity(prefix.len() + 64);
+    payload.extend_from_slice(prefix);
+    payload.extend_from_slice(&address.a_pk);
+    payload.extend_from_slice(&address.pk_enc);
+    base58check_encode(&payload)
+}
+
 fn is_valid_sapling_spending_key(zkey: &str, network: Network) -> bool {
     let expected_hrp = match network {
         Network::Mainnet => "secret-extended-key-main",
@@ -7197,6 +7232,38 @@ fn decode_sprout_spending_key(
         RPC_INVALID_ADDRESS_OR_KEY,
         "Invalid spending key",
     ))
+}
+
+fn encode_sprout_spending_key(key: fluxd_shielded::SproutSpendingKey, network: Network) -> String {
+    const PREFIX_MAINNET: [u8; 2] = [0xAB, 0x36];
+    const PREFIX_TESTNET: [u8; 2] = [0xAC, 0x08];
+
+    let prefix: &[u8] = match network {
+        Network::Mainnet => &PREFIX_MAINNET,
+        Network::Testnet | Network::Regtest => &PREFIX_TESTNET,
+    };
+
+    let key_bytes = key.to_bytes();
+    let mut payload = Vec::with_capacity(prefix.len() + key_bytes.len());
+    payload.extend_from_slice(prefix);
+    payload.extend_from_slice(&key_bytes);
+    base58check_encode(&payload)
+}
+
+fn encode_sprout_viewing_key(a_pk: &[u8; 32], sk_enc: &[u8; 32], network: Network) -> String {
+    const PREFIX_MAINNET: [u8; 3] = [0xA8, 0xAB, 0xD3];
+    const PREFIX_TESTNET: [u8; 3] = [0xA8, 0xAC, 0x0C];
+
+    let prefix: &[u8] = match network {
+        Network::Mainnet => &PREFIX_MAINNET,
+        Network::Testnet | Network::Regtest => &PREFIX_TESTNET,
+    };
+
+    let mut payload = Vec::with_capacity(prefix.len() + 64);
+    payload.extend_from_slice(prefix);
+    payload.extend_from_slice(a_pk);
+    payload.extend_from_slice(sk_enc);
+    base58check_encode(&payload)
 }
 
 fn decode_sapling_payment_address(address: &str, network: Network) -> Option<([u8; 11], [u8; 32])> {
@@ -20412,6 +20479,40 @@ mod tests {
     }
 
     #[test]
+    fn zcrawkeygen_returns_sprout_keys_with_network_prefixes() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_zcrawkeygen(Vec::new(), &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+
+        let zcaddr = obj
+            .get("zcaddress")
+            .and_then(Value::as_str)
+            .expect("zcaddress");
+        let sk = obj
+            .get("zcsecretkey")
+            .and_then(Value::as_str)
+            .expect("zcsecretkey");
+        let vk = obj
+            .get("zcviewingkey")
+            .and_then(Value::as_str)
+            .expect("zcviewingkey");
+
+        let decoded_key = decode_sprout_spending_key(sk, params.network).expect("decode sk");
+        let addr_from_key = decoded_key.address();
+        let (payingkey, transmissionkey) =
+            decode_sprout_payment_address(zcaddr, params.network).expect("decode zcaddr");
+        assert_eq!(addr_from_key.a_pk, payingkey);
+        assert_eq!(addr_from_key.pk_enc, transmissionkey);
+
+        let payload = base58check_decode(vk).expect("decode vk");
+        assert_eq!(payload.len(), 3 + 64);
+        assert!(
+            payload.starts_with(&[0xA8, 0xAC, 0x0C]),
+            "expected regtest viewing key prefix"
+        );
+    }
+
+    #[test]
     fn help_accepts_zvalidateaddress_alias() {
         let value = rpc_help(vec![json!("z_validateaddress")]).expect("rpc");
         assert!(value.as_str().unwrap_or_default().contains("supported"));
@@ -21577,7 +21678,6 @@ fn base58check_decode(input: &str) -> Result<Vec<u8>, AddressError> {
     Ok(payload.to_vec())
 }
 
-#[cfg(test)]
 fn base58check_encode(payload: &[u8]) -> String {
     let mut data = Vec::with_capacity(payload.len() + 4);
     data.extend_from_slice(payload);
@@ -21611,7 +21711,6 @@ fn base58_decode(input: &str) -> Result<Vec<u8>, AddressError> {
     Ok(out)
 }
 
-#[cfg(test)]
 fn base58_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     if data.is_empty() {

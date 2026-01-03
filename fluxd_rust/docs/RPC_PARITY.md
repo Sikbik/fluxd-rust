@@ -95,6 +95,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - submitblock - Partial (BIP22 return values; returns `duplicate` when the header is already known; side-chain acceptance is still simplified vs C++)
 - zcrawjoinsplit - Implemented (Sprout JoinSplit splice + Groth16 proof; requires shielded params)
 - zcrawreceive - Implemented (Sprout note decrypt + witness existence check; requires shielded params)
+- zcrawkeygen - Implemented (Sprout key/address generator; deprecated but useful for tooling/regtest)
 - prioritisetransaction - Implemented (stores fee/priority deltas for mining selection)
 
 - reindex - Implemented (requests shutdown; on next start wipes `db/` and rebuilds indexes from existing flatfiles under `blocks/`; use `--resync` to wipe blocks too)
