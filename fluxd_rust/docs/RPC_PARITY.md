@@ -67,7 +67,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getrawtransaction - Implemented (chain + mempool)
 - fundrawtransaction - Partial (P2PKH wallet UTXOs only; supports `minconf` option)
 - sendrawtransaction - Partial (supports spending mempool parents; C++-style reject-code formatting for common invalid/mempool-conflict failures; honors `allowhighfees` absurd-fee guard; orphan pool + full policy parity WIP)
-- createmultisig - Partial (hex pubkeys only; wallet address lookup not available)
+- createmultisig - Implemented (accepts Flux addresses or hex pubkeys; wallet lookup works while locked)
 - estimatefee - Implemented
 - estimatepriority - Stub (returns -1.0; priority estimator not implemented)
 - validateaddress - Implemented
@@ -129,7 +129,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getrawchangeaddress - Partial (P2PKH only; address_type param ignored; reserves change addresses tracked in wallet.dat)
 - getreceivedbyaddress - Partial (P2PKH only; uses address deltas for confirmed receives, plus mempool outputs when `minconf=0`)
 - getunconfirmedbalance - Partial (derived from spendable mempool outputs paying to the wallet)
-- getwalletinfo - Partial (balances derived from the address index; `txcount` and keypool fields are persisted)
+- getwalletinfo - Implemented (C++ key set + conditional `unlocked_until`; balances derived from the address index; also returns `*_zat` fields for exact amounts)
 - importaddress - Implemented (watch-only; rescan ignored due to address index)
 - importprivkey - Implemented (rescan param accepted but ignored; address index makes it unnecessary)
 - importwallet - Partial (best-effort WIF import from dump file)
@@ -139,7 +139,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listreceivedbyaddress - Partial (transparent only; `include_watchonly` supported; `txids` populated; labels are WIP)
 - listsinceblock - Partial (transparent only; confirmed via address deltas; mempool included; `include_watchonly` supported; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
 - listtransactions - Partial (transparent only; confirmed via address deltas; mempool included; `include_watchonly` supported; ordered oldest → newest; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
-- listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; returns spendable flag and locked state)
+- listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; includes `redeemScript` for known P2SH; excludes locked coins like C++)
 - lockunspent - Implemented
 - rescanblockchain - Implemented (scans address delta index; populates wallet tx history)
 

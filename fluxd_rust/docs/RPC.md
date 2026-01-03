@@ -649,11 +649,12 @@ Notes:
 
 - Params:
   - `nrequired` (number) - required signatures
-  - `keys` (array) - hex-encoded public keys
+  - `keys` (array) - Flux addresses or hex-encoded public keys
 - Result: `{ "address": "<p2sh>", "redeemScript": "<hex>" }`
 
 Notes:
-- Wallet-backed address lookup is not available yet, so keys must be hex public keys (not t-addrs).
+- Address inputs must refer to keys that the wallet can resolve to full public keys (matches C++ behavior).
+- Works while the wallet is locked (public keys are stored unencrypted).
 
 ### verifymessage
 

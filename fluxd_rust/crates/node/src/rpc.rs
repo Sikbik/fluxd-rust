@@ -1531,7 +1531,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             rpc_zvalidateaddress(wallet, params, chain_params)
         }
         "verifymessage" => rpc_verifymessage(params, chain_params),
-        "createmultisig" => rpc_createmultisig(params, chain_params),
+        "createmultisig" => rpc_createmultisig(wallet, params, chain_params),
         _ => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "method not found")),
     }
 }
@@ -4152,6 +4152,9 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
     let include_mempool_outputs = minconf == 0;
     let mut utxos = collect_wallet_utxos(chainstate, mempool, &scripts, include_mempool_outputs)?;
     utxos.retain(|utxo| {
+        if locked_set.contains(&utxo.outpoint) {
+            return false;
+        }
         if utxo.confirmations < minconf {
             return false;
         }
@@ -4170,25 +4173,44 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
             .then_with(|| a.outpoint.index.cmp(&b.outpoint.index))
     });
 
+    let wallet_guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
     let mut out = Vec::with_capacity(utxos.len());
     for row in utxos {
         let address = script_pubkey_to_address(&row.script_pubkey, chain_params.network)
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid script_pubkey"))?;
         let owned = owned_script_set.contains(&row.script_pubkey);
-        let locked = locked_set.contains(&row.outpoint);
-        let spendable = owned && !locked;
-        out.push(json!({
-            "txid": hash256_to_hex(&row.outpoint.hash),
-            "vout": row.outpoint.index,
-            "address": address,
-            "scriptPubKey": hex_bytes(&row.script_pubkey),
-            "amount": amount_to_value(row.value),
-            "amount_zat": row.value,
-            "confirmations": row.confirmations,
-            "spendable": spendable,
-            "solvable": spendable,
-            "generated": row.is_coinbase,
-        }));
+        let spendable = owned;
+
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "txid".to_string(),
+            Value::String(hash256_to_hex(&row.outpoint.hash)),
+        );
+        entry.insert("vout".to_string(), Value::Number(row.outpoint.index.into()));
+        entry.insert("generated".to_string(), Value::Bool(row.is_coinbase));
+        entry.insert("address".to_string(), Value::String(address));
+        entry.insert(
+            "scriptPubKey".to_string(),
+            Value::String(hex_bytes(&row.script_pubkey)),
+        );
+        entry.insert("amount".to_string(), amount_to_value(row.value));
+        entry.insert("amount_zat".to_string(), Value::Number(row.value.into()));
+        entry.insert(
+            "confirmations".to_string(),
+            Value::Number(row.confirmations.into()),
+        );
+        if let Some(redeem_script) =
+            wallet_guard.redeem_script_for_p2sh_script_pubkey(&row.script_pubkey)
+        {
+            entry.insert(
+                "redeemScript".to_string(),
+                Value::String(hex_bytes(&redeem_script)),
+            );
+        }
+        entry.insert("spendable".to_string(), Value::Bool(spendable));
+        out.push(Value::Object(entry));
     }
     Ok(Value::Array(out))
 }
@@ -4229,43 +4251,66 @@ fn rpc_getwalletinfo<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
     }
 
-    let (key_count, pay_tx_fee_per_kb, tx_count, keypool_oldest, keypool_size, unlocked_until) = {
+    let (pay_tx_fee_per_kb, tx_count, keypool_oldest, keypool_size, unlocked_until, encrypted) = {
         let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        let unlocked_until = if guard.is_encrypted() {
-            guard.unlocked_until()
-        } else {
-            0
-        };
+        let encrypted = guard.is_encrypted();
+        let unlocked_until = if encrypted { guard.unlocked_until() } else { 0 };
         (
-            guard.key_count(),
             guard.pay_tx_fee_per_kb(),
             guard.tx_count(),
             guard.keypool_oldest(),
             guard.keypool_size(),
             unlocked_until,
+            encrypted,
         )
     };
 
-    Ok(json!({
-        "walletname": "wallet.dat",
-        "walletversion": WALLET_FILE_VERSION,
-        "balance": amount_to_value(balance),
-        "balance_zat": balance,
-        "unconfirmed_balance": amount_to_value(unconfirmed),
-        "unconfirmed_balance_zat": unconfirmed,
-        "immature_balance": amount_to_value(immature),
-        "immature_balance_zat": immature,
-        "txcount": tx_count,
-        "keypoololdest": keypool_oldest,
-        "keypoolsize": keypool_size,
-        "unlocked_until": unlocked_until,
-        "paytxfee": amount_to_value(pay_tx_fee_per_kb),
-        "paytxfee_zat": pay_tx_fee_per_kb,
-        "private_keys_enabled": true,
-        "key_count": key_count,
-    }))
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "walletversion".to_string(),
+        Value::Number((WALLET_FILE_VERSION as u64).into()),
+    );
+    out.insert("balance".to_string(), amount_to_value(balance));
+    out.insert("balance_zat".to_string(), Value::Number(balance.into()));
+    out.insert(
+        "unconfirmed_balance".to_string(),
+        amount_to_value(unconfirmed),
+    );
+    out.insert(
+        "unconfirmed_balance_zat".to_string(),
+        Value::Number(unconfirmed.into()),
+    );
+    out.insert("immature_balance".to_string(), amount_to_value(immature));
+    out.insert(
+        "immature_balance_zat".to_string(),
+        Value::Number(immature.into()),
+    );
+    out.insert(
+        "txcount".to_string(),
+        Value::Number((tx_count as u64).into()),
+    );
+    out.insert(
+        "keypoololdest".to_string(),
+        Value::Number(keypool_oldest.into()),
+    );
+    out.insert(
+        "keypoolsize".to_string(),
+        Value::Number((keypool_size as u64).into()),
+    );
+    if encrypted {
+        out.insert(
+            "unlocked_until".to_string(),
+            Value::Number(unlocked_until.into()),
+        );
+    }
+    out.insert("paytxfee".to_string(), amount_to_value(pay_tx_fee_per_kb));
+    out.insert(
+        "paytxfee_zat".to_string(),
+        Value::Number(pay_tx_fee_per_kb.into()),
+    );
+    Ok(Value::Object(out))
 }
 
 fn rpc_getdbinfo<S: fluxd_storage::KeyValueStore>(
@@ -6950,6 +6995,46 @@ fn rpc_verifymessage(params: Vec<Value>, chain_params: &ChainParams) -> Result<V
     Ok(Value::Bool(recovered_hash == expected_key_hash))
 }
 
+fn multisig_pubkey_from_input(
+    wallet: &Wallet,
+    key: &str,
+    chain_params: &ChainParams,
+) -> Result<Vec<u8>, RpcError> {
+    if let Ok(script_pubkey) = address_to_script_pubkey(key, chain_params.network) {
+        if classify_script_pubkey(&script_pubkey) != ScriptType::P2Pkh {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                format!("{key} does not refer to a key"),
+            ));
+        }
+        let pubkey = wallet
+            .pubkey_bytes_for_p2pkh_script_pubkey(&script_pubkey)
+            .map_err(map_wallet_error)?
+            .ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    format!("no full public key for address {key}"),
+                )
+            })?;
+        PublicKey::from_slice(&pubkey).map_err(|_| {
+            RpcError::new(RPC_INVALID_PARAMETER, format!(" Invalid public key: {key}"))
+        })?;
+        return Ok(pubkey);
+    }
+
+    if let Some(bytes) = bytes_from_hex(key) {
+        PublicKey::from_slice(&bytes).map_err(|_| {
+            RpcError::new(RPC_INVALID_PARAMETER, format!(" Invalid public key: {key}"))
+        })?;
+        return Ok(bytes);
+    }
+
+    Err(RpcError::new(
+        RPC_INVALID_PARAMETER,
+        format!(" Invalid public key: {key}"),
+    ))
+}
+
 fn rpc_addmultisigaddress(
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
@@ -7012,32 +7097,11 @@ fn rpc_addmultisigaddress(
         let key = key
             .as_str()
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "keys must be strings"))?;
-        if let Some(bytes) = bytes_from_hex(key) {
-            PublicKey::from_slice(&bytes).map_err(|_| {
-                RpcError::new(RPC_INVALID_PARAMETER, format!(" Invalid public key: {key}"))
-            })?;
-            pubkeys.push(bytes);
-            continue;
-        }
-
-        let script_pubkey = address_to_script_pubkey(key, chain_params.network)
-            .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
-        if classify_script_pubkey(&script_pubkey) != ScriptType::P2Pkh {
-            return Err(RpcError::new(
-                RPC_INVALID_PARAMETER,
-                format!(" Invalid public key: {key}"),
-            ));
-        }
-        let Some((_secret, pubkey_bytes)) = wallet_guard
-            .signing_key_for_script_pubkey(&script_pubkey)
-            .map_err(map_wallet_error)?
-        else {
-            return Err(RpcError::new(
-                RPC_WALLET_ERROR,
-                "Private key for address is not known",
-            ));
-        };
-        pubkeys.push(pubkey_bytes);
+        pubkeys.push(multisig_pubkey_from_input(
+            &wallet_guard,
+            key,
+            chain_params,
+        )?);
     }
 
     let mut redeem_script = Vec::new();
@@ -7068,6 +7132,10 @@ fn rpc_addmultisigaddress(
     script_pubkey.push(0x14);
     script_pubkey.extend_from_slice(&hash);
     script_pubkey.push(0x87);
+
+    wallet_guard
+        .import_redeem_script(redeem_script)
+        .map_err(map_wallet_error)?;
     wallet_guard
         .import_watch_script_pubkey(script_pubkey)
         .map_err(map_wallet_error)?;
@@ -7075,7 +7143,11 @@ fn rpc_addmultisigaddress(
     Ok(Value::String(address))
 }
 
-fn rpc_createmultisig(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
+fn rpc_createmultisig(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
     const MAX_PUBKEYS: usize = 16;
     const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 
@@ -7114,18 +7186,20 @@ fn rpc_createmultisig(params: Vec<Value>, chain_params: &ChainParams) -> Result<
         ));
     }
 
+    let wallet_guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+
     let mut pubkeys = Vec::with_capacity(keys.len());
     for key in keys {
         let key = key
             .as_str()
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "keys must be strings"))?;
-        let bytes = bytes_from_hex(key).ok_or_else(|| {
-            RpcError::new(RPC_INVALID_PARAMETER, format!(" Invalid public key: {key}"))
-        })?;
-        PublicKey::from_slice(&bytes).map_err(|_| {
-            RpcError::new(RPC_INVALID_PARAMETER, format!(" Invalid public key: {key}"))
-        })?;
-        pubkeys.push(bytes);
+        pubkeys.push(multisig_pubkey_from_input(
+            &wallet_guard,
+            key,
+            chain_params,
+        )?);
     }
 
     let mut redeem_script = Vec::new();
@@ -16671,13 +16745,15 @@ mod tests {
 
     #[test]
     fn createmultisig_has_cpp_schema_keys() {
-        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
         let secret_a = SecretKey::from_slice(&[2u8; 32]).expect("secret key");
         let secret_b = SecretKey::from_slice(&[3u8; 32]).expect("secret key");
         let pub_a = secret_key_pubkey_bytes(&secret_a, true);
         let pub_b = secret_key_pubkey_bytes(&secret_b, true);
 
         let value = rpc_createmultisig(
+            &wallet,
             vec![
                 json!(1),
                 Value::Array(vec![
@@ -16692,6 +16768,37 @@ mod tests {
         for key in ["address", "redeemScript"] {
             assert!(obj.contains_key(key), "missing key {key}");
         }
+    }
+
+    #[test]
+    fn createmultisig_accepts_wallet_addresses_when_locked() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        {
+            let mut guard = wallet.lock().expect("wallet lock");
+            guard
+                .encryptwallet("test-passphrase")
+                .expect("encryptwallet");
+        }
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let value = rpc_createmultisig(&wallet, vec![json!(2), json!([addr_a, addr_b])], &params)
+            .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert!(obj.get("address").and_then(Value::as_str).is_some());
+        assert!(obj.get("redeemScript").and_then(Value::as_str).is_some());
     }
 
     #[test]
@@ -16763,6 +16870,10 @@ mod tests {
             row.get("spendable").and_then(Value::as_bool),
             Some(false),
             "p2sh multisig output should be watch-only"
+        );
+        assert!(
+            row.get("redeemScript").and_then(Value::as_str).is_some(),
+            "P2SH outputs should include redeemScript when known"
         );
     }
 
@@ -17636,11 +17747,7 @@ mod tests {
         let value =
             rpc_listunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
         let arr = value.as_array().expect("array");
-        assert_eq!(arr.len(), 1);
-        assert_eq!(
-            arr[0].get("spendable").and_then(Value::as_bool),
-            Some(false)
-        );
+        assert_eq!(arr.len(), 0, "locked coins are excluded from listunspent");
 
         let mempool_policy = MempoolPolicy::standard(1000, true);
         let to_script = p2pkh_script([0x22u8; 20]);

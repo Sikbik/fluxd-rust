@@ -43,7 +43,7 @@ use zeroize::Zeroize;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 11;
+pub const WALLET_FILE_VERSION: u32 = 12;
 
 const WALLET_DUMP_EPOCH: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
@@ -175,6 +175,7 @@ struct WalletKey {
     key_hash: [u8; 20],
     secret: Option<[u8; 32]>,
     compressed: bool,
+    pubkey_bytes: Vec<u8>,
 }
 
 impl WalletKey {
@@ -191,6 +192,7 @@ impl WalletKey {
             key_hash: hash160(&pubkey_bytes),
             secret: Some(secret),
             compressed,
+            pubkey_bytes,
         })
     }
 
@@ -204,13 +206,48 @@ impl WalletKey {
         Ok(PublicKey::from_secret_key(secp(), &secret))
     }
 
-    fn pubkey_bytes(&self) -> Result<Vec<u8>, WalletError> {
-        let pubkey = self.pubkey()?;
-        if self.compressed {
-            Ok(pubkey.serialize().to_vec())
-        } else {
-            Ok(pubkey.serialize_uncompressed().to_vec())
+    fn ensure_pubkey_bytes(&mut self) -> Result<(), WalletError> {
+        if !self.pubkey_bytes.is_empty() {
+            return Ok(());
         }
+        if self.secret.is_none() {
+            return Ok(());
+        }
+        let pubkey = self.pubkey()?;
+        self.pubkey_bytes = if self.compressed {
+            pubkey.serialize().to_vec()
+        } else {
+            pubkey.serialize_uncompressed().to_vec()
+        };
+        Ok(())
+    }
+
+    fn validate_pubkey_bytes(&self) -> Result<(), WalletError> {
+        if self.pubkey_bytes.is_empty() {
+            return Ok(());
+        }
+        let expected_len = if self.compressed { 33 } else { 65 };
+        if self.pubkey_bytes.len() != expected_len {
+            return Err(WalletError::InvalidData("wallet pubkey length mismatch"));
+        }
+        PublicKey::from_slice(&self.pubkey_bytes)
+            .map_err(|_| WalletError::InvalidData("wallet contains invalid pubkey bytes"))?;
+        if hash160(&self.pubkey_bytes) != self.key_hash {
+            return Err(WalletError::InvalidData("wallet pubkey hash mismatch"));
+        }
+        Ok(())
+    }
+
+    fn pubkey_bytes(&self) -> Result<Vec<u8>, WalletError> {
+        if !self.pubkey_bytes.is_empty() {
+            return Ok(self.pubkey_bytes.clone());
+        }
+        let pubkey = self.pubkey()?;
+        Ok(if self.compressed {
+            pubkey.serialize().to_vec()
+        } else {
+            pubkey.serialize_uncompressed().to_vec()
+        })
     }
 
     fn p2pkh_key_hash(&self) -> Result<[u8; 20], WalletError> {
@@ -238,6 +275,7 @@ pub struct Wallet {
     network: Network,
     keys: Vec<WalletKey>,
     watch_scripts: Vec<Vec<u8>>,
+    redeem_scripts: BTreeMap<[u8; 20], Vec<u8>>,
     tx_history: BTreeSet<Hash256>,
     keypool: VecDeque<KeyPoolEntry>,
     sapling_keys: Vec<SaplingKeyEntry>,
@@ -271,6 +309,7 @@ impl Wallet {
                 network,
                 keys: Vec::new(),
                 watch_scripts: Vec::new(),
+                redeem_scripts: BTreeMap::new(),
                 tx_history: BTreeSet::new(),
                 keypool: VecDeque::new(),
                 sapling_keys: Vec::new(),
@@ -411,6 +450,11 @@ impl Wallet {
             return Err(WalletError::WalletNotEncrypted);
         }
         self.lock_if_expired();
+        let needs_pubkey_persist = self.keys.iter().any(|key| key.pubkey_bytes.is_empty())
+            || self
+                .keypool
+                .iter()
+                .any(|entry| entry.key.pubkey_bytes.is_empty());
         let encrypted = self
             .encrypted_secrets
             .as_ref()
@@ -428,6 +472,9 @@ impl Wallet {
             existing.zeroize();
         }
         self.unlocked_key = Some(key);
+        if needs_pubkey_persist {
+            self.save()?;
+        }
         let mut key = key;
         key.zeroize();
         Ok((unlocked_until, self.unlock_generation))
@@ -581,6 +628,48 @@ impl Wallet {
             .any(|spk| spk.as_slice() == script_pubkey)
     }
 
+    pub fn pubkey_bytes_for_p2pkh_script_pubkey(
+        &self,
+        script_pubkey: &[u8],
+    ) -> Result<Option<Vec<u8>>, WalletError> {
+        let Some(key_hash) = p2pkh_key_hash_from_script_pubkey(script_pubkey) else {
+            return Ok(None);
+        };
+
+        for key in &self.keys {
+            if key.key_hash != key_hash {
+                continue;
+            }
+            if !key.pubkey_bytes.is_empty() {
+                return Ok(Some(key.pubkey_bytes.clone()));
+            }
+            if key.secret.is_some() {
+                return Ok(Some(key.pubkey_bytes()?));
+            }
+            return Ok(None);
+        }
+
+        for entry in &self.keypool {
+            if entry.key.key_hash != key_hash {
+                continue;
+            }
+            if !entry.key.pubkey_bytes.is_empty() {
+                return Ok(Some(entry.key.pubkey_bytes.clone()));
+            }
+            if entry.key.secret.is_some() {
+                return Ok(Some(entry.key.pubkey_bytes()?));
+            }
+            return Ok(None);
+        }
+
+        Ok(None)
+    }
+
+    pub fn redeem_script_for_p2sh_script_pubkey(&self, script_pubkey: &[u8]) -> Option<Vec<u8>> {
+        let script_hash = p2sh_hash_from_script_pubkey(script_pubkey)?;
+        self.redeem_scripts.get(&script_hash).cloned()
+    }
+
     pub fn import_wif(&mut self, wif: &str) -> Result<(), WalletError> {
         self.require_unlocked()?;
         let (secret, compressed) = wif_to_secret_key(wif, self.network)
@@ -628,6 +717,32 @@ impl Wallet {
         self.watch_scripts.push(script_pubkey);
         if let Err(err) = self.save() {
             self.watch_scripts.pop();
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn import_redeem_script(&mut self, redeem_script: Vec<u8>) -> Result<(), WalletError> {
+        let hash = hash160(&redeem_script);
+        if self
+            .redeem_scripts
+            .get(&hash)
+            .is_some_and(|existing| existing.as_slice() == redeem_script.as_slice())
+        {
+            return Ok(());
+        }
+
+        let prev = self.redeem_scripts.insert(hash, redeem_script);
+        if let Err(err) = self.save() {
+            match prev {
+                Some(existing) => {
+                    self.redeem_scripts.insert(hash, existing);
+                }
+                None => {
+                    self.redeem_scripts.remove(&hash);
+                }
+            }
             return Err(err);
         }
         self.revision = self.revision.saturating_add(1);
@@ -1598,6 +1713,8 @@ impl Wallet {
                 ));
             }
             key.secret = Some(*secret);
+            key.ensure_pubkey_bytes()?;
+            key.validate_pubkey_bytes()?;
         }
 
         for entry in &mut self.keypool {
@@ -1610,6 +1727,8 @@ impl Wallet {
                 ));
             }
             entry.key.secret = Some(*secret);
+            entry.key.ensure_pubkey_bytes()?;
+            entry.key.validate_pubkey_bytes()?;
         }
 
         for entry in &mut self.sapling_keys {
@@ -1821,6 +1940,7 @@ impl Wallet {
                 network,
                 keys,
                 watch_scripts,
+                redeem_scripts: BTreeMap::new(),
                 tx_history,
                 keypool,
                 sapling_keys,
@@ -1875,11 +1995,19 @@ impl Wallet {
         for _ in 0..key_count {
             let key_hash = decoder.read_fixed::<20>()?;
             let compressed = decoder.read_bool()?;
-            keys.push(WalletKey {
+            let pubkey_bytes = if version >= 12 {
+                decoder.read_var_bytes()?
+            } else {
+                Vec::new()
+            };
+            let key = WalletKey {
                 key_hash,
                 secret: None,
                 compressed,
-            });
+                pubkey_bytes,
+            };
+            key.validate_pubkey_bytes()?;
+            keys.push(key);
         }
 
         let watch_count = decoder.read_varint()?;
@@ -1889,6 +2017,21 @@ impl Wallet {
         for _ in 0..watch_count {
             let script = decoder.read_var_bytes()?;
             watch_scripts.push(script);
+        }
+
+        let mut redeem_scripts: BTreeMap<[u8; 20], Vec<u8>> = BTreeMap::new();
+        if version >= 12 {
+            let redeem_count = decoder.read_varint()?;
+            let redeem_count = usize::try_from(redeem_count)
+                .map_err(|_| WalletError::InvalidData("redeem script count too large"))?;
+            for _ in 0..redeem_count {
+                let hash = decoder.read_fixed::<20>()?;
+                let script = decoder.read_var_bytes()?;
+                if hash160(&script) != hash {
+                    return Err(WalletError::InvalidData("redeemScript hash mismatch"));
+                }
+                redeem_scripts.insert(hash, script);
+            }
         }
 
         let tx_count = decoder.read_varint()?;
@@ -1907,15 +2050,20 @@ impl Wallet {
         for _ in 0..keypool_count {
             let key_hash = decoder.read_fixed::<20>()?;
             let compressed = decoder.read_bool()?;
+            let pubkey_bytes = if version >= 12 {
+                decoder.read_var_bytes()?
+            } else {
+                Vec::new()
+            };
             let created_at = decoder.read_u64_le()?;
-            keypool.push_back(KeyPoolEntry {
-                key: WalletKey {
-                    key_hash,
-                    secret: None,
-                    compressed,
-                },
-                created_at,
-            });
+            let key = WalletKey {
+                key_hash,
+                secret: None,
+                compressed,
+                pubkey_bytes,
+            };
+            key.validate_pubkey_bytes()?;
+            keypool.push_back(KeyPoolEntry { key, created_at });
         }
 
         let sapling_count = decoder.read_varint()?;
@@ -2024,6 +2172,7 @@ impl Wallet {
             network,
             keys,
             watch_scripts,
+            redeem_scripts,
             tx_history,
             keypool,
             sapling_keys,
@@ -2074,10 +2223,17 @@ impl Wallet {
         for key in &self.keys {
             encoder.write_bytes(&key.key_hash);
             encoder.write_u8(if key.compressed { 1 } else { 0 });
+            encoder.write_var_bytes(&key.pubkey_bytes);
         }
 
         encoder.write_varint(self.watch_scripts.len() as u64);
         for script in &self.watch_scripts {
+            encoder.write_var_bytes(script);
+        }
+
+        encoder.write_varint(self.redeem_scripts.len() as u64);
+        for (hash, script) in &self.redeem_scripts {
+            encoder.write_bytes(hash);
             encoder.write_var_bytes(script);
         }
 
@@ -2090,6 +2246,7 @@ impl Wallet {
         for entry in &self.keypool {
             encoder.write_bytes(&entry.key.key_hash);
             encoder.write_u8(if entry.key.compressed { 1 } else { 0 });
+            encoder.write_var_bytes(&entry.key.pubkey_bytes);
             encoder.write_u64_le(entry.created_at);
         }
 
@@ -2345,6 +2502,35 @@ fn p2pkh_script(key_hash: &[u8; 20]) -> Vec<u8> {
     script.push(OP_EQUALVERIFY);
     script.push(OP_CHECKSIG);
     script
+}
+
+fn p2pkh_key_hash_from_script_pubkey(script_pubkey: &[u8]) -> Option<[u8; 20]> {
+    if script_pubkey.len() != 25 {
+        return None;
+    }
+    if script_pubkey[0] != 0x76 {
+        return None;
+    }
+    if script_pubkey[1] != 0xa9 || script_pubkey[2] != 0x14 {
+        return None;
+    }
+    if script_pubkey[23] != 0x88 || script_pubkey[24] != 0xac {
+        return None;
+    }
+    script_pubkey.get(3..23)?.try_into().ok()
+}
+
+fn p2sh_hash_from_script_pubkey(script_pubkey: &[u8]) -> Option<[u8; 20]> {
+    if script_pubkey.len() != 23 {
+        return None;
+    }
+    if script_pubkey[0] != 0xa9 || script_pubkey[1] != 0x14 {
+        return None;
+    }
+    if script_pubkey[22] != 0x87 {
+        return None;
+    }
+    script_pubkey.get(2..22)?.try_into().ok()
 }
 
 fn sapling_extfvk_from_extsk(extsk: &[u8; 169]) -> Result<[u8; 169], WalletError> {

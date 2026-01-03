@@ -72,7 +72,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `sendrawtransaction` reject-code parity + `allowhighfees` handling
   - [x] `submitblock` BIP22-ish return codes
   - [x] Fluxnode RPC field parity (IP tracking + C++ field/type shape)
-  - [ ] Wallet/multisig field parity
+  - [x] Wallet/multisig field parity
 
 ## Consensus and chainstate parity
 

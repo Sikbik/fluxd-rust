@@ -230,6 +230,11 @@ if [[ -z "$taddr" ]]; then
   echo "getnewaddress returned empty result" >&2
   exit 1
 fi
+taddr2="$(rpc_get "getnewaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
+if [[ -z "$taddr2" ]]; then
+  echo "getnewaddress returned empty result" >&2
+  exit 1
+fi
 rpc_get "validateaddress?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("isvalid","address","scriptPubKey","ismine","iswatchonly","isscript"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"; assert res.get("isvalid") is True; assert res.get("ismine") is True; assert res.get("iswatchonly") is False'
 rpc_get "validateaddress?address=notanaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert res.get("isvalid") is False, res'
 
@@ -240,6 +245,10 @@ rpc_post "walletpassphrase" '["test-passphrase", 15]' | python3 -c 'import json,
 rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result"); assert isinstance(res,str) and len(res)>0, res'
 rpc_get "walletlock" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
 rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
+
+echo "Checking multisig RPCs while wallet locked ..."
+rpc_post "createmultisig" "[2, [\"${taddr}\", \"${taddr2}\"]]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert "address" in res and "redeemScript" in res, res'
+rpc_post "addmultisigaddress" "[2, [\"${taddr}\", \"${taddr2}\"]]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, str) and len(res) > 0, res'
 
 echo "Checking gettxoutsetinfo ..."
 rpc_get "gettxoutsetinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("transactions","txouts","bytes_serialized","hash_serialized","total_amount"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"'
