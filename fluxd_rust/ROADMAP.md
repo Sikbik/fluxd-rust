@@ -301,6 +301,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Testing and release hardening
 
+- [x] [P1] GitHub Actions CI (fmt + tests) (owner: TBD)
 - [x] [P0] Automated consensus vector tests vs C++ (embedded sighash vectors) (owner: TBD)
 - [x] [P0] Shielded proof verification vectors (Sapling) + ignored harness (`fluxd-shielded`) (owner: TBD)
 - [x] [P0] Merkle tree parity vectors (Sprout/Sapling roots, witnesses, paths) (owner: TBD)
