@@ -11,11 +11,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## Current sprint (next 3-5)
 
-- [x] [P1] Spent index + `getspentinfo` (owner: TBD)
-- [x] [P1] Address indexes (deltas/utxos/txids) + `getaddress*` RPCs (owner: TBD)
-- [x] [P1] Address mempool deltas + `getaddressmempool` (owner: TBD)
-- [x] [P1] Remove header-gap bottleneck (fast header ancestry + block queue selection) (owner: TBD)
-- [x] [P1] Header-first sync speed parity with C++ (owner: TBD)
+- [x] [P1] Refresh `ROADMAP.md` RPC parity snapshot (keep in sync with `docs/RPC_PARITY.md`) (owner: TBD)
+- [ ] [P1] Wallet: expand `fundrawtransaction` beyond P2PKH (spendable P2SH/multisig) (owner: TBD)
+- [ ] [P1] Wallet: complete `gettransaction` field parity + regression tests (owner: TBD)
+- [ ] [P1] Wallet: improve `listaddressgroupings` clustering parity (inputs + change) (owner: TBD)
+- [x] [P2] P2P tx relay polish (avoid re-requesting known orphans) (owner: TBD)
 
 ## Completed (core)
 
@@ -368,7 +368,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `sendrawtransaction` (relays; spends mempool parents; C++-style reject reasons for common failures)<br>`fundrawtransaction` (P2PKH only)<br>`signrawtransaction` (P2PKH only)<br>`estimatepriority` (returns -1.0) | - |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `fundrawtransaction` (wallet funding uses P2PKH UTXOs only)<br>`signrawtransaction` (supports P2SH/multisig; may return incomplete signatures)<br>`estimatepriority` (returns -1.0) | - |
 
 ### Mempool and relay
 
@@ -380,13 +380,13 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getblocksubsidy`<br>`getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps`<br>`prioritisetransaction` | `getmininginfo` (placeholders)<br>`submitblock` (simplified return codes) | - |
+| `getblocksubsidy`<br>`getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps`<br>`getmininginfo`<br>`prioritisetransaction` | `submitblock` (simplified return codes) | - |
 
 ### Fluxnode
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getfluxnodecount`<br>`listfluxnodes`<br>`viewdeterministicfluxnodelist`<br>`getdoslist`<br>`getstartlist`<br>`createfluxnodekey`<br>`listfluxnodeconf`<br>`getfluxnodeoutputs` | `fluxnodecurrentwinner`<br>`getfluxnodestatus`<br>`startfluxnode`<br>`startdeterministicfluxnode` | - |
+| `getfluxnodecount`<br>`listfluxnodes`<br>`viewdeterministicfluxnodelist`<br>`getdoslist`<br>`getstartlist`<br>`fluxnodecurrentwinner`<br>`getfluxnodestatus`<br>`createfluxnodekey`<br>`listfluxnodeconf`<br>`getfluxnodeoutputs` | `startfluxnode`<br>`startdeterministicfluxnode` | - |
 
 ### Benchmarking
 
@@ -404,16 +404,16 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `addnode`<br>`disconnectnode`<br>`getaddednodeinfo`<br>`setban`<br>`clearbanned`<br>`verifychain` | `reindex`<br>`rescanblockchain` | - |
+| `addnode`<br>`disconnectnode`<br>`getaddednodeinfo`<br>`setban`<br>`clearbanned`<br>`verifychain`<br>`reindex`<br>`rescanblockchain` | - | - |
 
 ### Wallet (transparent)
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`getreceivedbyaddress`<br>`gettransaction`<br>`listtransactions`<br>`listsinceblock`<br>`listreceivedbyaddress`<br>`addmultisigaddress`<br>`settxfee`<br>`getwalletinfo`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany`<br>`importwallet`<br>`listaddressgroupings`<br>`sendfrom` | - |
+| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill`<br>`getwalletinfo`<br>`sendfrom` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`getreceivedbyaddress`<br>`gettransaction`<br>`listtransactions`<br>`listsinceblock`<br>`listreceivedbyaddress`<br>`addmultisigaddress`<br>`settxfee`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany`<br>`importwallet`<br>`listaddressgroupings` | - |
 
 ### Wallet (shielded)
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `zgetoperationstatus`<br>`zgetoperationresult`<br>`zlistoperationids`<br>`zgetmigrationstatus`<br>`zsetmigration`<br>`zshieldcoinbase` | `zvalidateaddress` (partial; Sapling `ismine` + `iswatchonly`)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zexportkey` (partial; Sapling only)<br>`zexportviewingkey` (partial; Sapling only)<br>`zimportkey` (partial; Sapling only)<br>`zimportviewingkey` (partial; Sapling only)<br>`zimportwallet` (partial; Sapling only)<br>`zgetbalance` (partial; Sapling note scanning)<br>`zgettotalbalance` (partial; Sapling note scanning)<br>`zlistunspent` (partial; Sapling note scanning)<br>`zlistreceivedbyaddress` (partial; Sapling note scanning)<br>`zsendmany` (partial; Sapling only; async op; tx builder WIP)<br>`zcrawjoinsplit` (stub)<br>`zcrawreceive` (stub) | - |
+| `zgetoperationstatus`<br>`zgetoperationresult`<br>`zlistoperationids`<br>`zgetmigrationstatus`<br>`zsetmigration`<br>`zshieldcoinbase`<br>`z_exportwallet`<br>`zsendmany`<br>`zcrawjoinsplit`<br>`zcrawreceive`<br>`zcrawkeygen` | `zvalidateaddress` (partial; Sapling `ismine` + `iswatchonly`)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zexportkey` (partial; Sapling only)<br>`zexportviewingkey` (partial; Sapling only)<br>`zimportkey` (partial; Sapling only)<br>`zimportviewingkey` (partial; Sapling only)<br>`zimportwallet` (partial; Sapling only)<br>`zgetbalance` (partial; Sapling note scanning)<br>`zgettotalbalance` (partial; Sapling note scanning)<br>`zlistunspent` (partial; Sapling note scanning)<br>`zlistreceivedbyaddress` (partial; Sapling note scanning) | - |

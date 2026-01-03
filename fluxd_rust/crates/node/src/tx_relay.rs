@@ -210,7 +210,7 @@ async fn handle_peer_message<S: KeyValueStore>(
                     .map_err(|_| "mempool lock poisoned".to_string())?;
                 for txid in txids {
                     let _ = touch_known(known, txid);
-                    if guard.contains(&txid) {
+                    if guard.contains(&txid) || guard.has_orphan(&txid) {
                         continue;
                     }
                     if requested.insert(txid) {

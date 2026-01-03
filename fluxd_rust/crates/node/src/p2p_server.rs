@@ -399,7 +399,7 @@ async fn handle_inv(
                 continue;
             }
             let _ = touch_known(known, vector.hash);
-            if guard.contains(&vector.hash) {
+            if guard.contains(&vector.hash) || guard.has_orphan(&vector.hash) {
                 continue;
             }
             if requested.insert(vector.hash) {

@@ -227,6 +227,10 @@ impl Mempool {
         self.orphan_bytes
     }
 
+    pub fn has_orphan(&self, txid: &Hash256) -> bool {
+        self.orphans.contains_key(txid)
+    }
+
     pub fn store_orphan(
         &mut self,
         txid: Hash256,
