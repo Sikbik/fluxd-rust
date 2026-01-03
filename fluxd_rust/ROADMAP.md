@@ -181,6 +181,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Reject transactions expiring soon after Acadia (`tx-expiring-soon`)
 - [x] [P1] `getmempoolinfo`, `getrawmempool` (owner: TBD)
 - [x] [P1] Basic P2P tx relay (inv/getdata/tx + `mempool`) (owner: TBD)
+  - [x] Orphan tx pool (store missing-input txs; request parents; reprocess after parent accept)
 - [x] [P1] `getmininginfo`, `submitblock` (owner: TBD)
 - [x] [P1] `getblocktemplate` (coinbase + deterministic payouts; tx selection/assembly) (owner: TBD)
   - [x] Basic mempool tx selection + dependency ordering

@@ -712,7 +712,7 @@ Notes:
 
 - Params:
   - `hexstring` (string)
-  - `allowhighfees` (boolean, optional; currently ignored)
+  - `allowhighfees` (boolean, optional; default false) - when true, disables the absurd-fee safety check.
 - Result: transaction id hex string.
 
 Notes:

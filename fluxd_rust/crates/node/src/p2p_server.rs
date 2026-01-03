@@ -329,6 +329,7 @@ async fn handle_inbound_message<S: KeyValueStore>(
         "inv" => handle_inv(peer, mempool, payload, known, requested).await?,
         "tx" => {
             handle_tx(
+                peer,
                 chainstate,
                 params,
                 mempool,
@@ -340,7 +341,8 @@ async fn handle_inbound_message<S: KeyValueStore>(
                 known,
                 requested,
                 payload,
-            )?;
+            )
+            .await?;
         }
         "mempool" => {
             let txids = mempool_txids(mempool, TX_KNOWN_CAP, *peer_fee_filter_per_kb)?;
@@ -412,7 +414,8 @@ async fn handle_inv(
     Ok(())
 }
 
-fn handle_tx<S: KeyValueStore>(
+async fn handle_tx<S: KeyValueStore>(
+    peer: &mut Peer,
     chainstate: &ChainState<S>,
     params: &ChainParams,
     mempool: &Mutex<mempool::Mempool>,
@@ -455,6 +458,32 @@ fn handle_tx<S: KeyValueStore>(
         Err(err) => {
             if err.kind == mempool::MempoolErrorKind::MissingInput {
                 let _ = requested.remove(&txid);
+                if let Ok(mut guard) = mempool.lock() {
+                    guard.store_orphan(txid, payload.to_vec(), err.missing_inputs.clone(), true);
+                }
+                let _ = touch_known(known, txid);
+
+                let mut parent_txids: Vec<Hash256> = err
+                    .missing_inputs
+                    .into_iter()
+                    .map(|outpoint| outpoint.hash)
+                    .collect();
+                parent_txids.sort();
+                parent_txids.dedup();
+                parent_txids.retain(|hash| *hash != [0u8; 32]);
+                let mut to_request = Vec::new();
+                for parent in parent_txids {
+                    if requested.insert(parent) {
+                        to_request.push(parent);
+                        if to_request.len() >= MAX_INBOUND_TX_REQUEST {
+                            break;
+                        }
+                    }
+                }
+                if !to_request.is_empty() {
+                    request_txids(peer, &to_request).await?;
+                }
+                return Ok(());
             }
             if err.kind == mempool::MempoolErrorKind::Internal {
                 log_warn!(
@@ -507,6 +536,27 @@ fn handle_tx<S: KeyValueStore>(
     let _ = touch_known(known, txid);
     let _ = requested.remove(&txid);
     let _ = tx_announce.send(txid);
+
+    let orphan_outcome = mempool::process_orphans_after_accept(
+        chainstate,
+        params,
+        mempool,
+        mempool_policy,
+        flags,
+        txid,
+    );
+    if orphan_outcome.evicted > 0 {
+        mempool_metrics.note_evicted(orphan_outcome.evicted, orphan_outcome.evicted_bytes);
+    }
+    for accepted in orphan_outcome.accepted {
+        mempool_metrics.note_relay_accept();
+        if accepted.observe_fee {
+            if let Ok(mut estimator) = fee_estimator.lock() {
+                estimator.observe_tx(accepted.fee, accepted.size);
+            }
+        }
+        let _ = tx_announce.send(accepted.txid);
+    }
     Ok(())
 }
 

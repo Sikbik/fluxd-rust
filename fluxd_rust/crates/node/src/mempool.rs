@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,7 @@ pub enum MempoolErrorKind {
 pub struct MempoolError {
     pub kind: MempoolErrorKind,
     pub message: String,
+    pub missing_inputs: Vec<OutPoint>,
 }
 
 impl MempoolError {
@@ -46,6 +47,15 @@ impl MempoolError {
         Self {
             kind,
             message: message.into(),
+            missing_inputs: Vec::new(),
+        }
+    }
+
+    pub fn missing_inputs(missing_inputs: Vec<OutPoint>) -> Self {
+        Self {
+            kind: MempoolErrorKind::MissingInput,
+            message: "missing inputs".to_string(),
+            missing_inputs,
         }
     }
 }
@@ -82,6 +92,15 @@ impl MempoolEntry {
 }
 
 #[derive(Clone, Debug)]
+struct OrphanTx {
+    txid: Hash256,
+    raw: Vec<u8>,
+    received: u64,
+    missing_parents: Vec<Hash256>,
+    limit_free: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct MempoolPrevout {
     pub value: i64,
     pub script_pubkey: Vec<u8>,
@@ -95,6 +114,9 @@ pub struct Mempool {
     sapling_nullifiers: HashMap<Hash256, Hash256>,
     children: HashMap<Hash256, Vec<Hash256>>,
     prioritisations: HashMap<Hash256, Prioritisation>,
+    orphans: HashMap<Hash256, OrphanTx>,
+    orphans_by_parent: HashMap<Hash256, Vec<Hash256>>,
+    orphan_bytes: usize,
     total_bytes: usize,
     max_bytes: usize,
     revision: u64,
@@ -115,6 +137,9 @@ impl Mempool {
             sapling_nullifiers: HashMap::new(),
             children: HashMap::new(),
             prioritisations: HashMap::new(),
+            orphans: HashMap::new(),
+            orphans_by_parent: HashMap::new(),
+            orphan_bytes: 0,
             total_bytes: 0,
             max_bytes,
             revision: 0,
@@ -192,6 +217,134 @@ impl Mempool {
 
     pub fn entries(&self) -> impl Iterator<Item = &MempoolEntry> {
         self.entries.values()
+    }
+
+    pub fn orphan_count(&self) -> usize {
+        self.orphans.len()
+    }
+
+    pub fn orphan_bytes(&self) -> usize {
+        self.orphan_bytes
+    }
+
+    pub fn store_orphan(
+        &mut self,
+        txid: Hash256,
+        raw: Vec<u8>,
+        missing_inputs: Vec<OutPoint>,
+        limit_free: bool,
+    ) {
+        let missing_parents = orphan_parent_txids(&missing_inputs);
+        if missing_parents.is_empty() {
+            return;
+        }
+        self.insert_orphan(OrphanTx {
+            txid,
+            raw,
+            received: now_secs(),
+            missing_parents,
+            limit_free,
+        });
+    }
+
+    fn take_orphans_for_parent(&mut self, parent_txid: &Hash256) -> Vec<OrphanTx> {
+        let Some(txids) = self.orphans_by_parent.remove(parent_txid) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for txid in txids {
+            if let Some(orphan) = self.remove_orphan(&txid) {
+                out.push(orphan);
+            }
+        }
+        out
+    }
+
+    fn insert_orphan(&mut self, orphan: OrphanTx) {
+        self.prune_orphans();
+
+        if DEFAULT_MAX_ORPHANS == 0 || DEFAULT_MAX_ORPHAN_BYTES == 0 {
+            return;
+        }
+
+        if orphan.raw.len() > DEFAULT_MAX_ORPHAN_BYTES {
+            return;
+        }
+
+        if self.orphans.contains_key(&orphan.txid) {
+            self.remove_orphan(&orphan.txid);
+        }
+
+        while self.orphans.len() >= DEFAULT_MAX_ORPHANS
+            || self.orphan_bytes.saturating_add(orphan.raw.len()) > DEFAULT_MAX_ORPHAN_BYTES
+        {
+            if !self.evict_oldest_orphan() {
+                break;
+            }
+        }
+
+        self.orphan_bytes = self.orphan_bytes.saturating_add(orphan.raw.len());
+        for parent in &orphan.missing_parents {
+            let children = self.orphans_by_parent.entry(*parent).or_default();
+            if !children.contains(&orphan.txid) {
+                children.push(orphan.txid);
+            }
+        }
+        self.orphans.insert(orphan.txid, orphan);
+    }
+
+    fn evict_oldest_orphan(&mut self) -> bool {
+        let Some(oldest_txid) = self
+            .orphans
+            .values()
+            .min_by_key(|orphan| orphan.received)
+            .map(|orphan| orphan.txid)
+        else {
+            return false;
+        };
+        self.remove_orphan(&oldest_txid);
+        true
+    }
+
+    fn prune_orphans(&mut self) {
+        if DEFAULT_ORPHAN_TTL_SECS == 0 {
+            return;
+        }
+        let cutoff = now_secs().saturating_sub(DEFAULT_ORPHAN_TTL_SECS);
+        let stale: Vec<Hash256> = self
+            .orphans
+            .iter()
+            .filter_map(|(txid, orphan)| {
+                if orphan.received <= cutoff {
+                    Some(*txid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for txid in stale {
+            self.remove_orphan(&txid);
+        }
+    }
+
+    fn remove_orphan(&mut self, txid: &Hash256) -> Option<OrphanTx> {
+        let orphan = self.orphans.remove(txid)?;
+        self.orphan_bytes = self.orphan_bytes.saturating_sub(orphan.raw.len());
+
+        let mut empty_parents = Vec::new();
+        for parent in &orphan.missing_parents {
+            if let Some(children) = self.orphans_by_parent.get_mut(parent) {
+                children.retain(|child| child != txid);
+                if children.is_empty() {
+                    empty_parents.push(*parent);
+                }
+            }
+        }
+        for parent in empty_parents {
+            self.orphans_by_parent.remove(&parent);
+        }
+
+        Some(orphan)
     }
 
     pub fn prioritise_transaction(&mut self, txid: Hash256, priority_delta: f64, fee_delta: i64) {
@@ -554,7 +707,17 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
     let mut spent_outpoints = Vec::with_capacity(tx.vin.len());
     let mut parents: HashSet<Hash256> = HashSet::new();
     let mut transparent_in = 0i64;
-    for (input_index, input) in tx.vin.iter().enumerate() {
+    struct PrevInfo {
+        value: i64,
+        script_pubkey: Vec<u8>,
+        is_coinbase: bool,
+        height: u32,
+    }
+
+    let mut previnfos: HashMap<OutPoint, PrevInfo> = HashMap::new();
+    let mut missing_inputs: HashSet<OutPoint> = HashSet::new();
+
+    for input in &tx.vin {
         if require_standard {
             if input.script_sig.len() > policy.max_scriptsig_size {
                 return Err(MempoolError::new(
@@ -570,27 +733,60 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
             }
         }
 
-        let (prev_value, prev_script_pubkey, prev_is_coinbase, prev_height) = match chainstate
+        let prevout = match chainstate
             .utxo_entry(&input.prevout)
             .map_err(|err| MempoolError::new(MempoolErrorKind::Internal, err.to_string()))?
         {
-            Some(entry) => (
-                entry.value,
-                entry.script_pubkey,
-                entry.is_coinbase,
-                entry.height,
-            ),
-            None => {
-                let prevout = mempool_prevouts.get(&input.prevout).ok_or_else(|| {
-                    MempoolError::new(MempoolErrorKind::MissingInput, "missing inputs")
-                })?;
-                parents.insert(input.prevout.hash);
-                (prevout.value, prevout.script_pubkey.clone(), false, 0)
+            Some(entry) => {
+                previnfos.insert(
+                    input.prevout.clone(),
+                    PrevInfo {
+                        value: entry.value,
+                        script_pubkey: entry.script_pubkey,
+                        is_coinbase: entry.is_coinbase,
+                        height: entry.height,
+                    },
+                );
+                continue;
             }
+            None => mempool_prevouts
+                .get(&input.prevout)
+                .map(|prevout| PrevInfo {
+                    value: prevout.value,
+                    script_pubkey: prevout.script_pubkey.clone(),
+                    is_coinbase: false,
+                    height: 0,
+                }),
         };
 
+        if let Some(prevout) = prevout {
+            parents.insert(input.prevout.hash);
+            previnfos.insert(input.prevout.clone(), prevout);
+        } else {
+            missing_inputs.insert(input.prevout.clone());
+        }
+    }
+
+    if !missing_inputs.is_empty() {
+        let mut missing_inputs: Vec<OutPoint> = missing_inputs.into_iter().collect();
+        missing_inputs.sort_by(|a, b| match a.hash.cmp(&b.hash) {
+            std::cmp::Ordering::Equal => a.index.cmp(&b.index),
+            other => other,
+        });
+        return Err(MempoolError::missing_inputs(missing_inputs));
+    }
+
+    for (input_index, input) in tx.vin.iter().enumerate() {
+        let previnfo = previnfos
+            .get(&input.prevout)
+            .ok_or_else(|| MempoolError::new(MempoolErrorKind::Internal, "missing prevout info"))?;
+        let prev_value = previnfo.value;
+        let prev_script_pubkey = &previnfo.script_pubkey;
+        let prev_is_coinbase = previnfo.is_coinbase;
+        let prev_height = previnfo.height;
+
         if prev_is_coinbase {
-            let spend_height = next_height as i64 - prev_height as i64;
+            let spend_height = i64::from(next_height).saturating_sub(i64::from(prev_height));
             if spend_height < COINBASE_MATURITY as i64 {
                 return Err(MempoolError::new(
                     MempoolErrorKind::InvalidTransaction,
@@ -618,7 +814,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
             };
             verify_script(
                 &input.script_sig,
-                &prev_script_pubkey,
+                prev_script_pubkey,
                 &tx,
                 input_index,
                 prev_value,
@@ -630,7 +826,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
             if require_standard {
                 verify_script(
                     &input.script_sig,
-                    &prev_script_pubkey,
+                    prev_script_pubkey,
                     &tx,
                     input_index,
                     prev_value,
@@ -728,6 +924,148 @@ const DEFAULT_LIMIT_FREE_RELAY_KB_PER_MINUTE: u64 = 500;
 const DEFAULT_BLOCK_PRIORITY_SIZE: usize = (MAX_BLOCK_SIZE as usize) / 2;
 const FREE_TX_SIZE_LIMIT: usize = DEFAULT_BLOCK_PRIORITY_SIZE - 1000;
 const ASYNC_RPC_OPERATION_DEFAULT_MINERS_FEE: i64 = 10_000;
+const DEFAULT_MAX_ORPHANS: usize = 100;
+const DEFAULT_MAX_ORPHAN_BYTES: usize = 5 * 1024 * 1024;
+const DEFAULT_ORPHAN_TTL_SECS: u64 = 20 * 60;
+
+pub struct OrphanProcessOutcome {
+    pub accepted: Vec<OrphanAcceptedTx>,
+    pub evicted: u64,
+    pub evicted_bytes: u64,
+}
+
+impl Default for OrphanProcessOutcome {
+    fn default() -> Self {
+        Self {
+            accepted: Vec::new(),
+            evicted: 0,
+            evicted_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OrphanAcceptedTx {
+    pub txid: Hash256,
+    pub fee: i64,
+    pub size: usize,
+    pub observe_fee: bool,
+}
+
+pub fn process_orphans_after_accept<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: &ChainParams,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    flags: &ValidationFlags,
+    parent_txid: Hash256,
+) -> OrphanProcessOutcome {
+    let mut queue = VecDeque::from([parent_txid]);
+    let mut visited = HashSet::new();
+    let mut outcome = OrphanProcessOutcome::default();
+
+    while let Some(parent) = queue.pop_front() {
+        if !visited.insert(parent) {
+            continue;
+        }
+
+        let orphans = match mempool.lock() {
+            Ok(mut guard) => guard.take_orphans_for_parent(&parent),
+            Err(_) => return outcome,
+        };
+        if orphans.is_empty() {
+            continue;
+        }
+
+        for orphan in orphans {
+            let OrphanTx {
+                txid,
+                raw: orphan_raw,
+                received: _,
+                missing_parents: _,
+                limit_free,
+            } = orphan;
+
+            let tx = match Transaction::consensus_decode(&orphan_raw) {
+                Ok(tx) => tx,
+                Err(_) => continue,
+            };
+
+            let mempool_prevouts = match mempool.lock() {
+                Ok(guard) => guard.prevouts_for_tx(&tx),
+                Err(_) => return outcome,
+            };
+
+            let entry = match build_mempool_entry(
+                chainstate,
+                &mempool_prevouts,
+                params,
+                flags,
+                mempool_policy,
+                tx,
+                orphan_raw.clone(),
+                limit_free,
+            ) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    if err.kind == MempoolErrorKind::MissingInput {
+                        if let Ok(mut guard) = mempool.lock() {
+                            guard.store_orphan(txid, orphan_raw, err.missing_inputs, limit_free);
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            let observe_fee = entry.tx.fluxnode.is_none();
+            let fee = entry.fee;
+            let size = entry.size();
+            let txid = entry.txid;
+
+            let insert_outcome = match mempool.lock() {
+                Ok(mut guard) => guard.insert(entry),
+                Err(_) => return outcome,
+            };
+
+            match insert_outcome {
+                Ok(inserted) => {
+                    if inserted.evicted > 0 {
+                        outcome.evicted = outcome.evicted.saturating_add(inserted.evicted);
+                        outcome.evicted_bytes =
+                            outcome.evicted_bytes.saturating_add(inserted.evicted_bytes);
+                    }
+                    outcome.accepted.push(OrphanAcceptedTx {
+                        txid,
+                        fee,
+                        size,
+                        observe_fee,
+                    });
+                    queue.push_back(txid);
+                }
+                Err(err) => {
+                    if err.kind == MempoolErrorKind::AlreadyInMempool {
+                        queue.push_back(txid);
+                    }
+                }
+            }
+        }
+    }
+
+    outcome
+}
+
+fn orphan_parent_txids(missing_inputs: &[OutPoint]) -> Vec<Hash256> {
+    let mut parents = HashSet::new();
+    for outpoint in missing_inputs {
+        if outpoint.hash == [0u8; 32] {
+            continue;
+        }
+        parents.insert(outpoint.hash);
+    }
+    let mut out: Vec<Hash256> = parents.into_iter().collect();
+    out.sort();
+    out
+}
 
 #[derive(Debug, Default)]
 struct FreeRelayLimiter {

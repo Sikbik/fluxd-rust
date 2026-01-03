@@ -251,6 +251,35 @@ async fn handle_peer_message<S: KeyValueStore>(
                 Err(err) => {
                     if err.kind == mempool::MempoolErrorKind::MissingInput {
                         let _ = requested.remove(&txid);
+                        if let Ok(mut guard) = mempool.lock() {
+                            guard.store_orphan(
+                                txid,
+                                payload.to_vec(),
+                                err.missing_inputs.clone(),
+                                true,
+                            );
+                        }
+                        let _ = touch_known(known, txid);
+
+                        let mut parent_txids: Vec<Hash256> = err
+                            .missing_inputs
+                            .into_iter()
+                            .map(|outpoint| outpoint.hash)
+                            .collect();
+                        parent_txids.sort();
+                        parent_txids.dedup();
+                        parent_txids.retain(|hash| *hash != [0u8; 32]);
+
+                        let mut to_request = Vec::new();
+                        for parent in parent_txids {
+                            if requested.insert(parent) {
+                                to_request.push(parent);
+                            }
+                        }
+                        if !to_request.is_empty() {
+                            request_txids(peer, &to_request).await?;
+                        }
+                        return Ok(());
                     }
                     if err.kind == mempool::MempoolErrorKind::Internal {
                         log_warn!(
@@ -307,6 +336,29 @@ async fn handle_peer_message<S: KeyValueStore>(
             let _ = touch_known(known, txid);
             let _ = requested.remove(&txid);
             let _ = tx_announce.send(txid);
+
+            let orphan_outcome = mempool::process_orphans_after_accept(
+                chainstate,
+                params,
+                mempool,
+                mempool_policy,
+                flags,
+                txid,
+            );
+            if orphan_outcome.evicted > 0 {
+                mempool_metrics.note_evicted(orphan_outcome.evicted, orphan_outcome.evicted_bytes);
+            }
+            if !orphan_outcome.accepted.is_empty() {
+                for accepted in orphan_outcome.accepted {
+                    mempool_metrics.note_relay_accept();
+                    if accepted.observe_fee {
+                        if let Ok(mut estimator) = fee_estimator.lock() {
+                            estimator.observe_tx(accepted.fee, accepted.size);
+                        }
+                    }
+                    let _ = tx_announce.send(accepted.txid);
+                }
+            }
         }
         "feefilter" => {
             if let Ok(filter) = parse_feefilter(payload) {

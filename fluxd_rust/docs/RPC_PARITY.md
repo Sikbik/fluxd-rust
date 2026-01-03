@@ -66,7 +66,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - decodescript - Implemented
 - getrawtransaction - Implemented (chain + mempool)
 - fundrawtransaction - Partial (wallet funding uses P2PKH UTXOs only; supports `minconf`; preserves existing `scriptSig` sizes for fee estimation; non-P2PKH inputs must be pre-signed)
-- sendrawtransaction - Partial (supports spending mempool parents; C++-style reject-code formatting for common invalid/mempool-conflict failures; honors `allowhighfees` absurd-fee guard; orphan pool + full policy parity WIP)
+- sendrawtransaction - Implemented (supports spending mempool parents; C++-style reject-code formatting for common invalid/mempool-conflict failures; honors `allowhighfees` absurd-fee guard)
 - createmultisig - Implemented (accepts Flux addresses or hex pubkeys; wallet lookup works while locked)
 - estimatefee - Implemented
 - estimatepriority - Stub (returns -1.0; priority estimator not implemented)
