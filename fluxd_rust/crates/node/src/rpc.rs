@@ -2868,6 +2868,8 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
 
     if let Ok(mempool_guard) = mempool.lock() {
         if let Some(entry) = mempool_guard.get(&txid) {
+            let is_coinbase =
+                entry.tx.vin.len() == 1 && entry.tx.vin[0].prevout == OutPoint::null();
             let mut credit_zat: i64 = 0;
             let mut debit_zat: i64 = 0;
             let mut involves_watchonly = false;
@@ -2997,6 +2999,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 "time": entry.time,
                 "timereceived": entry.time,
                 "details": details,
+                "vJoinSplit": joinsplits_to_json(&entry.tx.join_splits),
                 "walletconflicts": [],
                 "hex": hex_bytes(&entry.raw),
             });
@@ -3004,6 +3007,11 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 if let Value::Object(map) = &mut obj {
                     map.insert("fee".to_string(), amount_to_value(fee_zat));
                     map.insert("fee_zat".to_string(), Value::Number(fee_zat.into()));
+                }
+            }
+            if is_coinbase {
+                if let Value::Object(map) = &mut obj {
+                    map.insert("generated".to_string(), Value::Bool(true));
                 }
             }
             return Ok(obj);
@@ -3237,6 +3245,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         "time": block.header.time,
         "timereceived": block.header.time,
         "details": details,
+        "vJoinSplit": joinsplits_to_json(&tx.join_splits),
         "walletconflicts": [],
         "hex": hex_bytes(&encoded),
     });
@@ -3246,8 +3255,13 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
             map.insert("fee_zat".to_string(), Value::Number(fee_zat.into()));
         }
     }
+    if is_coinbase {
+        if let Value::Object(map) = &mut obj {
+            map.insert("generated".to_string(), Value::Bool(true));
+        }
+    }
 
-    if header_entry.is_some() {
+    if confirmations > 0 {
         if let Value::Object(map) = &mut obj {
             map.insert(
                 "blockhash".to_string(),
@@ -3261,10 +3275,44 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 "blocktime".to_string(),
                 Value::Number(block.header.time.into()),
             );
+            map.insert(
+                "expiryheight".to_string(),
+                Value::Number(i64::from(tx.expiry_height).into()),
+            );
         }
     }
 
     Ok(obj)
+}
+
+fn joinsplits_to_json(joinsplits: &[fluxd_primitives::transaction::JoinSplit]) -> Value {
+    Value::Array(
+        joinsplits
+            .iter()
+            .map(|joinsplit| {
+                json!({
+                    "anchor": hash256_to_hex(&joinsplit.anchor),
+                    "nullifiers": joinsplit
+                        .nullifiers
+                        .iter()
+                        .map(|hash| hash256_to_hex(hash))
+                        .collect::<Vec<_>>(),
+                    "commitments": joinsplit
+                        .commitments
+                        .iter()
+                        .map(|hash| hash256_to_hex(hash))
+                        .collect::<Vec<_>>(),
+                    "macs": joinsplit
+                        .macs
+                        .iter()
+                        .map(|hash| hash256_to_hex(hash))
+                        .collect::<Vec<_>>(),
+                    "vpub_old": amount_to_value(joinsplit.vpub_old),
+                    "vpub_new": amount_to_value(joinsplit.vpub_new),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn spent_address_info(script_pubkey: &[u8]) -> (u32, [u8; 20]) {
@@ -19405,6 +19453,13 @@ mod tests {
             obj.get("involvesWatchonly").and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(obj.get("generated").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("expiryheight").and_then(Value::as_i64), Some(0));
+        let joinsplits = obj
+            .get("vJoinSplit")
+            .and_then(Value::as_array)
+            .expect("vJoinSplit");
+        assert!(joinsplits.is_empty());
         let details = obj
             .get("details")
             .and_then(Value::as_array)
@@ -19717,6 +19772,12 @@ mod tests {
             Some(-sent_value)
         );
         assert_eq!(obj.get("fee_zat").and_then(Value::as_i64), Some(-100));
+        assert_eq!(obj.get("expiryheight").and_then(Value::as_i64), Some(0));
+        let joinsplits = obj
+            .get("vJoinSplit")
+            .and_then(Value::as_array)
+            .expect("vJoinSplit");
+        assert!(joinsplits.is_empty());
     }
 
     #[test]
@@ -19794,6 +19855,11 @@ mod tests {
             Some(incoming_value)
         );
         assert_eq!(obj.get("time").and_then(Value::as_u64), Some(123));
+        let joinsplits = obj
+            .get("vJoinSplit")
+            .and_then(Value::as_array)
+            .expect("vJoinSplit");
+        assert!(joinsplits.is_empty());
     }
 
     #[test]

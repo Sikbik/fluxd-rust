@@ -407,6 +407,9 @@ Notes:
 Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
 - If the wallet spends inputs, the response includes `fee` / `fee_zat` (negative) and `amount` / `amount_zat` excludes the fee (matches `fluxd` behavior).
+- Coinbase transactions include `generated=true` (matches `fluxd`).
+- `vJoinSplit` is included for Sprout JoinSplits (usually empty on modern Flux transactions).
+- Confirmed transactions include `expiryheight` (0 on non-Overwinter transactions).
 - Change outputs (to addresses reserved via `getrawchangeaddress` / `fundrawtransaction`) are omitted from `details` on outgoing transactions (closer to C++ wallet RPC behavior).
 - Coinbase transaction `details[].category` follows `fluxd` wallet semantics: `orphan` (not in main chain), `immature` (not yet matured), or `generate` (matured).
 - `details[]` ordering matches `fluxd`: `send` entries appear first, then receive/generate entries.
