@@ -63,12 +63,12 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Defer UTXO + address-outpoint writes to end-of-block (eliminate intrablock put+delete pairs)
   - [x] Reserve `WriteBatch` capacity per block (reduce allocator churn)
   - [x] Capture throughput stats (8-core mainnet: default worker auto-split yields ~120–150 b/s typical; shielded proof verification is the primary limiter)
-- [ ] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)
+- [x] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)
   - [x] `getrawmempool(true)` populates `depends` (mempool parents)
   - [x] `estimatepriority` (returns -1.0)
   - [x] `getbenchmarks`/`getbenchstatus` + `startbenchmark`/`stopbenchmark` (fluxbenchd proxy)
   - [x] `zcbenchmark sleep` (other benchmark types TBD)
-  - [ ] `zcrawjoinsplit`/`zcrawreceive`
+  - [x] `zcrawjoinsplit`/`zcrawreceive`
   - [x] `sendrawtransaction` reject-code parity + `allowhighfees` handling
   - [x] `submitblock` BIP22-ish return codes
   - [x] Fluxnode RPC field parity (IP tracking + C++ field/type shape)

@@ -1251,6 +1251,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
     let miner_address = ctx.miner_address.as_deref();
     let chain_params = &ctx.chain_params;
     let data_dir = ctx.data_dir.as_path();
+    let params_dir = ctx.params_dir.as_path();
     let net_totals = ctx.net_totals.as_ref();
     let peer_registry = ctx.peer_registry.as_ref();
     let header_peer_book = ctx.header_peer_book.as_ref();
@@ -1493,8 +1494,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         }
         "verifychain" => rpc_verifychain(chainstate, params),
         "validateaddress" => rpc_validateaddress(wallet, params, chain_params),
-        "zcrawjoinsplit" => rpc_shielded_not_implemented(params, "zcrawjoinsplit"),
-        "zcrawreceive" => rpc_shielded_not_implemented(params, "zcrawreceive"),
+        "zcrawjoinsplit" => rpc_zcrawjoinsplit(chainstate, params, chain_params, params_dir),
+        "zcrawreceive" => rpc_zcrawreceive(chainstate, params, chain_params),
         "zexportkey" | "z_exportkey" => rpc_zexportkey(wallet, params, chain_params),
         "zexportviewingkey" | "z_exportviewingkey" => {
             rpc_zexportviewingkey(wallet, params, chain_params)
@@ -4994,6 +4995,253 @@ fn rpc_decodescript(params: Vec<Value>, chain_params: &ChainParams) -> Result<Va
     Ok(Value::Object(map))
 }
 
+fn rpc_zcrawreceive<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() != 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zcrawreceive expects 2 parameters",
+        ));
+    }
+
+    let spending_key_str = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zcsecretkey must be a string"))?;
+    let spending_key = decode_sprout_spending_key(spending_key_str, chain_params.network)?;
+
+    let encrypted_note_hex = params[1]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "encryptednote must be a string"))?;
+    let encrypted_note = bytes_from_hex(encrypted_note_hex)
+        .ok_or_else(|| RpcError::new(RPC_MISC_ERROR, "encrypted_note could not be decoded"))?;
+    if encrypted_note.len() < fluxd_shielded::SPROUT_ENCRYPTED_NOTE_SIZE {
+        return Err(RpcError::new(
+            RPC_MISC_ERROR,
+            "encrypted_note could not be decoded",
+        ));
+    }
+
+    let encrypted_note: [u8; fluxd_shielded::SPROUT_ENCRYPTED_NOTE_SIZE] = encrypted_note
+        [..fluxd_shielded::SPROUT_ENCRYPTED_NOTE_SIZE]
+        .try_into()
+        .expect("slice length checked");
+    let encrypted_note = fluxd_shielded::SproutEncryptedNote::from_bytes(&encrypted_note)
+        .map_err(|_| RpcError::new(RPC_MISC_ERROR, "encrypted_note could not be decoded"))?;
+
+    let decryptor = fluxd_shielded::ZCNoteDecryption::new(spending_key.receiving_key());
+    let plaintext = fluxd_shielded::SproutNotePlaintext::decrypt(
+        &decryptor,
+        &encrypted_note.ciphertext,
+        &encrypted_note.epk,
+        &encrypted_note.h_sig,
+        encrypted_note.nonce,
+    )
+    .map_err(|err| RpcError::new(RPC_MISC_ERROR, err.to_string()))?;
+
+    let note = plaintext.note(spending_key.address());
+    let commitments = [note.cm()];
+    let (witnesses, _) = chainstate
+        .sprout_witness_paths(&commitments)
+        .map_err(map_internal)?;
+    let exists = witnesses
+        .get(0)
+        .map(|witness| witness.is_some())
+        .unwrap_or(false);
+
+    let plaintext_bytes = plaintext.to_bytes();
+    let amount = i64::try_from(note.value).map_err(|_| {
+        RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "sprout note value out of range for json encoding",
+        )
+    })?;
+
+    Ok(json!({
+        "amount": amount_to_value(amount),
+        "note": hex_bytes(&plaintext_bytes),
+        "exists": exists,
+    }))
+}
+
+fn rpc_zcrawjoinsplit<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    params_dir: &Path,
+) -> Result<Value, RpcError> {
+    if params.len() != 5 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "zcrawjoinsplit expects 5 parameters",
+        ));
+    }
+
+    let tx_hex = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "rawtx must be a string"))?;
+    let raw = bytes_from_hex(tx_hex)
+        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    let mut tx = Transaction::consensus_decode(&raw)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+
+    let inputs = params[1]
+        .as_object()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "inputs must be an object"))?;
+    let outputs = params[2]
+        .as_object()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "outputs must be an object"))?;
+
+    if inputs.len() > 2 || outputs.len() > 2 {
+        return Err(RpcError::new(
+            RPC_MISC_ERROR,
+            "unsupported joinsplit input/output counts",
+        ));
+    }
+
+    let vpub_old = u64::try_from(parse_amount(&params[3])?)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "nonsensical vpub_old value"))?;
+    let vpub_new = u64::try_from(parse_amount(&params[4])?)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "nonsensical vpub_new value"))?;
+
+    let mut input_keys = Vec::with_capacity(inputs.len());
+    let mut input_notes = Vec::with_capacity(inputs.len());
+    let mut commitments = Vec::with_capacity(inputs.len());
+    for (note_hex, key_value) in inputs {
+        let key_str = key_value
+            .as_str()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zcsecretkey must be a string"))?;
+        let key = decode_sprout_spending_key(key_str, chain_params.network)?;
+
+        let note_bytes = bytes_from_hex(note_hex)
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "note could not be decoded"))?;
+        if note_bytes.len() < fluxd_shielded::ZC_NOTEPLAINTEXT_SIZE {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "note could not be decoded",
+            ));
+        }
+        let note_bytes: [u8; fluxd_shielded::ZC_NOTEPLAINTEXT_SIZE] = note_bytes
+            [..fluxd_shielded::ZC_NOTEPLAINTEXT_SIZE]
+            .try_into()
+            .expect("slice length checked");
+
+        let plaintext = fluxd_shielded::SproutNotePlaintext::from_bytes(&note_bytes)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "note could not be decoded"))?;
+        let note = plaintext.note(key.address());
+
+        commitments.push(note.cm());
+        input_keys.push(key);
+        input_notes.push(note);
+    }
+
+    let (witnesses, anchor) = chainstate
+        .sprout_witness_paths(&commitments)
+        .map_err(map_internal)?;
+
+    if witnesses.len() != commitments.len() {
+        return Err(RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "sprout witness lookup returned mismatched lengths",
+        ));
+    }
+
+    let mut js_inputs = Vec::with_capacity(2);
+    for i in 0..witnesses.len() {
+        let Some(auth_path) = witnesses[i] else {
+            return Err(RpcError::new(
+                RPC_MISC_ERROR,
+                "joinsplit input could not be found in tree",
+            ));
+        };
+        js_inputs.push(fluxd_shielded::SproutJoinSplitInput {
+            key: input_keys[i],
+            note: input_notes[i],
+            auth_path,
+        });
+    }
+    while js_inputs.len() < 2 {
+        js_inputs.push(fluxd_shielded::dummy_joinsplit_input());
+    }
+    if js_inputs.len() != 2 {
+        return Err(RpcError::new(
+            RPC_MISC_ERROR,
+            "unsupported joinsplit input/output counts",
+        ));
+    }
+
+    let mut js_outputs = Vec::with_capacity(2);
+    for (addr_str, amount_value) in outputs {
+        let addr = decode_sprout_joinsplit_address(addr_str, chain_params.network)?;
+        let value = u64::try_from(parse_amount(amount_value)?)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "amount out of range"))?;
+        let mut memo = [0u8; 512];
+        memo[0] = 0xF6;
+        js_outputs.push(fluxd_shielded::SproutJoinSplitOutput { addr, value, memo });
+    }
+    while js_outputs.len() < 2 {
+        js_outputs.push(fluxd_shielded::SproutJoinSplitOutput::dummy());
+    }
+    if js_outputs.len() != 2 {
+        return Err(RpcError::new(
+            RPC_MISC_ERROR,
+            "unsupported joinsplit input/output counts",
+        ));
+    }
+
+    let js_inputs: [fluxd_shielded::SproutJoinSplitInput; 2] =
+        js_inputs.try_into().expect("length checked");
+    let js_outputs: [fluxd_shielded::SproutJoinSplitOutput; 2] =
+        js_outputs.try_into().expect("length checked");
+
+    let join_split_keypair = fluxd_shielded::JoinSplitKeypair::generate();
+    let params_path = sprout_param_path(params_dir, chain_params.network)
+        .map_err(|message| RpcError::new(RPC_WALLET_ERROR, message))?;
+    let proving_key = fluxd_shielded::sprout_proving_key(&params_path)
+        .map_err(|err| RpcError::new(RPC_WALLET_ERROR, err.to_string()))?;
+
+    let result = fluxd_shielded::prove_joinsplit(
+        proving_key.as_ref(),
+        anchor,
+        join_split_keypair.pubkey,
+        js_inputs,
+        js_outputs,
+        vpub_old,
+        vpub_new,
+    )
+    .map_err(|err| RpcError::new(RPC_MISC_ERROR, err.to_string()))?;
+
+    tx.f_overwintered = true;
+    tx.version = 4;
+    tx.version_group_id = SAPLING_VERSION_GROUP_ID;
+    tx.join_split_pub_key = join_split_keypair.pubkey;
+    tx.join_splits.push(result.joinsplit);
+
+    let next_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|block| block.height + 1)
+        .unwrap_or(0);
+    let branch_id = current_epoch_branch_id(next_height, &chain_params.consensus.upgrades);
+    let sighash = signature_hash(&tx, None, &[], 0, SighashType(SIGHASH_ALL), branch_id)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to compute joinsplit sighash"))?;
+    tx.join_split_sig = join_split_keypair.sign(&sighash);
+
+    let raw = tx
+        .consensus_encode()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode transaction"))?;
+    let enc1 = result.encrypted_notes[0].to_bytes();
+    let enc2 = result.encrypted_notes[1].to_bytes();
+
+    Ok(json!({
+        "encryptednote1": hex_bytes(&enc1),
+        "encryptednote2": hex_bytes(&enc2),
+        "rawtxn": hex_bytes(&raw),
+    }))
+}
+
 fn rpc_zvalidateaddress(
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
@@ -5250,6 +5498,32 @@ fn sapling_param_paths(params_dir: &Path, network: Network) -> Result<(PathBuf, 
     })?;
 
     Ok((spend, output))
+}
+
+fn sprout_param_path(params_dir: &Path, network: Network) -> Result<PathBuf, String> {
+    const SPROUT_GROTH16: &str = "sprout-groth16.params";
+    const SPROUT_GROTH16_TESTNET: &str = "sprout-groth16-testnet.params";
+
+    let (primary, fallback) = match network {
+        Network::Testnet => (SPROUT_GROTH16_TESTNET, Some(SPROUT_GROTH16)),
+        _ => (SPROUT_GROTH16, None),
+    };
+
+    let primary_path = params_dir.join(primary);
+    if primary_path.exists() {
+        return Ok(primary_path);
+    }
+    if let Some(fallback) = fallback {
+        let fallback_path = params_dir.join(fallback);
+        if fallback_path.exists() {
+            return Ok(fallback_path);
+        }
+    }
+
+    Err(format!(
+        "missing Sprout Groth16 parameters ({primary}) in {} (run with --fetch-params)",
+        params_dir.display()
+    ))
 }
 
 struct SaplingOutputRef<'a> {
@@ -6869,6 +7143,62 @@ fn decode_sprout_payment_address(
     Ok((payingkey, transmissionkey))
 }
 
+fn is_valid_sapling_spending_key(zkey: &str, network: Network) -> bool {
+    let expected_hrp = match network {
+        Network::Mainnet => "secret-extended-key-main",
+        Network::Testnet => "secret-extended-key-test",
+        Network::Regtest => "secret-extended-key-regtest",
+    };
+
+    let Ok(checked) = CheckedHrpstring::new::<Bech32>(zkey) else {
+        return false;
+    };
+    if checked.hrp().as_str() != expected_hrp {
+        return false;
+    }
+    let data: Vec<u8> = checked.byte_iter().collect();
+    let Ok(extsk) = <[u8; 169]>::try_from(data.as_slice()) else {
+        return false;
+    };
+    sapling_crypto::zip32::ExtendedSpendingKey::from_bytes(&extsk).is_ok()
+}
+
+fn decode_sprout_spending_key(
+    zkey: &str,
+    network: Network,
+) -> Result<fluxd_shielded::SproutSpendingKey, RpcError> {
+    const SPROUT_KEY_SIZE: usize = 32;
+    const PREFIX_MAINNET: [u8; 2] = [0xAB, 0x36];
+    const PREFIX_TESTNET: [u8; 2] = [0xAC, 0x08];
+
+    let prefix: &[u8] = match network {
+        Network::Mainnet => &PREFIX_MAINNET,
+        Network::Testnet | Network::Regtest => &PREFIX_TESTNET,
+    };
+
+    if let Ok(payload) = base58check_decode(zkey) {
+        if payload.starts_with(prefix) && payload.len() == prefix.len() + SPROUT_KEY_SIZE {
+            let bytes: [u8; 32] = payload[prefix.len()..]
+                .try_into()
+                .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid spending key"))?;
+            return fluxd_shielded::SproutSpendingKey::from_bytes(bytes)
+                .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid spending key"));
+        }
+    }
+
+    if is_valid_sapling_spending_key(zkey, network) {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Only works with Sprout spending keys",
+        ));
+    }
+
+    Err(RpcError::new(
+        RPC_INVALID_ADDRESS_OR_KEY,
+        "Invalid spending key",
+    ))
+}
+
 fn decode_sapling_payment_address(address: &str, network: Network) -> Option<([u8; 11], [u8; 32])> {
     const SAPLING_SIZE: usize = 43;
     const DIVERSIFIER_SIZE: usize = 11;
@@ -6896,6 +7226,30 @@ fn decode_sapling_payment_address(address: &str, network: Network) -> Option<([u
         decoded[DIVERSIFIER_SIZE..].try_into().ok()?;
 
     Some((diversifier, diversified_transmission_key))
+}
+
+fn decode_sprout_joinsplit_address(
+    address: &str,
+    network: Network,
+) -> Result<fluxd_shielded::SproutPaymentAddress, RpcError> {
+    if let Ok((payingkey, transmissionkey)) = decode_sprout_payment_address(address, network) {
+        return Ok(fluxd_shielded::SproutPaymentAddress {
+            a_pk: payingkey,
+            pk_enc: transmissionkey,
+        });
+    }
+
+    if decode_sapling_payment_address(address, network).is_some() {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Only works with Sprout payment addresses",
+        ));
+    }
+
+    Err(RpcError::new(
+        RPC_INVALID_ADDRESS_OR_KEY,
+        "Invalid recipient address.",
+    ))
 }
 
 fn rpc_validateaddress(
@@ -20027,10 +20381,24 @@ mod tests {
     }
 
     #[test]
-    fn zcraw_stubs_return_internal_error() {
-        let err = rpc_shielded_not_implemented(Vec::new(), "zcrawjoinsplit").unwrap_err();
-        assert_eq!(err.code, RPC_INTERNAL_ERROR);
-        assert_eq!(err.message, "zcrawjoinsplit not implemented");
+    fn decode_sprout_spending_key_accepts_regtest_prefix() {
+        let key_bytes = [0x00u8; 32];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0xAC, 0x08]);
+        payload.extend_from_slice(&key_bytes);
+        let encoded = base58check_encode(&payload);
+
+        let decoded = decode_sprout_spending_key(&encoded, Network::Regtest).expect("decode");
+        assert_eq!(decoded.to_bytes(), key_bytes);
+    }
+
+    #[test]
+    fn zcrawreceive_rejects_invalid_spending_key() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let err = rpc_zcrawreceive(&chainstate, vec![json!("notakey"), json!("")], &params)
+            .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
+        assert_eq!(err.message, "Invalid spending key");
     }
 
     #[test]

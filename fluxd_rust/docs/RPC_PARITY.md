@@ -93,8 +93,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - sendfrom - Implemented (fromaccount ignored; minconf supported)
 - submitblock - Partial (BIP22 return values; returns `duplicate` when the header is already known; side-chain acceptance is still simplified vs C++)
-- zcrawjoinsplit - Stub (returns error; joinsplit tooling not implemented)
-- zcrawreceive - Stub (returns error; joinsplit tooling not implemented)
+- zcrawjoinsplit - Implemented (Sprout JoinSplit splice + Groth16 proof; requires shielded params)
+- zcrawreceive - Implemented (Sprout note decrypt + witness existence check; requires shielded params)
 - prioritisetransaction - Implemented (stores fee/priority deltas for mining selection)
 
 - reindex - Implemented (requests shutdown; on next start wipes `db/` and rebuilds indexes from existing flatfiles under `blocks/`; use `--resync` to wipe blocks too)

@@ -3633,6 +3633,107 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(self.index.height_hash(height)?)
     }
 
+    pub fn sprout_witness_paths(
+        &self,
+        commitments: &[Hash256],
+    ) -> Result<
+        (
+            Vec<Option<[u8; fluxd_shielded::SPROUT_WITNESS_PATH_SIZE]>>,
+            Hash256,
+        ),
+        ChainStateError,
+    > {
+        use std::collections::HashMap;
+
+        use incrementalmerkletree::witness::IncrementalWitness;
+
+        use crate::shielded::{sprout_root_hash, SproutNode, SproutTree, SPROUT_TREE_DEPTH};
+
+        fn encode_sprout_path(
+            path: &incrementalmerkletree::MerklePath<SproutNode, SPROUT_TREE_DEPTH>,
+        ) -> [u8; fluxd_shielded::SPROUT_WITNESS_PATH_SIZE] {
+            let mut out = [0u8; fluxd_shielded::SPROUT_WITNESS_PATH_SIZE];
+            out[0] = SPROUT_TREE_DEPTH;
+            let mut cursor = 1usize;
+            for node in path.path_elems().iter().rev() {
+                out[cursor] = 32;
+                cursor += 1;
+                out[cursor..cursor + 32].copy_from_slice(&node.to_hash());
+                cursor += 32;
+            }
+            let position = u64::from(path.position());
+            out[cursor..cursor + 8].copy_from_slice(&position.to_le_bytes());
+            out
+        }
+
+        let Some(tip) = self.best_block()? else {
+            return Err(ChainStateError::InvalidHeader(
+                "missing best block for sprout witness scan",
+            ));
+        };
+
+        let mut want: HashMap<Hash256, Vec<usize>> = HashMap::new();
+        for (i, commitment) in commitments.iter().enumerate() {
+            want.entry(*commitment).or_default().push(i);
+        }
+
+        let mut tree = SproutTree::empty();
+        let mut witnesses: Vec<Option<IncrementalWitness<SproutNode, SPROUT_TREE_DEPTH>>> =
+            vec![None; commitments.len()];
+
+        for height in 0..=tip.height {
+            let hash = self
+                .height_hash(height)?
+                .ok_or(ChainStateError::CorruptIndex(
+                    "missing height index entry while scanning sprout witness",
+                ))?;
+            let location = self
+                .block_location(&hash)?
+                .ok_or(ChainStateError::CorruptIndex(
+                    "missing block location while scanning sprout witness",
+                ))?;
+            let bytes = self.read_block(location)?;
+            let block = Block::consensus_decode(&bytes)
+                .map_err(|_| ChainStateError::CorruptIndex("invalid block bytes"))?;
+
+            for tx in &block.transactions {
+                for joinsplit in &tx.join_splits {
+                    for commitment in &joinsplit.commitments {
+                        let node = SproutNode::from_hash(commitment);
+                        tree.append(node.clone()).map_err(|_| {
+                            ChainStateError::InvalidHeader("sprout commitment tree is full")
+                        })?;
+
+                        for witness in witnesses.iter_mut().filter_map(|w| w.as_mut()) {
+                            witness.append(node.clone()).map_err(|_| {
+                                ChainStateError::InvalidHeader("sprout witness append failed")
+                            })?;
+                        }
+
+                        if let Some(indexes) = want.get(commitment) {
+                            let witness = IncrementalWitness::from_tree(tree.clone()).ok_or(
+                                ChainStateError::InvalidHeader("sprout witness state missing"),
+                            )?;
+                            for i in indexes {
+                                witnesses[*i] = Some(witness.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let anchor = sprout_root_hash(&tree);
+        let mut out = Vec::with_capacity(witnesses.len());
+        for witness in witnesses {
+            let encoded = witness
+                .and_then(|witness| witness.path())
+                .map(|path| encode_sprout_path(&path));
+            out.push(encoded);
+        }
+        Ok((out, anchor))
+    }
+
     pub fn scan_headers(&self) -> Result<Vec<(Hash256, HeaderEntry)>, ChainStateError> {
         Ok(self.index.scan_headers()?)
     }

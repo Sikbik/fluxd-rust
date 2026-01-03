@@ -1,9 +1,17 @@
 mod params;
+mod sprout;
 mod verify;
 
 use std::fmt;
 
 pub use params::{default_params_dir, fetch_params, load_params, ParamPaths};
+pub use sprout::{
+    dummy_auth_path, dummy_joinsplit_input, joinsplit_hsig, prove_joinsplit, sprout_proving_key,
+    JoinSplitKeypair, SproutEncryptedNote, SproutError, SproutJoinSplitInput,
+    SproutJoinSplitOutput, SproutJoinSplitResult, SproutNote, SproutNotePlaintext,
+    SproutPaymentAddress, SproutSpendingKey, ZCNoteDecryption, ZCNoteEncryption,
+    SPROUT_ENCRYPTED_NOTE_SIZE, SPROUT_WITNESS_PATH_SIZE, ZC_NOTEPLAINTEXT_SIZE,
+};
 pub use verify::{verify_transaction, ShieldedParams};
 
 #[derive(Debug)]

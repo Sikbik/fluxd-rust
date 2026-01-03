@@ -199,9 +199,9 @@ still be spent out of the pool (z→t) and moved within the pool (z→z).
 - `zvalidateaddress` / `z_validateaddress` (Sapling `ismine` and `iswatchonly`)
 - `zlistreceivedbyaddress` / `z_listreceivedbyaddress`
 
-Joinsplit helper RPCs are also stubbed:
-- `zcrawjoinsplit` (returns error)
-- `zcrawreceive` (returns error)
+Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux mainnet; useful for tooling/regtest):
+- `zcrawjoinsplit` (splice a Sprout JoinSplit into a raw tx; requires shielded params)
+- `zcrawreceive` (decrypt a Sprout encrypted note and check witness existence; requires shielded params)
 
 ### Mining and mempool
 
