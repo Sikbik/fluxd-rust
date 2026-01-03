@@ -8111,7 +8111,8 @@ fn is_dust(value: i64, script_pubkey: &[u8], min_fee_per_kb: i64) -> bool {
 fn estimate_signed_tx_size(tx: &Transaction, scriptsig_len: usize) -> Result<usize, RpcError> {
     let mut tmp = tx.clone();
     for input in &mut tmp.vin {
-        input.script_sig = vec![0u8; scriptsig_len];
+        let target_len = scriptsig_len.max(input.script_sig.len());
+        input.script_sig = vec![0u8; target_len];
     }
     Ok(tmp.consensus_encode().map_err(map_internal)?.len())
 }
@@ -8222,10 +8223,12 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         }
         let prevout = resolve_prevout_info(chainstate, mempool, &input.prevout, &base_prevtxs)?
             .ok_or_else(|| RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs"))?;
-        if classify_script_pubkey(&prevout.script_pubkey) != ScriptType::P2Pkh {
+        if classify_script_pubkey(&prevout.script_pubkey) != ScriptType::P2Pkh
+            && input.script_sig.is_empty()
+        {
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
-                "fundrawtransaction only supports P2PKH inputs",
+                "fundrawtransaction only supports unsigned P2PKH inputs",
             ));
         }
         base_inputs_value = base_inputs_value
