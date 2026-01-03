@@ -3,7 +3,7 @@
 use fluxd_primitives::encoding::{Encodable, Encoder};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
-    FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
+    FluxnodeConfirmTx, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
 };
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch};
 
@@ -91,6 +91,7 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                 &confirm.collateral,
                 height,
                 confirm.update_type,
+                confirm,
             )?;
         }
     }
@@ -132,6 +133,7 @@ fn store_fluxnode_start(
         operator_pubkey: operator_key,
         collateral_pubkey: collateral_key,
         p2sh_script: p2sh_key,
+        ip: String::new(),
     };
 
     batch.put(Column::Fluxnode, outpoint_key(collateral), record.encode());
@@ -144,6 +146,7 @@ fn update_fluxnode_confirm<S: KeyValueStore>(
     collateral: &OutPoint,
     height: u32,
     update_type: u8,
+    confirm: &FluxnodeConfirmTx,
 ) -> Result<(), StoreError> {
     let Some(mut record) = load_fluxnode_record(store, collateral)? else {
         return Ok(());
@@ -169,6 +172,7 @@ fn update_fluxnode_confirm<S: KeyValueStore>(
             ));
         }
     }
+    record.ip = confirm.ip.clone();
     batch.put(Column::Fluxnode, outpoint_key(collateral), record.encode());
     Ok(())
 }

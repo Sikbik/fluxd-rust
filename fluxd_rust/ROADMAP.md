@@ -71,7 +71,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [ ] `zcrawjoinsplit`/`zcrawreceive`
   - [x] `sendrawtransaction` reject-code parity + `allowhighfees` handling
   - [x] `submitblock` BIP22-ish return codes
-  - [ ] Fluxnode RPC field parity
+  - [x] Fluxnode RPC field parity (IP tracking + C++ field/type shape)
   - [ ] Wallet/multisig field parity
 
 ## Consensus and chainstate parity

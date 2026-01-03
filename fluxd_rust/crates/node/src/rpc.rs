@@ -1441,9 +1441,11 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             rpc_getaddednodeinfo(params, chain_params, peer_registry, added_nodes)
         }
         "getfluxnodecount" => rpc_getfluxnodecount(chainstate, params),
-        "listfluxnodes" => rpc_viewdeterministicfluxnodelist(chainstate, params),
-        "viewdeterministicfluxnodelist" => rpc_viewdeterministicfluxnodelist(chainstate, params),
-        "fluxnodecurrentwinner" => rpc_fluxnodecurrentwinner(chainstate, params),
+        "listfluxnodes" => rpc_viewdeterministicfluxnodelist(chainstate, params, chain_params),
+        "viewdeterministicfluxnodelist" => {
+            rpc_viewdeterministicfluxnodelist(chainstate, params, chain_params)
+        }
+        "fluxnodecurrentwinner" => rpc_fluxnodecurrentwinner(chainstate, params, chain_params),
         "getfluxnodestatus" => rpc_getfluxnodestatus(chainstate, params, chain_params, data_dir),
         "getdoslist" => rpc_getdoslist(chainstate, params, chain_params),
         "getstartlist" => rpc_getstartlist(chainstate, params, chain_params),
@@ -10521,15 +10523,26 @@ fn rpc_getfluxnodecount<S: fluxd_storage::KeyValueStore>(
     let mut cumulus_enabled = 0i64;
     let mut nimbus_enabled = 0i64;
     let mut stratus_enabled = 0i64;
+    let mut ipv4 = 0i64;
+    let mut ipv6 = 0i64;
+    let mut onion = 0i64;
 
     for record in records {
         if record.confirmed_height == 0 {
             continue;
         }
         match record.tier {
-            0 | 1 => cumulus_enabled += 1,
+            1 => cumulus_enabled += 1,
             2 => nimbus_enabled += 1,
             3 => stratus_enabled += 1,
+            _ => {}
+        }
+
+        let (_host, network) = fluxnode_network_info(&record.ip);
+        match network.as_str() {
+            "ipv4" => ipv4 += 1,
+            "ipv6" => ipv6 += 1,
+            "onion" => onion += 1,
             _ => {}
         }
     }
@@ -10545,15 +10558,16 @@ fn rpc_getfluxnodecount<S: fluxd_storage::KeyValueStore>(
         "cumulus-enabled": cumulus_enabled,
         "nimbus-enabled": nimbus_enabled,
         "stratus-enabled": stratus_enabled,
-        "ipv4": 0,
-        "ipv6": 0,
-        "onion": 0,
+        "ipv4": ipv4,
+        "ipv6": ipv6,
+        "onion": onion,
     }))
 }
 
 fn rpc_viewdeterministicfluxnodelist<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
+    chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
     if params.len() > 1 {
         return Err(RpcError::new(
@@ -10564,107 +10578,161 @@ fn rpc_viewdeterministicfluxnodelist<S: fluxd_storage::KeyValueStore>(
     let filter = if params.is_empty() {
         String::new()
     } else {
-        params[0].as_str().unwrap_or_default().to_ascii_lowercase()
+        params[0].as_str().unwrap_or_default().to_string()
     };
     let records = chainstate.fluxnode_records().map_err(map_internal)?;
+    let best_height = best_block_height(chainstate)?;
     let mut out = Vec::new();
-    for record in records {
-        let operator_pubkey = chainstate
-            .fluxnode_key(record.operator_pubkey)
-            .map_err(map_internal)?
-            .unwrap_or_default();
-        let collateral_pubkey = match record.collateral_pubkey {
-            Some(key) => chainstate
-                .fluxnode_key(key)
+
+    for tier_id in [1u8, 2u8, 3u8] {
+        let mut tier_records: Vec<&FluxnodeRecord> = records
+            .iter()
+            .filter(|record| record.confirmed_height != 0 && record.tier == tier_id)
+            .collect();
+        tier_records.sort_by(|a, b| {
+            let a_cmp = if a.last_paid_height > 0 {
+                a.last_paid_height
+            } else {
+                a.confirmed_height
+            };
+            let b_cmp = if b.last_paid_height > 0 {
+                b.last_paid_height
+            } else {
+                b.confirmed_height
+            };
+            a_cmp
+                .cmp(&b_cmp)
+                .then_with(|| (a.last_paid_height > 0).cmp(&(b.last_paid_height > 0)))
+                .then_with(|| a.collateral.hash.cmp(&b.collateral.hash))
+                .then_with(|| a.collateral.index.cmp(&b.collateral.index))
+        });
+
+        for (rank, record) in tier_records.into_iter().enumerate() {
+            let txhash = hash256_to_hex(&record.collateral.hash);
+            let pubkey = chainstate
+                .fluxnode_key(record.operator_pubkey)
                 .map_err(map_internal)?
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let p2sh_script = match record.p2sh_script {
-            Some(key) => chainstate
-                .fluxnode_key(key)
-                .map_err(map_internal)?
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let outpoint_str = format_outpoint(&record.collateral);
-        let txhash = hash256_to_hex(&record.collateral.hash);
-        let operator_pubkey_b64 = if operator_pubkey.is_empty() {
-            String::new()
-        } else {
-            base64::engine::general_purpose::STANDARD.encode(&operator_pubkey)
-        };
-        let collateral_pubkey_b64 = if collateral_pubkey.is_empty() {
-            String::new()
-        } else {
-            base64::engine::general_purpose::STANDARD.encode(&collateral_pubkey)
-        };
-        let p2sh_hex = if p2sh_script.is_empty() {
-            String::new()
-        } else {
-            hex_bytes(&p2sh_script)
-        };
-        if !filter.is_empty() {
-            let haystack = format!(
-                "{} {} {} {} {}",
-                outpoint_str, txhash, operator_pubkey_b64, collateral_pubkey_b64, p2sh_hex
-            )
-            .to_ascii_lowercase();
-            if !haystack.contains(&filter) {
+                .unwrap_or_default();
+            let pubkey_hex = hex_bytes(&pubkey);
+            let payment_address =
+                fluxnode_payment_address(chainstate, record, chain_params)?.unwrap_or_default();
+
+            if !filter.is_empty()
+                && txhash.find(&filter) == None
+                && pubkey_hex.find(&filter) == None
+                && record.ip.find(&filter) == None
+                && payment_address.find(&filter) == None
+            {
                 continue;
             }
+
+            let (_host, network) = fluxnode_network_info(&record.ip);
+            let activesince = if best_height >= record.start_height as i32 {
+                header_time_at_height(chainstate, record.start_height as i32)
+                    .map(|time| Value::String(time.to_string()))
+                    .unwrap_or_else(|| Value::Number(0.into()))
+            } else {
+                Value::Number(0.into())
+            };
+            let lastpaid = if best_height >= record.last_paid_height as i32 {
+                header_time_at_height(chainstate, record.last_paid_height as i32)
+                    .map(|time| Value::String(time.to_string()))
+                    .unwrap_or_else(|| Value::Number(0.into()))
+            } else {
+                Value::Number(0.into())
+            };
+
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "collateral".to_string(),
+                Value::String(format_outpoint(&record.collateral)),
+            );
+            obj.insert("txhash".to_string(), Value::String(txhash));
+            obj.insert(
+                "outidx".to_string(),
+                Value::Number((record.collateral.index as i64).into()),
+            );
+            obj.insert("ip".to_string(), Value::String(record.ip.clone()));
+            obj.insert("network".to_string(), Value::String(network));
+            obj.insert(
+                "added_height".to_string(),
+                Value::Number((record.start_height as i64).into()),
+            );
+            obj.insert(
+                "confirmed_height".to_string(),
+                Value::Number((record.confirmed_height as i64).into()),
+            );
+            obj.insert(
+                "last_confirmed_height".to_string(),
+                Value::Number((record.last_confirmed_height as i64).into()),
+            );
+            obj.insert(
+                "last_paid_height".to_string(),
+                Value::Number((record.last_paid_height as i64).into()),
+            );
+            obj.insert(
+                "tier".to_string(),
+                Value::String(fluxnode_tier_name(record.tier).to_string()),
+            );
+            obj.insert(
+                "payment_address".to_string(),
+                Value::String(payment_address),
+            );
+            obj.insert("pubkey".to_string(), Value::String(pubkey_hex));
+            obj.insert("activesince".to_string(), activesince);
+            obj.insert("lastpaid".to_string(), lastpaid);
+            if record.collateral_value > 0 {
+                obj.insert(
+                    "amount".to_string(),
+                    Value::String(format_money(record.collateral_value)),
+                );
+            }
+            obj.insert("rank".to_string(), Value::Number((rank as i64).into()));
+
+            out.push(Value::Object(obj));
         }
-        out.push(json!({
-            "collateral": outpoint_str,
-            "txhash": txhash,
-            "outidx": record.collateral.index,
-            "ip": "",
-            "network": "",
-            "added_height": record.start_height,
-            "confirmed_height": record.start_height,
-            "last_confirmed_height": record.last_confirmed_height,
-            "last_paid_height": record.last_paid_height,
-            "tier": fluxnode_tier_name(record.tier),
-            "payment_address": "",
-            "pubkey": operator_pubkey_b64,
-            "collateral_pubkey": collateral_pubkey_b64,
-            "redeemscript": p2sh_hex,
-            "activesince": 0,
-            "lastpaid": 0,
-            "rank": 0
-        }));
     }
+
     Ok(Value::Array(out))
 }
 
 fn rpc_fluxnodecurrentwinner<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
+    chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
-    let records = chainstate.fluxnode_records().map_err(map_internal)?;
+    let best_height = best_block_height(chainstate)?;
+    let next_height = best_height.saturating_add(1);
+    let payouts = chainstate
+        .deterministic_fluxnode_payouts(next_height, chain_params)
+        .map_err(map_internal)?;
+    let mut records_by_outpoint: HashMap<OutPoint, FluxnodeRecord> = HashMap::new();
+    for record in chainstate.fluxnode_records().map_err(map_internal)? {
+        records_by_outpoint.insert(record.collateral.clone(), record);
+    }
+
     let mut result = serde_json::Map::new();
-    for (tier_label, tier_id) in [
-        ("CUMULUS Winner", 1u8),
-        ("NIMBUS Winner", 2u8),
-        ("STRATUS Winner", 3u8),
-    ] {
-        let winner = select_fluxnode_winner(&records, tier_id);
-        if let Some(record) = winner {
-            result.insert(
-                tier_label.to_string(),
-                json!({
-                    "collateral": format_outpoint(&record.collateral),
-                    "added_height": record.start_height,
-                    "confirmed_height": record.start_height,
-                    "last_confirmed_height": record.last_confirmed_height,
-                    "last_paid_height": record.last_paid_height,
-                    "tier": fluxnode_tier_name(record.tier),
-                }),
-            );
-        } else {
-            result.insert(tier_label.to_string(), Value::Null);
-        }
+    for (tier, outpoint, script_pubkey, _amount) in payouts {
+        let Some(record) = records_by_outpoint.get(&outpoint) else {
+            continue;
+        };
+        let payment_address =
+            script_pubkey_to_address(&script_pubkey, chain_params.network).unwrap_or_default();
+        let key = format!("{} Winner", fluxnode_tier_name(tier));
+        result.insert(
+            key,
+            json!({
+                "collateral": format_outpoint(&record.collateral),
+                "ip": record.ip.clone(),
+                "added_height": record.start_height,
+                "confirmed_height": record.confirmed_height,
+                "last_confirmed_height": record.last_confirmed_height,
+                "last_paid_height": record.last_paid_height,
+                "tier": fluxnode_tier_name(record.tier),
+                "payment_address": payment_address,
+            }),
+        );
     }
     Ok(Value::Object(result))
 }
@@ -10756,9 +10824,8 @@ fn rpc_listfluxnodeconf<S: fluxd_storage::KeyValueStore>(
         obj.insert("network".to_string(), Value::String(network));
 
         if let Some(record) = record {
-            let payment_address =
-                fluxnode_payment_address(chainstate, record, chain_params.network)?
-                    .unwrap_or_else(|| "UNKNOWN".to_string());
+            let payment_address = fluxnode_payment_address(chainstate, record, chain_params)?
+                .unwrap_or_else(|| "UNKNOWN".to_string());
             obj.insert(
                 "added_height".to_string(),
                 Value::Number((record.start_height as i64).into()),
@@ -11683,18 +11750,26 @@ fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
     };
 
     let payment_address =
-        fluxnode_payment_address(chainstate, &record, chain_params.network)?.unwrap_or_default();
+        fluxnode_status_payment_address(chainstate, &record, chain_params.network)?
+            .unwrap_or_default();
     let pubkey = chainstate
         .fluxnode_key(record.operator_pubkey)
         .map_err(map_internal)?
         .unwrap_or_default();
 
-    let activesince =
-        header_time_at_height(chainstate, record.start_height as i32).unwrap_or_default() as i64;
-    let lastpaid = if record.last_paid_height == 0 || best_height < record.last_paid_height as i32 {
-        0
+    let activesince = if best_height >= record.start_height as i32 {
+        header_time_at_height(chainstate, record.start_height as i32)
+            .map(|time| Value::String(time.to_string()))
+            .unwrap_or_else(|| Value::Number(0.into()))
     } else {
-        header_time_at_height(chainstate, record.last_paid_height as i32).unwrap_or_default() as i64
+        Value::Number(0.into())
+    };
+    let lastpaid = if best_height >= record.last_paid_height as i32 {
+        header_time_at_height(chainstate, record.last_paid_height as i32)
+            .map(|time| Value::String(time.to_string()))
+            .unwrap_or_else(|| Value::Number(0.into()))
+    } else {
+        Value::Number(0.into())
     };
 
     let mut info = serde_json::Map::new();
@@ -11708,14 +11783,16 @@ fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
         "outidx".to_string(),
         Value::Number((record.collateral.index as i64).into()),
     );
-    if let Some(entry) = selected_conf {
-        let (ip, network) = fluxnode_network_info(&entry.address);
-        info.insert("ip".to_string(), Value::String(ip));
-        info.insert("network".to_string(), Value::String(network));
+    let ip = if !record.ip.is_empty() {
+        record.ip.clone()
+    } else if let Some(entry) = selected_conf {
+        entry.address.clone()
     } else {
-        info.insert("ip".to_string(), Value::String(String::new()));
-        info.insert("network".to_string(), Value::String(String::new()));
-    }
+        String::new()
+    };
+    let (_host, network) = fluxnode_network_info(&ip);
+    info.insert("ip".to_string(), Value::String(ip));
+    info.insert("network".to_string(), Value::String(network));
     info.insert(
         "added_height".to_string(),
         Value::Number((record.start_height as i64).into()),
@@ -11741,13 +11818,13 @@ fn rpc_getfluxnodestatus<S: fluxd_storage::KeyValueStore>(
         Value::String(payment_address),
     );
     info.insert("pubkey".to_string(), Value::String(hex_bytes(&pubkey)));
-    info.insert("activesince".to_string(), Value::Number(activesince.into()));
-    info.insert("lastpaid".to_string(), Value::Number(lastpaid.into()));
+    info.insert("activesince".to_string(), activesince);
+    info.insert("lastpaid".to_string(), lastpaid);
 
     if record.collateral_value > 0 {
         info.insert(
             "amount".to_string(),
-            amount_to_value(record.collateral_value),
+            Value::String(format_money(record.collateral_value)),
         );
     }
 
@@ -11978,8 +12055,8 @@ fn rpc_getdoslist<S: fluxd_storage::KeyValueStore>(
             continue;
         }
         let eligible_in = dos_remove - age;
-        let payment_address = fluxnode_payment_address(chainstate, &record, chain_params.network)?
-            .unwrap_or_default();
+        let payment_address =
+            fluxnode_payment_address(chainstate, &record, chain_params)?.unwrap_or_default();
         let mut obj = serde_json::Map::new();
         obj.insert(
             "collateral".to_string(),
@@ -12000,7 +12077,7 @@ fn rpc_getdoslist<S: fluxd_storage::KeyValueStore>(
         if record.collateral_value > 0 {
             obj.insert(
                 "amount".to_string(),
-                amount_to_value(record.collateral_value),
+                Value::String(format_money(record.collateral_value)),
             );
         }
         entries.push(Value::Object(obj));
@@ -12053,8 +12130,8 @@ fn rpc_getstartlist<S: fluxd_storage::KeyValueStore>(
             continue;
         }
         let expires_in = expiration - age;
-        let payment_address = fluxnode_payment_address(chainstate, &record, chain_params.network)?
-            .unwrap_or_default();
+        let payment_address =
+            fluxnode_payment_address(chainstate, &record, chain_params)?.unwrap_or_default();
         let mut obj = serde_json::Map::new();
         obj.insert(
             "collateral".to_string(),
@@ -12075,7 +12152,7 @@ fn rpc_getstartlist<S: fluxd_storage::KeyValueStore>(
         if record.collateral_value > 0 {
             obj.insert(
                 "amount".to_string(),
-                amount_to_value(record.collateral_value),
+                Value::String(format_money(record.collateral_value)),
             );
         }
         entries.push(Value::Object(obj));
@@ -13007,31 +13084,33 @@ fn fluxnode_tier_name(tier: u8) -> &'static str {
     }
 }
 
-fn select_fluxnode_winner(records: &[FluxnodeRecord], tier: u8) -> Option<&FluxnodeRecord> {
-    let mut candidates: Vec<&FluxnodeRecord> = records
-        .iter()
-        .filter(|record| {
-            if tier == 1 && record.tier == 0 {
-                return true;
-            }
-            record.tier == tier
-        })
-        .collect();
-    candidates.sort_by(|a, b| {
-        a.last_paid_height
-            .cmp(&b.last_paid_height)
-            .then_with(|| a.start_height.cmp(&b.start_height))
-            .then_with(|| a.collateral.hash.cmp(&b.collateral.hash))
-            .then_with(|| a.collateral.index.cmp(&b.collateral.index))
-    });
-    candidates.into_iter().next()
-}
-
 fn amount_to_value(amount: i64) -> Value {
     let value = amount as f64 / COIN as f64;
     Number::from_f64(value)
         .map(Value::Number)
         .unwrap_or(Value::Number(0.into()))
+}
+
+fn format_money(amount: i64) -> String {
+    let abs = (amount as i128).abs();
+    let whole = abs / COIN as i128;
+    let frac = abs % COIN as i128;
+    let mut out = format!("{whole}.{frac:08}");
+
+    while out.len() >= 3 {
+        let len = out.len();
+        let bytes = out.as_bytes();
+        if bytes[len - 1] == b'0' && bytes[len - 3].is_ascii_digit() {
+            out.pop();
+        } else {
+            break;
+        }
+    }
+
+    if amount < 0 {
+        out.insert(0, '-');
+    }
+    out
 }
 
 fn parse_amount(value: &Value) -> Result<i64, RpcError> {
@@ -13740,6 +13819,7 @@ mod tests {
             operator_pubkey: operator_pubkey_key,
             collateral_pubkey: Some(collateral_pubkey_key),
             p2sh_script: None,
+            ip: String::new(),
         };
         let key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
         batch.put(Column::Fluxnode, key.as_bytes(), record.encode());
@@ -16692,6 +16772,19 @@ mod tests {
         extend_regtest_chain_to_height(&chainstate, &params, 69);
 
         let mut batch = WriteBatch::new();
+        add_fluxnode_record_to_batch(
+            &mut batch,
+            OutPoint {
+                hash: [0x13u8; 32],
+                index: 0,
+            },
+            1,
+            2,
+            2,
+            vec![0x02u8; 33],
+            vec![0x03u8; 33],
+            100_000,
+        );
         let record_cumulus = add_fluxnode_record_to_batch(
             &mut batch,
             OutPoint {
@@ -16751,7 +16844,8 @@ mod tests {
             assert!(obj.contains_key(key), "missing key {key}");
         }
 
-        let value = rpc_viewdeterministicfluxnodelist(&chainstate, Vec::new()).expect("rpc");
+        let value =
+            rpc_viewdeterministicfluxnodelist(&chainstate, Vec::new(), &params).expect("rpc");
         let list = value.as_array().expect("array");
         assert!(!list.is_empty());
         let first = list[0].as_object().expect("object");
@@ -16759,33 +16853,39 @@ mod tests {
             "collateral",
             "txhash",
             "outidx",
+            "ip",
+            "network",
             "added_height",
             "confirmed_height",
             "last_confirmed_height",
             "last_paid_height",
             "tier",
+            "payment_address",
             "pubkey",
-            "collateral_pubkey",
+            "activesince",
+            "lastpaid",
+            "rank",
         ] {
             assert!(first.contains_key(key), "missing key {key}");
         }
 
-        let value = rpc_fluxnodecurrentwinner(&chainstate, Vec::new()).expect("rpc");
+        let value = rpc_fluxnodecurrentwinner(&chainstate, Vec::new(), &params).expect("rpc");
         let winners = value.as_object().expect("object");
-        for tier_key in ["CUMULUS Winner", "NIMBUS Winner", "STRATUS Winner"] {
-            assert!(winners.contains_key(tier_key), "missing key {tier_key}");
-            let winner = winners.get(tier_key).expect("winner key present");
-            if winner.is_null() {
-                continue;
-            }
+        for (tier_key, winner) in winners {
+            assert!(
+                tier_key.ends_with(" Winner"),
+                "unexpected winner key {tier_key}"
+            );
             let obj = winner.as_object().expect("object");
             for key in [
                 "collateral",
+                "ip",
                 "added_height",
                 "confirmed_height",
                 "last_confirmed_height",
                 "last_paid_height",
                 "tier",
+                "payment_address",
             ] {
                 assert!(obj.contains_key(key), "missing key {key}");
             }
@@ -20851,6 +20951,54 @@ fn sign_compact_message(
 }
 
 fn fluxnode_payment_address<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    record: &FluxnodeRecord,
+    chain_params: &ChainParams,
+) -> Result<Option<String>, RpcError> {
+    let network = chain_params.network;
+    if let Some(key) = record.p2sh_script {
+        let script = chainstate.fluxnode_key(key).map_err(map_internal)?;
+        let Some(script) = script else {
+            return Ok(None);
+        };
+        let inner = hash160(&script);
+        let mut pubkey = Vec::with_capacity(23);
+        pubkey.extend_from_slice(&[0xa9, 0x14]);
+        pubkey.extend_from_slice(&inner);
+        pubkey.push(0x87);
+        return Ok(script_pubkey_to_address(&pubkey, network));
+    }
+    if let Some(key) = record.collateral_pubkey {
+        let pubkey = chainstate.fluxnode_key(key).map_err(map_internal)?;
+        let Some(pubkey) = pubkey else {
+            return Ok(None);
+        };
+        let is_p2sh_signing_key = chain_params
+            .fluxnode
+            .p2sh_public_keys
+            .iter()
+            .filter_map(|key| bytes_from_hex(key.key))
+            .any(|expected| expected == pubkey);
+        if is_p2sh_signing_key {
+            let utxo = chainstate
+                .utxo_entry(&record.collateral)
+                .map_err(map_internal)?;
+            let Some(utxo) = utxo else {
+                return Ok(None);
+            };
+            return Ok(script_pubkey_to_address(&utxo.script_pubkey, network));
+        }
+        let hash = hash160(&pubkey);
+        let mut script = Vec::with_capacity(25);
+        script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        script.extend_from_slice(&hash);
+        script.extend_from_slice(&[0x88, 0xac]);
+        return Ok(script_pubkey_to_address(&script, network));
+    }
+    Ok(None)
+}
+
+fn fluxnode_status_payment_address<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     record: &FluxnodeRecord,
     network: Network,

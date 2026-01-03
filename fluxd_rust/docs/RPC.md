@@ -1044,18 +1044,25 @@ Returns counts of confirmed fluxnodes by tier (Cumulus/Nimbus/Stratus) using the
 - `total`, `stable`
 - `basic-enabled`, `super-enabled`, `bamf-enabled`
 - `cumulus-enabled`, `nimbus-enabled`, `stratus-enabled` (aliases)
-- `ipv4`, `ipv6`, `onion` (currently always `0` until node IP tracking is added)
+- `ipv4`, `ipv6`, `onion` (derived from stored fluxnode confirm IPs)
 
 ### listfluxnodes / viewdeterministicfluxnodelist
 
-Returns a list of fluxnode records. Fields currently include collateral info,
-heights, tier, and stored pubkeys. Network and payment fields are placeholders
-and may be empty.
+Returns a list of confirmed fluxnodes matching the C++ daemon field shape:
+
+- `collateral`, `txhash`, `outidx`
+- `ip`, `network`
+- `added_height`, `confirmed_height`, `last_confirmed_height`, `last_paid_height`
+- `tier`, `payment_address`, `pubkey`, `rank`
+- optional `amount` (string, C++ `FormatMoney`)
+
+Note: `activesince` and `lastpaid` follow C++ behavior: either a string unix timestamp, or `0`.
 
 ### fluxnodecurrentwinner
 
-Returns a per-tier winner selection derived from indexed fluxnode records.
-This logic is a best-effort placeholder and will evolve toward C++ parity.
+Returns the per-tier deterministic next payee (C++ `fluxnodecurrentwinner` shape).
+
+Note: keys like `"CUMULUS Winner"` are only present when a payee exists.
 
 ### getstartlist
 
@@ -1066,7 +1073,7 @@ Fields:
 - `added_height`
 - `payment_address`
 - `expires_in` (blocks remaining before it expires)
-- `amount` (collateral amount, FLUX)
+- `amount` (string, collateral amount, FLUX)
 
 ### getdoslist
 
@@ -1077,18 +1084,18 @@ Fields:
 - `added_height`
 - `payment_address`
 - `eligible_in` (blocks remaining until it can be started again)
-- `amount` (collateral amount, FLUX)
+- `amount` (string, collateral amount, FLUX)
 
 ### getfluxnodestatus
 
-Partial parity implementation.
+Parity implementation.
 
 - Params:
   - no params: attempts to read the first entry in `fluxnode.conf` under `--data-dir`
   - one param: either an alias from `fluxnode.conf` or an explicit `txid:vout`
 - Result:
   - object with collateral fields, tier, payment address, and time/height metadata
-  - `ip` / `network` are currently empty (not yet stored in the DB)
+  - `ip` / `network` are populated from stored confirm IPs (with a config fallback)
 
 `fluxnode.conf` parsing uses the standard C++ layout: `<alias> <ip:port> <privkey> <txid> <vout>`.
 

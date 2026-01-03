@@ -5284,6 +5284,7 @@ mod tests {
                 operator_pubkey: KeyId([0u8; 32]),
                 collateral_pubkey: None,
                 p2sh_script: None,
+                ip: String::new(),
             }
         }
 
@@ -6547,6 +6548,7 @@ mod tests {
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
+            ip: String::new(),
         };
         store
             .put(
@@ -6650,6 +6652,7 @@ mod tests {
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
+            ip: String::new(),
         };
         store
             .put(
@@ -6760,6 +6763,7 @@ mod tests {
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
+            ip: String::new(),
         };
         store
             .put(
@@ -6854,6 +6858,7 @@ mod tests {
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
+            ip: String::new(),
         };
         store
             .put(
