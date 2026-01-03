@@ -299,6 +299,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Version secondary indexes (`txindex_version`, `spentindex_version`, `addressindex_version`)
   - [x] Add per-version migrations and compatibility checks
 - [x] [P2] Systemd unit template + ops docs (owner: TBD)
+- [x] [P2] Docker image + `docker compose` quickstart (owner: TBD)
 
 ## Testing and release hardening
 

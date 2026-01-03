@@ -1,0 +1,30 @@
+services:
+  fluxd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fluxd-rust:local
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    command:
+      - --network
+      - mainnet
+      - --backend
+      - fjall
+      - --data-dir
+      - /data
+      - --params-dir
+      - /data/params
+      - --fetch-params
+      - --profile
+      - high
+      - --rpc-addr
+      - 0.0.0.0:16124
+      - --dashboard-addr
+      - 0.0.0.0:8080
+    ports:
+      # P2P is public; RPC + dashboard are localhost-only by default.
+      - "16125:16125"
+      - "127.0.0.1:16124:16124"
+      - "127.0.0.1:8080:8080"

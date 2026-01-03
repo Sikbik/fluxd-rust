@@ -109,3 +109,34 @@ rm -rf ./data
 ```
 
 RPC defaults to port `26124` for testnet/regtest.
+
+## Docker
+
+Build the image from the repo root:
+
+```bash
+docker build -t fluxd-rust .
+```
+
+Run (P2P public, RPC/dashboard localhost-only):
+
+```bash
+docker run --rm -it \
+  -v "$(pwd)/data:/data" \
+  -p 16125:16125 \
+  -p 127.0.0.1:16124:16124 \
+  -p 127.0.0.1:8080:8080 \
+  fluxd-rust
+```
+
+Read the RPC cookie from the volume:
+
+```bash
+cat ./data/rpc.cookie
+```
+
+Or with `docker compose`:
+
+```bash
+docker compose up --build
+```
