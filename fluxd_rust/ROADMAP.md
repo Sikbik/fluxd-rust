@@ -15,7 +15,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [ ] [P1] Wallet: expand `fundrawtransaction` beyond P2PKH (spendable P2SH/multisig) (owner: TBD)
 - [ ] [P1] Wallet: complete `gettransaction` field parity + regression tests (owner: TBD)
   - [x] Add `generated`, `expiryheight`, and `vJoinSplit` fields (C++ parity)
-  - [ ] Track wallet `time`/`timereceived` (persist first-seen timestamp)
+  - [x] Track wallet `time`/`timereceived` (persist first-seen timestamp)
   - [ ] Populate `walletconflicts` (conflicting/replaced txids)
 - [ ] [P1] Wallet: improve `listaddressgroupings` clustering parity (inputs + change) (owner: TBD)
 - [x] [P2] P2P tx relay polish (avoid re-requesting known orphans) (owner: TBD)

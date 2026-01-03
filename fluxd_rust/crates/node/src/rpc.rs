@@ -2812,20 +2812,21 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         Some(value) => parse_bool(value)?,
     };
 
-    let (wallet_scripts, owned_set, change_key_hashes) = {
+    let (wallet_scripts, owned_set, change_key_hashes, tx_received_at) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
         let owned_scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
         let change_key_hashes = guard.change_key_hashes();
+        let tx_received_at = guard.tx_received_time(&txid);
         if include_watchonly {
             let scripts = guard
                 .all_script_pubkeys_including_watchonly()
                 .map_err(map_wallet_error)?;
             let owned_set = owned_scripts.into_iter().collect::<HashSet<_>>();
-            (scripts, Some(owned_set), change_key_hashes)
+            (scripts, Some(owned_set), change_key_hashes, tx_received_at)
         } else {
-            (owned_scripts, None, change_key_hashes)
+            (owned_scripts, None, change_key_hashes, tx_received_at)
         }
     };
     if wallet_scripts.is_empty() {
@@ -3236,14 +3237,18 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
     details.extend(send_details);
     details.extend(receive_details);
 
+    let confirmed_time = tx_received_at
+        .filter(|value| *value != 0)
+        .unwrap_or(u64::from(block.header.time));
+
     let mut obj = json!({
         "amount": amount_to_value(amount_zat),
         "amount_zat": amount_zat,
         "confirmations": confirmations,
         "involvesWatchonly": involves_watchonly,
         "txid": hash256_to_hex(&txid),
-        "time": block.header.time,
-        "timereceived": block.header.time,
+        "time": confirmed_time,
+        "timereceived": confirmed_time,
         "details": details,
         "vJoinSplit": joinsplits_to_json(&tx.join_splits),
         "walletconflicts": [],

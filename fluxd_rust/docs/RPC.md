@@ -410,6 +410,7 @@ Notes:
 - Coinbase transactions include `generated=true` (matches `fluxd`).
 - `vJoinSplit` is included for Sprout JoinSplits (usually empty on modern Flux transactions).
 - Confirmed transactions include `expiryheight` (0 on non-Overwinter transactions).
+- For confirmed transactions, `time` / `timereceived` uses the wallet’s recorded first-seen timestamp when available (otherwise falls back to block time).
 - Change outputs (to addresses reserved via `getrawchangeaddress` / `fundrawtransaction`) are omitted from `details` on outgoing transactions (closer to C++ wallet RPC behavior).
 - Coinbase transaction `details[].category` follows `fluxd` wallet semantics: `orphan` (not in main chain), `immature` (not yet matured), or `generate` (matured).
 - `details[]` ordering matches `fluxd`: `send` entries appear first, then receive/generate entries.

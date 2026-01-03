@@ -43,7 +43,7 @@ use zeroize::Zeroize;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 12;
+pub const WALLET_FILE_VERSION: u32 = 13;
 
 const WALLET_DUMP_EPOCH: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
@@ -277,6 +277,7 @@ pub struct Wallet {
     watch_scripts: Vec<Vec<u8>>,
     redeem_scripts: BTreeMap<[u8; 20], Vec<u8>>,
     tx_history: BTreeSet<Hash256>,
+    tx_received_at: BTreeMap<Hash256, u64>,
     keypool: VecDeque<KeyPoolEntry>,
     sapling_keys: Vec<SaplingKeyEntry>,
     sapling_viewing_keys: Vec<SaplingViewingKeyEntry>,
@@ -311,6 +312,7 @@ impl Wallet {
                 watch_scripts: Vec::new(),
                 redeem_scripts: BTreeMap::new(),
                 tx_history: BTreeSet::new(),
+                tx_received_at: BTreeMap::new(),
                 keypool: VecDeque::new(),
                 sapling_keys: Vec::new(),
                 sapling_viewing_keys: Vec::new(),
@@ -569,13 +571,20 @@ impl Wallet {
         self.tx_history.len()
     }
 
+    pub fn tx_received_time(&self, txid: &Hash256) -> Option<u64> {
+        self.tx_received_at.get(txid).copied()
+    }
+
     pub fn record_txids(
         &mut self,
         txids: impl IntoIterator<Item = Hash256>,
     ) -> Result<usize, WalletError> {
+        let now = current_unix_seconds();
         let prev_len = self.tx_history.len();
         for txid in txids {
-            self.tx_history.insert(txid);
+            if self.tx_history.insert(txid) {
+                self.tx_received_at.entry(txid).or_insert(now);
+            }
         }
         let added = self.tx_history.len().saturating_sub(prev_len);
         if added > 0 {
@@ -1963,6 +1972,7 @@ impl Wallet {
                 watch_scripts,
                 redeem_scripts: BTreeMap::new(),
                 tx_history,
+                tx_received_at: BTreeMap::new(),
                 keypool,
                 sapling_keys,
                 sapling_viewing_keys,
@@ -2062,6 +2072,18 @@ impl Wallet {
         for _ in 0..tx_count {
             let txid = decoder.read_fixed::<32>()?;
             tx_history.insert(txid);
+        }
+
+        let mut tx_received_at = BTreeMap::new();
+        if version >= 13 {
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("tx received time count too large"))?;
+            for _ in 0..count {
+                let txid = decoder.read_fixed::<32>()?;
+                let received_at = decoder.read_u64_le()?;
+                tx_received_at.insert(txid, received_at);
+            }
         }
 
         let keypool_count = decoder.read_varint()?;
@@ -2195,6 +2217,7 @@ impl Wallet {
             watch_scripts,
             redeem_scripts,
             tx_history,
+            tx_received_at,
             keypool,
             sapling_keys,
             sapling_viewing_keys,
@@ -2261,6 +2284,14 @@ impl Wallet {
         encoder.write_varint(self.tx_history.len() as u64);
         for txid in &self.tx_history {
             encoder.write_bytes(txid);
+        }
+
+        self.tx_received_at
+            .retain(|txid, _| self.tx_history.contains(txid));
+        encoder.write_varint(self.tx_received_at.len() as u64);
+        for (txid, received_at) in &self.tx_received_at {
+            encoder.write_bytes(txid);
+            encoder.write_u64_le(*received_at);
         }
 
         encoder.write_varint(self.keypool.len() as u64);
@@ -2722,6 +2753,25 @@ mod tests {
             .generate_new_sapling_address_bytes()
             .expect("generate sapling address");
         assert_ne!(addr1, addr2);
+    }
+
+    #[test]
+    fn tx_received_time_persists_across_restart() {
+        let data_dir = temp_data_dir("fluxd-wallet-tx-time-test");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+
+        let mut wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet");
+        let txid = [0x11u8; 32];
+        wallet
+            .record_txids(std::iter::once(txid))
+            .expect("record txids");
+        let before = wallet.tx_received_time(&txid).expect("before timestamp");
+        assert!(before > 0);
+        drop(wallet);
+
+        let wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet reload");
+        let after = wallet.tx_received_time(&txid).expect("after timestamp");
+        assert_eq!(before, after);
     }
 
     #[test]
