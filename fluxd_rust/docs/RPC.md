@@ -207,12 +207,12 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 
 - `getmempoolinfo`
 - `getrawmempool [verbose]`
-- `getmininginfo` (partial; `localsolps` is 0.0)
-- `getblocktemplate` (partial; includes deterministic fluxnode payouts + basic mempool tx selection)
+- `getmininginfo`
+- `getblocktemplate` (includes deterministic fluxnode payouts + basic mempool tx selection)
 - `submitblock <hexdata>` (partial)
 - `getnetworkhashps [blocks] [height]` (implemented; chainwork/time estimate)
 - `getnetworksolps [blocks] [height]` (implemented; chainwork/time estimate)
-- `getlocalsolps` (returns 0.0)
+- `getlocalsolps` (reports local POW header validation throughput; returns 0.0 when idle)
 - `prioritisetransaction <txid> <priority_delta> <fee_delta_sat>` (mining selection hint)
 - `estimatefee <nblocks>`
 - `estimatepriority <nblocks>` (returns -1.0; priority estimator not implemented)
@@ -825,7 +825,7 @@ Returns the transaction ids for one or more transparent addresses.
 - `getnetworksolps` and `getnetworkhashps` return a chainwork/time-based estimate, modeled after the legacy C++ daemon.
   - `blocks` defaults to `120`. If `blocks <= 0`, the Digishield averaging window is used.
   - `height` defaults to `-1` (current tip).
-- `getlocalsolps` currently returns `0.0` (mining telemetry not yet implemented).
+- `getlocalsolps` reports local POW header validation throughput; it returns `0.0` when idle.
 
 ### getmininginfo
 
@@ -834,10 +834,11 @@ Returns a summary of mining state (modeled after the legacy C++ daemon).
 - Params: none
 - Result: object with keys including:
   - `blocks` (best block height)
+  - `currentblocksize`, `currentblocktx` (from the last connected block)
   - `difficulty` (derived from best header bits)
   - `pooledtx` (mempool transaction count)
   - `testnet`, `chain`
-  - Various rate/size fields (`networkhashps`/`networksolps` are chainwork/time estimates; `localsolps` is currently `0.0`)
+  - Various rate fields (`networkhashps`/`networksolps` are chainwork/time estimates; `localsolps` reports local POW header validation throughput)
 
 ### getblocktemplate
 

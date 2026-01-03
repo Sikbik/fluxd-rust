@@ -3507,7 +3507,7 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(self.block_index_entry(hash)?.map(|entry| entry.block))
     }
 
-    fn block_index_entry(
+    pub fn block_index_entry(
         &self,
         hash: &Hash256,
     ) -> Result<Option<BlockIndexEntry>, ChainStateError> {

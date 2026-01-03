@@ -10783,11 +10783,21 @@ fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
 ) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
 
-    let best_block = chainstate
-        .best_block()
-        .map_err(map_internal)?
-        .map(|tip| tip.height)
-        .unwrap_or(0);
+    let best_tip = chainstate.best_block().map_err(map_internal)?;
+    let best_block = best_tip.as_ref().map(|tip| tip.height).unwrap_or(0);
+    let (currentblocksize, currentblocktx) = match best_tip.as_ref() {
+        Some(tip) => match chainstate
+            .block_index_entry(&tip.hash)
+            .map_err(map_internal)?
+        {
+            Some(entry) => (
+                i64::try_from(entry.block.len).unwrap_or(0),
+                i64::from(entry.tx_count),
+            ),
+            None => (0, 0),
+        },
+        None => (0, 0),
+    };
 
     let best_header = chainstate
         .best_header()
@@ -10814,8 +10824,8 @@ fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
 
     Ok(json!({
         "blocks": best_block,
-        "currentblocksize": 0,
-        "currentblocktx": 0,
+        "currentblocksize": currentblocksize,
+        "currentblocktx": currentblocktx,
         "difficulty": difficulty,
         "errors": "",
         "generate": false,
@@ -20395,8 +20405,8 @@ mod tests {
     #[test]
     fn zcrawreceive_rejects_invalid_spending_key() {
         let (chainstate, params, _data_dir) = setup_regtest_chainstate();
-        let err = rpc_zcrawreceive(&chainstate, vec![json!("notakey"), json!("")], &params)
-            .unwrap_err();
+        let err =
+            rpc_zcrawreceive(&chainstate, vec![json!("notakey"), json!("")], &params).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
         assert_eq!(err.message, "Invalid spending key");
     }

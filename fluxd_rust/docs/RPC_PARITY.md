@@ -46,7 +46,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getblocksubsidy - Implemented
 - getblocktemplate - Implemented (template fields + longpoll + proposal; falls back to `--miner-address` then the wallet if mineraddress is unset)
 - getlocalsolps - Implemented (reports local POW header validation throughput; returns 0.0 when idle)
-- getmininginfo - Partial (`currentblock*` fields are placeholders; `localsolps` reports local POW header validation throughput)
+- getmininginfo - Implemented (`currentblock*` fields reflect the last connected block; `localsolps` reports local POW header validation throughput)
 - getnetworkhashps - Implemented (chainwork/time-based estimate; `blocks<=0` uses Digishield averaging window)
 - getnetworksolps - Implemented (chainwork/time-based estimate; `blocks<=0` uses Digishield averaging window)
 

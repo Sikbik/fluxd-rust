@@ -73,6 +73,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `submitblock` BIP22-ish return codes
   - [x] Fluxnode RPC field parity (IP tracking + C++ field/type shape)
   - [x] Wallet/multisig field parity
+- [ ] [P1] RPC parity polish (partial -> implemented) (owner: TBD)
+  - [x] `getmininginfo` currentblock metrics (`currentblocksize`, `currentblocktx`)
 
 ## Consensus and chainstate parity
 
