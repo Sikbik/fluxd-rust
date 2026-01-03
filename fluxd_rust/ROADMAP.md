@@ -298,6 +298,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Store DB schema version in `meta` (`db_schema_version`)
   - [x] Version secondary indexes (`txindex_version`, `spentindex_version`, `addressindex_version`)
   - [x] Add per-version migrations and compatibility checks
+- [x] [P2] Systemd unit template + ops docs (owner: TBD)
 
 ## Testing and release hardening
 

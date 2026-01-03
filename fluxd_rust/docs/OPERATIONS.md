@@ -108,6 +108,29 @@ will exit with an error.
 If you need a lower-resource run (or are debugging OOM issues), use `--profile low` or override the
 individual `--db-*` / worker flags explicitly.
 
+## Systemd service (recommended for long-running nodes)
+
+A hardened example unit is provided at `contrib/systemd/fluxd.service`.
+
+Typical install flow:
+
+```bash
+sudo install -m 0644 contrib/systemd/fluxd.service /etc/systemd/system/fluxd.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fluxd
+```
+
+Assumptions in the example unit:
+- the `fluxd` binary is installed at `/usr/local/bin/fluxd`
+- data is stored under `/var/lib/fluxd` (created via `StateDirectory=fluxd`)
+- RPC and dashboard bind to localhost by default
+
+Logs (journald):
+
+```bash
+sudo journalctl -u fluxd -f
+```
+
 ## Data dir notes
 
 The daemon writes a few non-db helper files into `--data-dir`:
