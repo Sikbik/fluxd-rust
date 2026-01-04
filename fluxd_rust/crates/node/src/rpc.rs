@@ -10998,10 +10998,10 @@ fn rpc_verifychain<S: fluxd_storage::KeyValueStore>(
     } else {
         3
     };
-    if checklevel > 4 {
+    if checklevel > 5 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
-            "checklevel must be 0-4",
+            "checklevel must be 0-5",
         ));
     }
 

@@ -232,6 +232,9 @@ if [[ "$rpc_ready" != "1" ]]; then
   exit 1
 fi
 
+echo "Checking verifychain ..."
+rpc_get "verifychain?checklevel=5&numblocks=1" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; assert obj.get("result") is True, obj'
+
 rpc_get "getinfo" >/dev/null
 
 echo "Checking validateaddress ..."

@@ -3835,6 +3835,45 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(self.address_deltas.scan(script_pubkey)?)
     }
 
+    pub fn address_delta_value_for_script_hash(
+        &self,
+        script_hash: &Hash256,
+        height: u32,
+        tx_index: u32,
+        txid: &Hash256,
+        index: u32,
+        spending: bool,
+    ) -> Result<Option<i64>, ChainStateError> {
+        let key = crate::address_deltas::address_delta_key(
+            script_hash,
+            height,
+            tx_index,
+            txid,
+            index,
+            spending,
+        );
+        let bytes = match self.store.get(Column::AddressDelta, &key)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        if bytes.len() != 8 {
+            return Err(ChainStateError::CorruptIndex("invalid address delta entry"));
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        Ok(Some(i64::from_le_bytes(buf)))
+    }
+
+    pub fn address_outpoint_present_for_script_hash(
+        &self,
+        script_hash: &Hash256,
+        outpoint: &OutPoint,
+    ) -> Result<bool, ChainStateError> {
+        let key =
+            crate::address_index::address_outpoint_key_with_script_hash(script_hash, outpoint);
+        Ok(self.store.get(Column::AddressOutpoint, &key)?.is_some())
+    }
+
     pub fn for_each_address_delta(
         &self,
         script_pubkey: &[u8],

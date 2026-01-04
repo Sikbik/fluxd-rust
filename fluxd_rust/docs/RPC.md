@@ -781,7 +781,7 @@ Notes:
 Verifies the blockchain database (best-effort parity).
 
 - Params: `(checklevel numblocks)`
-  - `checklevel` (optional number, 0–4, default 3)
+  - `checklevel` (optional number, 0–5, default 3)
   - `numblocks` (optional number, default 288, 0=all)
 - Result: boolean
 
@@ -789,6 +789,8 @@ Notes:
 - This is currently a read-only consistency check (flatfile decode + header linkage + merkle root + txindex).
 - `checklevel=4` also verifies that every non-coinbase input has a matching spent-index entry pointing back to the
   spending tx (`outpoint → (txid, vin, height)`).
+- `checklevel=5` also verifies `address_delta` (credits/spends) and `address_outpoint` (UTXO) index consistency for
+  scripts tracked by the address index; spend-side checks require spent-index details (P2PKH/P2SH).
 - It does not re-apply full UTXO/script validation like the C++ daemon.
 
 ### getblockdeltas

@@ -7,6 +7,22 @@ use fluxd_primitives::outpoint::OutPoint;
 
 use crate::stats::hash256_to_hex;
 
+fn p2pkh_script_pubkey(pubkey_hash: &[u8; 20]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(25);
+    out.extend_from_slice(&[0x76, 0xa9, 0x14]);
+    out.extend_from_slice(pubkey_hash);
+    out.extend_from_slice(&[0x88, 0xac]);
+    out
+}
+
+fn p2sh_script_pubkey(script_hash: &[u8; 20]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(23);
+    out.extend_from_slice(&[0xa9, 0x14]);
+    out.extend_from_slice(script_hash);
+    out.push(0x87);
+    out
+}
+
 pub(crate) fn verify_chain<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     checklevel: u32,
@@ -189,6 +205,159 @@ pub(crate) fn verify_chain<S: fluxd_storage::KeyValueStore>(
                         }
                     }
                 }
+
+                if checklevel >= 5 {
+                    let height_u32 = entry.height.max(0) as u32;
+                    for (tx_index, tx) in block.transactions.iter().enumerate() {
+                        let txid = txids
+                            .get(tx_index)
+                            .copied()
+                            .ok_or_else(|| "transaction id cache mismatch".to_string())?;
+
+                        for (vout_index, output) in tx.vout.iter().enumerate() {
+                            let Some(script_hash) =
+                                fluxd_chainstate::address_index::script_hash(&output.script_pubkey)
+                            else {
+                                continue;
+                            };
+
+                            let delta = chainstate
+                                .address_delta_value_for_script_hash(
+                                    &script_hash,
+                                    height_u32,
+                                    tx_index as u32,
+                                    &txid,
+                                    vout_index as u32,
+                                    false,
+                                )
+                                .map_err(|err| err.to_string())?
+                                .ok_or_else(|| {
+                                    format!(
+                                        "missing address delta credit for {}:{} at height {} (tx {} vout {})",
+                                        hash256_to_hex(&txid),
+                                        vout_index,
+                                        height_u32,
+                                        tx_index,
+                                        vout_index
+                                    )
+                                })?;
+                            if delta != output.value {
+                                return Err(format!(
+                                    "address delta credit mismatch for {}:{} at height {}: expected {} got {}",
+                                    hash256_to_hex(&txid),
+                                    vout_index,
+                                    height_u32,
+                                    output.value,
+                                    delta
+                                ));
+                            }
+
+                            let outpoint = OutPoint {
+                                hash: txid,
+                                index: vout_index as u32,
+                            };
+                            let utxo_present = chainstate
+                                .utxo_exists(&outpoint)
+                                .map_err(|err| err.to_string())?;
+                            let index_present = chainstate
+                                .address_outpoint_present_for_script_hash(&script_hash, &outpoint)
+                                .map_err(|err| err.to_string())?;
+                            if utxo_present != index_present {
+                                return Err(format!(
+                                    "address outpoint index mismatch for {}:{} at height {}: utxo_present={} address_index_present={}",
+                                    hash256_to_hex(&txid),
+                                    vout_index,
+                                    height_u32,
+                                    utxo_present,
+                                    index_present
+                                ));
+                            }
+                        }
+
+                        if tx_index == 0 {
+                            continue;
+                        }
+
+                        for (vin_index, input) in tx.vin.iter().enumerate() {
+                            if input.prevout == OutPoint::null() {
+                                continue;
+                            }
+
+                            let spent = chainstate
+                                .spent_info(&input.prevout)
+                                .map_err(|err| err.to_string())?;
+                            let Some(details) = spent.and_then(|spent| spent.details) else {
+                                continue;
+                            };
+
+                            let script_pubkey = match details.address_type {
+                                1 => p2pkh_script_pubkey(&details.address_hash),
+                                2 => p2sh_script_pubkey(&details.address_hash),
+                                _ => continue,
+                            };
+                            let Some(script_hash) =
+                                fluxd_chainstate::address_index::script_hash(&script_pubkey)
+                            else {
+                                continue;
+                            };
+
+                            let expected_delta =
+                                details.satoshis.checked_neg().ok_or_else(|| {
+                                    format!(
+                                        "address delta spend value overflow for {}:{} at height {}",
+                                        hash256_to_hex(&input.prevout.hash),
+                                        input.prevout.index,
+                                        height_u32
+                                    )
+                                })?;
+                            let actual_delta = chainstate
+                                .address_delta_value_for_script_hash(
+                                    &script_hash,
+                                    height_u32,
+                                    tx_index as u32,
+                                    &txid,
+                                    vin_index as u32,
+                                    true,
+                                )
+                                .map_err(|err| err.to_string())?
+                                .ok_or_else(|| {
+                                    format!(
+                                        "missing address delta spend for {}:{} at height {} (spent by {} vin {})",
+                                        hash256_to_hex(&input.prevout.hash),
+                                        input.prevout.index,
+                                        height_u32,
+                                        hash256_to_hex(&txid),
+                                        vin_index
+                                    )
+                                })?;
+                            if actual_delta != expected_delta {
+                                return Err(format!(
+                                    "address delta spend mismatch for {}:{} at height {}: expected {} got {}",
+                                    hash256_to_hex(&input.prevout.hash),
+                                    input.prevout.index,
+                                    height_u32,
+                                    expected_delta,
+                                    actual_delta
+                                ));
+                            }
+
+                            let index_present = chainstate
+                                .address_outpoint_present_for_script_hash(
+                                    &script_hash,
+                                    &input.prevout,
+                                )
+                                .map_err(|err| err.to_string())?;
+                            if index_present {
+                                return Err(format!(
+                                    "address outpoint index mismatch for {}:{} at height {}: spent outpoint still present",
+                                    hash256_to_hex(&input.prevout.hash),
+                                    input.prevout.index,
+                                    height_u32
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -234,6 +403,7 @@ mod tests {
     use crate::ensure_genesis;
     use fluxd_chainstate::flatfiles::FlatFileStore;
     use fluxd_chainstate::utxo::outpoint_key_bytes;
+    use fluxd_chainstate::utxo::UtxoEntry;
     use fluxd_chainstate::validation::ValidationFlags;
     use fluxd_consensus::block_subsidy;
     use fluxd_consensus::money::COIN;
@@ -261,6 +431,189 @@ mod tests {
         out.extend_from_slice(&pubkey_hash);
         out.extend_from_slice(&[0x88, 0xac]);
         out
+    }
+
+    fn address_delta_key_bytes(
+        script_hash: &Hash256,
+        height: u32,
+        tx_index: u32,
+        txid: &Hash256,
+        index: u32,
+        spending: bool,
+    ) -> [u8; 77] {
+        let mut key = [0u8; 77];
+        let mut offset = 0;
+        key[offset..offset + 32].copy_from_slice(script_hash);
+        offset += 32;
+        key[offset..offset + 4].copy_from_slice(&height.to_be_bytes());
+        offset += 4;
+        key[offset..offset + 4].copy_from_slice(&tx_index.to_be_bytes());
+        offset += 4;
+        key[offset..offset + 32].copy_from_slice(txid);
+        offset += 32;
+        key[offset..offset + 4].copy_from_slice(&index.to_le_bytes());
+        offset += 4;
+        key[offset] = if spending { 1 } else { 0 };
+        key
+    }
+
+    fn setup_chain_with_seed_spend_block(
+        seed_script: Vec<u8>,
+        seed_value: i64,
+    ) -> (
+        ChainState<MemoryStore>,
+        fluxd_consensus::params::ChainParams,
+        Hash256,
+        OutPoint,
+    ) {
+        let data_dir = temp_data_dir("fluxd-verifychain-test");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let blocks_dir = data_dir.join("blocks");
+        let blocks = FlatFileStore::new(&blocks_dir, 10_000_000).expect("flatfiles");
+        let undo = FlatFileStore::new_with_prefix(&blocks_dir, "undo", 10_000_000).expect("undo");
+        let store = Arc::new(MemoryStore::new());
+        let chainstate = ChainState::new(Arc::clone(&store), blocks, undo);
+
+        let params = chain_params(Network::Regtest);
+        let flags = ValidationFlags::default();
+        let write_lock = Mutex::new(());
+        ensure_genesis(&chainstate, &params, &flags, None, &write_lock).expect("insert genesis");
+
+        let seed_outpoint = OutPoint {
+            hash: [0x99u8; 32],
+            index: 0,
+        };
+
+        let utxo_entry = UtxoEntry {
+            value: seed_value,
+            script_pubkey: seed_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = outpoint_key_bytes(&seed_outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&seed_script, &seed_outpoint)
+                .expect("address outpoint key");
+        let mut seed_batch = WriteBatch::new();
+        seed_batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        seed_batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(seed_batch).expect("seed utxo");
+
+        let spend_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: seed_outpoint.clone(),
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: seed_value,
+                script_pubkey: p2pkh_script([0x22u8; 20]),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: block_subsidy(1, &params.consensus),
+                script_pubkey: Vec::new(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let spend_txid = spend_tx.txid().expect("spend txid");
+        let txids = [coinbase.txid().expect("coinbase txid"), spend_txid];
+        let merkle_root = compute_merkle_root(&txids);
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = 1;
+        let time = tip_entry.time.saturating_add(1);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root,
+            final_sapling_root: chainstate.sapling_root().expect("sapling root"),
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase, spend_tx],
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                &params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+                None,
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+
+        (chainstate, params, spend_txid, seed_outpoint)
     }
 
     #[test]
@@ -427,5 +780,78 @@ mod tests {
 
         let err = verify_chain(&chainstate, 4, 1).unwrap_err();
         assert!(err.contains("missing spent index entry"), "{err}");
+    }
+
+    #[test]
+    fn verifychain_checklevel5_detects_missing_address_delta_credit() {
+        let seed_script = p2pkh_script([0x11u8; 20]);
+        let seed_value = 2 * COIN;
+        let (chainstate, _params, spend_txid, _seed_outpoint) =
+            setup_chain_with_seed_spend_block(seed_script, seed_value);
+
+        verify_chain(&chainstate, 5, 1).expect("verifychain checklevel5 ok");
+
+        let output_script = p2pkh_script([0x22u8; 20]);
+        let script_hash =
+            fluxd_chainstate::address_index::script_hash(&output_script).expect("script hash");
+        let key = address_delta_key_bytes(&script_hash, 1, 1, &spend_txid, 0, false);
+
+        let mut corrupt = WriteBatch::new();
+        corrupt.delete(Column::AddressDelta, key);
+        chainstate
+            .commit_batch(corrupt)
+            .expect("corrupt address delta");
+
+        let err = verify_chain(&chainstate, 5, 1).unwrap_err();
+        assert!(err.contains("missing address delta credit"), "{err}");
+    }
+
+    #[test]
+    fn verifychain_checklevel5_detects_missing_address_delta_spend() {
+        let seed_script = p2pkh_script([0x11u8; 20]);
+        let seed_value = 2 * COIN;
+        let (chainstate, _params, spend_txid, _seed_outpoint) =
+            setup_chain_with_seed_spend_block(seed_script.clone(), seed_value);
+
+        verify_chain(&chainstate, 5, 1).expect("verifychain checklevel5 ok");
+
+        let script_hash = fluxd_chainstate::address_index::script_hash(&seed_script).expect("hash");
+        let key = address_delta_key_bytes(&script_hash, 1, 1, &spend_txid, 0, true);
+
+        let mut corrupt = WriteBatch::new();
+        corrupt.delete(Column::AddressDelta, key);
+        chainstate
+            .commit_batch(corrupt)
+            .expect("corrupt address delta");
+
+        let err = verify_chain(&chainstate, 5, 1).unwrap_err();
+        assert!(err.contains("missing address delta spend"), "{err}");
+    }
+
+    #[test]
+    fn verifychain_checklevel5_detects_address_outpoint_mismatch() {
+        let seed_script = p2pkh_script([0x11u8; 20]);
+        let seed_value = 2 * COIN;
+        let (chainstate, _params, spend_txid, _seed_outpoint) =
+            setup_chain_with_seed_spend_block(seed_script, seed_value);
+
+        verify_chain(&chainstate, 5, 1).expect("verifychain checklevel5 ok");
+
+        let output_script = p2pkh_script([0x22u8; 20]);
+        let outpoint = OutPoint {
+            hash: spend_txid,
+            index: 0,
+        };
+        let key = fluxd_chainstate::address_index::address_outpoint_key(&output_script, &outpoint)
+            .expect("address outpoint key");
+
+        let mut corrupt = WriteBatch::new();
+        corrupt.delete(Column::AddressOutpoint, key);
+        chainstate
+            .commit_batch(corrupt)
+            .expect("corrupt address outpoint");
+
+        let err = verify_chain(&chainstate, 5, 1).unwrap_err();
+        assert!(err.contains("address outpoint index mismatch"), "{err}");
     }
 }

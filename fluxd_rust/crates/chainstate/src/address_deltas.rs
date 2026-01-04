@@ -135,7 +135,7 @@ impl<S: KeyValueStore> AddressDeltaIndex<S> {
     }
 }
 
-fn address_delta_key(
+pub(crate) fn address_delta_key(
     script_hash: &Hash256,
     height: u32,
     tx_index: u32,
