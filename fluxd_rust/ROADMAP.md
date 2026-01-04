@@ -24,6 +24,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] RPC: `validateaddress` field parity (pubkey/iscompressed + P2SH redeem-script details) (owner: TBD)
 - [x] [P1] Wallet: address labels / `account` parity (store labels; surface in wallet RPCs) (owner: TBD)
 - [x] [P1] Wallet: preserve labels in `dumpwallet`/`importwallet` (EncodeDumpString parity) (owner: TBD)
+- [x] [P1] Wallet RPC: honor `listtransactions` `account` filter (labels) (owner: TBD)
 
 ## Completed (core)
 

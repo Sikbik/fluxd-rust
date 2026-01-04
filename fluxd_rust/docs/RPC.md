@@ -421,7 +421,7 @@ Notes:
 
 ### listtransactions
 
-- Params: `[account] [count] [skip] [include_watchonly]` (partial; `account` is ignored, `include_watchonly` is honored).
+- Params: `[account] [count] [skip] [include_watchonly]` (partial; `account="*"` returns all, otherwise filters entries by wallet label/account; `include_watchonly` is honored).
 - Result: array of wallet transaction entries (ordered oldest → newest; unconfirmed entries appear last). Each entry corresponds to a wallet-relevant output (send/receive/generate/etc), similar to `fluxd`.
 
 Notes:

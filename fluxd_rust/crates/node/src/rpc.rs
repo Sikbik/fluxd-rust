@@ -3572,7 +3572,15 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                                 "invalid wallet script_pubkey",
                             ))?;
                     let mut row = serde_json::Map::new();
-                    row.insert("account".to_string(), Value::String(String::new()));
+                    row.insert(
+                        "account".to_string(),
+                        Value::String(
+                            script_labels
+                                .get(&output.script_pubkey)
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    );
                     if involves_watchonly || script_is_watchonly(&output.script_pubkey) {
                         row.insert("involvesWatchonly".to_string(), Value::Bool(true));
                     }
@@ -3851,7 +3859,15 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                     RpcError::new(RPC_INTERNAL_ERROR, "invalid wallet script_pubkey"),
                 )?;
             let mut row = serde_json::Map::new();
-            row.insert("account".to_string(), Value::String(String::new()));
+            row.insert(
+                "account".to_string(),
+                Value::String(
+                    script_labels
+                        .get(&output.script_pubkey)
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            );
             if involves_watchonly || script_is_watchonly(&output.script_pubkey) {
                 row.insert("involvesWatchonly".to_string(), Value::Bool(true));
             }
@@ -4094,6 +4110,21 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
             ));
         }
     }
+    let account_filter = match params.first() {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let account = value
+                .as_str()
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "account must be a string"))?
+                .trim()
+                .to_string();
+            if account == "*" {
+                None
+            } else {
+                Some(account)
+            }
+        }
+    };
     let count = match params.get(1) {
         Some(value) if !value.is_null() => parse_u32(value, "count")?,
         _ => 10,
@@ -4327,6 +4358,15 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
             let Some(detail) = detail.as_object() else {
                 continue;
             };
+            if let Some(filter) = account_filter.as_deref() {
+                let account = detail
+                    .get("account")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if account != filter {
+                    continue;
+                }
+            }
             let mut row = serde_json::Map::new();
             row.insert(
                 "account".to_string(),
@@ -22553,6 +22593,96 @@ mod tests {
             row.get("involvesWatchonly").and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn listtransactions_honors_account_filter() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, vec![json!("label-a")])
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_a = address_to_script_pubkey(&addr_a, params.network).expect("script pubkey");
+        {
+            let guard = wallet.lock().expect("wallet lock");
+            assert_eq!(
+                guard.label_for_script_pubkey(&script_a),
+                Some("label-a"),
+                "wallet should store label for addr_a script"
+            );
+        }
+        let (txid_a, _vout_a, _height_a, _value_a) =
+            mine_regtest_block_to_script(&chainstate, &params, script_a);
+
+        let addr_b = rpc_getnewaddress(&wallet, vec![json!("label-b")])
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_b = address_to_script_pubkey(&addr_b, params.network).expect("script pubkey");
+        let (txid_b, _vout_b, _height_b, _value_b) =
+            mine_regtest_block_to_script(&chainstate, &params, script_b);
+
+        let mempool = Mutex::new(Mempool::new(0));
+
+        let view_a = rpc_gettransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![Value::String(hash256_to_hex(&txid_a))],
+            &params,
+        )
+        .expect("gettransaction");
+        let details_a = view_a
+            .as_object()
+            .and_then(|obj| obj.get("details"))
+            .and_then(Value::as_array)
+            .expect("details array");
+        assert!(
+            details_a.iter().any(|row| {
+                row.get("address")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == addr_a.as_str())
+            }),
+            "expected gettransaction details to include addr_a"
+        );
+        assert!(
+            details_a.iter().any(|row| {
+                row.get("account")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == "label-a")
+            }),
+            "expected gettransaction details to include label-a account"
+        );
+
+        let filtered = rpc_listtransactions(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!("label-a"), json!(100)],
+            &params,
+        )
+        .expect("rpc");
+        let arr = filtered.as_array().expect("array");
+        assert!(
+            !arr.is_empty(),
+            "expected at least one listtransactions row"
+        );
+        assert!(arr.iter().all(|row| {
+            row.get("account")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "label-a")
+        }));
+
+        let txids = arr
+            .iter()
+            .filter_map(|row| row.get("txid").and_then(Value::as_str))
+            .collect::<HashSet<_>>();
+        assert!(txids.contains(hash256_to_hex(&txid_a).as_str()));
+        assert!(!txids.contains(hash256_to_hex(&txid_b).as_str()));
     }
 
     #[test]
