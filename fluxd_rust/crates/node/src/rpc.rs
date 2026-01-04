@@ -2929,7 +2929,16 @@ fn rpc_getbalance<S: fluxd_storage::KeyValueStore>(
         ));
     }
     if let Some(value) = params.get(0) {
-        if !value.is_null() && value.as_str().is_none() {
+        if value.is_null() {
+            // account omitted
+        } else if let Some(account) = value.as_str() {
+            if account != "*" && !account.is_empty() {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "account must be \"\" or \"*\"",
+                ));
+            }
+        } else {
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
                 "account must be a string",
@@ -20761,6 +20770,29 @@ mod tests {
             row.get("confirmations").and_then(Value::as_i64),
             Some(i64::from(COINBASE_MATURITY))
         );
+    }
+
+    #[test]
+    fn getbalance_rejects_nonempty_account_param() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let mempool = Mutex::new(Mempool::new(0));
+
+        let value = rpc_getbalance(&chainstate, &mempool, &wallet, vec![json!("")]).expect("rpc");
+        assert_eq!(parse_amount(&value).expect("amount"), 0);
+
+        let value = rpc_getbalance(&chainstate, &mempool, &wallet, vec![json!("*")]).expect("rpc");
+        assert_eq!(parse_amount(&value).expect("amount"), 0);
+
+        let err = rpc_getbalance(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!("label-not-allowed")],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert_eq!(err.message, "account must be \"\" or \"*\"");
     }
 
     #[test]

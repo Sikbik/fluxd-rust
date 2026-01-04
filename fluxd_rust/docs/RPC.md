@@ -382,7 +382,7 @@ Notes:
 
 ### getbalance
 
-- Params: `[account] [minconf] [include_watchonly]` (partial; `minconf` is enforced).
+- Params: `[account] [minconf] [include_watchonly]` (partial; `account` must be `""` or `"*"` like `fluxd`; `minconf` is enforced).
 - Result: wallet balance (mature + not spent by mempool).
 
 Notes:

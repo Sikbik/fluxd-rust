@@ -25,6 +25,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Wallet: address labels / `account` parity (store labels; surface in wallet RPCs) (owner: TBD)
 - [x] [P1] Wallet: preserve labels in `dumpwallet`/`importwallet` (EncodeDumpString parity) (owner: TBD)
 - [x] [P1] Wallet RPC: honor `listtransactions` `account` filter (labels) (owner: TBD)
+- [x] [P1] RPC: tighten `getbalance` account param validation (`""`/`"*"` only) (owner: TBD)
 
 ## Completed (core)
 
