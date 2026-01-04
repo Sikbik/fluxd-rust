@@ -18,6 +18,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Track wallet `time`/`timereceived` (persist first-seen timestamp)
   - [x] Populate `walletconflicts` (conflicting/replaced txids)
   - [x] Persist wallet-sent tx bytes and serve `gettransaction` when not in chain/mempool (`confirmations=-1`)
+- [x] [P1] Wallet: persist raw tx bytes during `rescanblockchain` (improves reorg/mempool-eviction parity) (owner: TBD)
 - [x] [P1] Wallet: improve `listaddressgroupings` clustering parity (inputs + change) (owner: TBD)
 - [x] [P2] P2P tx relay polish (avoid re-requesting known orphans) (owner: TBD)
 
@@ -206,7 +207,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Persist watch-only scripts in `wallet.dat` (v2; `importaddress`)
   - [x] Persist `paytxfee` in `wallet.dat` (v2; `settxfee`)
   - [x] Keypool/change-address management parity
-  - [x] Wallet tx history / persistence (txid set in `wallet.dat` v3; first-seen time v13; raw tx bytes v14 for wallet-created txs)
+  - [x] Wallet tx history / persistence (txid set in `wallet.dat` v3; first-seen time v13; raw tx bytes v14 for wallet tx store)
 - [x] [P1] Transparent wallet RPCs (owner: TBD)
   - [x] `importaddress` (watch-only; rescan is a no-op due to address index)
   - [x] `importwallet` (best-effort WIF import from dump file)

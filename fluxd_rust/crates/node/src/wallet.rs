@@ -600,6 +600,36 @@ impl Wallet {
         Ok(added)
     }
 
+    pub fn record_transactions(
+        &mut self,
+        transactions: impl IntoIterator<Item = (Hash256, Vec<u8>)>,
+    ) -> Result<usize, WalletError> {
+        let now = current_unix_seconds();
+        let prev_len = self.tx_history.len();
+        let mut changed = false;
+
+        for (txid, raw) in transactions {
+            if self.tx_history.insert(txid) {
+                self.tx_received_at.entry(txid).or_insert(now);
+                changed = true;
+            }
+            match self.tx_store.get(&txid) {
+                Some(existing) if existing.as_slice() == raw.as_slice() => {}
+                _ => {
+                    self.tx_store.insert(txid, raw);
+                    changed = true;
+                }
+            }
+        }
+
+        let added = self.tx_history.len().saturating_sub(prev_len);
+        if changed {
+            self.save()?;
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(added)
+    }
+
     pub fn record_transaction(&mut self, txid: Hash256, raw: Vec<u8>) -> Result<(), WalletError> {
         let now = current_unix_seconds();
         let mut changed = false;

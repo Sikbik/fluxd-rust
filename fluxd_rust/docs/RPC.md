@@ -412,6 +412,7 @@ Notes:
 - Confirmed transactions include `expiryheight` (0 on non-Overwinter transactions).
 - For confirmed transactions, `time` / `timereceived` uses the wallet’s recorded first-seen timestamp when available (otherwise falls back to block time).
 - Transactions that are not in chain and not in mempool return `confirmations=-1` (matches `fluxd`).
+- `rescanblockchain` persists raw bytes for discovered wallet transactions, which allows `gettransaction` to answer after a reorg or mempool eviction.
 - Change outputs (to addresses reserved via `getrawchangeaddress` / `fundrawtransaction`) are omitted from `details` on outgoing transactions (closer to C++ wallet RPC behavior).
 - Coinbase transaction `details[].category` follows `fluxd` wallet semantics: `orphan` (not in main chain), `immature` (not yet matured), or `generate` (matured).
 - `details[]` ordering matches `fluxd`: `send` entries appear first, then receive/generate entries.

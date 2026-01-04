@@ -1815,11 +1815,60 @@ fn rpc_rescanblockchain<S: fluxd_storage::KeyValueStore>(
             .map_err(map_internal)?;
     }
 
-    let _added = wallet
+    let mut blocks: std::collections::BTreeMap<(u32, u64, u32), Vec<(Hash256, u32)>> =
+        std::collections::BTreeMap::new();
+    for txid in &txids {
+        if let Some(location) = chainstate.tx_location(txid).map_err(map_internal)? {
+            blocks
+                .entry((
+                    location.block.file_id,
+                    location.block.offset,
+                    location.block.len,
+                ))
+                .or_default()
+                .push((*txid, location.index));
+        }
+    }
+
+    let mut stored = Vec::new();
+    for ((file_id, offset, len), entries) in blocks {
+        let location = fluxd_chainstate::flatfiles::FileLocation {
+            file_id,
+            offset,
+            len,
+        };
+        let bytes = chainstate.read_block(location).map_err(map_internal)?;
+        let block = Block::consensus_decode(&bytes).map_err(map_internal)?;
+        for (txid, tx_index) in entries {
+            let Some(tx) = block.transactions.get(tx_index as usize) else {
+                continue;
+            };
+            let candidate = tx.txid().map_err(map_internal)?;
+            if candidate != txid {
+                continue;
+            }
+            let encoded = tx.consensus_encode().map_err(map_internal)?;
+            stored.push((txid, encoded));
+        }
+    }
+
+    let stored_set: HashSet<Hash256> = stored.iter().map(|(txid, _)| *txid).collect();
+    let remaining = txids
+        .into_iter()
+        .filter(|txid| !stored_set.contains(txid))
+        .collect::<Vec<_>>();
+
+    let mut guard = wallet
         .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .record_txids(txids.into_iter())
-        .map_err(map_wallet_error)?;
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    if !stored.is_empty() {
+        let _ = guard
+            .record_transactions(stored)
+            .map_err(map_wallet_error)?;
+    }
+    if !remaining.is_empty() {
+        let _ = guard.record_txids(remaining).map_err(map_wallet_error)?;
+    }
 
     Ok(json!({
         "start_height": start_height,
@@ -22345,6 +22394,66 @@ mod tests {
         let mempool = Mutex::new(Mempool::new(0));
         let info = rpc_getwalletinfo(&chainstate, &mempool, &wallet, Vec::new()).expect("rpc");
         assert_eq!(info.get("txcount").and_then(Value::as_u64), Some(1));
+    }
+
+    #[test]
+    fn rescanblockchain_persists_tx_bytes_for_gettransaction_fallback() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let (txid, _vout, _height, miner_value) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey);
+
+        rpc_rescanblockchain(&chainstate, &wallet, vec![json!(1), json!(1)]).expect("rpc");
+
+        {
+            let guard = wallet.lock().expect("wallet lock");
+            assert!(
+                guard.transaction_bytes(&txid).is_some(),
+                "rescan should store wallet tx bytes"
+            );
+        }
+
+        let mut batch = WriteBatch::new();
+        batch.delete(Column::TxIndex, txid);
+        chainstate
+            .commit_batch(batch)
+            .expect("commit txindex delete");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let txid_hex = hash256_to_hex(&txid);
+        let value = rpc_gettransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(txid_hex.clone())],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("confirmations").and_then(Value::as_i64), Some(-1));
+        assert_eq!(
+            obj.get("amount_zat").and_then(Value::as_i64),
+            Some(miner_value)
+        );
+        assert_eq!(obj.get("generated").and_then(Value::as_bool), Some(true));
+
+        let details = obj
+            .get("details")
+            .and_then(Value::as_array)
+            .expect("details array");
+        assert!(details
+            .iter()
+            .filter_map(Value::as_object)
+            .any(|row| { row.get("category").and_then(Value::as_str) == Some("orphan") }));
     }
 
     #[test]
