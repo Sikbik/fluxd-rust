@@ -225,6 +225,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] Coinbase categories in `details` (`orphan`/`immature`/`generate`) (C++ parity)
     - [x] `details` ordering: `send` entries first (C++ parity)
     - [x] `confirmations=-1` when not in chain/mempool (wallet tx store)
+    - [x] Persist + expose wallet tx metadata (`comment`/`to`) like `fluxd` `mapValue`
   - [x] `listtransactions` (partial)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag
@@ -233,11 +234,13 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `vout` output per entry (from `gettransaction.details[].vout`)
     - [x] `size` output (derived from `gettransaction.hex`, repeated per entry)
     - [x] Include wallet tx store entries not in chain/mempool (`confirmations=-1`)
+    - [x] Include WalletTxToJSON fields (`walletconflicts`, `generated`, `expiryheight`, `vJoinSplit`, `comment`, `to`)
   - [x] `listsinceblock` (partial)
     - [x] `fee` output for `send` entries (via `gettransaction`)
     - [x] `vout` output per entry (from `gettransaction.details[].vout`)
     - [x] `size` output (derived from `gettransaction.hex`, repeated per entry)
     - [x] Include wallet tx store entries not in chain/mempool (`confirmations=-1`)
+    - [x] Include WalletTxToJSON fields (`walletconflicts`, `generated`, `expiryheight`, `vJoinSplit`, `comment`, `to`)
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index

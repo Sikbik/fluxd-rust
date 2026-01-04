@@ -43,7 +43,7 @@ use zeroize::Zeroize;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 14;
+pub const WALLET_FILE_VERSION: u32 = 15;
 
 const WALLET_DUMP_EPOCH: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
@@ -279,6 +279,7 @@ pub struct Wallet {
     tx_history: BTreeSet<Hash256>,
     tx_received_at: BTreeMap<Hash256, u64>,
     tx_store: BTreeMap<Hash256, Vec<u8>>,
+    tx_values: BTreeMap<Hash256, BTreeMap<String, String>>,
     keypool: VecDeque<KeyPoolEntry>,
     sapling_keys: Vec<SaplingKeyEntry>,
     sapling_viewing_keys: Vec<SaplingViewingKeyEntry>,
@@ -315,6 +316,7 @@ impl Wallet {
                 tx_history: BTreeSet::new(),
                 tx_received_at: BTreeMap::new(),
                 tx_store: BTreeMap::new(),
+                tx_values: BTreeMap::new(),
                 keypool: VecDeque::new(),
                 sapling_keys: Vec::new(),
                 sapling_viewing_keys: Vec::new(),
@@ -581,6 +583,10 @@ impl Wallet {
         self.tx_store.get(txid).map(|bytes| bytes.as_slice())
     }
 
+    pub fn transaction_values(&self, txid: &Hash256) -> Option<&BTreeMap<String, String>> {
+        self.tx_values.get(txid)
+    }
+
     pub fn stored_transactions(&self) -> Vec<(Hash256, u64)> {
         self.tx_store
             .keys()
@@ -637,7 +643,12 @@ impl Wallet {
         Ok(added)
     }
 
-    pub fn record_transaction(&mut self, txid: Hash256, raw: Vec<u8>) -> Result<(), WalletError> {
+    pub fn record_transaction_with_values(
+        &mut self,
+        txid: Hash256,
+        raw: Vec<u8>,
+        values: BTreeMap<String, String>,
+    ) -> Result<(), WalletError> {
         let now = current_unix_seconds();
         let mut changed = false;
 
@@ -653,11 +664,34 @@ impl Wallet {
             }
         }
 
+        if !values.is_empty() {
+            let entry = self.tx_values.entry(txid).or_default();
+            for (key, value) in values {
+                if value.is_empty() {
+                    continue;
+                }
+                match entry.get(&key) {
+                    Some(existing) if existing == &value => {}
+                    _ => {
+                        entry.insert(key, value);
+                        changed = true;
+                    }
+                }
+            }
+            if entry.is_empty() {
+                self.tx_values.remove(&txid);
+            }
+        }
+
         if changed {
             self.save()?;
             self.revision = self.revision.saturating_add(1);
         }
         Ok(())
+    }
+
+    pub fn record_transaction(&mut self, txid: Hash256, raw: Vec<u8>) -> Result<(), WalletError> {
+        self.record_transaction_with_values(txid, raw, BTreeMap::new())
     }
 
     pub fn lock_outpoint(&mut self, outpoint: OutPoint) {
@@ -2084,6 +2118,7 @@ impl Wallet {
                 tx_history,
                 tx_received_at: BTreeMap::new(),
                 tx_store: BTreeMap::new(),
+                tx_values: BTreeMap::new(),
                 keypool,
                 sapling_keys,
                 sapling_viewing_keys,
@@ -2206,6 +2241,32 @@ impl Wallet {
                 let txid = decoder.read_fixed::<32>()?;
                 let raw = decoder.read_var_bytes()?;
                 tx_store.insert(txid, raw);
+            }
+        }
+
+        let mut tx_values: BTreeMap<Hash256, BTreeMap<String, String>> = BTreeMap::new();
+        if version >= 15 {
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("tx values count too large"))?;
+            for _ in 0..count {
+                let txid = decoder.read_fixed::<32>()?;
+                let entry_count = decoder.read_varint()?;
+                let entry_count = usize::try_from(entry_count)
+                    .map_err(|_| WalletError::InvalidData("tx value entry count too large"))?;
+                let mut entries = BTreeMap::new();
+                for _ in 0..entry_count {
+                    let key = String::from_utf8(decoder.read_var_bytes()?)
+                        .map_err(|_| WalletError::InvalidData("tx value key is not utf8"))?;
+                    let value = String::from_utf8(decoder.read_var_bytes()?)
+                        .map_err(|_| WalletError::InvalidData("tx value is not utf8"))?;
+                    if !key.is_empty() && !value.is_empty() {
+                        entries.insert(key, value);
+                    }
+                }
+                if !entries.is_empty() {
+                    tx_values.insert(txid, entries);
+                }
             }
         }
 
@@ -2342,6 +2403,7 @@ impl Wallet {
             tx_history,
             tx_received_at,
             tx_store,
+            tx_values,
             keypool,
             sapling_keys,
             sapling_viewing_keys,
@@ -2424,6 +2486,18 @@ impl Wallet {
         for (txid, raw) in &self.tx_store {
             encoder.write_bytes(txid);
             encoder.write_var_bytes(raw);
+        }
+
+        self.tx_values
+            .retain(|txid, _| self.tx_history.contains(txid));
+        encoder.write_varint(self.tx_values.len() as u64);
+        for (txid, values) in &self.tx_values {
+            encoder.write_bytes(txid);
+            encoder.write_varint(values.len() as u64);
+            for (key, value) in values {
+                encoder.write_var_bytes(key.as_bytes());
+                encoder.write_var_bytes(value.as_bytes());
+            }
         }
 
         encoder.write_varint(self.keypool.len() as u64);
@@ -3038,6 +3112,28 @@ mod tests {
         let wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet reload");
         let after = wallet.tx_received_time(&txid).expect("after timestamp");
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn tx_values_persist_across_restart() {
+        let data_dir = temp_data_dir("fluxd-wallet-tx-values-test");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+
+        let mut wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet");
+        let txid = [0x22u8; 32];
+        let raw = vec![1u8, 2, 3];
+        let mut values = BTreeMap::new();
+        values.insert("comment".to_string(), "hello".to_string());
+        values.insert("to".to_string(), "world".to_string());
+        wallet
+            .record_transaction_with_values(txid, raw, values)
+            .expect("record tx values");
+        drop(wallet);
+
+        let wallet = Wallet::load_or_create(&data_dir, Network::Regtest).expect("wallet reload");
+        let values = wallet.transaction_values(&txid).expect("values");
+        assert_eq!(values.get("comment").map(String::as_str), Some("hello"));
+        assert_eq!(values.get("to").map(String::as_str), Some("world"));
     }
 
     #[test]

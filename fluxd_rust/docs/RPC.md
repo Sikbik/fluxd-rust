@@ -412,6 +412,7 @@ Notes:
 - Confirmed transactions include `expiryheight` (0 on non-Overwinter transactions).
 - For confirmed transactions, `time` / `timereceived` uses the wallet’s recorded first-seen timestamp when available (otherwise falls back to block time).
 - Transactions that are not in chain and not in mempool return `confirmations=-1` (matches `fluxd`).
+- Wallet tx metadata (`comment`, `to`) is included when set via `sendtoaddress` / `sendfrom` / `sendmany` (matches `fluxd` wallet `mapValue` behavior).
 - `rescanblockchain` persists raw bytes for discovered wallet transactions, which allows `gettransaction` to answer after a reorg or mempool eviction.
 - Change outputs (to addresses reserved via `getrawchangeaddress` / `fundrawtransaction`) are omitted from `details` on outgoing transactions (closer to C++ wallet RPC behavior).
 - Coinbase transaction `details[].category` follows `fluxd` wallet semantics: `orphan` (not in main chain), `immature` (not yet matured), or `generate` (matured).
@@ -429,6 +430,8 @@ Notes:
 - `size` is included (transaction size in bytes) and is repeated across entries for the same `txid`.
 - For coinbase wallet receives, `category` may be `orphan` / `immature` / `generate` (matches `fluxd`).
 - Wallet-known transactions that are not in chain and not in mempool are served from the wallet tx store and appear with `confirmations=-1`.
+- Includes `walletconflicts`, `generated`, `expiryheight`, and `vJoinSplit` when available (closer to `fluxd`’s `WalletTxToJSON`).
+- Includes wallet tx metadata (`comment`, `to`) when present.
 
 ### listsinceblock
 
@@ -443,6 +446,8 @@ Notes:
 - `size` is included (transaction size in bytes) and is repeated across entries for the same `txid`.
 - For coinbase wallet receives, `category` may be `orphan` / `immature` / `generate` (matches `fluxd`).
 - Wallet-known transactions that are not in chain and not in mempool are served from the wallet tx store and appear with `confirmations=-1`.
+- Includes `walletconflicts`, `generated`, `expiryheight`, and `vJoinSplit` when available (closer to `fluxd`’s `WalletTxToJSON`).
+- Includes wallet tx metadata (`comment`, `to`) when present.
 
 ### addmultisigaddress
 

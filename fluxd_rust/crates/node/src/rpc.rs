@@ -3049,7 +3049,14 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         Some(value) => parse_bool(value)?,
     };
 
-    let (wallet_scripts, owned_set, change_key_hashes, tx_received_at, wallet_tx_raw) = {
+    let (
+        wallet_scripts,
+        owned_set,
+        change_key_hashes,
+        tx_received_at,
+        wallet_tx_raw,
+        wallet_tx_values,
+    ) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -3057,6 +3064,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         let change_key_hashes = guard.change_key_hashes();
         let tx_received_at = guard.tx_received_time(&txid);
         let wallet_tx_raw = guard.transaction_bytes(&txid).map(|bytes| bytes.to_vec());
+        let wallet_tx_values = guard.transaction_values(&txid).cloned();
         if include_watchonly {
             let scripts = guard
                 .all_script_pubkeys_including_watchonly()
@@ -3068,6 +3076,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 change_key_hashes,
                 tx_received_at,
                 wallet_tx_raw,
+                wallet_tx_values,
             )
         } else {
             (
@@ -3076,6 +3085,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 change_key_hashes,
                 tx_received_at,
                 wallet_tx_raw,
+                wallet_tx_values,
             )
         }
     };
@@ -3316,6 +3326,14 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                     map.insert("generated".to_string(), Value::Bool(true));
                 }
             }
+            if let (Value::Object(map), Some(values)) = (&mut obj, wallet_tx_values.as_ref()) {
+                for (key, value) in values {
+                    if map.contains_key(key) {
+                        continue;
+                    }
+                    map.insert(key.clone(), Value::String(value.clone()));
+                }
+            }
             return Ok(obj);
         }
     }
@@ -3553,6 +3571,15 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
             if is_coinbase {
                 if let Value::Object(map) = &mut obj {
                     map.insert("generated".to_string(), Value::Bool(true));
+                }
+            }
+
+            if let (Value::Object(map), Some(values)) = (&mut obj, wallet_tx_values.as_ref()) {
+                for (key, value) in values {
+                    if map.contains_key(key) {
+                        continue;
+                    }
+                    map.insert(key.clone(), Value::String(value.clone()));
                 }
             }
 
@@ -3844,6 +3871,15 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 "expiryheight".to_string(),
                 Value::Number(i64::from(tx.expiry_height).into()),
             );
+        }
+    }
+
+    if let (Value::Object(map), Some(values)) = (&mut obj, wallet_tx_values.as_ref()) {
+        for (key, value) in values {
+            if map.contains_key(key) {
+                continue;
+            }
+            map.insert(key.clone(), Value::String(value.clone()));
         }
     }
 
@@ -4248,6 +4284,24 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
             if let Some(value) = obj.get("timereceived") {
                 row.insert("timereceived".to_string(), value.clone());
             }
+            if let Some(value) = obj.get("generated") {
+                row.insert("generated".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("expiryheight") {
+                row.insert("expiryheight".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("walletconflicts") {
+                row.insert("walletconflicts".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("vJoinSplit") {
+                row.insert("vJoinSplit".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("comment") {
+                row.insert("comment".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("to") {
+                row.insert("to".to_string(), value.clone());
+            }
             if let Some(size) = &size {
                 row.insert("size".to_string(), size.clone());
             }
@@ -4588,6 +4642,24 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
             }
             if let Some(value) = obj.get("timereceived") {
                 row.insert("timereceived".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("generated") {
+                row.insert("generated".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("expiryheight") {
+                row.insert("expiryheight".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("walletconflicts") {
+                row.insert("walletconflicts".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("vJoinSplit") {
+                row.insert("vJoinSplit".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("comment") {
+                row.insert("comment".to_string(), value.clone());
+            }
+            if let Some(value) = obj.get("to") {
+                row.insert("to".to_string(), value.clone());
             }
             if let Some(size) = &size {
                 row.insert("size".to_string(), size.clone());
@@ -9559,6 +9631,24 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         }
     }
 
+    let comment = params
+        .get(4)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let comment_to = params
+        .get(5)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let mut tx_values = std::collections::BTreeMap::new();
+    if let Some(comment) = comment {
+        tx_values.insert("comment".to_string(), comment);
+    }
+    if let Some(comment_to) = comment_to {
+        tx_values.insert("to".to_string(), comment_to);
+    }
+
     let script_pubkey = address_to_script_pubkey(address, chain_params.network)
         .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
 
@@ -9661,12 +9751,12 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         chain_params,
         tx_announce,
     )
-    .and_then(|txid_value| {
+    .and_then(move |txid_value| {
         let txid = parse_hash(&txid_value)?;
         wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-            .record_transaction(txid, signed_bytes)
+            .record_transaction_with_values(txid, signed_bytes, tx_values)
             .map_err(map_wallet_error)?;
         Ok(txid_value)
     })
@@ -9712,6 +9802,24 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
                 "comment_to must be a string",
             ));
         }
+    }
+
+    let comment = params
+        .get(2)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let comment_to = params
+        .get(3)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let mut tx_values = std::collections::BTreeMap::new();
+    if let Some(comment) = comment {
+        tx_values.insert("comment".to_string(), comment);
+    }
+    if let Some(comment_to) = comment_to {
+        tx_values.insert("to".to_string(), comment_to);
     }
 
     let subtract_fee = match params.get(4) {
@@ -9826,12 +9934,12 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         chain_params,
         tx_announce,
     )
-    .and_then(|txid_value| {
+    .and_then(move |txid_value| {
         let txid = parse_hash(&txid_value)?;
         wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-            .record_transaction(txid, signed_bytes)
+            .record_transaction_with_values(txid, signed_bytes, tx_values)
             .map_err(map_wallet_error)?;
         Ok(txid_value)
     })
@@ -9888,6 +9996,16 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
                 ));
             }
         }
+    }
+
+    let comment = params
+        .get(3)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let mut tx_values = std::collections::BTreeMap::new();
+    if let Some(comment) = comment {
+        tx_values.insert("comment".to_string(), comment);
     }
 
     let mut subtract_fee_from_outputs: HashSet<String> = HashSet::new();
@@ -10040,12 +10158,12 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         chain_params,
         tx_announce,
     )
-    .and_then(|txid_value| {
+    .and_then(move |txid_value| {
         let txid = parse_hash(&txid_value)?;
         wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-            .record_transaction(txid, signed_bytes)
+            .record_transaction_with_values(txid, signed_bytes, tx_values)
             .map_err(map_wallet_error)?;
         Ok(txid_value)
     })
@@ -21637,8 +21755,11 @@ mod tests {
         let stored_raw = stored_tx.consensus_encode().expect("encode tx");
         {
             let mut guard = wallet.lock().expect("wallet lock");
+            let mut tx_values = std::collections::BTreeMap::new();
+            tx_values.insert("comment".to_string(), "hello".to_string());
+            tx_values.insert("to".to_string(), "world".to_string());
             guard
-                .record_transaction(stored_txid, stored_raw)
+                .record_transaction_with_values(stored_txid, stored_raw, tx_values)
                 .expect("record tx");
         }
 
@@ -21652,6 +21773,8 @@ mod tests {
             Some(stored_txid_hex.as_str())
         );
         assert_eq!(last.get("confirmations").and_then(Value::as_i64), Some(-1));
+        assert_eq!(last.get("comment").and_then(Value::as_str), Some("hello"));
+        assert_eq!(last.get("to").and_then(Value::as_str), Some("world"));
     }
 
     #[test]
@@ -21973,8 +22096,11 @@ mod tests {
         let stored_raw = stored_tx.consensus_encode().expect("encode tx");
         {
             let mut guard = wallet.lock().expect("wallet lock");
+            let mut tx_values = std::collections::BTreeMap::new();
+            tx_values.insert("comment".to_string(), "hello".to_string());
+            tx_values.insert("to".to_string(), "world".to_string());
             guard
-                .record_transaction(stored_txid, stored_raw)
+                .record_transaction_with_values(stored_txid, stored_raw, tx_values)
                 .expect("record tx");
         }
 
@@ -21992,6 +22118,8 @@ mod tests {
             Some(stored_txid_hex.as_str())
         );
         assert_eq!(last.get("confirmations").and_then(Value::as_i64), Some(-1));
+        assert_eq!(last.get("comment").and_then(Value::as_str), Some("hello"));
+        assert_eq!(last.get("to").and_then(Value::as_str), Some("world"));
     }
 
     #[test]
