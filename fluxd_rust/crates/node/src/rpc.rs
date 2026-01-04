@@ -8123,7 +8123,7 @@ fn rpc_validateaddress(
         }
     };
 
-    let (ismine, iswatchonly) = {
+    let (ismine, iswatchonly, pubkey, redeem_script) = {
         let wallet_guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -8133,21 +8133,76 @@ fn rpc_validateaddress(
         } else {
             wallet_guard.script_pubkey_is_watchonly(&script_pubkey)
         };
-        (ismine, iswatchonly)
+        let pubkey = wallet_guard
+            .pubkey_bytes_for_p2pkh_script_pubkey(&script_pubkey)
+            .map_err(map_wallet_error)?;
+        let redeem_script = wallet_guard.redeem_script_for_p2sh_script_pubkey(&script_pubkey);
+        (ismine, iswatchonly, pubkey, redeem_script)
     };
 
     let isscript = matches!(
         classify_script_pubkey(&script_pubkey),
         ScriptType::P2Sh | ScriptType::P2Wsh
     );
-    Ok(json!({
-        "isvalid": true,
-        "address": address,
-        "scriptPubKey": hex_bytes(&script_pubkey),
-        "ismine": ismine,
-        "iswatchonly": iswatchonly,
-        "isscript": isscript,
-    }))
+
+    let mut out = serde_json::Map::new();
+    out.insert("isvalid".to_string(), Value::Bool(true));
+    out.insert("address".to_string(), Value::String(address.to_string()));
+    out.insert(
+        "scriptPubKey".to_string(),
+        Value::String(hex_bytes(&script_pubkey)),
+    );
+    out.insert("ismine".to_string(), Value::Bool(ismine));
+    out.insert("iswatchonly".to_string(), Value::Bool(iswatchonly));
+    out.insert("isscript".to_string(), Value::Bool(isscript));
+
+    if let Some(pubkey) = pubkey {
+        out.insert("pubkey".to_string(), Value::String(hex_bytes(&pubkey)));
+        out.insert("iscompressed".to_string(), Value::Bool(pubkey.len() == 33));
+    }
+
+    if isscript {
+        if let Some(redeem_script) = redeem_script {
+            if let Some((required, pubkeys)) =
+                parse_multisig_redeem_script_with_required(&redeem_script)
+            {
+                out.insert("script".to_string(), Value::String("multisig".to_string()));
+                out.insert("hex".to_string(), Value::String(hex_bytes(&redeem_script)));
+                let addresses = pubkeys
+                    .iter()
+                    .filter_map(|pubkey| {
+                        let key_hash = hash160(&pubkey.serialize());
+                        let mut p2pkh = Vec::with_capacity(25);
+                        p2pkh.extend_from_slice(&[0x76, 0xa9, 0x14]);
+                        p2pkh.extend_from_slice(&key_hash);
+                        p2pkh.extend_from_slice(&[0x88, 0xac]);
+                        script_pubkey_to_address(&p2pkh, chain_params.network)
+                    })
+                    .map(Value::String)
+                    .collect::<Vec<_>>();
+                out.insert("addresses".to_string(), Value::Array(addresses));
+                out.insert(
+                    "sigsrequired".to_string(),
+                    Value::Number((required as u64).into()),
+                );
+            } else {
+                if let Value::Object(map) = script_pubkey_json(&redeem_script, chain_params.network)
+                {
+                    if let Some(Value::String(script_type)) = map.get("type") {
+                        out.insert("script".to_string(), Value::String(script_type.clone()));
+                    }
+                    if let Some(Value::String(hex)) = map.get("hex") {
+                        out.insert("hex".to_string(), Value::String(hex.clone()));
+                    }
+                    if let Some(Value::Array(addresses)) = map.get("addresses") {
+                        out.insert("addresses".to_string(), Value::Array(addresses.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Value::Object(out))
 }
 
 fn rpc_verifymessage(params: Vec<Value>, chain_params: &ChainParams) -> Result<Value, RpcError> {
@@ -16779,6 +16834,91 @@ mod tests {
         assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(true));
         assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(false));
         assert_eq!(obj.get("isscript").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn validateaddress_includes_pubkey_for_wallet_address() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("string")
+            .to_string();
+
+        let ok = rpc_validateaddress(&wallet, vec![Value::String(addr)], &params).expect("rpc");
+        let obj = ok.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(true));
+        assert!(
+            obj.get("pubkey").and_then(Value::as_str).is_some(),
+            "wallet-owned P2PKH should include pubkey"
+        );
+        assert!(
+            obj.get("iscompressed").and_then(Value::as_bool).is_some(),
+            "wallet-owned P2PKH should include iscompressed"
+        );
+    }
+
+    #[test]
+    fn validateaddress_includes_multisig_details_for_known_p2sh_script() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let p2sh_address = rpc_addmultisigaddress(
+            &wallet,
+            vec![json!(2), json!([addr_a.clone(), addr_b.clone()])],
+            &params,
+        )
+        .expect("rpc")
+        .as_str()
+        .expect("p2sh address")
+        .to_string();
+
+        let script_pubkey =
+            address_to_script_pubkey(&p2sh_address, params.network).expect("script_pubkey");
+        let redeem_script = {
+            let guard = wallet.lock().expect("wallet lock");
+            guard
+                .redeem_script_for_p2sh_script_pubkey(&script_pubkey)
+                .expect("redeem script")
+        };
+        let redeem_script_hex = hex_bytes(&redeem_script);
+
+        let ok =
+            rpc_validateaddress(&wallet, vec![Value::String(p2sh_address)], &params).expect("rpc");
+        let obj = ok.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("isscript").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("script").and_then(Value::as_str), Some("multisig"));
+        assert_eq!(
+            obj.get("hex").and_then(Value::as_str),
+            Some(redeem_script_hex.as_str())
+        );
+        assert_eq!(obj.get("sigsrequired").and_then(Value::as_u64), Some(2));
+        let got_addresses = obj
+            .get("addresses")
+            .and_then(Value::as_array)
+            .expect("addresses array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let expected = [addr_a.as_str(), addr_b.as_str()]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(got_addresses, expected);
     }
 
     #[test]

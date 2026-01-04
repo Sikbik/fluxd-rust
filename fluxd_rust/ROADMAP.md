@@ -21,6 +21,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Wallet: persist raw tx bytes during `rescanblockchain` (improves reorg/mempool-eviction parity) (owner: TBD)
 - [x] [P1] Wallet: improve `listaddressgroupings` clustering parity (inputs + change) (owner: TBD)
 - [x] [P2] P2P tx relay polish (avoid re-requesting known orphans) (owner: TBD)
+- [x] [P1] RPC: `validateaddress` field parity (pubkey/iscompressed + P2SH redeem-script details) (owner: TBD)
 
 ## Completed (core)
 
@@ -78,7 +79,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `submitblock` BIP22-ish return codes
   - [x] Fluxnode RPC field parity (IP tracking + C++ field/type shape)
   - [x] Wallet/multisig field parity
-- [ ] [P1] RPC parity polish (partial -> implemented) (owner: TBD)
+- [x] [P1] RPC parity polish (partial -> implemented) (owner: TBD)
   - [x] `getmininginfo` currentblock metrics (`currentblocksize`, `currentblocktx`)
   - [x] `zcrawkeygen` (Sprout key/address generator; deprecated but useful for tooling/regtest)
   - [x] `fundrawtransaction` fee estimation respects pre-filled `scriptSig` sizes (avoids underfunding partially-signed txs)

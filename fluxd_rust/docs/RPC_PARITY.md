@@ -70,7 +70,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - createmultisig - Implemented (accepts Flux addresses or hex pubkeys; wallet lookup works while locked)
 - estimatefee - Implemented
 - estimatepriority - Stub (returns -1.0; priority estimator not implemented)
-- validateaddress - Implemented
+- validateaddress - Implemented (includes `pubkey`/`iscompressed` for wallet-owned P2PKH; includes redeem-script details for known P2SH/multisig scripts)
 - verifymessage - Implemented
 
 ## Extra queries

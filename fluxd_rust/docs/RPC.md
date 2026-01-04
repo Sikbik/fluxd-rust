@@ -642,10 +642,12 @@ Notes:
 - Params: `fluxaddress` (string)
 - Result:
   - If invalid: `{ "isvalid": false }`
-  - If valid: `{ "isvalid": true, "address": "...", "scriptPubKey": "...", "ismine": <bool>, "iswatchonly": <bool>, "isscript": <bool> }`
+  - If valid: `{ "isvalid": true, "address": "...", "scriptPubKey": "...", "ismine": <bool>, "iswatchonly": <bool>, "isscript": <bool>, ... }`
 
 Notes:
 - `ismine` is true when the wallet has a private key for the address; `iswatchonly` is true for imported watch-only scripts (e.g., `importaddress` / `addmultisigaddress`).
+- Wallet-owned P2PKH addresses include `pubkey` and `iscompressed`.
+- For P2SH addresses with a known redeem script (e.g., created via `addmultisigaddress`), includes `script`, `hex` (redeem script), `addresses`, and `sigsrequired` (for multisig).
 
 ### zvalidateaddress
 
