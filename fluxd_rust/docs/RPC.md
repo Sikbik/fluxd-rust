@@ -129,7 +129,7 @@ Type notes:
 Wallet state is stored at `--data-dir/wallet.dat`.
 
 - `getwalletinfo` (partial)
-- `gettransaction <txid> [include_watchonly]` (partial)
+- `gettransaction <txid> [include_watchonly]`
 - `listtransactions [account] [count] [skip] [include_watchonly]` (partial)
 - `listsinceblock [blockhash] [target_confirmations] [include_watchonly]` (partial)
 - `addmultisigaddress <nrequired> <keys> [account]` (partial; adds a watch-only P2SH script)
@@ -401,8 +401,8 @@ Notes:
 
 ### gettransaction
 
-- Params: `<txid> [include_watchonly]` (partial; `include_watchonly=true` includes watch-only scripts imported via `importaddress`).
-- Result: best-effort wallet view of a transaction (confirmed txs via address deltas + tx index; mempool txs via script matching).
+- Params: `<txid> [include_watchonly]` (`include_watchonly=true` includes watch-only scripts imported via `importaddress`).
+- Result: wallet view of a transaction (confirmed txs via address deltas + tx index; mempool txs via script matching; wallet-created txs can be served from the wallet store when not in chain and not in mempool).
 
 Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
@@ -411,6 +411,7 @@ Notes:
 - `vJoinSplit` is included for Sprout JoinSplits (usually empty on modern Flux transactions).
 - Confirmed transactions include `expiryheight` (0 on non-Overwinter transactions).
 - For confirmed transactions, `time` / `timereceived` uses the wallet’s recorded first-seen timestamp when available (otherwise falls back to block time).
+- Transactions that are not in chain and not in mempool return `confirmations=-1` (matches `fluxd`).
 - Change outputs (to addresses reserved via `getrawchangeaddress` / `fundrawtransaction`) are omitted from `details` on outgoing transactions (closer to C++ wallet RPC behavior).
 - Coinbase transaction `details[].category` follows `fluxd` wallet semantics: `orphan` (not in main chain), `immature` (not yet matured), or `generate` (matured).
 - `details[]` ordering matches `fluxd`: `send` entries appear first, then receive/generate entries.

@@ -13,10 +13,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 - [x] [P1] Refresh `ROADMAP.md` RPC parity snapshot (keep in sync with `docs/RPC_PARITY.md`) (owner: TBD)
 - [x] [P1] Wallet: expand `fundrawtransaction` beyond P2PKH (spendable P2SH/multisig) (owner: TBD)
-- [ ] [P1] Wallet: complete `gettransaction` field parity + regression tests (owner: TBD)
+- [x] [P1] Wallet: complete `gettransaction` field parity + regression tests (owner: TBD)
   - [x] Add `generated`, `expiryheight`, and `vJoinSplit` fields (C++ parity)
   - [x] Track wallet `time`/`timereceived` (persist first-seen timestamp)
   - [x] Populate `walletconflicts` (conflicting/replaced txids)
+  - [x] Persist wallet-sent tx bytes and serve `gettransaction` when not in chain/mempool (`confirmations=-1`)
 - [x] [P1] Wallet: improve `listaddressgroupings` clustering parity (inputs + change) (owner: TBD)
 - [x] [P2] P2P tx relay polish (avoid re-requesting known orphans) (owner: TBD)
 
@@ -205,7 +206,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Persist watch-only scripts in `wallet.dat` (v2; `importaddress`)
   - [x] Persist `paytxfee` in `wallet.dat` (v2; `settxfee`)
   - [x] Keypool/change-address management parity
-  - [x] Wallet tx history / persistence (txid set in `wallet.dat` v3; updated by `rescanblockchain` + wallet send RPCs)
+  - [x] Wallet tx history / persistence (txid set in `wallet.dat` v3; first-seen time v13; raw tx bytes v14 for wallet-created txs)
 - [x] [P1] Transparent wallet RPCs (owner: TBD)
   - [x] `importaddress` (watch-only; rescan is a no-op due to address index)
   - [x] `importwallet` (best-effort WIF import from dump file)
@@ -215,13 +216,14 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `lockunspent`, `listlockunspent`
   - [x] `listaddressgroupings` (groups co-spent inputs + wallet-owned outputs)
   - [x] `getreceivedbyaddress` (P2PKH only)
-  - [x] `gettransaction` (partial)
+  - [x] `gettransaction` (implemented)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag
     - [x] `fee` output and amount excludes fee (C++ parity)
     - [x] Omit change outputs from `details` on send txs (wallet.dat v7 change tracking)
     - [x] Coinbase categories in `details` (`orphan`/`immature`/`generate`) (C++ parity)
     - [x] `details` ordering: `send` entries first (C++ parity)
+    - [x] `confirmations=-1` when not in chain/mempool (wallet tx store)
   - [x] `listtransactions` (partial)
     - [x] `include_watchonly` support
     - [x] `involvesWatchonly` output flag

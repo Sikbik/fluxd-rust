@@ -3000,21 +3000,34 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         Some(value) => parse_bool(value)?,
     };
 
-    let (wallet_scripts, owned_set, change_key_hashes, tx_received_at) = {
+    let (wallet_scripts, owned_set, change_key_hashes, tx_received_at, wallet_tx_raw) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
         let owned_scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
         let change_key_hashes = guard.change_key_hashes();
         let tx_received_at = guard.tx_received_time(&txid);
+        let wallet_tx_raw = guard.transaction_bytes(&txid).map(|bytes| bytes.to_vec());
         if include_watchonly {
             let scripts = guard
                 .all_script_pubkeys_including_watchonly()
                 .map_err(map_wallet_error)?;
             let owned_set = owned_scripts.into_iter().collect::<HashSet<_>>();
-            (scripts, Some(owned_set), change_key_hashes, tx_received_at)
+            (
+                scripts,
+                Some(owned_set),
+                change_key_hashes,
+                tx_received_at,
+                wallet_tx_raw,
+            )
         } else {
-            (owned_scripts, None, change_key_hashes, tx_received_at)
+            (
+                owned_scripts,
+                None,
+                change_key_hashes,
+                tx_received_at,
+                wallet_tx_raw,
+            )
         }
     };
     if wallet_scripts.is_empty() {
@@ -3258,15 +3271,245 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    let location = chainstate
-        .tx_location(&txid)
-        .map_err(map_internal)?
-        .ok_or_else(|| {
-            RpcError::new(
-                RPC_INVALID_ADDRESS_OR_KEY,
-                "Invalid or non-wallet transaction id",
-            )
-        })?;
+    let location = match chainstate.tx_location(&txid).map_err(map_internal)? {
+        Some(location) => location,
+        None => {
+            let raw = wallet_tx_raw.ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Invalid or non-wallet transaction id",
+                )
+            })?;
+            let tx = Transaction::consensus_decode(&raw)
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "stored wallet tx decode failed"))?;
+            let stored_txid = tx
+                .txid()
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "stored wallet txid failed"))?;
+            if stored_txid != txid {
+                return Err(RpcError::new(
+                    RPC_INTERNAL_ERROR,
+                    "stored wallet txid mismatch",
+                ));
+            }
+
+            let confirmations = -1;
+            let is_coinbase = tx.vin.len() == 1 && tx.vin[0].prevout == OutPoint::null();
+            let mut credit_zat: i64 = 0;
+            let mut debit_zat: i64 = 0;
+            let mut involves_watchonly = false;
+            let mut wallet_spent_outpoints: HashSet<OutPoint> = HashSet::new();
+
+            for output in &tx.vout {
+                if !wallet_script_set.contains(output.script_pubkey.as_slice()) {
+                    continue;
+                }
+                if script_is_watchonly(&output.script_pubkey) {
+                    involves_watchonly = true;
+                }
+                credit_zat = credit_zat
+                    .checked_add(output.value)
+                    .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+            }
+
+            for input in &tx.vin {
+                let mut prev_value = None;
+                let mut prev_script_pubkey = None;
+
+                match chainstate
+                    .utxo_entry(&input.prevout)
+                    .map_err(map_internal)?
+                {
+                    Some(utxo) => {
+                        prev_value = Some(utxo.value);
+                        prev_script_pubkey = Some(utxo.script_pubkey);
+                    }
+                    None => {
+                        if let Ok(Some(prev_location)) = chainstate.tx_location(&input.prevout.hash)
+                        {
+                            if let Ok(prev_bytes) = chainstate.read_block(prev_location.block) {
+                                if let Ok(prev_block) = Block::consensus_decode(&prev_bytes) {
+                                    let tx_index = prev_location.index as usize;
+                                    let vout = input.prevout.index as usize;
+                                    if let Some(prev_tx) = prev_block.transactions.get(tx_index) {
+                                        if let Some(out) = prev_tx.vout.get(vout) {
+                                            prev_value = Some(out.value);
+                                            prev_script_pubkey = Some(out.script_pubkey.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let (Some(value), Some(script_pubkey)) = (prev_value, prev_script_pubkey) else {
+                    continue;
+                };
+                if !wallet_script_set.contains(script_pubkey.as_slice()) {
+                    continue;
+                }
+                if script_is_watchonly(&script_pubkey) {
+                    involves_watchonly = true;
+                }
+                debit_zat = debit_zat
+                    .checked_add(value)
+                    .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+                wallet_spent_outpoints.insert(input.prevout.clone());
+            }
+
+            if credit_zat == 0 && debit_zat == 0 {
+                return Err(RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Invalid or non-wallet transaction id",
+                ));
+            }
+
+            let mut fee_zat: i64 = 0;
+            if debit_zat > 0 {
+                let value_out_zat = tx_value_out_for_fee(&tx)?;
+                fee_zat = value_out_zat
+                    .checked_sub(debit_zat)
+                    .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+            }
+
+            let net_zat = credit_zat
+                .checked_sub(debit_zat)
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+            let amount_zat = net_zat
+                .checked_sub(fee_zat)
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+
+            let mut send_details = Vec::new();
+            let mut receive_details = Vec::new();
+            let receive_category = if is_coinbase {
+                if confirmations < 1 {
+                    "orphan"
+                } else if confirmations < COINBASE_MATURITY {
+                    "immature"
+                } else {
+                    "generate"
+                }
+            } else {
+                "receive"
+            };
+            for (vout, output) in tx.vout.iter().enumerate() {
+                if wallet_script_set.contains(output.script_pubkey.as_slice()) {
+                    if debit_zat > 0 {
+                        if let Some(hash) = extract_p2pkh_hash(&output.script_pubkey) {
+                            if change_key_hash_set.contains(&hash) {
+                                continue;
+                            }
+                        }
+                    }
+                    let address =
+                        script_pubkey_to_address(&output.script_pubkey, chain_params.network)
+                            .ok_or(RpcError::new(
+                                RPC_INTERNAL_ERROR,
+                                "invalid wallet script_pubkey",
+                            ))?;
+                    let mut row = serde_json::Map::new();
+                    row.insert("account".to_string(), Value::String(String::new()));
+                    if involves_watchonly || script_is_watchonly(&output.script_pubkey) {
+                        row.insert("involvesWatchonly".to_string(), Value::Bool(true));
+                    }
+                    row.insert("address".to_string(), Value::String(address));
+                    row.insert(
+                        "category".to_string(),
+                        Value::String(receive_category.to_string()),
+                    );
+                    row.insert("amount".to_string(), amount_to_value(output.value));
+                    row.insert("amount_zat".to_string(), Value::Number(output.value.into()));
+                    row.insert("vout".to_string(), Value::Number((vout as i64).into()));
+                    receive_details.push(Value::Object(row));
+                    continue;
+                }
+
+                if debit_zat > 0 {
+                    let mut row = serde_json::Map::new();
+                    row.insert("account".to_string(), Value::String(String::new()));
+                    if involves_watchonly {
+                        row.insert("involvesWatchonly".to_string(), Value::Bool(true));
+                    }
+                    if let Some(address) =
+                        script_pubkey_to_address(&output.script_pubkey, chain_params.network)
+                    {
+                        row.insert("address".to_string(), Value::String(address));
+                    }
+                    row.insert("category".to_string(), Value::String("send".to_string()));
+                    row.insert("amount".to_string(), amount_to_value(-output.value));
+                    row.insert(
+                        "amount_zat".to_string(),
+                        Value::Number((-output.value).into()),
+                    );
+                    row.insert("vout".to_string(), Value::Number((vout as i64).into()));
+                    row.insert("fee".to_string(), amount_to_value(fee_zat));
+                    row.insert("fee_zat".to_string(), Value::Number(fee_zat.into()));
+                    send_details.push(Value::Object(row));
+                }
+            }
+
+            let mut details = Vec::with_capacity(send_details.len() + receive_details.len());
+            details.extend(send_details);
+            details.extend(receive_details);
+
+            let walletconflicts = {
+                let mut conflicts: BTreeSet<Hash256> = BTreeSet::new();
+                if let Ok(mempool_guard) = mempool.lock() {
+                    for outpoint in &wallet_spent_outpoints {
+                        if let Some(spender) = mempool_guard.spender(outpoint) {
+                            if spender != txid {
+                                conflicts.insert(spender);
+                            }
+                        }
+                    }
+                }
+                for outpoint in &wallet_spent_outpoints {
+                    if let Some(info) = chainstate.spent_info(outpoint).map_err(map_internal)? {
+                        if info.txid != txid {
+                            conflicts.insert(info.txid);
+                        }
+                    }
+                }
+                Value::Array(
+                    conflicts
+                        .into_iter()
+                        .map(|conflict| Value::String(hash256_to_hex(&conflict)))
+                        .collect(),
+                )
+            };
+
+            let confirmed_time = tx_received_at
+                .filter(|value| *value != 0)
+                .unwrap_or_else(current_unix_seconds_u64);
+
+            let mut obj = json!({
+                "amount": amount_to_value(amount_zat),
+                "amount_zat": amount_zat,
+                "confirmations": confirmations,
+                "involvesWatchonly": involves_watchonly,
+                "txid": hash256_to_hex(&txid),
+                "time": confirmed_time,
+                "timereceived": confirmed_time,
+                "details": details,
+                "vJoinSplit": joinsplits_to_json(&tx.join_splits),
+                "walletconflicts": walletconflicts,
+                "hex": hex_bytes(&raw),
+            });
+            if debit_zat > 0 {
+                if let Value::Object(map) = &mut obj {
+                    map.insert("fee".to_string(), amount_to_value(fee_zat));
+                    map.insert("fee_zat".to_string(), Value::Number(fee_zat.into()));
+                }
+            }
+            if is_coinbase {
+                if let Value::Object(map) = &mut obj {
+                    map.insert("generated".to_string(), Value::Bool(true));
+                }
+            }
+
+            return Ok(obj);
+        }
+    };
     let bytes = chainstate
         .read_block(location.block)
         .map_err(map_internal)?;
@@ -9255,6 +9498,12 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no hex"))?
         .to_string();
+    let signed_bytes = bytes_from_hex(&signed_hex).ok_or_else(|| {
+        RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "signrawtransaction returned invalid hex",
+        )
+    })?;
 
     rpc_sendrawtransaction(
         chainstate,
@@ -9272,7 +9521,7 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-            .record_txids(std::iter::once(txid))
+            .record_transaction(txid, signed_bytes)
             .map_err(map_wallet_error)?;
         Ok(txid_value)
     })
@@ -9414,6 +9663,12 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no hex"))?
         .to_string();
+    let signed_bytes = bytes_from_hex(&signed_hex).ok_or_else(|| {
+        RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "signrawtransaction returned invalid hex",
+        )
+    })?;
 
     rpc_sendrawtransaction(
         chainstate,
@@ -9431,7 +9686,7 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-            .record_txids(std::iter::once(txid))
+            .record_transaction(txid, signed_bytes)
             .map_err(map_wallet_error)?;
         Ok(txid_value)
     })
@@ -9622,6 +9877,12 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "signrawtransaction returned no hex"))?
         .to_string();
+    let signed_bytes = bytes_from_hex(&signed_hex).ok_or_else(|| {
+        RpcError::new(
+            RPC_INTERNAL_ERROR,
+            "signrawtransaction returned invalid hex",
+        )
+    })?;
 
     rpc_sendrawtransaction(
         chainstate,
@@ -9639,7 +9900,7 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-            .record_txids(std::iter::once(txid))
+            .record_transaction(txid, signed_bytes)
             .map_err(map_wallet_error)?;
         Ok(txid_value)
     })
@@ -20179,6 +20440,88 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    #[test]
+    fn gettransaction_falls_back_to_wallet_store_when_missing_from_chain_and_mempool() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x11u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("address");
+        let txid_hex = rpc_sendtoaddress(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![json!(to_address), json!("1.0")],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc")
+        .as_str()
+        .expect("txid string")
+        .to_string();
+
+        drop(wallet);
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let empty_mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_gettransaction(
+            &chainstate,
+            &empty_mempool,
+            &wallet,
+            vec![json!(txid_hex.clone())],
+            &params,
+        )
+        .expect("rpc");
+
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("confirmations").and_then(Value::as_i64), Some(-1));
+        assert_eq!(obj.get("amount_zat").and_then(Value::as_i64), Some(-COIN));
+
+        let hex = obj.get("hex").and_then(Value::as_str).expect("hex");
+        let bytes = bytes_from_hex(hex).expect("hex decode");
+        let decoded = Transaction::consensus_decode(&bytes).expect("decode tx");
+        let decoded_txid = decoded.txid().expect("txid");
+        assert_eq!(hash256_to_hex(&decoded_txid), txid_hex);
     }
 
     #[test]

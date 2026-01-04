@@ -43,7 +43,7 @@ use zeroize::Zeroize;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 13;
+pub const WALLET_FILE_VERSION: u32 = 14;
 
 const WALLET_DUMP_EPOCH: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
@@ -278,6 +278,7 @@ pub struct Wallet {
     redeem_scripts: BTreeMap<[u8; 20], Vec<u8>>,
     tx_history: BTreeSet<Hash256>,
     tx_received_at: BTreeMap<Hash256, u64>,
+    tx_store: BTreeMap<Hash256, Vec<u8>>,
     keypool: VecDeque<KeyPoolEntry>,
     sapling_keys: Vec<SaplingKeyEntry>,
     sapling_viewing_keys: Vec<SaplingViewingKeyEntry>,
@@ -313,6 +314,7 @@ impl Wallet {
                 redeem_scripts: BTreeMap::new(),
                 tx_history: BTreeSet::new(),
                 tx_received_at: BTreeMap::new(),
+                tx_store: BTreeMap::new(),
                 keypool: VecDeque::new(),
                 sapling_keys: Vec::new(),
                 sapling_viewing_keys: Vec::new(),
@@ -575,6 +577,10 @@ impl Wallet {
         self.tx_received_at.get(txid).copied()
     }
 
+    pub fn transaction_bytes(&self, txid: &Hash256) -> Option<&[u8]> {
+        self.tx_store.get(txid).map(|bytes| bytes.as_slice())
+    }
+
     pub fn record_txids(
         &mut self,
         txids: impl IntoIterator<Item = Hash256>,
@@ -592,6 +598,29 @@ impl Wallet {
             self.revision = self.revision.saturating_add(1);
         }
         Ok(added)
+    }
+
+    pub fn record_transaction(&mut self, txid: Hash256, raw: Vec<u8>) -> Result<(), WalletError> {
+        let now = current_unix_seconds();
+        let mut changed = false;
+
+        if self.tx_history.insert(txid) {
+            self.tx_received_at.entry(txid).or_insert(now);
+            changed = true;
+        }
+        match self.tx_store.get(&txid) {
+            Some(existing) if existing.as_slice() == raw.as_slice() => {}
+            _ => {
+                self.tx_store.insert(txid, raw);
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.save()?;
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(())
     }
 
     pub fn lock_outpoint(&mut self, outpoint: OutPoint) {
@@ -2017,6 +2046,7 @@ impl Wallet {
                 redeem_scripts: BTreeMap::new(),
                 tx_history,
                 tx_received_at: BTreeMap::new(),
+                tx_store: BTreeMap::new(),
                 keypool,
                 sapling_keys,
                 sapling_viewing_keys,
@@ -2127,6 +2157,18 @@ impl Wallet {
                 let txid = decoder.read_fixed::<32>()?;
                 let received_at = decoder.read_u64_le()?;
                 tx_received_at.insert(txid, received_at);
+            }
+        }
+
+        let mut tx_store: BTreeMap<Hash256, Vec<u8>> = BTreeMap::new();
+        if version >= 14 {
+            let count = decoder.read_varint()?;
+            let count = usize::try_from(count)
+                .map_err(|_| WalletError::InvalidData("tx store count too large"))?;
+            for _ in 0..count {
+                let txid = decoder.read_fixed::<32>()?;
+                let raw = decoder.read_var_bytes()?;
+                tx_store.insert(txid, raw);
             }
         }
 
@@ -2262,6 +2304,7 @@ impl Wallet {
             redeem_scripts,
             tx_history,
             tx_received_at,
+            tx_store,
             keypool,
             sapling_keys,
             sapling_viewing_keys,
@@ -2336,6 +2379,14 @@ impl Wallet {
         for (txid, received_at) in &self.tx_received_at {
             encoder.write_bytes(txid);
             encoder.write_u64_le(*received_at);
+        }
+
+        self.tx_store
+            .retain(|txid, _| self.tx_history.contains(txid));
+        encoder.write_varint(self.tx_store.len() as u64);
+        for (txid, raw) in &self.tx_store {
+            encoder.write_bytes(txid);
+            encoder.write_var_bytes(raw);
         }
 
         encoder.write_varint(self.keypool.len() as u64);
