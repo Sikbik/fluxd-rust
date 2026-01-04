@@ -420,7 +420,7 @@ Notes:
 ### listtransactions
 
 - Params: `[account] [count] [skip] [include_watchonly]` (partial; `account` is ignored, `include_watchonly` is honored).
-- Result: array of wallet transaction entries (ordered oldest → newest; mempool entries appear last). Each entry corresponds to a wallet-relevant output (send/receive/generate/etc), similar to `fluxd`.
+- Result: array of wallet transaction entries (ordered oldest → newest; unconfirmed entries appear last). Each entry corresponds to a wallet-relevant output (send/receive/generate/etc), similar to `fluxd`.
 
 Notes:
 - `involvesWatchonly` is set when the transaction touches watch-only scripts.
@@ -428,6 +428,7 @@ Notes:
 - `vout` is included per entry (index of the referenced output in the transaction).
 - `size` is included (transaction size in bytes) and is repeated across entries for the same `txid`.
 - For coinbase wallet receives, `category` may be `orphan` / `immature` / `generate` (matches `fluxd`).
+- Wallet-known transactions that are not in chain and not in mempool are served from the wallet tx store and appear with `confirmations=-1`.
 
 ### listsinceblock
 
@@ -441,6 +442,7 @@ Notes:
 - `vout` is included per entry (index of the referenced output in the transaction).
 - `size` is included (transaction size in bytes) and is repeated across entries for the same `txid`.
 - For coinbase wallet receives, `category` may be `orphan` / `immature` / `generate` (matches `fluxd`).
+- Wallet-known transactions that are not in chain and not in mempool are served from the wallet tx store and appear with `confirmations=-1`.
 
 ### addmultisigaddress
 

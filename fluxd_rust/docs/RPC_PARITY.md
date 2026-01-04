@@ -138,8 +138,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listaddressgroupings - Partial (clusters co-spent inputs + wallet-owned outputs; heuristic is index-driven vs C++ wallet internals)
 - listlockunspent - Implemented
 - listreceivedbyaddress - Partial (transparent only; `include_watchonly` supported; `txids` populated; labels are WIP)
-- listsinceblock - Partial (transparent only; confirmed via address deltas; mempool included; `include_watchonly` supported; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
-- listtransactions - Partial (transparent only; confirmed via address deltas; mempool included; `include_watchonly` supported; ordered oldest → newest; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
+- listsinceblock - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); `include_watchonly` supported; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
+- listtransactions - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); `include_watchonly` supported; ordered oldest → newest; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
 - listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; includes `redeemScript` for known P2SH; excludes locked coins like C++)
 - lockunspent - Implemented
 - rescanblockchain - Implemented (scans address delta index; populates wallet tx history)

@@ -3975,17 +3975,19 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         Some(value) => parse_bool(value)?,
     };
 
-    let wallet_scripts = {
+    let (wallet_scripts, stored_transactions) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        if include_watchonly {
+        let scripts = if include_watchonly {
             guard
                 .all_script_pubkeys_including_watchonly()
                 .map_err(map_wallet_error)?
         } else {
             guard.all_script_pubkeys().map_err(map_wallet_error)?
-        }
+        };
+        let stored_transactions = guard.stored_transactions();
+        (scripts, stored_transactions)
     };
     if wallet_scripts.is_empty() {
         return Ok(Value::Array(Vec::new()));
@@ -3997,6 +3999,7 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
     #[derive(Clone, Copy)]
     enum CandidateOrder {
         Mempool { time: u64 },
+        WalletStore { time: u64 },
         Chain { height: u32, tx_index: u32 },
     }
 
@@ -4006,7 +4009,7 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         order: CandidateOrder,
     }
 
-    let mut mempool_candidates = Vec::new();
+    let mut unconfirmed_candidates = Vec::new();
     if let Ok(mempool_guard) = mempool.lock() {
         for entry in mempool_guard.entries() {
             let mut touches_wallet = entry
@@ -4034,19 +4037,13 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
                 }
             }
             if touches_wallet {
-                mempool_candidates.push(Candidate {
+                unconfirmed_candidates.push(Candidate {
                     txid: entry.txid,
                     order: CandidateOrder::Mempool { time: entry.time },
                 });
             }
         }
     }
-    mempool_candidates.sort_by(|a, b| match (a.order, b.order) {
-        (CandidateOrder::Mempool { time: a_time }, CandidateOrder::Mempool { time: b_time }) => {
-            b_time.cmp(&a_time).then_with(|| b.txid.cmp(&a.txid))
-        }
-        _ => std::cmp::Ordering::Equal,
-    });
 
     let mut seen_chain: HashMap<Hash256, (u32, u32)> = HashMap::new();
     for script_pubkey in &wallet_scripts {
@@ -4087,8 +4084,50 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         _ => std::cmp::Ordering::Equal,
     });
 
-    let mut candidates = Vec::with_capacity(mempool_candidates.len() + chain_candidates.len());
-    candidates.extend(mempool_candidates);
+    let mut seen_txids: HashSet<Hash256> = unconfirmed_candidates
+        .iter()
+        .map(|cand| cand.txid)
+        .collect();
+    for cand in &chain_candidates {
+        seen_txids.insert(cand.txid);
+    }
+
+    for (txid, time) in stored_transactions {
+        if !seen_txids.insert(txid) {
+            continue;
+        }
+        unconfirmed_candidates.push(Candidate {
+            txid,
+            order: CandidateOrder::WalletStore { time },
+        });
+    }
+
+    let order_rank = |order| match order {
+        CandidateOrder::Mempool { .. } => 0u8,
+        CandidateOrder::WalletStore { .. } => 1u8,
+        CandidateOrder::Chain { .. } => 2u8,
+    };
+    unconfirmed_candidates.sort_by(|a, b| {
+        let a_time = match a.order {
+            CandidateOrder::Mempool { time } | CandidateOrder::WalletStore { time } => time,
+            CandidateOrder::Chain { .. } => 0,
+        };
+        let b_time = match b.order {
+            CandidateOrder::Mempool { time } | CandidateOrder::WalletStore { time } => time,
+            CandidateOrder::Chain { .. } => 0,
+        };
+        b_time
+            .cmp(&a_time)
+            .then_with(|| order_rank(a.order).cmp(&order_rank(b.order)))
+            .then_with(|| b.txid.cmp(&a.txid))
+    });
+
+    let mut candidates = Vec::with_capacity(
+        unconfirmed_candidates
+            .len()
+            .saturating_add(chain_candidates.len()),
+    );
+    candidates.extend(unconfirmed_candidates);
     candidates.extend(chain_candidates);
 
     let skip = usize::try_from(skip).unwrap_or(usize::MAX);
@@ -4104,7 +4143,7 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         if newest_to_oldest.len() >= target {
             break;
         }
-        let view = rpc_gettransaction(
+        let view = match rpc_gettransaction(
             chainstate,
             mempool,
             wallet,
@@ -4113,7 +4152,16 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
                 Value::Bool(include_watchonly),
             ],
             chain_params,
-        )?;
+        ) {
+            Ok(view) => view,
+            Err(err)
+                if matches!(cand.order, CandidateOrder::WalletStore { .. })
+                    && err.code == RPC_INVALID_ADDRESS_OR_KEY =>
+            {
+                continue
+            }
+            Err(err) => return Err(err),
+        };
         let obj = view
             .as_object()
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid gettransaction result"))?;
@@ -4262,22 +4310,25 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
         Some(value) => parse_bool(value)?,
     };
 
-    let wallet_scripts = {
+    let (wallet_scripts, stored_transactions) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        if include_watchonly {
+        let scripts = if include_watchonly {
             guard
                 .all_script_pubkeys_including_watchonly()
                 .map_err(map_wallet_error)?
         } else {
             guard.all_script_pubkeys().map_err(map_wallet_error)?
-        }
+        };
+        let stored_transactions = guard.stored_transactions();
+        (scripts, stored_transactions)
     };
 
     #[derive(Clone, Copy)]
     enum CandidateOrder {
         Mempool { time: u64 },
+        WalletStore { time: u64 },
         Chain { height: u32, tx_index: u32 },
     }
 
@@ -4290,7 +4341,7 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
     let wallet_contains_script =
         |script_pubkey: &[u8]| wallet_scripts.iter().any(|s| s.as_slice() == script_pubkey);
 
-    let mut mempool_candidates = Vec::new();
+    let mut unconfirmed_candidates = Vec::new();
     if !wallet_scripts.is_empty() {
         if let Ok(mempool_guard) = mempool.lock() {
             for entry in mempool_guard.entries() {
@@ -4319,7 +4370,7 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
                     }
                 }
                 if touches_wallet {
-                    mempool_candidates.push(Candidate {
+                    unconfirmed_candidates.push(Candidate {
                         txid: entry.txid,
                         order: CandidateOrder::Mempool { time: entry.time },
                     });
@@ -4327,12 +4378,6 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
             }
         }
     }
-    mempool_candidates.sort_by(|a, b| match (a.order, b.order) {
-        (CandidateOrder::Mempool { time: a_time }, CandidateOrder::Mempool { time: b_time }) => {
-            b_time.cmp(&a_time).then_with(|| b.txid.cmp(&a.txid))
-        }
-        _ => std::cmp::Ordering::Equal,
-    });
 
     let mut seen_chain: HashMap<Hash256, (u32, u32)> = HashMap::new();
     if !wallet_scripts.is_empty() {
@@ -4380,13 +4425,55 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
         _ => std::cmp::Ordering::Equal,
     });
 
-    let mut candidates = Vec::with_capacity(mempool_candidates.len() + chain_candidates.len());
-    candidates.extend(mempool_candidates);
+    let mut seen_txids: HashSet<Hash256> = unconfirmed_candidates
+        .iter()
+        .map(|cand| cand.txid)
+        .collect();
+    for cand in &chain_candidates {
+        seen_txids.insert(cand.txid);
+    }
+
+    for (txid, time) in stored_transactions {
+        if !seen_txids.insert(txid) {
+            continue;
+        }
+        unconfirmed_candidates.push(Candidate {
+            txid,
+            order: CandidateOrder::WalletStore { time },
+        });
+    }
+
+    let order_rank = |order| match order {
+        CandidateOrder::Mempool { .. } => 0u8,
+        CandidateOrder::WalletStore { .. } => 1u8,
+        CandidateOrder::Chain { .. } => 2u8,
+    };
+    unconfirmed_candidates.sort_by(|a, b| {
+        let a_time = match a.order {
+            CandidateOrder::Mempool { time } | CandidateOrder::WalletStore { time } => time,
+            CandidateOrder::Chain { .. } => 0,
+        };
+        let b_time = match b.order {
+            CandidateOrder::Mempool { time } | CandidateOrder::WalletStore { time } => time,
+            CandidateOrder::Chain { .. } => 0,
+        };
+        b_time
+            .cmp(&a_time)
+            .then_with(|| order_rank(a.order).cmp(&order_rank(b.order)))
+            .then_with(|| b.txid.cmp(&a.txid))
+    });
+
+    let mut candidates = Vec::with_capacity(
+        unconfirmed_candidates
+            .len()
+            .saturating_add(chain_candidates.len()),
+    );
+    candidates.extend(unconfirmed_candidates);
     candidates.extend(chain_candidates);
 
     let mut transactions = Vec::new();
     for cand in candidates {
-        let view = rpc_gettransaction(
+        let view = match rpc_gettransaction(
             chainstate,
             mempool,
             wallet,
@@ -4395,7 +4482,16 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
                 Value::Bool(include_watchonly),
             ],
             chain_params,
-        )?;
+        ) {
+            Ok(view) => view,
+            Err(err)
+                if matches!(cand.order, CandidateOrder::WalletStore { .. })
+                    && err.code == RPC_INVALID_ADDRESS_OR_KEY =>
+            {
+                continue
+            }
+            Err(err) => return Err(err),
+        };
         let obj = view
             .as_object()
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid gettransaction result"))?;
@@ -21446,6 +21542,119 @@ mod tests {
     }
 
     #[test]
+    fn listtransactions_includes_wallet_store_transactions() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let (_txid_a, _vout, height_a, _miner_value_a) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        assert_eq!(height_a, 1);
+        let (_txid_b, _vout, height_b, _miner_value_b) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        assert_eq!(height_b, 2);
+
+        let mempool_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x77u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey: script_pubkey.clone(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let mempool_txid = mempool_tx.txid().expect("txid");
+        let mempool_raw = mempool_tx.consensus_encode().expect("encode tx");
+        let entry = MempoolEntry {
+            txid: mempool_txid,
+            tx: mempool_tx,
+            raw: mempool_raw,
+            time: 0,
+            height: 0,
+            fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
+            spent_outpoints: Vec::new(),
+            parents: Vec::new(),
+        };
+        let mut inner = Mempool::new(0);
+        inner.insert(entry).expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let stored_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x99u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let stored_txid = stored_tx.txid().expect("txid");
+        let stored_txid_hex = hash256_to_hex(&stored_txid);
+        let stored_raw = stored_tx.consensus_encode().expect("encode tx");
+        {
+            let mut guard = wallet.lock().expect("wallet lock");
+            guard
+                .record_transaction(stored_txid, stored_raw)
+                .expect("record tx");
+        }
+
+        let value =
+            rpc_listtransactions(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 4);
+        let last = arr[3].as_object().expect("object");
+        assert_eq!(
+            last.get("txid").and_then(Value::as_str),
+            Some(stored_txid_hex.as_str())
+        );
+        assert_eq!(last.get("confirmations").and_then(Value::as_i64), Some(-1));
+    }
+
+    #[test]
     fn listtransactions_includes_fee_for_send_tx() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
@@ -21666,6 +21875,123 @@ mod tests {
             obj.get("lastblock").and_then(Value::as_str),
             Some(blockhash_a_hex.as_str())
         );
+    }
+
+    #[test]
+    fn listsinceblock_includes_wallet_store_transactions() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let (_txid_a, _vout, height_a, _miner_value_a) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        assert_eq!(height_a, 1);
+        let (_txid_b, _vout, height_b, _miner_value_b) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey.clone());
+        assert_eq!(height_b, 2);
+
+        let mempool_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x77u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey: script_pubkey.clone(),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let mempool_txid = mempool_tx.txid().expect("txid");
+        let mempool_raw = mempool_tx.consensus_encode().expect("encode tx");
+        let entry = MempoolEntry {
+            txid: mempool_txid,
+            tx: mempool_tx,
+            raw: mempool_raw,
+            time: 0,
+            height: 0,
+            fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
+            spent_outpoints: Vec::new(),
+            parents: Vec::new(),
+        };
+        let mut inner = Mempool::new(0);
+        inner.insert(entry).expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let stored_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: [0x99u8; 32],
+                    index: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+            }],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let stored_txid = stored_tx.txid().expect("txid");
+        let stored_txid_hex = hash256_to_hex(&stored_txid);
+        let stored_raw = stored_tx.consensus_encode().expect("encode tx");
+        {
+            let mut guard = wallet.lock().expect("wallet lock");
+            guard
+                .record_transaction(stored_txid, stored_raw)
+                .expect("record tx");
+        }
+
+        let value =
+            rpc_listsinceblock(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+        let txs = obj
+            .get("transactions")
+            .and_then(Value::as_array)
+            .expect("transactions array");
+        assert_eq!(txs.len(), 4);
+        let last = txs[3].as_object().expect("object");
+        assert_eq!(
+            last.get("txid").and_then(Value::as_str),
+            Some(stored_txid_hex.as_str())
+        );
+        assert_eq!(last.get("confirmations").and_then(Value::as_i64), Some(-1));
     }
 
     #[test]

@@ -581,6 +581,13 @@ impl Wallet {
         self.tx_store.get(txid).map(|bytes| bytes.as_slice())
     }
 
+    pub fn stored_transactions(&self) -> Vec<(Hash256, u64)> {
+        self.tx_store
+            .keys()
+            .map(|txid| (*txid, self.tx_received_at.get(txid).copied().unwrap_or(0)))
+            .collect()
+    }
+
     pub fn record_txids(
         &mut self,
         txids: impl IntoIterator<Item = Hash256>,

@@ -232,10 +232,12 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `fee` output for `send` entries (via `gettransaction`)
     - [x] `vout` output per entry (from `gettransaction.details[].vout`)
     - [x] `size` output (derived from `gettransaction.hex`, repeated per entry)
+    - [x] Include wallet tx store entries not in chain/mempool (`confirmations=-1`)
   - [x] `listsinceblock` (partial)
     - [x] `fee` output for `send` entries (via `gettransaction`)
     - [x] `vout` output per entry (from `gettransaction.details[].vout`)
     - [x] `size` output (derived from `gettransaction.hex`, repeated per entry)
+    - [x] Include wallet tx store entries not in chain/mempool (`confirmations=-1`)
   - [x] `listreceivedbyaddress` (partial)
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index
