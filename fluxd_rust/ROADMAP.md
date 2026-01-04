@@ -258,8 +258,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `backupwallet`
   - [x] `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs)
   - [x] `signrawtransaction` (supports P2SH/multisig; may return incomplete signatures)
-  - [x] `sendtoaddress` (P2PKH only; supports `subtractfeefromamount`)
-  - [x] `sendmany` (P2PKH only; supports `subtractfeefrom`)
+  - [x] `sendtoaddress` (supports P2PKH + P2SH destinations; supports `subtractfeefromamount`)
+  - [x] `sendmany` (supports P2PKH + P2SH destinations; supports `subtractfeefrom`)
   - [x] `sendfrom` (fromaccount ignored; minconf supported)
   - [x] `rescanblockchain` (scans address delta index; populates wallet tx history)
 - [x] [P1] Shielded wallet RPCs (owner: TBD)

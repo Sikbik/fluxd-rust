@@ -22925,6 +22925,91 @@ mod tests {
     }
 
     #[test]
+    fn sendtoaddress_supports_p2sh_destination() {
+        let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let other_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let multisig = rpc_createmultisig(
+            &wallet,
+            vec![json!(2), json!([from_address.clone(), other_address])],
+            &params,
+        )
+        .expect("rpc");
+        let ms_addr = multisig
+            .get("address")
+            .and_then(Value::as_str)
+            .expect("multisig address")
+            .to_string();
+        let ms_script =
+            address_to_script_pubkey(&ms_addr, params.network).expect("multisig script");
+
+        let outpoint = OutPoint {
+            hash: [0x15u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let value = rpc_sendtoaddress(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![json!(ms_addr), json!("1.0")],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("parse txid");
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("mempool entry");
+        assert!(entry
+            .tx
+            .vout
+            .iter()
+            .any(|out| out.value == COIN && out.script_pubkey == ms_script));
+    }
+
+    #[test]
     fn sendtoaddress_supports_subtractfeefromamount() {
         let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
         params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
@@ -23106,6 +23191,107 @@ mod tests {
         }
         assert!(found_a);
         assert!(found_b);
+    }
+
+    #[test]
+    fn sendmany_supports_p2sh_destination() {
+        let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let other_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let multisig = rpc_createmultisig(
+            &wallet,
+            vec![json!(2), json!([from_address.clone(), other_address])],
+            &params,
+        )
+        .expect("rpc");
+        let ms_addr = multisig
+            .get("address")
+            .and_then(Value::as_str)
+            .expect("multisig address")
+            .to_string();
+        let ms_script =
+            address_to_script_pubkey(&ms_addr, params.network).expect("multisig script");
+
+        let outpoint = OutPoint {
+            hash: [0x16u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 10 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address =
+            script_pubkey_to_address(&p2pkh_script([0x21u8; 20]), params.network).expect("address");
+        let to_script = address_to_script_pubkey(&to_address, params.network).expect("dest script");
+
+        let mut amounts = serde_json::Map::new();
+        amounts.insert(ms_addr.clone(), json!("1.0"));
+        amounts.insert(to_address.clone(), json!("2.0"));
+
+        let value = rpc_sendmany(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            &wallet,
+            vec![json!(""), Value::Object(amounts), json!(1)],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("parse txid");
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("mempool entry");
+
+        let mut found_ms = false;
+        let mut found_to = false;
+        for output in &entry.tx.vout {
+            if output.value == COIN && output.script_pubkey == ms_script {
+                found_ms = true;
+            }
+            if output.value == 2 * COIN && output.script_pubkey == to_script {
+                found_to = true;
+            }
+        }
+        assert!(found_ms);
+        assert!(found_to);
     }
 
     #[test]

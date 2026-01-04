@@ -144,8 +144,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - lockunspent - Implemented
 - rescanblockchain - Implemented (scans address delta index; populates wallet tx history)
 
-- sendmany - Partial (P2PKH only)
-- sendtoaddress - Partial (P2PKH only)
+- sendmany - Partial (supports P2PKH + P2SH destinations; `subtractfeefrom` supported)
+- sendtoaddress - Partial (supports P2PKH + P2SH destinations; `subtractfeefromamount` supported)
 - settxfee - Partial (sets in-process wallet fee-rate override used by fundrawtransaction/send*)
 - signmessage - Implemented (P2PKH only; compatible with verifymessage)
 
