@@ -2874,6 +2874,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
             let mut credit_zat: i64 = 0;
             let mut debit_zat: i64 = 0;
             let mut involves_watchonly = false;
+            let mut wallet_spent_outpoints: HashSet<OutPoint> = HashSet::new();
 
             for output in &entry.tx.vout {
                 if !wallet_script_set.contains(output.script_pubkey.as_slice()) {
@@ -2889,15 +2890,42 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
 
             let prevouts = mempool_guard.prevouts_for_tx(&entry.tx);
             for input in &entry.tx.vin {
-                let (value, script_pubkey) = match chainstate
+                let mut prev_value = None;
+                let mut prev_script_pubkey = None;
+
+                match chainstate
                     .utxo_entry(&input.prevout)
                     .map_err(map_internal)?
                 {
-                    Some(utxo) => (utxo.value, utxo.script_pubkey),
-                    None => match prevouts.get(&input.prevout) {
-                        Some(prev) => (prev.value, prev.script_pubkey.clone()),
-                        None => continue,
-                    },
+                    Some(utxo) => {
+                        prev_value = Some(utxo.value);
+                        prev_script_pubkey = Some(utxo.script_pubkey);
+                    }
+                    None => {
+                        if let Some(prev) = prevouts.get(&input.prevout) {
+                            prev_value = Some(prev.value);
+                            prev_script_pubkey = Some(prev.script_pubkey.clone());
+                        } else if let Ok(Some(prev_location)) =
+                            chainstate.tx_location(&input.prevout.hash)
+                        {
+                            if let Ok(prev_bytes) = chainstate.read_block(prev_location.block) {
+                                if let Ok(prev_block) = Block::consensus_decode(&prev_bytes) {
+                                    let tx_index = prev_location.index as usize;
+                                    let vout = input.prevout.index as usize;
+                                    if let Some(prev_tx) = prev_block.transactions.get(tx_index) {
+                                        if let Some(out) = prev_tx.vout.get(vout) {
+                                            prev_value = Some(out.value);
+                                            prev_script_pubkey = Some(out.script_pubkey.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let (Some(value), Some(script_pubkey)) = (prev_value, prev_script_pubkey) else {
+                    continue;
                 };
                 if !wallet_script_set.contains(script_pubkey.as_slice()) {
                     continue;
@@ -2908,6 +2936,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 debit_zat = debit_zat
                     .checked_add(value)
                     .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+                wallet_spent_outpoints.insert(input.prevout.clone());
             }
 
             if credit_zat == 0 && debit_zat == 0 {
@@ -2991,6 +3020,28 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
             details.extend(send_details);
             details.extend(receive_details);
 
+            let walletconflicts = {
+                let mut conflicts: BTreeSet<Hash256> = BTreeSet::new();
+                for outpoint in &wallet_spent_outpoints {
+                    if let Some(spender) = mempool_guard.spender(outpoint) {
+                        if spender != txid {
+                            conflicts.insert(spender);
+                        }
+                    }
+                    if let Some(info) = chainstate.spent_info(outpoint).map_err(map_internal)? {
+                        if info.txid != txid {
+                            conflicts.insert(info.txid);
+                        }
+                    }
+                }
+                Value::Array(
+                    conflicts
+                        .into_iter()
+                        .map(|conflict| Value::String(hash256_to_hex(&conflict)))
+                        .collect(),
+                )
+            };
+
             let mut obj = json!({
                 "amount": amount_to_value(amount_zat),
                 "amount_zat": amount_zat,
@@ -3001,7 +3052,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                 "timereceived": entry.time,
                 "details": details,
                 "vJoinSplit": joinsplits_to_json(&entry.tx.join_splits),
-                "walletconflicts": [],
+                "walletconflicts": walletconflicts,
                 "hex": hex_bytes(&entry.raw),
             });
             if debit_zat > 0 {
@@ -3051,6 +3102,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
     let mut credit_zat: i64 = 0;
     let mut debit_zat: i64 = 0;
     let mut involves_watchonly = false;
+    let mut wallet_spent_outpoints: HashSet<OutPoint> = HashSet::new();
 
     for output in &tx.vout {
         if !wallet_script_set.contains(output.script_pubkey.as_slice()) {
@@ -3096,6 +3148,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                                 debit_zat.checked_add(details.satoshis).ok_or_else(|| {
                                     RpcError::new(RPC_INTERNAL_ERROR, "amount overflow")
                                 })?;
+                            wallet_spent_outpoints.insert(input.prevout.clone());
                         }
                     }
                 }
@@ -3142,6 +3195,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         debit_zat = debit_zat
             .checked_add(value)
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "amount overflow"))?;
+        wallet_spent_outpoints.insert(input.prevout.clone());
     }
 
     if credit_zat == 0 && debit_zat == 0 {
@@ -3237,6 +3291,32 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
     details.extend(send_details);
     details.extend(receive_details);
 
+    let walletconflicts = {
+        let mut conflicts: BTreeSet<Hash256> = BTreeSet::new();
+        if let Ok(mempool_guard) = mempool.lock() {
+            for outpoint in &wallet_spent_outpoints {
+                if let Some(spender) = mempool_guard.spender(outpoint) {
+                    if spender != txid {
+                        conflicts.insert(spender);
+                    }
+                }
+            }
+        }
+        for outpoint in &wallet_spent_outpoints {
+            if let Some(info) = chainstate.spent_info(outpoint).map_err(map_internal)? {
+                if info.txid != txid {
+                    conflicts.insert(info.txid);
+                }
+            }
+        }
+        Value::Array(
+            conflicts
+                .into_iter()
+                .map(|conflict| Value::String(hash256_to_hex(&conflict)))
+                .collect(),
+        )
+    };
+
     let confirmed_time = tx_received_at
         .filter(|value| *value != 0)
         .unwrap_or(u64::from(block.header.time));
@@ -3251,7 +3331,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         "timereceived": confirmed_time,
         "details": details,
         "vJoinSplit": joinsplits_to_json(&tx.join_splits),
-        "walletconflicts": [],
+        "walletconflicts": walletconflicts,
         "hex": hex_bytes(&encoded),
     });
     if debit_zat > 0 {
@@ -20147,6 +20227,114 @@ mod tests {
             Some(-sent_value)
         );
         assert_eq!(obj.get("fee_zat").and_then(Value::as_i64), Some(-100));
+    }
+
+    #[test]
+    fn gettransaction_populates_walletconflicts_for_mempool_tx() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let wallet_script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let prevout = OutPoint {
+            hash: [0x55u8; 32],
+            index: 0,
+        };
+        let input_value = 10_000i64;
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: input_value,
+            script_pubkey: wallet_script_pubkey.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&prevout);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+
+        let conflict_txid: Hash256 = [0x99u8; 32];
+        let spent_value = fluxd_chainstate::spentindex::SpentIndexValue {
+            txid: conflict_txid,
+            input_index: 0,
+            block_height: 1,
+            details: None,
+        };
+        batch.put(
+            Column::SpentIndex,
+            utxo_key.as_bytes(),
+            spent_value.encode(),
+        );
+        chainstate
+            .commit_batch(batch)
+            .expect("commit utxo+spentindex");
+
+        let other_script = p2pkh_script([0x66u8; 20]);
+        let spend_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: prevout.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: 9_000i64,
+                script_pubkey: other_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let txid = spend_tx.txid().expect("txid");
+        let raw = spend_tx.consensus_encode().expect("encode tx");
+
+        let entry = MempoolEntry {
+            txid,
+            tx: spend_tx,
+            raw,
+            time: 123,
+            height: 0,
+            fee: 0,
+            fee_delta: 0,
+            priority_delta: 0.0,
+            spent_outpoints: vec![prevout],
+            parents: Vec::new(),
+        };
+        let mut inner = Mempool::new(0);
+        inner.insert(entry).expect("insert mempool tx");
+        let mempool = Mutex::new(inner);
+
+        let txid_hex = hash256_to_hex(&txid);
+        let value = rpc_gettransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(txid_hex)],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        let conflicts = obj
+            .get("walletconflicts")
+            .and_then(Value::as_array)
+            .expect("walletconflicts");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].as_str(),
+            Some(hash256_to_hex(&conflict_txid).as_str())
+        );
     }
 
     #[test]

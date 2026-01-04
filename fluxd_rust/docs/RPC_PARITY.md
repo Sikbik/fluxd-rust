@@ -75,7 +75,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Extra queries
 
-- gettransaction - Partial (wallet-only view; amount/fee match `fluxd` semantics; includes `generated`/`expiryheight`/`vJoinSplit`; change outputs are omitted from `details` on outgoing txs; `details` ordering + coinbase categories match `fluxd`; `walletconflicts` is always empty and confirmed `time`/`timereceived` uses wallet first-seen time when available)
+- gettransaction - Partial (wallet-only view; amount/fee match `fluxd` semantics; includes `generated`/`expiryheight`/`vJoinSplit`; change outputs are omitted from `details` on outgoing txs; `details` ordering + coinbase categories match `fluxd`; `walletconflicts` is populated from known spend conflicts (chain spent-index + mempool) and confirmed `time`/`timereceived` uses wallet first-seen time when available)
 - zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; Sapling `ismine` checks wallet spending keys; `iswatchonly` checks imported Sapling viewing keys)
 - getbenchmarks - Partial (Fluxnode-only; proxies to `fluxbench-cli getbenchmarks` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
 - getbenchstatus - Partial (Fluxnode-only; proxies to `fluxbench-cli getstatus` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
