@@ -107,7 +107,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getfluxnodeoutputs - Implemented (wallet-less; uses fluxnode.conf + UTXO lookups)
 - startfluxnode - Partial (wallet-less; uses fluxnode.conf; requires a collateral WIF key)
 - startdeterministicfluxnode - Partial (wallet-less; requires a collateral WIF key; P2SH collateral also requires redeem script)
-- verifychain - Partial (checks flatfile decode + header linkage + merkle root + txindex; does not re-apply full UTXO/script validation like C++)
+- verifychain - Partial (checks flatfile decode + header linkage + merkle root + txindex; `checklevel=4` verifies spent-index consistency; does not re-apply full UTXO/script validation like C++)
 - addnode - Implemented (IP/IP:PORT only; no DNS resolution yet)
 - clearbanned - Implemented
 - disconnectnode - Implemented (address-based; best-effort)
