@@ -22,6 +22,7 @@ and how they affect behavior.
   - Config file path (default: `<data-dir>/flux.conf`).
 - `--db-info`, `--db-info-keys`, `--db-integrity`
   - Print JSON diagnostics and exit.
+  - `--db-integrity` runs `verifychain(checklevel=4, numblocks=288)` (includes spent-index checks).
   - `--db-info-keys` scans every key in the DB and can be slow on mainnet.
 
 ## Logging

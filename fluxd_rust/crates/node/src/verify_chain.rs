@@ -235,9 +235,9 @@ mod tests {
     use fluxd_chainstate::flatfiles::FlatFileStore;
     use fluxd_chainstate::utxo::outpoint_key_bytes;
     use fluxd_chainstate::validation::ValidationFlags;
+    use fluxd_consensus::block_subsidy;
     use fluxd_consensus::money::COIN;
     use fluxd_consensus::params::chain_params;
-    use fluxd_consensus::block_subsidy;
     use fluxd_consensus::Network;
     use fluxd_primitives::block::{Block, BlockHeader, CURRENT_VERSION};
     use fluxd_primitives::transaction::{Transaction, TxIn, TxOut};

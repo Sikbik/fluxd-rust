@@ -27,6 +27,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] Wallet RPC: honor `listtransactions` `account` filter (labels) (owner: TBD)
 - [x] [P1] RPC: tighten `getbalance` account param validation (`""`/`"*"` only) (owner: TBD)
 - [x] [P1] RPC: `verifychain` checklevel=4 spent-index consistency (owner: TBD)
+- [x] [P2] CLI: `--db-integrity` runs `verifychain` at checklevel=4 (owner: TBD)
 
 ## Completed (core)
 
