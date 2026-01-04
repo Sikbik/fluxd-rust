@@ -156,6 +156,16 @@ if [[ "$LISTEN_P2P" != "1" ]]; then
   P2P_ARGS=(--no-p2p-listen)
 fi
 
+echo "Checking --db-integrity ..."
+"$BIN" \
+  --network "$NETWORK" \
+  --backend fjall \
+  --data-dir "$DATA_DIR" \
+  --params-dir "$PARAMS_DIR" \
+  --log-level error \
+  --db-integrity \
+  | python3 -c 'import json,sys; obj=json.load(sys.stdin); vc=obj.get("verifychain", {}) or {}; assert vc.get("ok") is True, vc; assert int(vc.get("checklevel", 0)) == 4, vc'
+
 nohup "$BIN" \
   --network "$NETWORK" \
   --backend fjall \

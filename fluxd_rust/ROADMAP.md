@@ -291,7 +291,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P2] Wallet encryption and key management parity (owner: TBD)
   - [x] `encryptwallet`, `walletpassphrase`, `walletlock`, `walletpassphrasechange`
   - [x] Encrypted wallet secrets in `wallet.dat`; locked-by-default semantics + auto-lock timer
-  - [x] RPC smoke coverage (`scripts/remote_smoke_test.sh`)
+  - [x] RPC smoke coverage (`scripts/remote_smoke_test.sh`, includes `--db-integrity`)
 
 ## UX, ops, and tooling
 
@@ -357,7 +357,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] Mining metrics/template schemas (`getblocktemplate`, `getnetworkhashps`, `getnetworksolps`, `getlocalsolps`)
     - [x] Fluxnode admin/control schemas (`createfluxnodekey`, `listfluxnodeconf`, `getfluxnodeoutputs`, `startfluxnode`, `startdeterministicfluxnode`)
 - [x] [P1] Long-run sync tests with regression gates (owner: TBD)
-  - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity (supports seeding peers.dat and progress thresholds)
+  - [x] VPS smoke test script (`scripts/remote_smoke_test.sh`) to validate startup + RPC + peer connectivity + `--db-integrity` (supports seeding peers.dat and progress thresholds)
   - [x] VPS progress gate (`scripts/progress_gate.sh`) to detect stalls/regressions during sync
   - [x] VPS watchdog loop (`scripts/longrun_watchdog.sh`) to combine stall detection + fatal log pattern checks
 - [x] [P1] Shielded wallet RPC smoke test (`scripts/shielded_wallet_smoke_test.sh`) (owner: TBD)
