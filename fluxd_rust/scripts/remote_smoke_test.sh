@@ -164,7 +164,7 @@ echo "Checking --db-integrity ..."
   --params-dir "$PARAMS_DIR" \
   --log-level error \
   --db-integrity \
-  | python3 -c 'import json,sys; obj=json.load(sys.stdin); vc=obj.get("verifychain", {}) or {}; assert vc.get("ok") is True, vc; assert int(vc.get("checklevel", 0)) == 4, vc'
+  | python3 -c 'import json,sys; obj=json.load(sys.stdin); vc=obj.get("verifychain", {}) or {}; assert vc.get("ok") is True, vc; assert int(vc.get("checklevel", 0)) == 5, vc'
 
 nohup "$BIN" \
   --network "$NETWORK" \

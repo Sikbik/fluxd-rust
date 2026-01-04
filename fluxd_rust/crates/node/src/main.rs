@@ -1179,7 +1179,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
     );
 
     if config.db_integrity {
-        const CHECKLEVEL: u32 = 4;
+        const CHECKLEVEL: u32 = 5;
         const NUMBLOCKS: u32 = 288;
 
         let verify = crate::verify_chain::verify_chain(chainstate.as_ref(), CHECKLEVEL, NUMBLOCKS);
@@ -8890,7 +8890,7 @@ fn usage() -> String {
         "  --reindex-addressindex  Rebuild address index (outpoints + deltas) from blocks under --data-dir/blocks",
         "  --db-info  Print DB/flatfile size breakdown and fjall telemetry, then exit",
         "  --db-info-keys  Like --db-info, but also counts keys/bytes in each DB partition (slow)",
-        "  --db-integrity  Print DB/flatfile sanity + verify last 288 blocks (checklevel 4), then exit nonzero on failure",
+        "  --db-integrity  Print DB/flatfile sanity + verify last 288 blocks (checklevel 5), then exit nonzero on failure",
         "  --scan-flatfiles  Scan flatfiles for block index mismatches, then exit",
         "  --scan-supply  Scan blocks in the local DB and print coinbase totals, then exit",
         "  --scan-fluxnodes  Scan fluxnode records in the local DB and print summary stats, then exit",
