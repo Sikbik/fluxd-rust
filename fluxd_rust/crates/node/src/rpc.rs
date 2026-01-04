@@ -7399,10 +7399,7 @@ fn rpc_validateaddress(
         let wallet_guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        let ismine = wallet_guard
-            .signing_key_for_script_pubkey(&script_pubkey)
-            .map_err(map_wallet_error)?
-            .is_some();
+        let ismine = wallet_guard.can_spend_script_pubkey(&script_pubkey);
         let iswatchonly = if ismine {
             false
         } else {
@@ -8447,6 +8444,67 @@ fn estimate_signed_tx_size(tx: &Transaction, scriptsig_len: usize) -> Result<usi
     Ok(tmp.consensus_encode().map_err(map_internal)?.len())
 }
 
+fn pushdata_prefix_len(len: usize) -> usize {
+    const OP_PUSHDATA1: usize = 0x4c;
+    const OP_PUSHDATA2: usize = 0x4d;
+
+    if len < OP_PUSHDATA1 {
+        1
+    } else if len <= u8::MAX as usize {
+        2
+    } else if len <= u16::MAX as usize {
+        3
+    } else {
+        5
+    }
+}
+
+fn estimate_signed_tx_size_with_prevouts(
+    tx: &Transaction,
+    prevouts: &HashMap<OutPoint, PrevoutInfo>,
+) -> Result<usize, RpcError> {
+    const P2PKH_SCRIPTSIG_ESTIMATE: usize = 141;
+    const SIGNATURE_PLUS_SIGHASH_LEN: usize = 74;
+
+    let mut tmp = tx.clone();
+    for input in &mut tmp.vin {
+        if !input.script_sig.is_empty() {
+            input.script_sig = vec![0u8; input.script_sig.len()];
+            continue;
+        }
+
+        let scriptsig_estimate = match prevouts.get(&input.prevout) {
+            Some(prevout) => match classify_script_pubkey(&prevout.script_pubkey) {
+                ScriptType::P2Pkh => P2PKH_SCRIPTSIG_ESTIMATE,
+                ScriptType::P2Sh => match prevout.redeem_script.as_deref() {
+                    None => P2PKH_SCRIPTSIG_ESTIMATE,
+                    Some(redeem_script) => {
+                        if let Some((required, _pubkeys)) =
+                            parse_multisig_redeem_script_with_required(redeem_script)
+                        {
+                            1usize
+                                .saturating_add(required.saturating_mul(
+                                    1usize.saturating_add(SIGNATURE_PLUS_SIGHASH_LEN),
+                                ))
+                                .saturating_add(pushdata_prefix_len(redeem_script.len()))
+                                .saturating_add(redeem_script.len())
+                        } else {
+                            P2PKH_SCRIPTSIG_ESTIMATE
+                                .saturating_add(pushdata_prefix_len(redeem_script.len()))
+                                .saturating_add(redeem_script.len())
+                        }
+                    }
+                },
+                _ => P2PKH_SCRIPTSIG_ESTIMATE,
+            },
+            None => P2PKH_SCRIPTSIG_ESTIMATE,
+        };
+
+        input.script_sig = vec![0u8; scriptsig_estimate];
+    }
+    Ok(tmp.consensus_encode().map_err(map_internal)?.len())
+}
+
 fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
@@ -8543,6 +8601,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
 
     let mut used_outpoints: HashSet<OutPoint> = HashSet::new();
     let mut base_inputs_value: i64 = 0;
+    let mut prevouts: HashMap<OutPoint, PrevoutInfo> = HashMap::new();
     let base_prevtxs = HashMap::new();
     for input in &tx.vin {
         if !used_outpoints.insert(input.prevout.clone()) {
@@ -8564,6 +8623,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         base_inputs_value = base_inputs_value
             .checked_add(prevout.value)
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+        prevouts.insert(input.prevout.clone(), prevout);
     }
 
     let (wallet_scripts, change_script_pubkey, pay_tx_fee_per_kb, locked_outpoints) = {
@@ -8623,11 +8683,10 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     let mut selected_value: i64 = 0;
     let mut change_pos: i32 = -1;
 
-    const P2PKH_SCRIPTSIG_ESTIMATE: usize = 141;
     let mut fee = 0i64;
 
     for _ in 0..512 {
-        let estimated_size = estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?;
+        let estimated_size = estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?;
         let target_fee = fee_for_size(estimated_size);
         if target_fee > fee {
             fee = target_fee;
@@ -8652,12 +8711,28 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             selected_value = selected_value
                 .checked_add(next.value)
                 .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+            let redeem_script = if classify_script_pubkey(&next.script_pubkey) == ScriptType::P2Sh {
+                wallet
+                    .lock()
+                    .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+                    .redeem_script_for_p2sh_script_pubkey(&next.script_pubkey)
+            } else {
+                None
+            };
+            prevouts.insert(
+                next.outpoint.clone(),
+                PrevoutInfo {
+                    value: next.value,
+                    script_pubkey: next.script_pubkey.clone(),
+                    redeem_script,
+                },
+            );
             tx.vin.push(TxIn {
                 prevout: next.outpoint,
                 script_sig: Vec::new(),
                 sequence: u32::MAX,
             });
-            fee = fee_for_size(estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?);
+            fee = fee_for_size(estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?);
             continue;
         }
 
@@ -8699,7 +8774,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             }
         }
 
-        let new_fee = fee_for_size(estimate_signed_tx_size(&tx, P2PKH_SCRIPTSIG_ESTIMATE)?);
+        let new_fee = fee_for_size(estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?);
         if new_fee > fee {
             fee = new_fee;
             continue;
@@ -17713,7 +17788,7 @@ mod tests {
     }
 
     #[test]
-    fn addmultisigaddress_adds_watchonly_p2sh_script() {
+    fn addmultisigaddress_adds_spendable_p2sh_script_when_keys_present() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
@@ -17779,8 +17854,8 @@ mod tests {
         );
         assert_eq!(
             row.get("spendable").and_then(Value::as_bool),
-            Some(false),
-            "p2sh multisig output should be watch-only"
+            Some(true),
+            "p2sh multisig output should be spendable when wallet has enough keys"
         );
         assert!(
             row.get("redeemScript").and_then(Value::as_str).is_some(),
@@ -18700,6 +18775,115 @@ mod tests {
             .and_then(Value::as_i64)
             .expect("fee_zat");
         assert!(after_fee > before_fee, "fee should increase after settxfee");
+    }
+
+    #[test]
+    fn fundrawtransaction_can_select_spendable_p2sh_multisig_utxo() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address")
+            .to_string();
+
+        let multisig_address =
+            rpc_addmultisigaddress(&wallet, vec![json!(2), json!([addr_a, addr_b])], &params)
+                .expect("rpc")
+                .as_str()
+                .expect("multisig address")
+                .to_string();
+
+        let multisig_script =
+            address_to_script_pubkey(&multisig_address, params.network).expect("multisig script");
+        assert_eq!(classify_script_pubkey(&multisig_script), ScriptType::P2Sh);
+
+        let validate =
+            rpc_validateaddress(&wallet, vec![json!(multisig_address)], &params).expect("rpc");
+        assert_eq!(validate.get("ismine").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            validate.get("iswatchonly").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let outpoint = OutPoint {
+            hash: [0x33u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: multisig_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&multisig_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+
+        let value =
+            rpc_listunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].get("spendable").and_then(Value::as_bool), Some(true));
+
+        let to_script = p2pkh_script([0x22u8; 20]);
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: vec![TxOut {
+                value: 1 * COIN,
+                script_pubkey: to_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let funded = rpc_fundrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &wallet,
+            vec![json!(raw_hex)],
+            &params,
+        )
+        .expect("rpc");
+        let funded_hex = funded
+            .get("hex")
+            .and_then(Value::as_str)
+            .expect("hex")
+            .to_string();
+        let funded_bytes = bytes_from_hex(&funded_hex).expect("decode hex");
+        let funded_tx =
+            Transaction::consensus_decode(&funded_bytes).expect("decode funded transaction");
+        assert!(
+            funded_tx.vin.iter().any(|input| input.prevout == outpoint),
+            "funded tx should select multisig outpoint"
+        );
     }
 
     #[test]

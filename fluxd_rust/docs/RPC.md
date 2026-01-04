@@ -696,7 +696,7 @@ Notes:
 
 Notes:
 - Selects spendable wallet UTXOs via the address index and adds inputs + a change output when needed.
-- Only supports funding with P2PKH wallet UTXOs.
+- Supports funding with spendable P2PKH and P2SH (multisig) wallet UTXOs.
 
 ### signrawtransaction
 

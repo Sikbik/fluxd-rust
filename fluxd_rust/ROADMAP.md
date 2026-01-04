@@ -12,7 +12,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 ## Current sprint (next 3-5)
 
 - [x] [P1] Refresh `ROADMAP.md` RPC parity snapshot (keep in sync with `docs/RPC_PARITY.md`) (owner: TBD)
-- [ ] [P1] Wallet: expand `fundrawtransaction` beyond P2PKH (spendable P2SH/multisig) (owner: TBD)
+- [x] [P1] Wallet: expand `fundrawtransaction` beyond P2PKH (spendable P2SH/multisig) (owner: TBD)
 - [ ] [P1] Wallet: complete `gettransaction` field parity + regression tests (owner: TBD)
   - [x] Add `generated`, `expiryheight`, and `vJoinSplit` fields (C++ parity)
   - [x] Track wallet `time`/`timereceived` (persist first-seen timestamp)
@@ -237,12 +237,12 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index
   - [x] `keypoolrefill`
-  - [x] `addmultisigaddress` (partial; watch-only P2SH)
+  - [x] `addmultisigaddress` (partial; P2SH multisig; spendable when keys present)
   - [x] `settxfee` (partial)
   - [x] `signmessage`
   - [x] `backupwallet`
-  - [x] `fundrawtransaction` (P2PKH only)
-  - [x] `signrawtransaction` (P2PKH only)
+  - [x] `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs)
+  - [x] `signrawtransaction` (supports P2SH/multisig; may return incomplete signatures)
   - [x] `sendtoaddress` (P2PKH only; supports `subtractfeefromamount`)
   - [x] `sendmany` (P2PKH only; supports `subtractfeefrom`)
   - [x] `sendfrom` (fromaccount ignored; minconf supported)
@@ -371,7 +371,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `fundrawtransaction` (wallet funding uses P2PKH UTXOs only)<br>`signrawtransaction` (supports P2SH/multisig; may return incomplete signatures)<br>`estimatepriority` (returns -1.0) | - |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs; non-P2PKH inputs must be pre-signed)<br>`signrawtransaction` (supports P2SH/multisig; may return incomplete signatures)<br>`estimatepriority` (returns -1.0) | - |
 
 ### Mempool and relay
 

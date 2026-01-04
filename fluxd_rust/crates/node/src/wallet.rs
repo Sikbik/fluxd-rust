@@ -617,21 +617,55 @@ impl Wallet {
         Ok(Some(key.address(self.network)?))
     }
 
+    pub fn can_spend_script_pubkey(&self, script_pubkey: &[u8]) -> bool {
+        if let Some(key_hash) = p2pkh_key_hash_from_script_pubkey(script_pubkey) {
+            return self.has_key_hash(&key_hash);
+        }
+        let Some(script_hash) = p2sh_hash_from_script_pubkey(script_pubkey) else {
+            return false;
+        };
+        let Some(redeem_script) = self.redeem_scripts.get(&script_hash) else {
+            return false;
+        };
+        self.can_spend_redeem_script(redeem_script)
+    }
+
     pub fn all_script_pubkeys(&self) -> Result<Vec<Vec<u8>>, WalletError> {
-        let mut out = Vec::with_capacity(self.keys.len());
+        let mut out = Vec::with_capacity(self.keys.len() + self.redeem_scripts.len());
         for key in &self.keys {
             out.push(key.p2pkh_script_pubkey()?);
         }
+        for redeem_script in self.redeem_scripts.values() {
+            if !self.can_spend_redeem_script(redeem_script) {
+                continue;
+            }
+            out.push(p2sh_script_pubkey_from_redeem_script(redeem_script));
+        }
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 
     pub fn all_script_pubkeys_including_watchonly(&self) -> Result<Vec<Vec<u8>>, WalletError> {
         let mut out = self.all_script_pubkeys()?;
         out.extend(self.watch_scripts.iter().cloned());
+        for redeem_script in self.redeem_scripts.values() {
+            out.push(p2sh_script_pubkey_from_redeem_script(redeem_script));
+        }
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 
     pub fn script_pubkey_is_watchonly(&self, script_pubkey: &[u8]) -> bool {
+        if self.can_spend_script_pubkey(script_pubkey) {
+            return false;
+        }
+        if let Some(script_hash) = p2sh_hash_from_script_pubkey(script_pubkey) {
+            if self.redeem_scripts.contains_key(&script_hash) {
+                return true;
+            }
+        }
         self.watch_scripts
             .iter()
             .any(|spk| spk.as_slice() == script_pubkey)
@@ -1588,6 +1622,14 @@ impl Wallet {
                 out.push(key.p2pkh_script_pubkey()?);
             }
         }
+        for redeem_script in self.redeem_scripts.values() {
+            let script_pubkey = p2sh_script_pubkey_from_redeem_script(redeem_script);
+            if let Some(addr) = script_pubkey_to_address(&script_pubkey, self.network) {
+                if allow.contains(addr.as_str()) {
+                    out.push(script_pubkey);
+                }
+            }
+        }
         for script_pubkey in &self.watch_scripts {
             if let Some(addr) = script_pubkey_to_address(script_pubkey, self.network) {
                 if allow.contains(addr.as_str()) {
@@ -1595,6 +1637,8 @@ impl Wallet {
                 }
             }
         }
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 
@@ -2393,6 +2437,50 @@ struct SaplingScanKey {
 }
 
 impl Wallet {
+    fn has_key_hash(&self, key_hash: &[u8; 20]) -> bool {
+        self.keys.iter().any(|key| &key.key_hash == key_hash)
+            || self
+                .keypool
+                .iter()
+                .any(|entry| &entry.key.key_hash == key_hash)
+    }
+
+    fn has_pubkey(&self, target: &PublicKey) -> bool {
+        for key in &self.keys {
+            if wallet_key_matches_pubkey(key, target) {
+                return true;
+            }
+        }
+        for entry in &self.keypool {
+            if wallet_key_matches_pubkey(&entry.key, target) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn can_spend_redeem_script(&self, redeem_script: &[u8]) -> bool {
+        if let Some((required, pubkeys)) = parse_multisig_redeem_script_with_required(redeem_script)
+        {
+            let mut available = 0usize;
+            for pubkey in pubkeys {
+                if self.has_pubkey(&pubkey) {
+                    available = available.saturating_add(1);
+                    if available >= required {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        if let Some(key_hash) = p2pkh_key_hash_from_script_pubkey(redeem_script) {
+            return self.has_key_hash(&key_hash);
+        }
+
+        false
+    }
+
     fn sapling_scan_keys(&self) -> Result<Vec<SaplingScanKey>, WalletError> {
         let mut keys =
             Vec::with_capacity(self.sapling_keys.len() + self.sapling_viewing_keys.len());
@@ -2583,6 +2671,96 @@ fn p2sh_hash_from_script_pubkey(script_pubkey: &[u8]) -> Option<[u8; 20]> {
         return None;
     }
     script_pubkey.get(2..22)?.try_into().ok()
+}
+
+fn p2sh_script_pubkey_from_redeem_script(redeem_script: &[u8]) -> Vec<u8> {
+    let hash = hash160(redeem_script);
+    let mut script = Vec::with_capacity(23);
+    script.push(0xa9);
+    script.push(0x14);
+    script.extend_from_slice(&hash);
+    script.push(0x87);
+    script
+}
+
+fn wallet_key_matches_pubkey(key: &WalletKey, target: &PublicKey) -> bool {
+    if !key.pubkey_bytes.is_empty() {
+        let Ok(pubkey) = PublicKey::from_slice(&key.pubkey_bytes) else {
+            return false;
+        };
+        return &pubkey == target;
+    }
+    let Ok(secret) = key.secret_key() else {
+        return false;
+    };
+    let pubkey = PublicKey::from_secret_key(secp(), &secret);
+    &pubkey == target
+}
+
+fn decode_small_int_opcode(opcode: u8) -> Option<usize> {
+    match opcode {
+        0x00 => Some(0),
+        0x51..=0x60 => Some((opcode - 0x50) as usize),
+        _ => None,
+    }
+}
+
+fn parse_multisig_redeem_script_with_required(script: &[u8]) -> Option<(usize, Vec<PublicKey>)> {
+    const OP_CHECKMULTISIG: u8 = 0xae;
+    const OP_PUSHDATA1: u8 = 0x4c;
+    const OP_PUSHDATA2: u8 = 0x4d;
+    const OP_PUSHDATA4: u8 = 0x4e;
+
+    if script.len() < 3 {
+        return None;
+    }
+    if script.last().copied() != Some(OP_CHECKMULTISIG) {
+        return None;
+    }
+    let n = decode_small_int_opcode(*script.get(script.len().saturating_sub(2))?)?;
+    let m = decode_small_int_opcode(*script.first()?)?;
+    if m == 0 || n == 0 || m > n || n > 16 {
+        return None;
+    }
+
+    let mut pubkeys = Vec::new();
+    let mut cursor = 1usize;
+    let end = script.len().saturating_sub(2);
+    while cursor < end {
+        let opcode = *script.get(cursor)?;
+        let (len, advance) = match opcode {
+            len @ 1..=75 => (len as usize, 1usize),
+            OP_PUSHDATA1 => (*script.get(cursor + 1)? as usize, 2usize),
+            OP_PUSHDATA2 => {
+                let bytes: [u8; 2] = script.get(cursor + 1..cursor + 3)?.try_into().ok()?;
+                (u16::from_le_bytes(bytes) as usize, 3usize)
+            }
+            OP_PUSHDATA4 => {
+                let bytes: [u8; 4] = script.get(cursor + 1..cursor + 5)?.try_into().ok()?;
+                (u32::from_le_bytes(bytes) as usize, 5usize)
+            }
+            _ => return None,
+        };
+        cursor = cursor.saturating_add(advance);
+        if len != 33 && len != 65 {
+            return None;
+        }
+        let start = cursor;
+        let stop = start.saturating_add(len);
+        if stop > end {
+            return None;
+        }
+        let pubkey = PublicKey::from_slice(script.get(start..stop)?).ok()?;
+        pubkeys.push(pubkey);
+        cursor = stop;
+    }
+    if cursor != end {
+        return None;
+    }
+    if pubkeys.len() != n {
+        return None;
+    }
+    Some((m, pubkeys))
 }
 
 fn sapling_extfvk_from_extsk(extsk: &[u8; 169]) -> Result<[u8; 169], WalletError> {
