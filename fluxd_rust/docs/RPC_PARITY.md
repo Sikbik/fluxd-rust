@@ -119,7 +119,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - signrawtransaction - Partial (supports P2PKH and P2SH (multisig and P2PKH redeem scripts); uses wallet redeem scripts when available; supports `prevtxs[].redeemScript` and optional WIF override list)
 - addmultisigaddress - Partial (adds P2SH redeem script + watch script to the wallet; stores optional `account` label; P2SH outputs are marked spendable when enough keys are present)
 - backupwallet - Implemented
-- dumpwallet - Implemented (exports transparent keys; refuses to overwrite an existing file)
+- dumpwallet - Implemented (exports transparent keys; includes `label=` with C++-style percent encoding; refuses to overwrite an existing file)
 - encryptwallet - Implemented (encrypts wallet private keys in wallet.dat; wallet starts locked)
 - walletpassphrase - Implemented (temporarily unlocks an encrypted wallet)
 - walletpassphrasechange - Implemented
@@ -133,7 +133,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getwalletinfo - Implemented (C++ key set + conditional `unlocked_until`; balances derived from the address index; also returns `*_zat` fields for exact amounts)
 - importaddress - Implemented (watch-only; rescan ignored due to address index)
 - importprivkey - Implemented (rescan param accepted but ignored; address index makes it unnecessary)
-- importwallet - Partial (best-effort WIF import from dump file)
+- importwallet - Partial (imports WIFs from a wallet dump; also imports `label=` fields)
 - keypoolrefill - Implemented (fills persisted keypool; does not create addresses)
 - listaddressgroupings - Partial (clusters co-spent inputs + wallet-owned outputs; heuristic is index-driven vs C++ wallet internals)
 - listlockunspent - Implemented

@@ -23,6 +23,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P2] P2P tx relay polish (avoid re-requesting known orphans) (owner: TBD)
 - [x] [P1] RPC: `validateaddress` field parity (pubkey/iscompressed + P2SH redeem-script details) (owner: TBD)
 - [x] [P1] Wallet: address labels / `account` parity (store labels; surface in wallet RPCs) (owner: TBD)
+- [x] [P1] Wallet: preserve labels in `dumpwallet`/`importwallet` (EncodeDumpString parity) (owner: TBD)
 
 ## Completed (core)
 

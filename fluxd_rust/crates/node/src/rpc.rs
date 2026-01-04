@@ -1968,11 +1968,48 @@ fn rpc_importwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value,
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let Some(wif) = trimmed.split_whitespace().next() else {
-            continue;
-        };
+        let mut parts = trimmed.split_whitespace();
+        let Some(wif) = parts.next() else { continue };
+        let _timestamp = parts.next();
+
+        let mut label = None::<String>;
+        for token in parts {
+            if token == "#" {
+                break;
+            }
+            if let Some(encoded) = token.strip_prefix("label=") {
+                label = Some(crate::wallet::decode_wallet_dump_string(encoded));
+            }
+        }
+
         match guard.import_wif(wif) {
-            Ok(()) => imported += 1,
+            Ok(()) => {
+                imported += 1;
+                if let Some(label) = label.filter(|value| !value.is_empty()) {
+                    let (secret, compressed) = match wif_to_secret_key(wif, guard.network()) {
+                        Ok(decoded) => decoded,
+                        Err(_) => continue,
+                    };
+                    let secret_key = match SecretKey::from_slice(&secret) {
+                        Ok(key) => key,
+                        Err(_) => continue,
+                    };
+                    let pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &secret_key);
+                    let pubkey_bytes = if compressed {
+                        pubkey.serialize().to_vec()
+                    } else {
+                        pubkey.serialize_uncompressed().to_vec()
+                    };
+                    let key_hash = hash160(&pubkey_bytes);
+                    let mut script_pubkey = Vec::with_capacity(25);
+                    script_pubkey.extend_from_slice(&[0x76, 0xa9, 0x14]);
+                    script_pubkey.extend_from_slice(&key_hash);
+                    script_pubkey.extend_from_slice(&[0x88, 0xac]);
+                    guard
+                        .set_label_for_script_pubkey(script_pubkey, label)
+                        .map_err(map_wallet_error)?;
+                }
+            }
             Err(WalletError::InvalidData("invalid wif")) => continue,
             Err(err) => return Err(map_wallet_error(err)),
         }
@@ -19706,6 +19743,67 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, RPC_INVALID_PARAMETER);
         assert!(err.message.contains("Cannot overwrite existing file"));
+    }
+
+    #[test]
+    fn dumpwallet_exports_labels_and_importwallet_restores_them() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        rpc_keypoolrefill(&wallet, vec![json!(2)]).expect("rpc");
+        rpc_encryptwallet(&wallet, vec![json!("test-passphrase")]).expect("rpc");
+
+        let address = rpc_getnewaddress(&wallet, vec![json!("hello world")])
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        {
+            let mut guard = wallet.lock().expect("wallet lock");
+            guard
+                .walletpassphrase("test-passphrase", 60)
+                .expect("unlock wallet");
+        }
+
+        let dump_dir = temp_data_dir("fluxd-rpc-test-dumpwallet-labels");
+        std::fs::create_dir_all(&dump_dir).expect("create dump dir");
+        let dump_path = dump_dir.join("dumpwallet.txt");
+        let dump_string = dump_path.to_string_lossy().to_string();
+
+        let value = rpc_dumpwallet(&wallet, vec![json!(dump_string.clone())], &data_dir)
+            .expect("rpc")
+            .as_str()
+            .expect("path string")
+            .to_string();
+        assert_eq!(value, dump_string);
+
+        let contents = std::fs::read_to_string(&dump_path).expect("read dump");
+        let addr_marker = format!("# addr={address}");
+        let line = contents
+            .lines()
+            .find(|line| line.contains(addr_marker.as_str()))
+            .expect("wallet dump line for address");
+        assert!(
+            line.contains("label=hello%20world"),
+            "expected percent-encoded label in dumpwallet line: {line}"
+        );
+
+        let other_dir = temp_data_dir("fluxd-rpc-test-dumpwallet-labels-import");
+        std::fs::create_dir_all(&other_dir).expect("create import dir");
+        let wallet_b =
+            Mutex::new(Wallet::load_or_create(&other_dir, params.network).expect("wallet"));
+        rpc_importwallet(&wallet_b, vec![json!(dump_string)]).expect("rpc");
+
+        let ok =
+            rpc_validateaddress(&wallet_b, vec![Value::String(address)], &params).expect("rpc");
+        let obj = ok.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            obj.get("account").and_then(Value::as_str),
+            Some("hello world")
+        );
     }
 
     #[test]

@@ -132,17 +132,17 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `gettransaction <txid> [include_watchonly]`
 - `listtransactions [account] [count] [skip] [include_watchonly]` (partial)
 - `listsinceblock [blockhash] [target_confirmations] [include_watchonly]` (partial)
-- `addmultisigaddress <nrequired> <keys> [account]` (partial; adds a watch-only P2SH script)
+- `addmultisigaddress <nrequired> <keys> [account]` (partial; adds a P2SH redeem script + watch script; stores optional `account` label)
 - `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` (partial)
 - `keypoolrefill [newsize]` (partial)
 - `settxfee <amount>` (partial)
-- `getnewaddress [label]` (label ignored)
+- `getnewaddress [label]` (label stored as legacy `account`)
 - `getrawchangeaddress [address_type]` (partial; address_type ignored; marks address as internal change)
-- `importprivkey <wif> [label] [rescan]` (label accepted; rescan ignored)
-- `importwallet <filename>` (best-effort WIF import from dump file)
+- `importprivkey <wif> [label] [rescan]` (label stored; rescan ignored)
+- `importwallet <filename>` (imports WIFs and `label=` fields from a wallet dump)
 - `dumpprivkey <address>`
 - `backupwallet <destination>`
-- `dumpwallet <filename>` (exports transparent keys; refuses to overwrite an existing file)
+- `dumpwallet <filename>` (exports transparent keys with `label=`; refuses to overwrite an existing file)
 - `encryptwallet <passphrase>` (encrypts `wallet.dat` private keys; wallet starts locked)
 - `walletpassphrase <passphrase> <timeout>` (temporarily unlocks an encrypted wallet)
 - `walletpassphrasechange <oldpassphrase> <newpassphrase>`
@@ -349,6 +349,7 @@ Notes:
 
 Notes:
 - Writes a wallet dump compatible with the legacy `dumpwallet` format (transparent keys only).
+- Includes `label=<percent-encoded>` metadata (C++ `EncodeDumpString`-style) for labeled addresses.
 - Refuses to overwrite an existing file.
 
 ### encryptwallet

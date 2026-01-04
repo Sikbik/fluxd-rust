@@ -990,6 +990,7 @@ impl Wallet {
             address: String,
             wif: String,
             flag: TransparentDumpFlag,
+            label: String,
         }
 
         let mut out = String::new();
@@ -1003,12 +1004,24 @@ impl Wallet {
             let address = key.address(self.network)?;
             let wif = key.wif(self.network)?;
             let key_hash = key.p2pkh_key_hash()?;
+            let label = if let Ok(script_pubkey) = key.p2pkh_script_pubkey() {
+                self.label_for_script_pubkey(&script_pubkey)
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                String::new()
+            };
             let flag = if self.change_key_hashes.contains(&key_hash) {
                 TransparentDumpFlag::Change
             } else {
                 TransparentDumpFlag::Default
             };
-            transparent.push(TransparentDumpEntry { address, wif, flag });
+            transparent.push(TransparentDumpEntry {
+                address,
+                wif,
+                flag,
+                label,
+            });
         }
 
         for entry in &self.keypool {
@@ -1018,6 +1031,7 @@ impl Wallet {
                 address,
                 wif,
                 flag: TransparentDumpFlag::Reserve,
+                label: String::new(),
             });
         }
 
@@ -1025,9 +1039,11 @@ impl Wallet {
 
         for entry in transparent {
             let flag = match entry.flag {
-                TransparentDumpFlag::Reserve => "reserve=1",
-                TransparentDumpFlag::Change => "change=1",
-                TransparentDumpFlag::Default => "label=",
+                TransparentDumpFlag::Reserve => "reserve=1".to_string(),
+                TransparentDumpFlag::Change => "change=1".to_string(),
+                TransparentDumpFlag::Default => {
+                    format!("label={}", encode_wallet_dump_string(&entry.label))
+                }
             };
             out.push_str(&format!(
                 "{} {} {} # addr={}\n",
@@ -2847,6 +2863,59 @@ fn extract_p2pkh_hash(script_pubkey: &[u8]) -> Option<[u8; 20]> {
     let mut hash = [0u8; 20];
     hash.copy_from_slice(&script_pubkey[3..23]);
     Some(hash)
+}
+
+pub(crate) fn encode_wallet_dump_string(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        if *byte <= 32 || *byte >= 128 || *byte == b'%' {
+            out.push('%');
+            out.push(hex_nibble_to_char(byte >> 4));
+            out.push(hex_nibble_to_char(byte & 0x0f));
+        } else {
+            out.push(*byte as char);
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_wallet_dump_string(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte == b'%' && pos + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                decode_hex_digit(bytes[pos + 1]),
+                decode_hex_digit(bytes[pos + 2]),
+            ) {
+                out.push((hi << 4) | lo);
+                pos += 3;
+                continue;
+            }
+        }
+        out.push(byte);
+        pos += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble_to_char(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'A' + (nibble - 10)) as char,
+        _ => '0',
+    }
+}
+
+fn decode_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn current_unix_seconds() -> u64 {
