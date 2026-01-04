@@ -17,7 +17,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Add `generated`, `expiryheight`, and `vJoinSplit` fields (C++ parity)
   - [x] Track wallet `time`/`timereceived` (persist first-seen timestamp)
   - [x] Populate `walletconflicts` (conflicting/replaced txids)
-- [ ] [P1] Wallet: improve `listaddressgroupings` clustering parity (inputs + change) (owner: TBD)
+- [x] [P1] Wallet: improve `listaddressgroupings` clustering parity (inputs + change) (owner: TBD)
 - [x] [P2] P2P tx relay polish (avoid re-requesting known orphans) (owner: TBD)
 
 ## Completed (core)
@@ -213,7 +213,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `getrawchangeaddress`
   - [x] `getbalance`, `getunconfirmedbalance`, `listunspent`, `getwalletinfo` (partial fields)
   - [x] `lockunspent`, `listlockunspent`
-  - [x] `listaddressgroupings` (simplified grouping)
+  - [x] `listaddressgroupings` (groups co-spent inputs + wallet-owned outputs)
   - [x] `getreceivedbyaddress` (P2PKH only)
   - [x] `gettransaction` (partial)
     - [x] `include_watchonly` support

@@ -2145,39 +2145,227 @@ fn rpc_listaddressgroupings<S: fluxd_storage::KeyValueStore>(
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
         .all_script_pubkeys_including_watchonly()
         .map_err(map_wallet_error)?;
+    if scripts.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    #[derive(Clone)]
+    struct TxScriptGrouping {
+        inputs: HashSet<usize>,
+        outputs: HashSet<usize>,
+    }
+
+    struct UnionFind {
+        parent: Vec<usize>,
+        rank: Vec<u8>,
+    }
+
+    impl UnionFind {
+        fn new(size: usize) -> Self {
+            Self {
+                parent: (0..size).collect(),
+                rank: vec![0u8; size],
+            }
+        }
+
+        fn find(&mut self, idx: usize) -> usize {
+            let mut current = idx;
+            while self.parent[current] != current {
+                current = self.parent[current];
+            }
+            let root = current;
+            let mut current = idx;
+            while self.parent[current] != current {
+                let next = self.parent[current];
+                self.parent[current] = root;
+                current = next;
+            }
+            root
+        }
+
+        fn union(&mut self, a: usize, b: usize) {
+            let root_a = self.find(a);
+            let root_b = self.find(b);
+            if root_a == root_b {
+                return;
+            }
+            let rank_a = self.rank[root_a];
+            let rank_b = self.rank[root_b];
+            if rank_a < rank_b {
+                self.parent[root_a] = root_b;
+            } else if rank_a > rank_b {
+                self.parent[root_b] = root_a;
+            } else {
+                self.parent[root_b] = root_a;
+                self.rank[root_a] = rank_a.saturating_add(1);
+            }
+        }
+    }
+
+    let mut script_to_index: HashMap<Vec<u8>, usize> = HashMap::with_capacity(scripts.len());
+    let mut address_by_index: Vec<Option<String>> = Vec::with_capacity(scripts.len());
+    for (idx, script_pubkey) in scripts.iter().enumerate() {
+        script_to_index.insert(script_pubkey.clone(), idx);
+        address_by_index.push(script_pubkey_to_address(
+            script_pubkey,
+            chain_params.network,
+        ));
+    }
+
+    let mut dsu = UnionFind::new(scripts.len());
+
+    let mut tx_groupings: HashMap<Hash256, TxScriptGrouping> = HashMap::new();
+    for (idx, script_pubkey) in scripts.iter().enumerate() {
+        let mut visitor = |delta: fluxd_chainstate::address_deltas::AddressDeltaEntry| {
+            let grouping = tx_groupings
+                .entry(delta.txid)
+                .or_insert_with(|| TxScriptGrouping {
+                    inputs: HashSet::new(),
+                    outputs: HashSet::new(),
+                });
+            if delta.spending {
+                grouping.inputs.insert(idx);
+            } else {
+                grouping.outputs.insert(idx);
+            }
+            Ok(())
+        };
+        chainstate
+            .for_each_address_delta(script_pubkey, &mut visitor)
+            .map_err(map_internal)?;
+    }
+
+    for grouping in tx_groupings.values() {
+        if grouping.inputs.is_empty() {
+            continue;
+        }
+        let mut all = Vec::with_capacity(grouping.inputs.len() + grouping.outputs.len());
+        all.extend(grouping.inputs.iter().copied());
+        all.extend(grouping.outputs.iter().copied());
+        all.sort_unstable();
+        all.dedup();
+        if all.len() < 2 {
+            continue;
+        }
+        let first = all[0];
+        for other in &all[1..] {
+            dsu.union(first, *other);
+        }
+    }
+
+    if let Ok(mempool_guard) = mempool.lock() {
+        for entry in mempool_guard.entries() {
+            let mut touched: HashSet<usize> = HashSet::new();
+            for output in &entry.tx.vout {
+                if let Some(idx) = script_to_index.get(&output.script_pubkey) {
+                    touched.insert(*idx);
+                }
+            }
+            let prevouts = mempool_guard.prevouts_for_tx(&entry.tx);
+            for input in &entry.tx.vin {
+                let mut script_pubkey = None;
+                if let Ok(Some(utxo)) = chainstate.utxo_entry(&input.prevout) {
+                    script_pubkey = Some(utxo.script_pubkey);
+                } else if let Some(prev) = prevouts.get(&input.prevout) {
+                    script_pubkey = Some(prev.script_pubkey.clone());
+                } else if let Ok(Some(prev_location)) = chainstate.tx_location(&input.prevout.hash)
+                {
+                    if let Ok(prev_bytes) = chainstate.read_block(prev_location.block) {
+                        if let Ok(prev_block) = Block::consensus_decode(&prev_bytes) {
+                            let tx_index = prev_location.index as usize;
+                            let vout = input.prevout.index as usize;
+                            if let Some(prev_tx) = prev_block.transactions.get(tx_index) {
+                                if let Some(out) = prev_tx.vout.get(vout) {
+                                    script_pubkey = Some(out.script_pubkey.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let Some(script_pubkey) = script_pubkey else {
+                    continue;
+                };
+                if let Some(idx) = script_to_index.get(&script_pubkey) {
+                    touched.insert(*idx);
+                }
+            }
+
+            let mut all = touched.into_iter().collect::<Vec<_>>();
+            all.sort_unstable();
+            all.dedup();
+            if all.len() < 2 {
+                continue;
+            }
+            let first = all[0];
+            for other in &all[1..] {
+                dsu.union(first, *other);
+            }
+        }
+    }
 
     let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, true)?;
-    let mut totals: HashMap<Vec<u8>, i64> = HashMap::new();
+    let mut balances_zat: Vec<i64> = vec![0; scripts.len()];
     for row in utxos {
-        let entry = totals.entry(row.script_pubkey).or_insert(0);
-        *entry = entry
+        let Some(idx) = script_to_index.get(&row.script_pubkey) else {
+            continue;
+        };
+        balances_zat[*idx] = balances_zat[*idx]
             .checked_add(row.value)
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
     }
 
-    let mut entries: Vec<(String, i64)> = Vec::new();
-    for (script_pubkey, value) in totals {
+    let mut groups: HashMap<usize, Vec<(String, i64)>> = HashMap::new();
+    for (idx, value) in balances_zat.into_iter().enumerate() {
         if value <= 0 {
             continue;
         }
-        if let Some(address) = script_pubkey_to_address(&script_pubkey, chain_params.network) {
-            entries.push((address, value));
-        }
+        let Some(address) = address_by_index
+            .get(idx)
+            .and_then(|value| value.as_ref())
+            .cloned()
+        else {
+            continue;
+        };
+        let root = dsu.find(idx);
+        groups.entry(root).or_default().push((address, value));
     }
 
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(Value::Array(
-        entries
-            .into_iter()
-            .map(|(address, value)| {
-                Value::Array(vec![Value::Array(vec![
-                    Value::String(address),
-                    amount_to_value(value),
-                    Value::String(String::new()),
-                ])])
-            })
-            .collect(),
-    ))
+    let mut out_groups: Vec<Value> = Vec::new();
+    for mut entries in groups.into_values() {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        out_groups.push(Value::Array(
+            entries
+                .into_iter()
+                .map(|(address, value)| {
+                    Value::Array(vec![
+                        Value::String(address),
+                        amount_to_value(value),
+                        Value::String(String::new()),
+                    ])
+                })
+                .collect(),
+        ));
+    }
+    out_groups.sort_by(|a, b| {
+        let a_first = a
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let b_first = b
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        a_first.cmp(b_first)
+    });
+
+    Ok(Value::Array(out_groups))
 }
 
 fn map_wallet_error(err: WalletError) -> RpcError {
@@ -19215,6 +19403,248 @@ mod tests {
 
         assert_eq!(totals.get(&addr_a).copied(), Some(1 * COIN));
         assert_eq!(totals.get(&addr_b).copied(), Some(2 * COIN));
+    }
+
+    #[test]
+    fn listaddressgroupings_clusters_inputs_and_change() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_c = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let script_a = address_to_script_pubkey(&addr_a, params.network).expect("script a");
+        let script_b = address_to_script_pubkey(&addr_b, params.network).expect("script b");
+        let script_c = address_to_script_pubkey(&addr_c, params.network).expect("script c");
+
+        let a1 = OutPoint {
+            hash: [0xa1u8; 32],
+            index: 0,
+        };
+        let a2 = OutPoint {
+            hash: [0xa2u8; 32],
+            index: 0,
+        };
+        let b1 = OutPoint {
+            hash: [0xb1u8; 32],
+            index: 0,
+        };
+        let b2 = OutPoint {
+            hash: [0xb2u8; 32],
+            index: 0,
+        };
+
+        let mut batch = WriteBatch::new();
+        for (outpoint, value, script) in [
+            (a1.clone(), 1 * COIN, script_a.clone()),
+            (a2.clone(), 2 * COIN, script_a.clone()),
+            (b1.clone(), 1 * COIN, script_b.clone()),
+            (b2.clone(), 3 * COIN, script_b.clone()),
+        ] {
+            let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+                value,
+                script_pubkey: script.clone(),
+                height: 0,
+                is_coinbase: false,
+            };
+            let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+            let addr_key =
+                fluxd_chainstate::address_index::address_outpoint_key(&script, &outpoint)
+                    .expect("addr key");
+            batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+            batch.put(Column::AddressOutpoint, addr_key, []);
+        }
+        chainstate.commit_batch(batch).expect("commit utxos");
+
+        let spend_tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![
+                TxIn {
+                    prevout: a1.clone(),
+                    script_sig: Vec::new(),
+                    sequence: u32::MAX,
+                },
+                TxIn {
+                    prevout: b1.clone(),
+                    script_sig: Vec::new(),
+                    sequence: u32::MAX,
+                },
+            ],
+            vout: vec![
+                TxOut {
+                    value: 1 * COIN,
+                    script_pubkey: p2pkh_script([0x77u8; 20]),
+                },
+                TxOut {
+                    value: 1 * COIN,
+                    script_pubkey: script_c.clone(),
+                },
+            ],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let time = tip_entry.time.saturating_add(1);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let exchange_amount = exchange_fund_amount(height, &params.funding);
+        let foundation_amount = foundation_fund_amount(height, &params.funding);
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+        let mut vout = Vec::new();
+        vout.push(TxOut {
+            value: miner_value,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout.push(TxOut {
+                value: exchange_amount,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout.push(TxOut {
+                value: foundation_amount,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout.push(TxOut {
+                value: swap_amount,
+                script_pubkey: script,
+            });
+        }
+
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = fluxd_primitives::block::Block {
+            header,
+            transactions: vec![coinbase, spend_tx],
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let flags = ValidationFlags::default();
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                &params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+                None,
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let value = rpc_listaddressgroupings(&chainstate, &mempool, &wallet, Vec::new(), &params)
+            .expect("rpc");
+        let groups = value.as_array().expect("array");
+        assert_eq!(groups.len(), 1);
+
+        let entries = groups[0].as_array().expect("group array");
+        let mut grouped: HashMap<String, i64> = HashMap::new();
+        for entry in entries {
+            let arr = entry.as_array().expect("entry array");
+            let address = arr[0].as_str().expect("address").to_string();
+            let amount = parse_amount(&arr[1]).expect("amount");
+            grouped.insert(address, amount);
+        }
+
+        assert_eq!(grouped.get(&addr_a).copied(), Some(2 * COIN));
+        assert_eq!(grouped.get(&addr_b).copied(), Some(3 * COIN));
+        assert_eq!(grouped.get(&addr_c).copied(), Some(1 * COIN));
     }
 
     #[test]

@@ -135,7 +135,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - importprivkey - Implemented (rescan param accepted but ignored; address index makes it unnecessary)
 - importwallet - Partial (best-effort WIF import from dump file)
 - keypoolrefill - Implemented (fills persisted keypool; does not create addresses)
-- listaddressgroupings - Partial (simplified grouping)
+- listaddressgroupings - Partial (clusters co-spent inputs + wallet-owned outputs; heuristic is index-driven vs C++ wallet internals)
 - listlockunspent - Implemented
 - listreceivedbyaddress - Partial (transparent only; `include_watchonly` supported; `txids` populated; labels are WIP)
 - listsinceblock - Partial (transparent only; confirmed via address deltas; mempool included; `include_watchonly` supported; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
