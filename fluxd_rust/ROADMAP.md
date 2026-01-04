@@ -249,7 +249,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] `size` output (derived from `gettransaction.hex`, repeated per entry)
     - [x] Include wallet tx store entries not in chain/mempool (`confirmations=-1`)
     - [x] Include WalletTxToJSON fields (`walletconflicts`, `generated`, `expiryheight`, `vJoinSplit`, `comment`, `to`)
-  - [x] `listreceivedbyaddress` (partial)
+  - [x] `listreceivedbyaddress`
     - [x] `include_watchonly` support + `involvesWatchonly`
     - [x] Populate `txids` via address delta index
   - [x] `keypoolrefill`
@@ -429,7 +429,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill`<br>`getwalletinfo`<br>`sendfrom` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`getreceivedbyaddress`<br>`gettransaction`<br>`listtransactions`<br>`listsinceblock`<br>`listreceivedbyaddress`<br>`addmultisigaddress`<br>`settxfee`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany`<br>`importwallet`<br>`listaddressgroupings` | - |
+| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill`<br>`getwalletinfo`<br>`sendfrom`<br>`listreceivedbyaddress` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`getreceivedbyaddress`<br>`gettransaction`<br>`listtransactions`<br>`listsinceblock`<br>`addmultisigaddress`<br>`settxfee`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany`<br>`importwallet`<br>`listaddressgroupings` | - |
 
 ### Wallet (shielded)
 

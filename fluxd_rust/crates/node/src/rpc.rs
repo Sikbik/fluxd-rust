@@ -4927,7 +4927,7 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    let mut out = Vec::new();
+    let mut out: Vec<(i64, Value)> = Vec::new();
     for script_pubkey in &wallet_scripts {
         let Some(address) = script_pubkey_to_address(script_pubkey, chain_params.network) else {
             return Err(RpcError::new(
@@ -5004,24 +5004,24 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
             .get(script_pubkey)
             .cloned()
             .unwrap_or_default();
-        out.push(json!({
-            "involvesWatchonly": !owned_set.contains(script_pubkey),
-            "address": address,
-            "account": label.clone(),
-            "amount": amount_to_value(received_zat),
-            "confirmations": confirmations,
-            "label": label,
-            "txids": txids,
-            "amount_zat": received_zat,
-        }));
+        out.push((
+            received_zat,
+            json!({
+                "involvesWatchonly": !owned_set.contains(script_pubkey),
+                "address": address,
+                "account": label.clone(),
+                "amount": amount_to_value(received_zat),
+                "confirmations": confirmations,
+                "label": label,
+                "txids": txids,
+            }),
+        ));
     }
 
-    out.sort_by(|a, b| {
-        let a_amount = a.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
-        let b_amount = b.get("amount_zat").and_then(Value::as_i64).unwrap_or(0);
-        b_amount.cmp(&a_amount)
-    });
-    Ok(Value::Array(out))
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(Value::Array(
+        out.into_iter().map(|(_amount, row)| row).collect(),
+    ))
 }
 
 fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
@@ -22749,8 +22749,8 @@ mod tests {
         assert_eq!(row.get("account").and_then(Value::as_str), Some("label-a"));
         assert_eq!(row.get("label").and_then(Value::as_str), Some("label-a"));
         assert_eq!(
-            row.get("amount_zat").and_then(Value::as_i64),
-            Some(miner_value_a + miner_value_b)
+            row.get("amount"),
+            Some(&amount_to_value(miner_value_a + miner_value_b))
         );
         assert_eq!(row.get("confirmations").and_then(Value::as_i64), Some(1));
         let txids = row.get("txids").and_then(Value::as_array).expect("txids");
@@ -22775,10 +22775,7 @@ mod tests {
         );
         assert_eq!(row.get("account").and_then(Value::as_str), Some("label-a"));
         assert_eq!(row.get("label").and_then(Value::as_str), Some("label-a"));
-        assert_eq!(
-            row.get("amount_zat").and_then(Value::as_i64),
-            Some(miner_value_a)
-        );
+        assert_eq!(row.get("amount"), Some(&amount_to_value(miner_value_a)));
         assert_eq!(row.get("confirmations").and_then(Value::as_i64), Some(2));
         let txids = row.get("txids").and_then(Value::as_array).expect("txids");
         let expected_txid = hash256_to_hex(&txid_a);
@@ -22843,10 +22840,7 @@ mod tests {
             row.get("address").and_then(Value::as_str),
             Some(watch_address.as_str())
         );
-        assert_eq!(
-            row.get("amount_zat").and_then(Value::as_i64),
-            Some(miner_value)
-        );
+        assert_eq!(row.get("amount"), Some(&amount_to_value(miner_value)));
         assert_eq!(
             row.get("involvesWatchonly").and_then(Value::as_bool),
             Some(true)

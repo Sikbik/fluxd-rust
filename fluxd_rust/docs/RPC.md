@@ -133,7 +133,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `listtransactions [account] [count] [skip] [include_watchonly]` (partial)
 - `listsinceblock [blockhash] [target_confirmations] [include_watchonly]` (partial)
 - `addmultisigaddress <nrequired> <keys> [account]` (partial; adds a P2SH redeem script + watch script; stores optional `account` label)
-- `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]` (partial)
+- `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]`
 - `keypoolrefill [newsize]` (partial)
 - `settxfee <amount>` (partial)
 - `getnewaddress [label]` (label stored as legacy `account`)
@@ -461,7 +461,7 @@ Notes:
 
 ### listreceivedbyaddress
 
-- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (partial; `include_watchonly` is honored).
+- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (`include_watchonly` is honored).
 - Result: array of wallet addresses with received totals.
 
 Notes:
