@@ -451,20 +451,21 @@ Notes:
 
 ### addmultisigaddress
 
-- Params: `<nrequired> <keys> [account]` (partial; `account` must be `""` if provided).
+- Params: `<nrequired> <keys> [account]` (`account` is a legacy label, stored by the wallet).
 - Result: string (P2SH address).
 
 Notes:
 - `keys` entries may be hex public keys or P2PKH wallet addresses (the address must be present in the wallet).
-- Adds the resulting P2SH `scriptPubKey` to the wallet as watch-only (spending multisig outputs is not yet supported).
+- Adds the resulting P2SH redeem script + `scriptPubKey` to the wallet; `validateaddress`/`listunspent` can resolve the script as spendable when the wallet has enough keys.
 
 ### listreceivedbyaddress
 
-- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (partial; `include_watchonly` is honored; labels are WIP).
+- Params: `[minconf] [include_empty] [include_watchonly] [address_filter]` (partial; `include_watchonly` is honored).
 - Result: array of wallet addresses with received totals.
 
 Notes:
 - `txids` is derived from the address delta index (and includes mempool txids when `minconf=0`).
+- `account`/`label` reflect the wallet address label set via `getnewaddress`/`importaddress`/`addmultisigaddress`.
 
 ### keypoolrefill
 
@@ -646,6 +647,7 @@ Notes:
 
 Notes:
 - `ismine` is true when the wallet has a private key for the address; `iswatchonly` is true for imported watch-only scripts (e.g., `importaddress` / `addmultisigaddress`).
+- Wallet-known addresses include `account` (legacy label); for unlabeled wallet addresses this is an empty string.
 - Wallet-owned P2PKH addresses include `pubkey` and `iscompressed`.
 - For P2SH addresses with a known redeem script (e.g., created via `addmultisigaddress`), includes `script`, `hex` (redeem script), `addresses`, and `sigsrequired` (for multisig).
 

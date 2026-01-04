@@ -1922,11 +1922,22 @@ fn rpc_importaddress(
         })?,
     };
 
-    wallet
+    let label = params
+        .get(1)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut guard = wallet
         .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .import_watch_script_pubkey(script_pubkey)
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    guard
+        .import_watch_script_pubkey(script_pubkey.clone())
         .map_err(map_wallet_error)?;
+    if !label.is_empty() {
+        guard
+            .set_label_for_script_pubkey(script_pubkey, label)
+            .map_err(map_wallet_error)?;
+    }
 
     Ok(Value::Null)
 }
@@ -2532,10 +2543,22 @@ fn rpc_getnewaddress(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
             ));
         }
     }
+    let label = params
+        .get(0)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
     let address = guard.generate_new_address(true).map_err(map_wallet_error)?;
+    if !label.is_empty() {
+        let script_pubkey = address_to_script_pubkey(&address, guard.network())
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid wallet address encoding"))?;
+        guard
+            .set_label_for_script_pubkey(script_pubkey, label)
+            .map_err(map_wallet_error)?;
+    }
     Ok(Value::String(address))
 }
 
@@ -2590,10 +2613,35 @@ fn rpc_importprivkey(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
         }
     }
 
+    let label = params
+        .get(1)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
     guard.import_wif(wif).map_err(map_wallet_error)?;
+    if !label.is_empty() {
+        let (secret, compressed) = wif_to_secret_key(wif, guard.network())
+            .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key"))?;
+        let secret_key = SecretKey::from_slice(&secret)
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "Invalid private key"))?;
+        let pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &secret_key);
+        let pubkey_bytes = if compressed {
+            pubkey.serialize().to_vec()
+        } else {
+            pubkey.serialize_uncompressed().to_vec()
+        };
+        let key_hash = hash160(&pubkey_bytes);
+        let mut script_pubkey = Vec::with_capacity(25);
+        script_pubkey.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        script_pubkey.extend_from_slice(&key_hash);
+        script_pubkey.extend_from_slice(&[0x88, 0xac]);
+        guard
+            .set_label_for_script_pubkey(script_pubkey, label)
+            .map_err(map_wallet_error)?;
+    }
     Ok(Value::Null)
 }
 
@@ -3052,6 +3100,7 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
     let (
         wallet_scripts,
         owned_set,
+        script_labels,
         change_key_hashes,
         tx_received_at,
         wallet_tx_raw,
@@ -3065,29 +3114,32 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
         let tx_received_at = guard.tx_received_time(&txid);
         let wallet_tx_raw = guard.transaction_bytes(&txid).map(|bytes| bytes.to_vec());
         let wallet_tx_values = guard.transaction_values(&txid).cloned();
-        if include_watchonly {
+        let (scripts, owned_set) = if include_watchonly {
             let scripts = guard
                 .all_script_pubkeys_including_watchonly()
                 .map_err(map_wallet_error)?;
             let owned_set = owned_scripts.into_iter().collect::<HashSet<_>>();
-            (
-                scripts,
-                Some(owned_set),
-                change_key_hashes,
-                tx_received_at,
-                wallet_tx_raw,
-                wallet_tx_values,
-            )
+            (scripts, Some(owned_set))
         } else {
-            (
-                owned_scripts,
-                None,
-                change_key_hashes,
-                tx_received_at,
-                wallet_tx_raw,
-                wallet_tx_values,
-            )
+            (owned_scripts, None)
+        };
+
+        let mut script_labels = HashMap::new();
+        for script_pubkey in &scripts {
+            if let Some(label) = guard.label_for_script_pubkey(script_pubkey) {
+                script_labels.insert(script_pubkey.clone(), label.to_string());
+            }
         }
+
+        (
+            scripts,
+            owned_set,
+            script_labels,
+            change_key_hashes,
+            tx_received_at,
+            wallet_tx_raw,
+            wallet_tx_values,
+        )
     };
     if wallet_scripts.is_empty() {
         return Err(RpcError::new(
@@ -3239,7 +3291,15 @@ fn rpc_gettransaction<S: fluxd_storage::KeyValueStore>(
                                 "invalid wallet script_pubkey",
                             ))?;
                     let mut row = serde_json::Map::new();
-                    row.insert("account".to_string(), Value::String(String::new()));
+                    row.insert(
+                        "account".to_string(),
+                        Value::String(
+                            script_labels
+                                .get(&output.script_pubkey)
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    );
                     if involves_watchonly || script_is_watchonly(&output.script_pubkey) {
                         row.insert("involvesWatchonly".to_string(), Value::Bool(true));
                     }
@@ -4724,7 +4784,7 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
     }
     .filter(|s| !s.is_empty());
 
-    let (wallet_scripts, owned_scripts) = {
+    let (wallet_scripts, owned_scripts, script_labels) = {
         let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -4736,7 +4796,13 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
         } else {
             owned_scripts.clone()
         };
-        (wallet_scripts, owned_scripts)
+        let mut script_labels = HashMap::new();
+        for script_pubkey in &wallet_scripts {
+            if let Some(label) = guard.label_for_script_pubkey(script_pubkey) {
+                script_labels.insert(script_pubkey.clone(), label.to_string());
+            }
+        }
+        (wallet_scripts, owned_scripts, script_labels)
     };
     if wallet_scripts.is_empty() {
         return Ok(Value::Array(Vec::new()));
@@ -4848,13 +4914,17 @@ fn rpc_listreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
                 .unwrap_or(0) as i32
         };
 
+        let label = script_labels
+            .get(script_pubkey)
+            .cloned()
+            .unwrap_or_default();
         out.push(json!({
             "involvesWatchonly": !owned_set.contains(script_pubkey),
             "address": address,
-            "account": "",
+            "account": label.clone(),
             "amount": amount_to_value(received_zat),
             "confirmations": confirmations,
-            "label": "",
+            "label": label,
             "txids": txids,
             "amount_zat": received_zat,
         }));
@@ -8123,7 +8193,7 @@ fn rpc_validateaddress(
         }
     };
 
-    let (ismine, iswatchonly, pubkey, redeem_script) = {
+    let (ismine, iswatchonly, pubkey, redeem_script, account) = {
         let wallet_guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -8133,11 +8203,19 @@ fn rpc_validateaddress(
         } else {
             wallet_guard.script_pubkey_is_watchonly(&script_pubkey)
         };
+        let stored_label = wallet_guard
+            .label_for_script_pubkey(&script_pubkey)
+            .map(|label| label.to_string());
+        let account = if ismine || iswatchonly {
+            Some(stored_label.clone().unwrap_or_default())
+        } else {
+            stored_label
+        };
         let pubkey = wallet_guard
             .pubkey_bytes_for_p2pkh_script_pubkey(&script_pubkey)
             .map_err(map_wallet_error)?;
         let redeem_script = wallet_guard.redeem_script_for_p2sh_script_pubkey(&script_pubkey);
-        (ismine, iswatchonly, pubkey, redeem_script)
+        (ismine, iswatchonly, pubkey, redeem_script, account)
     };
 
     let isscript = matches!(
@@ -8155,6 +8233,9 @@ fn rpc_validateaddress(
     out.insert("ismine".to_string(), Value::Bool(ismine));
     out.insert("iswatchonly".to_string(), Value::Bool(iswatchonly));
     out.insert("isscript".to_string(), Value::Bool(isscript));
+    if let Some(account) = account {
+        out.insert("account".to_string(), Value::String(account));
+    }
 
     if let Some(pubkey) = pubkey {
         out.insert("pubkey".to_string(), Value::String(hex_bytes(&pubkey)));
@@ -8333,14 +8414,13 @@ fn rpc_addmultisigaddress(
         ));
     }
 
-    if let Some(value) = params.get(2) {
-        let account = value
+    let label = match params.get(2) {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => value
             .as_str()
-            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "account must be a string"))?;
-        if !account.is_empty() {
-            return Err(RpcError::new(RPC_INVALID_PARAMETER, "Invalid parameter"));
-        }
-    }
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "account must be a string"))?
+            .to_string(),
+    };
 
     let mut wallet_guard = wallet
         .lock()
@@ -8391,8 +8471,13 @@ fn rpc_addmultisigaddress(
         .import_redeem_script(redeem_script)
         .map_err(map_wallet_error)?;
     wallet_guard
-        .import_watch_script_pubkey(script_pubkey)
+        .import_watch_script_pubkey(script_pubkey.clone())
         .map_err(map_wallet_error)?;
+    if !label.is_empty() {
+        wallet_guard
+            .set_label_for_script_pubkey(script_pubkey, label)
+            .map_err(map_wallet_error)?;
+    }
 
     Ok(Value::String(address))
 }
@@ -16834,6 +16919,24 @@ mod tests {
         assert_eq!(obj.get("ismine").and_then(Value::as_bool), Some(true));
         assert_eq!(obj.get("iswatchonly").and_then(Value::as_bool), Some(false));
         assert_eq!(obj.get("isscript").and_then(Value::as_bool), Some(false));
+        assert_eq!(obj.get("account").and_then(Value::as_str), Some(""));
+    }
+
+    #[test]
+    fn validateaddress_returns_account_label_for_labeled_wallet_address() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr = rpc_getnewaddress(&wallet, vec![json!("label-a")])
+            .expect("rpc")
+            .as_str()
+            .expect("string")
+            .to_string();
+
+        let ok = rpc_validateaddress(&wallet, vec![Value::String(addr)], &params).expect("rpc");
+        let obj = ok.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(obj.get("account").and_then(Value::as_str), Some("label-a"));
     }
 
     #[test]
@@ -16919,6 +17022,42 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(got_addresses, expected);
+    }
+
+    #[test]
+    fn validateaddress_reports_account_for_labeled_multisig_script() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let p2sh_address = rpc_addmultisigaddress(
+            &wallet,
+            vec![json!(2), json!([addr_a, addr_b]), json!("multisig-label")],
+            &params,
+        )
+        .expect("rpc")
+        .as_str()
+        .expect("p2sh address")
+        .to_string();
+
+        let ok =
+            rpc_validateaddress(&wallet, vec![Value::String(p2sh_address)], &params).expect("rpc");
+        let obj = ok.as_object().expect("object");
+        assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            obj.get("account").and_then(Value::as_str),
+            Some("multisig-label")
+        );
     }
 
     #[test]
@@ -22322,7 +22461,7 @@ mod tests {
     fn listreceivedbyaddress_reports_wallet_receives() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
-        let address = rpc_getnewaddress(&wallet, Vec::new())
+        let address = rpc_getnewaddress(&wallet, vec![json!("label-a")])
             .expect("rpc")
             .as_str()
             .expect("address string")
@@ -22347,6 +22486,8 @@ mod tests {
             row.get("address").and_then(Value::as_str),
             Some(address.as_str())
         );
+        assert_eq!(row.get("account").and_then(Value::as_str), Some("label-a"));
+        assert_eq!(row.get("label").and_then(Value::as_str), Some("label-a"));
         assert_eq!(
             row.get("amount_zat").and_then(Value::as_i64),
             Some(miner_value_a + miner_value_b)
@@ -22372,6 +22513,8 @@ mod tests {
             row.get("address").and_then(Value::as_str),
             Some(address.as_str())
         );
+        assert_eq!(row.get("account").and_then(Value::as_str), Some("label-a"));
+        assert_eq!(row.get("label").and_then(Value::as_str), Some("label-a"));
         assert_eq!(
             row.get("amount_zat").and_then(Value::as_i64),
             Some(miner_value_a)

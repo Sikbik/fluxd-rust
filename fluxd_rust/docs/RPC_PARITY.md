@@ -70,7 +70,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - createmultisig - Implemented (accepts Flux addresses or hex pubkeys; wallet lookup works while locked)
 - estimatefee - Implemented
 - estimatepriority - Stub (returns -1.0; priority estimator not implemented)
-- validateaddress - Implemented (includes `pubkey`/`iscompressed` for wallet-owned P2PKH; includes redeem-script details for known P2SH/multisig scripts)
+- validateaddress - Implemented (includes `pubkey`/`iscompressed` for wallet-owned P2PKH; includes `account` label for wallet-known scripts; includes redeem-script details for known P2SH/multisig scripts)
 - verifymessage - Implemented
 
 ## Extra queries
@@ -117,7 +117,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Wallet
 
 - signrawtransaction - Partial (supports P2PKH and P2SH (multisig and P2PKH redeem scripts); uses wallet redeem scripts when available; supports `prevtxs[].redeemScript` and optional WIF override list)
-- addmultisigaddress - Partial (adds a watch-only P2SH script; spending multisig outputs is not yet supported)
+- addmultisigaddress - Partial (adds P2SH redeem script + watch script to the wallet; stores optional `account` label; P2SH outputs are marked spendable when enough keys are present)
 - backupwallet - Implemented
 - dumpwallet - Implemented (exports transparent keys; refuses to overwrite an existing file)
 - encryptwallet - Implemented (encrypts wallet private keys in wallet.dat; wallet starts locked)
@@ -137,7 +137,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - keypoolrefill - Implemented (fills persisted keypool; does not create addresses)
 - listaddressgroupings - Partial (clusters co-spent inputs + wallet-owned outputs; heuristic is index-driven vs C++ wallet internals)
 - listlockunspent - Implemented
-- listreceivedbyaddress - Partial (transparent only; `include_watchonly` supported; `txids` populated; labels are WIP)
+- listreceivedbyaddress - Partial (transparent only; `include_watchonly` supported; `txids` populated; `account`/`label` populated from wallet address labels)
 - listsinceblock - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `include_watchonly` supported; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
 - listtransactions - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `include_watchonly` supported; ordered oldest → newest; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
 - listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; includes `redeemScript` for known P2SH; excludes locked coins like C++)

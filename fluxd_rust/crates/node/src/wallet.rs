@@ -43,7 +43,7 @@ use zeroize::Zeroize;
 
 pub const WALLET_FILE_NAME: &str = "wallet.dat";
 
-pub const WALLET_FILE_VERSION: u32 = 15;
+pub const WALLET_FILE_VERSION: u32 = 16;
 
 const WALLET_DUMP_EPOCH: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_KEYPOOL_SIZE: usize = 100;
@@ -276,6 +276,7 @@ pub struct Wallet {
     keys: Vec<WalletKey>,
     watch_scripts: Vec<Vec<u8>>,
     redeem_scripts: BTreeMap<[u8; 20], Vec<u8>>,
+    address_labels: BTreeMap<Vec<u8>, String>,
     tx_history: BTreeSet<Hash256>,
     tx_received_at: BTreeMap<Hash256, u64>,
     tx_store: BTreeMap<Hash256, Vec<u8>>,
@@ -313,6 +314,7 @@ impl Wallet {
                 keys: Vec::new(),
                 watch_scripts: Vec::new(),
                 redeem_scripts: BTreeMap::new(),
+                address_labels: BTreeMap::new(),
                 tx_history: BTreeSet::new(),
                 tx_received_at: BTreeMap::new(),
                 tx_store: BTreeMap::new(),
@@ -341,6 +343,60 @@ impl Wallet {
 
     pub fn pay_tx_fee_per_kb(&self) -> i64 {
         self.pay_tx_fee_per_kb
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    pub fn label_for_script_pubkey(&self, script_pubkey: &[u8]) -> Option<&str> {
+        self.address_labels
+            .get(script_pubkey)
+            .map(|label| label.as_str())
+    }
+
+    pub fn set_label_for_script_pubkey(
+        &mut self,
+        script_pubkey: Vec<u8>,
+        label: String,
+    ) -> Result<(), WalletError> {
+        if label.is_empty() {
+            let prev = self.address_labels.remove(script_pubkey.as_slice());
+            if prev.is_none() {
+                return Ok(());
+            }
+            if let Err(err) = self.save() {
+                if let Some(prev) = prev {
+                    self.address_labels.insert(script_pubkey, prev);
+                }
+                return Err(err);
+            }
+            self.revision = self.revision.saturating_add(1);
+            return Ok(());
+        }
+
+        if self
+            .address_labels
+            .get(script_pubkey.as_slice())
+            .is_some_and(|existing| existing == &label)
+        {
+            return Ok(());
+        }
+
+        let prev = self.address_labels.insert(script_pubkey.clone(), label);
+        if let Err(err) = self.save() {
+            match prev {
+                Some(prev) => {
+                    self.address_labels.insert(script_pubkey, prev);
+                }
+                None => {
+                    self.address_labels.remove(script_pubkey.as_slice());
+                }
+            }
+            return Err(err);
+        }
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -2115,6 +2171,7 @@ impl Wallet {
                 keys,
                 watch_scripts,
                 redeem_scripts: BTreeMap::new(),
+                address_labels: BTreeMap::new(),
                 tx_history,
                 tx_received_at: BTreeMap::new(),
                 tx_store: BTreeMap::new(),
@@ -2388,6 +2445,25 @@ impl Wallet {
             sapling_witnesses.insert((txid, out_index), witness);
         }
 
+        let label_count = if version >= 16 {
+            decoder.read_varint()?
+        } else {
+            0
+        };
+        let label_count = usize::try_from(label_count)
+            .map_err(|_| WalletError::InvalidData("wallet label count too large"))?;
+        let mut address_labels = BTreeMap::new();
+        for _ in 0..label_count {
+            let script_pubkey = decoder.read_var_bytes()?;
+            let label_bytes = decoder.read_var_bytes()?;
+            let label = String::from_utf8(label_bytes)
+                .map_err(|_| WalletError::InvalidData("invalid wallet label encoding"))?;
+            if label.is_empty() {
+                continue;
+            }
+            address_labels.insert(script_pubkey, label);
+        }
+
         let secrets_payload = decoder.read_var_bytes()?;
 
         if !decoder.is_empty() {
@@ -2400,6 +2476,7 @@ impl Wallet {
             keys,
             watch_scripts,
             redeem_scripts,
+            address_labels,
             tx_history,
             tx_received_at,
             tx_store,
@@ -2562,6 +2639,12 @@ impl Wallet {
             write_incremental_witness(witness, &mut bytes)
                 .map_err(|_| WalletError::InvalidData("invalid sapling witness state"))?;
             encoder.write_var_bytes(&bytes);
+        }
+
+        encoder.write_varint(self.address_labels.len() as u64);
+        for (script_pubkey, label) in &self.address_labels {
+            encoder.write_var_bytes(script_pubkey);
+            encoder.write_var_bytes(label.as_bytes());
         }
 
         let mut secrets_payload = if encrypted_flag {
