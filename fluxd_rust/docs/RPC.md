@@ -150,7 +150,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `signmessage <address> <message>`
 - `getbalance [account] [minconf] [include_watchonly]` (partial)
 - `getunconfirmedbalance`
-- `getreceivedbyaddress <address> [minconf]` (partial)
+- `getreceivedbyaddress <address> [minconf]`
 - `listunspent [minconf] [maxconf] [addresses]` (partial)
 - `sendtoaddress <address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
 - `sendmany <fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]` (partial)
@@ -394,10 +394,11 @@ Notes:
 
 ### getreceivedbyaddress
 
-- Params: `<address> [minconf]` (partial; P2PKH wallet addresses only).
+- Params: `<address> [minconf]`.
 - Result: total amount received by the address with at least `minconf` confirmations.
 
 Notes:
+- The address must be present in the wallet (owned, multisig, or watch-only), matching `fluxd` behavior.
 - If `minconf=0`, includes mempool outputs paying to the address.
 
 ### gettransaction

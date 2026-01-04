@@ -21087,6 +21087,47 @@ mod tests {
     }
 
     #[test]
+    fn getreceivedbyaddress_counts_p2sh_wallet_receives() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let key_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let key_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let multisig =
+            rpc_addmultisigaddress(&wallet, vec![json!(2), json!([key_a, key_b])], &params)
+                .expect("rpc")
+                .as_str()
+                .expect("p2sh address string")
+                .to_string();
+
+        let script_pubkey =
+            address_to_script_pubkey(&multisig, params.network).expect("address script");
+        let (_txid, _vout, height, miner_value) =
+            mine_regtest_block_to_script(&chainstate, &params, script_pubkey);
+        assert_eq!(height, 1);
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let received = rpc_getreceivedbyaddress(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!(multisig)],
+            &params,
+        )
+        .expect("rpc");
+        assert_eq!(parse_amount(&received).expect("amount"), miner_value);
+    }
+
+    #[test]
     fn gettransaction_reports_confirmed_wallet_tx() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
