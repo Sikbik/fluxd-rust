@@ -68,6 +68,9 @@ impl std::fmt::Display for MempoolError {
 
 impl std::error::Error for MempoolError {}
 
+const MEMPOOL_HEIGHT: u32 = 0x7fff_ffff;
+const MAX_PRIORITY: f64 = 1e16;
+
 pub struct MempoolEntry {
     pub txid: Hash256,
     pub tx: Transaction,
@@ -75,6 +78,9 @@ pub struct MempoolEntry {
     pub time: u64,
     pub height: i32,
     pub fee: i64,
+    pub value_in: i64,
+    pub modified_size: usize,
+    pub priority: f64,
     pub fee_delta: i64,
     pub priority_delta: f64,
     pub spent_outpoints: Vec<OutPoint>,
@@ -88,6 +94,20 @@ impl MempoolEntry {
 
     pub fn modified_fee(&self) -> i64 {
         self.fee.saturating_add(self.fee_delta)
+    }
+
+    pub fn starting_priority(&self) -> f64 {
+        self.priority + self.priority_delta
+    }
+
+    pub fn current_priority(&self, current_height: i32) -> f64 {
+        if self.modified_size == 0 {
+            return self.starting_priority();
+        }
+        let delta = current_height.saturating_sub(self.height).max(0) as f64;
+        let value_in = self.value_in.max(0) as f64;
+        let increased = delta * value_in / (self.modified_size as f64);
+        (self.priority + increased + self.priority_delta).min(MAX_PRIORITY)
     }
 }
 
@@ -759,7 +779,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
                     value: prevout.value,
                     script_pubkey: prevout.script_pubkey.clone(),
                     is_coinbase: false,
-                    height: 0,
+                    height: MEMPOOL_HEIGHT,
                 }),
         };
 
@@ -874,6 +894,27 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
     }
     let fee = value_in - value_out;
 
+    let modified_size = calculate_modified_size(&tx, raw.len());
+    let priority = if tx_needs_shielded(&tx) {
+        MAX_PRIORITY
+    } else if modified_size == 0 {
+        0.0
+    } else {
+        let best_height_u32 = u32::try_from(best_height.max(0)).unwrap_or(0);
+        let mut inputs_priority = 0.0;
+        for input in &tx.vin {
+            let previnfo = previnfos.get(&input.prevout).ok_or_else(|| {
+                MempoolError::new(MempoolErrorKind::Internal, "missing prevout info")
+            })?;
+            if previnfo.height >= best_height_u32 {
+                continue;
+            }
+            let age = best_height_u32.saturating_sub(previnfo.height);
+            inputs_priority += (previnfo.value.max(0) as f64) * (age as f64);
+        }
+        (inputs_priority / (modified_size as f64)).min(MAX_PRIORITY)
+    };
+
     if limit_free {
         let size = raw.len();
         let min_relay_fee = policy.min_relay_fee_for_size(size);
@@ -917,6 +958,9 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
         time: now,
         height: best_height,
         fee,
+        value_in,
+        modified_size,
+        priority,
         fee_delta: 0,
         priority_delta: 0.0,
         spent_outpoints,
@@ -1365,6 +1409,17 @@ fn tx_shielded_value_in(tx: &Transaction) -> Result<i64, MempoolError> {
     Ok(total)
 }
 
+fn calculate_modified_size(tx: &Transaction, tx_size: usize) -> usize {
+    let mut size = tx_size;
+    for input in &tx.vin {
+        let offset = 41usize.saturating_add(110usize.min(input.script_sig.len()));
+        if size > offset {
+            size = size.saturating_sub(offset);
+        }
+    }
+    size
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1588,6 +1643,9 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            value_in: 0,
+            modified_size: 0,
+            priority: 0.0,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -1610,6 +1668,9 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            value_in: 0,
+            modified_size: 0,
+            priority: 0.0,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: vec![parent_outpoint],
@@ -1655,6 +1716,9 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            value_in: 0,
+            modified_size: 0,
+            priority: 0.0,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -1677,6 +1741,9 @@ mod tests {
             time: 0,
             height: 0,
             fee: 0,
+            value_in: 0,
+            modified_size: 0,
+            priority: 0.0,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: vec![parent_outpoint],

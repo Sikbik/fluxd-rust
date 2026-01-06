@@ -78,7 +78,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Capture throughput stats (8-core mainnet: default worker auto-split yields ~120–150 b/s typical; shielded proof verification is the primary limiter)
 - [x] [P1] RPC parity expansion (see detailed checklist below) (owner: TBD)
   - [x] `getrawmempool(true)` populates `depends` (mempool parents)
-  - [x] `estimatepriority` (returns -1.0)
+  - [x] `estimatepriority` (mempool-based estimate; returns -1.0 when insufficient samples are available)
   - [x] `getbenchmarks`/`getbenchstatus` + `startbenchmark`/`stopbenchmark` (fluxbenchd proxy)
   - [x] `zcbenchmark sleep` (other benchmark types TBD)
   - [x] `zcrawjoinsplit`/`zcrawreceive`
@@ -387,7 +387,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs; non-P2PKH inputs must be pre-signed)<br>`signrawtransaction` (supports P2SH/multisig; may return incomplete signatures)<br>`estimatepriority` (returns -1.0) | - |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs; non-P2PKH inputs must be pre-signed)<br>`signrawtransaction` (supports P2SH/multisig; may return incomplete signatures)<br>`estimatepriority` (mempool-based; returns -1.0 when insufficient samples are available) | - |
 
 ### Mempool and relay
 

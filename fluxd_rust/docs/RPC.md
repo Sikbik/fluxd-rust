@@ -216,7 +216,7 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 - `getlocalsolps` (reports local POW header validation throughput; returns 0.0 when idle)
 - `prioritisetransaction <txid> <priority_delta> <fee_delta_sat>` (mining selection hint)
 - `estimatefee <nblocks>`
-- `estimatepriority <nblocks>` (returns -1.0; priority estimator not implemented)
+- `estimatepriority <nblocks>` (estimated priority for a zero-fee tx; returns `-1.0` when insufficient samples are available)
 
 ### Fluxnode
 
@@ -926,7 +926,12 @@ Estimates the approximate priority a zero-fee transaction needs to begin confirm
 
 - Params: `nblocks` (numeric).
 - Result: numeric priority estimate.
-  - Currently returns `-1.0` (priority estimator not implemented).
+  - Returns `-1.0` when insufficient data is available.
+
+Notes:
+- This is currently based on the distribution of `currentpriority` for fee-free mempool transactions
+  (excluding fluxnode txs and txs with unconfirmed parents).
+- Returns `-1.0` for `nblocks > 25` (matching C++ `fluxd`'s `MAX_BLOCK_CONFIRMS` limit).
 
 ### prioritisetransaction
 
