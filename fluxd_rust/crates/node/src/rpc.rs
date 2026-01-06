@@ -9564,15 +9564,32 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
                 "transaction has duplicate inputs",
             ));
         }
-        let prevout = resolve_prevout_info(chainstate, mempool, &input.prevout, &base_prevtxs)?
+        let mut prevout = resolve_prevout_info(chainstate, mempool, &input.prevout, &base_prevtxs)?
             .ok_or_else(|| RpcError::new(RPC_TRANSACTION_ERROR, "Missing inputs"))?;
-        if classify_script_pubkey(&prevout.script_pubkey) != ScriptType::P2Pkh
-            && input.script_sig.is_empty()
-        {
-            return Err(RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "fundrawtransaction only supports unsigned P2PKH inputs",
-            ));
+
+        if input.script_sig.is_empty() {
+            match classify_script_pubkey(&prevout.script_pubkey) {
+                ScriptType::P2Pkh => {}
+                ScriptType::P2Sh => {
+                    let redeem_script = wallet
+                        .lock()
+                        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+                        .redeem_script_for_p2sh_script_pubkey(&prevout.script_pubkey);
+                    if redeem_script.is_none() {
+                        return Err(RpcError::new(
+                            RPC_INVALID_PARAMETER,
+                            "fundrawtransaction requires redeemScript for unsigned P2SH inputs",
+                        ));
+                    }
+                    prevout.redeem_script = redeem_script;
+                }
+                _ => {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "fundrawtransaction only supports unsigned P2PKH inputs",
+                    ))
+                }
+            }
         }
         base_inputs_value = base_inputs_value
             .checked_add(prevout.value)
@@ -20194,6 +20211,92 @@ mod tests {
         assert_eq!(err.code, RPC_WALLET_ERROR);
 
         rpc_lockunspent(&wallet, vec![json!(true)]).expect("rpc unlockall");
+
+        let value = rpc_fundrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &wallet,
+            vec![json!(raw_hex)],
+            &params,
+        )
+        .expect("rpc");
+        assert!(value.get("hex").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn fundrawtransaction_accepts_unsigned_p2sh_inputs_when_wallet_has_redeem_script() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address")
+            .to_string();
+
+        let multisig_address =
+            rpc_addmultisigaddress(&wallet, vec![json!(2), json!([addr_a, addr_b])], &params)
+                .expect("rpc")
+                .as_str()
+                .expect("multisig address")
+                .to_string();
+        let multisig_script =
+            address_to_script_pubkey(&multisig_address, params.network).expect("multisig script");
+
+        let outpoint = OutPoint {
+            hash: [0x41u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: multisig_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&multisig_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+
+        let to_script = p2pkh_script([0x22u8; 20]);
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: outpoint,
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: 1 * COIN,
+                script_pubkey: to_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
 
         let value = rpc_fundrawtransaction(
             &chainstate,
