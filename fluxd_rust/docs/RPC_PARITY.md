@@ -44,7 +44,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Mining
 
 - getblocksubsidy - Implemented
-- getblocktemplate - Implemented (template fields + longpoll + proposal; falls back to `--miner-address` then the wallet if mineraddress is unset)
+- getblocktemplate - Implemented (template fields + longpoll + proposal; tx selection uses a C++-style priority window then modified fee-rate; honors `prioritisetransaction` deltas; falls back to `--miner-address` then the wallet if mineraddress is unset)
 - getlocalsolps - Implemented (reports local POW header validation throughput; returns 0.0 when idle)
 - getmininginfo - Implemented (`currentblock*` fields reflect the last connected block; `localsolps` reports local POW header validation throughput)
 - getnetworkhashps - Implemented (chainwork/time-based estimate; `blocks<=0` uses Digishield averaging window)
@@ -96,7 +96,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - zcrawjoinsplit - Implemented (Sprout JoinSplit splice + Groth16 proof; requires shielded params)
 - zcrawreceive - Implemented (Sprout note decrypt + witness existence check; requires shielded params)
 - zcrawkeygen - Implemented (Sprout key/address generator; deprecated but useful for tooling/regtest)
-- prioritisetransaction - Implemented (stores fee/priority deltas for mining selection)
+- prioritisetransaction - Implemented (stores fee/priority deltas for mining selection; affects `getblocktemplate` ordering/skip policy)
 
 - reindex - Implemented (requests shutdown; on next start wipes `db/` and rebuilds indexes from existing flatfiles under `blocks/`; use `--resync` to wipe blocks too)
 - stop - Implemented

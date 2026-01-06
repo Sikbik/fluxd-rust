@@ -209,7 +209,7 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 - `getmempoolinfo`
 - `getrawmempool [verbose]`
 - `getmininginfo`
-- `getblocktemplate` (includes deterministic fluxnode payouts + basic mempool tx selection)
+- `getblocktemplate` (includes deterministic fluxnode payouts + priority/fee mempool tx selection)
 - `submitblock <hexdata>` (partial)
 - `getnetworkhashps [blocks] [height]` (implemented; chainwork/time estimate)
 - `getnetworksolps [blocks] [height]` (implemented; chainwork/time estimate)
@@ -894,6 +894,9 @@ Notes:
 - Longpoll waits until either the best block changes or the mempool revision changes.
 - Proposal mode returns `null` when the block would be accepted, otherwise a string reason (BIP22-style).
 - Template mode requires a miner address; if none is provided, the daemon falls back to `--miner-address` and then the wallet.
+- Template transaction selection follows the C++ daemon model: a priority window (roughly half the max block bytes)
+  is filled first, then remaining space is filled by modified fee-rate; low-fee txs below `minrelaytxfee`
+  are skipped in the fee-sorted phase unless `prioritisetransaction` has applied a delta.
 
 ### submitblock
 
@@ -944,6 +947,10 @@ would actually be paid on-chain.
   - `priority_delta` (numeric)
   - `fee_delta_sat` (numeric) - delta in zatoshis/satoshis (can be negative)
 - Result: `true`
+ 
+Notes:
+- The deltas affect `getblocktemplate` selection: `fee_delta_sat` changes effective fee-rate ordering, while a
+  positive `priority_delta` can keep an otherwise-free tx from being skipped in the fee-sorted phase.
 
 ### getconnectioncount
 

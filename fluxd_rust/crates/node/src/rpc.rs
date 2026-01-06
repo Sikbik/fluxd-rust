@@ -39,7 +39,7 @@ use fluxd_consensus::constants::{
     FLUXNODE_START_TX_EXPIRATION_HEIGHT, FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2, MAX_BLOCK_SIGOPS,
     MAX_BLOCK_SIZE, PROTOCOL_VERSION,
 };
-use fluxd_consensus::money::{money_range, COIN, MAX_MONEY};
+use fluxd_consensus::money::{money_range, CENT, COIN, MAX_MONEY};
 use fluxd_consensus::params::{hash256_from_hex, ChainParams, Network};
 use fluxd_consensus::upgrades::{
     current_epoch_branch_id, network_upgrade_active, network_upgrade_state, UpgradeIndex,
@@ -1414,6 +1414,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             rpc_getblocktemplate(
                 chainstate,
                 mempool,
+                mempool_policy,
                 params,
                 chain_params,
                 mempool_flags,
@@ -11605,6 +11606,7 @@ fn rpc_getaddressmempool<S: fluxd_storage::KeyValueStore>(
 fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
     params: Vec<Value>,
     chain_params: &ChainParams,
     flags: &ValidationFlags,
@@ -11957,7 +11959,55 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         fee: i64,
         modified_fee: i64,
         size: usize,
+        priority: f64,
+        fee_delta: i64,
+        priority_delta: f64,
         parents: Vec<Hash256>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct PriorityTx {
+        txid: Hash256,
+        priority: f64,
+        fee: i64,
+        size: usize,
+    }
+
+    impl PartialEq for PriorityTx {
+        fn eq(&self, other: &Self) -> bool {
+            self.txid == other.txid
+                && self.priority.to_bits() == other.priority.to_bits()
+                && self.fee == other.fee
+                && self.size == other.size
+        }
+    }
+
+    impl Eq for PriorityTx {}
+
+    impl Ord for PriorityTx {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            match self.priority.total_cmp(&other.priority) {
+                std::cmp::Ordering::Equal => {
+                    let fee_a = i128::from(self.fee);
+                    let fee_b = i128::from(other.fee);
+                    let size_a = i128::try_from(self.size.max(1)).unwrap_or(i128::MAX);
+                    let size_b = i128::try_from(other.size.max(1)).unwrap_or(i128::MAX);
+                    let left = fee_a.saturating_mul(size_b);
+                    let right = fee_b.saturating_mul(size_a);
+                    match left.cmp(&right) {
+                        std::cmp::Ordering::Equal => self.txid.cmp(&other.txid),
+                        other => other,
+                    }
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl PartialOrd for PriorityTx {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11996,6 +12046,12 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
     block_bytes_limit = block_bytes_limit
         .saturating_sub(coinbase_size)
         .saturating_sub(coinbase_overhead_bytes);
+    let block_priority_bytes_limit = (usize::try_from(MAX_BLOCK_SIZE).unwrap_or(0) / 2)
+        .min(block_bytes_limit)
+        .max(1);
+
+    const ALLOW_FREE_THRESHOLD: f64 = (COIN * 144 / 250) as f64;
+    let allow_free = |priority: f64| priority > ALLOW_FREE_THRESHOLD;
 
     let (mempool_revision, selected_fees, transactions_json, sapling_commitments) = {
         let mempool_snapshot = mempool
@@ -12005,12 +12061,19 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
 
         let mut templates: HashMap<Hash256, TemplateTx> = HashMap::new();
         for entry in mempool_snapshot.entries() {
+            let mut modified_fee = entry.modified_fee();
+            if entry.tx.fluxnode.is_some() {
+                modified_fee = modified_fee.max(CENT);
+            }
             templates.insert(
                 entry.txid,
                 TemplateTx {
                     fee: entry.fee,
-                    modified_fee: entry.modified_fee(),
+                    modified_fee,
                     size: entry.size(),
+                    priority: entry.current_priority(height),
+                    fee_delta: entry.fee_delta,
+                    priority_delta: entry.priority_delta,
                     parents: entry.parents.clone(),
                 },
             );
@@ -12033,6 +12096,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         }
 
         let mut heap: BinaryHeap<FeeRateTx> = BinaryHeap::new();
+        let mut priority_heap: BinaryHeap<PriorityTx> = BinaryHeap::new();
         for (txid, tx) in &templates {
             let parent_count = remaining_parents
                 .get(txid)
@@ -12044,6 +12108,12 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                     fee: tx.modified_fee,
                     size: tx.size,
                 });
+                priority_heap.push(PriorityTx {
+                    txid: *txid,
+                    priority: tx.priority,
+                    fee: tx.modified_fee,
+                    size: tx.size,
+                });
             }
         }
 
@@ -12051,12 +12121,27 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
         let mut selected_set: HashSet<Hash256> = HashSet::new();
         let mut selected_fees: i64 = 0;
         let mut selected_bytes: usize = 0;
+        let mut sorted_by_fee = block_priority_bytes_limit == 0;
 
-        while let Some(candidate) = heap.pop() {
-            if selected_set.contains(&candidate.txid) {
+        while !heap.is_empty() || !priority_heap.is_empty() {
+            let candidate_txid = if sorted_by_fee {
+                heap.pop().map(|candidate| candidate.txid)
+            } else {
+                priority_heap
+                    .pop()
+                    .map(|candidate| candidate.txid)
+                    .or_else(|| {
+                        sorted_by_fee = true;
+                        heap.pop().map(|candidate| candidate.txid)
+                    })
+            };
+            let Some(candidate_txid) = candidate_txid else {
+                break;
+            };
+            if selected_set.contains(&candidate_txid) {
                 continue;
             }
-            let Some(entry) = templates.get(&candidate.txid) else {
+            let Some(entry) = templates.get(&candidate_txid) else {
                 continue;
             };
 
@@ -12064,14 +12149,29 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                 continue;
             }
 
+            if sorted_by_fee
+                && entry.priority_delta <= 0.0
+                && entry.fee_delta <= 0
+                && entry.modified_fee < mempool_policy.min_relay_fee_for_size(entry.size)
+            {
+                continue;
+            }
+
+            if !sorted_by_fee
+                && (selected_bytes.saturating_add(entry.size) >= block_priority_bytes_limit
+                    || !allow_free(entry.priority))
+            {
+                sorted_by_fee = true;
+            }
+
             selected_fees = selected_fees
                 .checked_add(entry.fee)
                 .ok_or_else(|| map_internal("mempool fee overflow"))?;
             selected_bytes = selected_bytes.saturating_add(entry.size);
-            selected_set.insert(candidate.txid);
-            selected.push(candidate.txid);
+            selected_set.insert(candidate_txid);
+            selected.push(candidate_txid);
 
-            if let Some(outgoing) = children.get(&candidate.txid) {
+            if let Some(outgoing) = children.get(&candidate_txid) {
                 for child in outgoing {
                     let Some(count) = remaining_parents.get_mut(child) else {
                         continue;
@@ -12081,6 +12181,12 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                         if let Some(child_tx) = templates.get(child) {
                             heap.push(FeeRateTx {
                                 txid: *child,
+                                fee: child_tx.modified_fee,
+                                size: child_tx.size,
+                            });
+                            priority_heap.push(PriorityTx {
+                                txid: *child,
+                                priority: child_tx.priority,
                                 fee: child_tx.modified_fee,
                                 size: child_tx.size,
                             });
@@ -23959,6 +24065,7 @@ mod tests {
     fn getblocktemplate_has_cpp_schema_keys() {
         let (chainstate, params, _data_dir) = setup_regtest_chainstate();
         let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, true);
         let flags = ValidationFlags::default();
 
         let pubkey_hash = [0x11u8; 20];
@@ -23969,6 +24076,7 @@ mod tests {
         let value = rpc_getblocktemplate(
             &chainstate,
             &mempool,
+            &mempool_policy,
             Vec::new(),
             &params,
             &flags,
@@ -24019,6 +24127,103 @@ mod tests {
         assert!(is_hex_64(coinbase_hash));
         assert!(coinbase.get("depends").and_then(Value::as_array).is_some());
         assert!(coinbase.get("required").and_then(Value::as_bool).is_some());
+    }
+
+    #[test]
+    fn getblocktemplate_honors_prioritisetransaction_priority_delta_for_free_txs() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let flags = ValidationFlags::default();
+
+        let pubkey_hash = [0x11u8; 20];
+        let script_pubkey = p2pkh_script(pubkey_hash);
+        let miner_address =
+            script_pubkey_to_address(&script_pubkey, params.network).expect("p2pkh address");
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let trigger_txid: Hash256 = [0x01u8; 32];
+        let skipped_txid: Hash256 = [0x02u8; 32];
+        let prioritised_txid: Hash256 = [0x03u8; 32];
+
+        let mut inner = Mempool::new(0);
+        for (txid, priority) in [
+            (trigger_txid, 2.0f64),
+            (skipped_txid, 0.0f64),
+            (prioritised_txid, 0.0f64),
+        ] {
+            inner
+                .insert(MempoolEntry {
+                    txid,
+                    tx: tx.clone(),
+                    raw: vec![0u8; 10],
+                    time: 0,
+                    height: 0,
+                    fee: 0,
+                    value_in: 0,
+                    modified_size: 0,
+                    priority,
+                    fee_delta: 0,
+                    priority_delta: 0.0,
+                    spent_outpoints: Vec::new(),
+                    parents: Vec::new(),
+                })
+                .expect("insert");
+        }
+        inner.prioritise_transaction(prioritised_txid, 1.0, 0);
+        let mempool = Mutex::new(inner);
+
+        let value = rpc_getblocktemplate(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            Vec::new(),
+            &params,
+            &flags,
+            Some(&miner_address),
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        let txs = obj
+            .get("transactions")
+            .and_then(Value::as_array)
+            .expect("transactions array");
+        let hashes = txs
+            .iter()
+            .filter_map(|entry| entry.as_object())
+            .filter_map(|entry| entry.get("hash"))
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            hashes.contains(&hash256_to_hex(&trigger_txid)),
+            "missing trigger txid, hashes={hashes:?}"
+        );
+        assert!(
+            hashes.contains(&hash256_to_hex(&prioritised_txid)),
+            "missing prioritised txid, hashes={hashes:?}"
+        );
+        assert!(
+            !hashes.contains(&hash256_to_hex(&skipped_txid)),
+            "unexpected skipped txid, hashes={hashes:?}"
+        );
     }
 
     #[test]

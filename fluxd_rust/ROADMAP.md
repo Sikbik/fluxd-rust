@@ -197,7 +197,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Orphan tx pool (store missing-input txs; request parents; reprocess after parent accept)
 - [x] [P1] `getmininginfo`, `submitblock` (owner: TBD)
 - [x] [P1] `getblocktemplate` (coinbase + deterministic payouts; tx selection/assembly) (owner: TBD)
-  - [x] Basic mempool tx selection + dependency ordering
+  - [x] Priority/fee mempool tx selection (C++-style priority window; honors `prioritisetransaction` deltas) + dependency ordering
   - [x] Template field parity (BIP22-ish keys + Flux deterministic payout fields)
   - [x] Longpoll wait behavior (honor request `longpollid`) (owner: TBD)
   - [x] Proposal mode support (`{"mode":"proposal","data":"..."}`) (owner: TBD)
