@@ -174,7 +174,6 @@ const PEERS_FILE_VERSION_V1: u32 = 1;
 const MEMPOOL_FILE_VERSION: u32 = 1;
 const PEERS_PERSIST_INTERVAL_SECS: u64 = 60;
 const BANLIST_PERSIST_INTERVAL_SECS: u64 = 60;
-const DEFAULT_FEE_ESTIMATOR_MAX_SAMPLES: usize = 10_000;
 const DEFAULT_FEE_ESTIMATES_PERSIST_INTERVAL_SECS: u64 = 300;
 const GENESIS_TIMESTAMP: &str =
     "Zelcash06f40b01ab1f135bd96c5d72f8e37c7906dc216dcaaa36fcd00ebf9b8e109567";
@@ -1350,19 +1349,17 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
     let mempool_policy = Arc::new(mempool_policy);
     let mempool_metrics = Arc::new(stats::MempoolMetrics::default());
     let fee_estimates_path = data_dir.join(FEE_ESTIMATES_FILE_NAME);
-    let fee_estimator = match fee_estimator::FeeEstimator::load(
-        &fee_estimates_path,
-        DEFAULT_FEE_ESTIMATOR_MAX_SAMPLES,
-    ) {
-        Ok(estimator) => estimator,
-        Err(err) => {
-            log_warn!(
-                "failed to load fee estimates from {}: {err}",
-                fee_estimates_path.display()
-            );
-            fee_estimator::FeeEstimator::new(DEFAULT_FEE_ESTIMATOR_MAX_SAMPLES)
-        }
-    };
+    let fee_estimator =
+        match fee_estimator::FeeEstimator::load(&fee_estimates_path, config.min_relay_fee_per_kb) {
+            Ok(estimator) => estimator,
+            Err(err) => {
+                log_warn!(
+                    "failed to load fee estimates from {}: {err}",
+                    fee_estimates_path.display()
+                );
+                fee_estimator::FeeEstimator::new(config.min_relay_fee_per_kb)
+            }
+        };
     let fee_estimator = Arc::new(Mutex::new(fee_estimator));
     let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
     let wallet =
@@ -1497,6 +1494,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                 let mut rejected = 0u64;
                 let mut evicted = 0u64;
                 let mut evicted_bytes = 0u64;
+                let current_estimate = current_fee_estimate(chainstate.as_ref());
                 for raw in raws {
                     let tx = match Transaction::consensus_decode(&raw) {
                         Ok(tx) => tx,
@@ -1529,21 +1527,23 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                             continue;
                         }
                     };
-                    let should_observe_fee = entry.tx.fluxnode.is_none();
-                    let entry_fee = entry.fee;
-                    let entry_size = entry.size();
+                    let tx_info = fee_estimator::MempoolTxInfo {
+                        txid: entry.txid,
+                        height: u32::try_from(entry.height.max(0)).unwrap_or(0),
+                        fee: entry.fee,
+                        size: entry.size(),
+                        starting_priority: entry.starting_priority(),
+                        was_clear_at_entry: entry.was_clear_at_entry,
+                    };
 
-                    let (inserted, observe_fee) = match mempool.lock() {
+                    let insert_outcome = match mempool.lock() {
                         Ok(mut guard) => match guard.insert(entry) {
                             Ok(outcome) => {
                                 evicted = evicted.saturating_add(outcome.evicted);
                                 evicted_bytes = evicted_bytes.saturating_add(outcome.evicted_bytes);
-                                (true, should_observe_fee)
+                                Ok(outcome)
                             }
-                            Err(err) => (
-                                err.kind == mempool::MempoolErrorKind::AlreadyInMempool,
-                                false,
-                            ),
+                            Err(err) => Err(err.kind),
                         },
                         Err(_) => {
                             log_warn!("mempool lock poisoned");
@@ -1551,13 +1551,22 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                             continue;
                         }
                     };
+
+                    let inserted = match insert_outcome {
+                        Ok(outcome) => {
+                            if let Ok(mut estimator) = fee_estimator.lock() {
+                                estimator.process_transaction(tx_info, current_estimate);
+                                for txid in outcome.evicted_txids {
+                                    estimator.remove_transaction(&txid);
+                                }
+                            }
+                            true
+                        }
+                        Err(mempool::MempoolErrorKind::AlreadyInMempool) => true,
+                        Err(_) => false,
+                    };
                     if inserted {
                         accepted += 1;
-                        if observe_fee {
-                            if let Ok(mut estimator) = fee_estimator.lock() {
-                                estimator.observe_tx(entry_fee, entry_size);
-                            }
-                        }
                     } else {
                         rejected += 1;
                     }
@@ -1934,6 +1943,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         block_peers_target,
         Arc::clone(&chainstate),
         Arc::clone(&mempool),
+        Arc::clone(&fee_estimator),
         Arc::clone(&sync_metrics),
         Arc::clone(&params),
         addr_book.as_ref(),
@@ -3210,6 +3220,22 @@ fn header_gap<S: KeyValueStore>(chainstate: &ChainState<S>) -> Result<(i32, i32)
         .map(|tip| tip.height)
         .unwrap_or(0);
     Ok((best_header - best_block, best_header))
+}
+
+fn current_fee_estimate<S: KeyValueStore>(chainstate: &ChainState<S>) -> bool {
+    let best_header = chainstate
+        .best_header()
+        .ok()
+        .flatten()
+        .map(|tip| tip.height.max(0))
+        .unwrap_or(0);
+    let best_block = chainstate
+        .best_block()
+        .ok()
+        .flatten()
+        .map(|tip| tip.height.max(0))
+        .unwrap_or(0);
+    best_header.saturating_sub(best_block) <= 1
 }
 
 fn max_fetch_blocks(peer_count: usize, getdata_batch: usize, inflight_per_peer: usize) -> usize {
@@ -5662,6 +5688,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
     block_peers_target: usize,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<mempool::Mempool>>,
+    fee_estimator: Arc<Mutex<fee_estimator::FeeEstimator>>,
     metrics: Arc<SyncMetrics>,
     params: Arc<ChainParams>,
     addr_book: &AddrBook,
@@ -5844,6 +5871,7 @@ async fn sync_chain<S: KeyValueStore + 'static>(
                 peer_book,
                 Arc::clone(&chainstate),
                 Arc::clone(&mempool),
+                Arc::clone(&fee_estimator),
                 Arc::clone(&metrics),
                 Arc::clone(&params),
                 &missing,
@@ -6538,6 +6566,7 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
     peer_book: Option<&HeaderPeerBook>,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<mempool::Mempool>>,
+    fee_estimator: Arc<Mutex<fee_estimator::FeeEstimator>>,
     metrics: Arc<SyncMetrics>,
     params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
@@ -6559,6 +6588,7 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
             peer,
             chainstate,
             mempool,
+            fee_estimator,
             Arc::clone(&metrics),
             params,
             hashes,
@@ -6591,6 +6621,7 @@ async fn fetch_blocks<S: KeyValueStore + 'static>(
         peer_book,
         chainstate,
         mempool,
+        fee_estimator,
         metrics,
         params,
         hashes,
@@ -6610,6 +6641,7 @@ async fn fetch_blocks_single<S: KeyValueStore + 'static>(
     peer: &mut Peer,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<mempool::Mempool>>,
+    fee_estimator: Arc<Mutex<fee_estimator::FeeEstimator>>,
     metrics: Arc<SyncMetrics>,
     params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
@@ -6633,6 +6665,7 @@ async fn fetch_blocks_single<S: KeyValueStore + 'static>(
     let chainstate = Arc::clone(&chainstate);
     let params = Arc::clone(&params);
     let mempool = Arc::clone(&mempool);
+    let fee_estimator = Arc::clone(&fee_estimator);
     let metrics = Arc::clone(&metrics);
     let flags = flags.clone();
     let verify_settings = *verify_settings;
@@ -6643,6 +6676,7 @@ async fn fetch_blocks_single<S: KeyValueStore + 'static>(
         connect_pending(
             chainstate.as_ref(),
             mempool.as_ref(),
+            fee_estimator.as_ref(),
             params.as_ref(),
             &flags,
             metrics.as_ref(),
@@ -6669,6 +6703,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     peer_book: Option<&HeaderPeerBook>,
     chainstate: Arc<ChainState<S>>,
     mempool: Arc<Mutex<mempool::Mempool>>,
+    fee_estimator: Arc<Mutex<fee_estimator::FeeEstimator>>,
     metrics: Arc<SyncMetrics>,
     params: Arc<ChainParams>,
     hashes: &[fluxd_consensus::Hash256],
@@ -6800,6 +6835,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
     let chainstate = Arc::clone(&chainstate);
     let params = Arc::clone(&params);
     let mempool = Arc::clone(&mempool);
+    let fee_estimator = Arc::clone(&fee_estimator);
     let metrics = Arc::clone(&metrics);
     let flags = flags.clone();
     let verify_settings = *verify_settings;
@@ -6810,6 +6846,7 @@ async fn fetch_blocks_multi<S: KeyValueStore + 'static>(
         connect_pending(
             chainstate.as_ref(),
             mempool.as_ref(),
+            fee_estimator.as_ref(),
             params.as_ref(),
             &flags,
             metrics.as_ref(),
@@ -7086,6 +7123,7 @@ async fn fetch_blocks_on_peer_inner(
 fn connect_pending<S: KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<mempool::Mempool>,
+    fee_estimator: &Mutex<fee_estimator::FeeEstimator>,
     params: &ChainParams,
     flags: &ValidationFlags,
     metrics: &SyncMetrics,
@@ -7308,11 +7346,25 @@ fn connect_pending<S: KeyValueStore>(
                 return Ok(());
             }
             metrics.record_commit(1, commit_start.elapsed());
-            purge_mempool_for_connected_block(
+            let purge = purge_mempool_for_connected_block(
                 mempool,
+                verified_block.height,
                 verified_block.block.as_ref(),
                 verified_block.txids.as_slice(),
             )?;
+            if !purge.removed_txids.is_empty() || !purge.mined_entries.is_empty() {
+                let current_estimate = current_fee_estimate(chainstate);
+                if let Ok(mut estimator) = fee_estimator.lock() {
+                    for txid in &purge.removed_txids {
+                        estimator.remove_transaction(txid);
+                    }
+                    estimator.process_block(
+                        u32::try_from(verified_block.height.max(0)).unwrap_or(0),
+                        purge.mined_entries.as_slice(),
+                        current_estimate,
+                    );
+                }
+            }
 
             pending.pop_front();
             continue;
@@ -7400,13 +7452,20 @@ fn connect_pending<S: KeyValueStore>(
     Ok(())
 }
 
+#[derive(Default)]
+struct MempoolPurgeOutcome {
+    removed_txids: Vec<Hash256>,
+    mined_entries: Vec<fee_estimator::BlockTxInfo>,
+}
+
 fn purge_mempool_for_connected_block(
     mempool: &Mutex<mempool::Mempool>,
+    block_height: i32,
     block: &Block,
     txids: &[Hash256],
-) -> Result<(), String> {
+) -> Result<MempoolPurgeOutcome, String> {
     if block.transactions.len() <= 1 {
-        return Ok(());
+        return Ok(MempoolPurgeOutcome::default());
     }
     if txids.len() != block.transactions.len() {
         return Err("transaction id cache mismatch".to_string());
@@ -7433,13 +7492,31 @@ fn purge_mempool_for_connected_block(
         }
     }
 
+    let mut outcome = MempoolPurgeOutcome::default();
     for txid in mined {
-        guard.remove(&txid);
+        let Some(entry) = guard.remove(&txid) else {
+            continue;
+        };
+        outcome.removed_txids.push(txid);
+        outcome.mined_entries.push(fee_estimator::BlockTxInfo {
+            fee: entry.fee,
+            size: entry.size(),
+            height: u32::try_from(entry.height.max(0)).unwrap_or(0),
+            priority: entry.current_priority(block_height),
+            was_clear_at_entry: entry.was_clear_at_entry,
+        });
     }
     for txid in conflicts {
-        guard.remove_with_descendants(&txid);
+        let removed = guard.remove_with_descendants(&txid);
+        if removed.is_empty() {
+            continue;
+        }
+        outcome
+            .removed_txids
+            .extend(removed.iter().map(|entry| entry.txid));
     }
-    Ok(())
+
+    Ok(outcome)
 }
 
 async fn read_message_with_timeout(peer: &mut Peer) -> Result<(String, Vec<u8>), String> {

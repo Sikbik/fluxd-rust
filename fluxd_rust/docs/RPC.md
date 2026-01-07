@@ -919,8 +919,11 @@ within `nblocks` blocks.
   - Returns `-1.0` when insufficient data is available.
 
 Notes:
-- This is currently based on a rolling sample of mempool-accepted transactions.
-- Samples are persisted to `fee_estimates.dat` in `--data-dir`.
+- Confirmation-based estimator modeled after the C++ daemon `CBlockPolicyEstimator`
+  (decaying bucket stats fed by mempool accepts + connected blocks).
+- Estimates are only updated when the node is near-tip synced; during initial sync they may remain `-1.0`.
+- Estimator state is persisted to `fee_estimates.dat` in `--data-dir`.
+- Returns `-1.0` for `nblocks > 25` (matching C++ `fluxd`'s `MAX_BLOCK_CONFIRMS` limit).
 
 ### estimatepriority
 
@@ -932,8 +935,10 @@ Estimates the approximate priority a zero-fee transaction needs to begin confirm
   - Returns `-1.0` when insufficient data is available.
 
 Notes:
-- This is currently based on the distribution of `currentpriority` for fee-free mempool transactions
-  (excluding fluxnode txs and txs with unconfirmed parents).
+- Confirmation-based estimator modeled after the C++ daemon `CBlockPolicyEstimator`
+  (decaying bucket stats fed by mempool accepts + connected blocks).
+- Estimates are only updated when the node is near-tip synced; during initial sync they may remain `-1.0`.
+- Estimator state is persisted to `fee_estimates.dat` in `--data-dir`.
 - Returns `-1.0` for `nblocks > 25` (matching C++ `fluxd`'s `MAX_BLOCK_CONFIRMS` limit).
 
 ### prioritisetransaction

@@ -1428,7 +1428,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "getnetworksolps" => rpc_getnetworksolps(chainstate, params, chain_params),
         "getlocalsolps" => rpc_getlocalsolps(params, header_metrics),
         "estimatefee" => rpc_estimatefee(params, fee_estimator),
-        "estimatepriority" => rpc_estimatepriority(chainstate, params, mempool),
+        "estimatepriority" => rpc_estimatepriority(params, fee_estimator),
         "prioritisetransaction" => rpc_prioritisetransaction(params, mempool),
         "getconnectioncount" => rpc_getconnectioncount(params, peer_registry, net_totals),
         "getnettotals" => rpc_getnettotals(params, net_totals),
@@ -10540,22 +10540,32 @@ fn submit_raw_transaction<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    let should_observe_fee = entry.tx.fluxnode.is_none();
-    let entry_fee = entry.fee;
-    let entry_size = entry.size();
     let txid = entry.txid;
+    let current_estimate = crate::current_fee_estimate(chainstate);
+    let tx_info = crate::fee_estimator::MempoolTxInfo {
+        txid,
+        height: u32::try_from(entry.height.max(0)).unwrap_or(0),
+        fee: entry.fee,
+        size: entry.size(),
+        starting_priority: entry.starting_priority(),
+        was_clear_at_entry: entry.was_clear_at_entry,
+    };
 
-    let mut guard = mempool
-        .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
-    match guard.insert(entry) {
+    let insert_outcome = {
+        let mut guard = mempool
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "mempool lock poisoned"))?;
+        guard.insert(entry)
+    };
+    match insert_outcome {
         Ok(outcome) => {
             if outcome.evicted > 0 {
                 mempool_metrics.note_evicted(outcome.evicted, outcome.evicted_bytes);
             }
-            if should_observe_fee {
-                if let Ok(mut estimator) = fee_estimator.lock() {
-                    estimator.observe_tx(entry_fee, entry_size);
+            if let Ok(mut estimator) = fee_estimator.lock() {
+                estimator.process_transaction(tx_info, current_estimate);
+                for txid in outcome.evicted_txids {
+                    estimator.remove_transaction(&txid);
                 }
             }
         }
@@ -12071,7 +12081,7 @@ fn rpc_getblocktemplate<S: fluxd_storage::KeyValueStore>(
                     fee: entry.fee,
                     modified_fee,
                     size: entry.size(),
-                    priority: entry.current_priority(height),
+                    priority: entry.modified_current_priority(height),
                     fee_delta: entry.fee_delta,
                     priority_delta: entry.priority_delta,
                     parents: entry.parents.clone(),
@@ -14495,10 +14505,9 @@ fn rpc_estimatefee(
     }
 }
 
-fn rpc_estimatepriority<S: fluxd_storage::KeyValueStore>(
-    chainstate: &ChainState<S>,
+fn rpc_estimatepriority(
     params: Vec<Value>,
-    mempool: &Mutex<Mempool>,
+    fee_estimator: &Mutex<FeeEstimator>,
 ) -> Result<Value, RpcError> {
     if params.len() != 1 {
         return Err(RpcError::new(
@@ -14510,50 +14519,18 @@ fn rpc_estimatepriority<S: fluxd_storage::KeyValueStore>(
     if blocks < 1 {
         blocks = 1;
     }
-    if blocks > 25 {
-        return Ok(Number::from_f64(-1.0)
-            .map(Value::Number)
-            .unwrap_or(Value::Number((-1).into())));
-    }
-
-    let best_height = chainstate
-        .best_block()
-        .map_err(map_internal)?
-        .map(|tip| tip.height)
-        .unwrap_or(0);
-    let guard = mempool
+    let estimate = fee_estimator
         .lock()
-        .map_err(|_| map_internal("mempool lock poisoned"))?;
-    let mut priorities: Vec<f64> = guard
-        .entries()
-        .filter(|entry| entry.tx.fluxnode.is_none())
-        .filter(|entry| entry.modified_fee() == 0)
-        .filter(|entry| entry.parents.is_empty())
-        .map(|entry| entry.current_priority(best_height))
-        .filter(|priority| priority.is_finite() && *priority >= 0.0)
-        .collect();
-
-    if priorities.len() < 32 {
-        return Ok(Number::from_f64(-1.0)
+        .map_err(|_| map_internal("fee estimator lock poisoned"))?
+        .estimate_priority(blocks);
+    match estimate {
+        Some(priority) => Ok(Number::from_f64(priority)
             .map(Value::Number)
-            .unwrap_or(Value::Number((-1).into())));
+            .unwrap_or(Value::Number(0.into()))),
+        None => Ok(Number::from_f64(-1.0)
+            .map(Value::Number)
+            .unwrap_or(Value::Number((-1).into()))),
     }
-
-    priorities.sort_by(|a, b| a.total_cmp(b));
-    let percentile = match blocks {
-        0 | 1 => 0.90,
-        2 => 0.75,
-        3..=6 => 0.50,
-        7..=12 => 0.25,
-        _ => 0.10,
-    };
-    let last_index = priorities.len().saturating_sub(1);
-    let index = ((last_index as f64) * percentile).round() as usize;
-    let estimate = priorities.get(index).copied().unwrap_or(-1.0);
-
-    Ok(Number::from_f64(estimate)
-        .map(Value::Number)
-        .unwrap_or(Value::Number((-1).into())))
 }
 
 fn rpc_prioritisetransaction(
@@ -16515,6 +16492,7 @@ mod tests {
                 value_in: 0,
                 modified_size: 0,
                 priority: 0.0,
+                was_clear_at_entry: true,
                 fee_delta: 0,
                 priority_delta: 0.0,
                 spent_outpoints: Vec::new(),
@@ -16532,6 +16510,7 @@ mod tests {
                 value_in: 0,
                 modified_size: 0,
                 priority: 0.0,
+                was_clear_at_entry: false,
                 fee_delta: 0,
                 priority_delta: 0.0,
                 spent_outpoints: Vec::new(),
@@ -16632,6 +16611,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -16838,65 +16818,59 @@ mod tests {
 
     #[test]
     fn estimatefee_has_cpp_schema() {
-        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let fee_estimator = Mutex::new(FeeEstimator::new(0));
         let value = rpc_estimatefee(vec![json!(1)], &fee_estimator).expect("rpc");
         assert!(value.is_number());
     }
 
     #[test]
     fn estimatepriority_returns_number() {
-        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
-        let mempool = Mutex::new(Mempool::new(0));
-        let value = rpc_estimatepriority(&chainstate, vec![json!(1)], &mempool).expect("rpc");
+        let fee_estimator = Mutex::new(FeeEstimator::new(0));
+        let value = rpc_estimatepriority(vec![json!(1)], &fee_estimator).expect("rpc");
         assert_eq!(value.as_f64(), Some(-1.0));
     }
 
     #[test]
-    fn estimatepriority_returns_percentile_from_mempool_samples() {
-        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
-        let tx = Transaction {
-            f_overwintered: false,
-            version: 1,
-            version_group_id: 0,
-            vin: Vec::new(),
-            vout: Vec::new(),
-            lock_time: 0,
-            expiry_height: 0,
-            value_balance: 0,
-            shielded_spends: Vec::new(),
-            shielded_outputs: Vec::new(),
-            join_splits: Vec::new(),
-            join_split_pub_key: [0u8; 32],
-            join_split_sig: [0u8; 64],
-            binding_sig: [0u8; 64],
-            fluxnode: None,
-        };
-
-        let mut inner = Mempool::new(0);
-        for value in 1..=100 {
-            let txid: Hash256 = [value as u8; 32];
-            inner
-                .insert(MempoolEntry {
-                    txid,
-                    tx: tx.clone(),
-                    raw: vec![0u8; 10],
-                    time: 0,
-                    height: 0,
-                    fee: 0,
-                    value_in: 0,
-                    modified_size: 0,
-                    priority: value as f64,
-                    fee_delta: 0,
-                    priority_delta: 0.0,
-                    spent_outpoints: Vec::new(),
-                    parents: Vec::new(),
-                })
-                .expect("insert");
+    fn estimatepriority_returns_value_after_observing_blocks() {
+        let mut estimator = FeeEstimator::new(0);
+        for height in 1u32..=20 {
+            let entry = crate::fee_estimator::BlockTxInfo {
+                fee: 0,
+                size: 250,
+                height: height.saturating_sub(1),
+                priority: 1000.0,
+                was_clear_at_entry: true,
+            };
+            let entries = vec![entry; 10];
+            estimator.process_block(height, &entries, true);
         }
-        let mempool = Mutex::new(inner);
 
-        let value = rpc_estimatepriority(&chainstate, vec![json!(1)], &mempool).expect("rpc");
-        assert_eq!(value.as_f64(), Some(90.0));
+        let fee_estimator = Mutex::new(estimator);
+        let value = rpc_estimatepriority(vec![json!(1)], &fee_estimator).expect("rpc");
+        let estimate = value.as_f64().unwrap_or(-1.0);
+        assert!(estimate > 0.0);
+        assert!((estimate - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimatefee_returns_value_after_observing_blocks() {
+        let mut estimator = FeeEstimator::new(0);
+        for height in 1u32..=20 {
+            let entry = crate::fee_estimator::BlockTxInfo {
+                fee: 1000,
+                size: 250,
+                height: height.saturating_sub(1),
+                priority: 0.0,
+                was_clear_at_entry: true,
+            };
+            let entries = vec![entry; 50];
+            estimator.process_block(height, &entries, true);
+        }
+
+        let fee_estimator = Mutex::new(estimator);
+        let value = rpc_estimatefee(vec![json!(1)], &fee_estimator).expect("rpc");
+        let estimate = value.as_f64().unwrap_or(-1.0);
+        assert!(estimate > 0.0);
     }
 
     #[test]
@@ -16930,6 +16904,7 @@ mod tests {
                 value_in: 0,
                 modified_size: 0,
                 priority: 0.0,
+                was_clear_at_entry: true,
                 fee_delta: 0,
                 priority_delta: 0.0,
                 spent_outpoints: Vec::new(),
@@ -19055,6 +19030,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -21183,6 +21159,7 @@ mod tests {
                 value_in: 0,
                 modified_size: 0,
                 priority: 0.0,
+                was_clear_at_entry: true,
                 fee_delta: 0,
                 priority_delta: 0.0,
                 spent_outpoints: vec![incoming_prevout],
@@ -21282,6 +21259,7 @@ mod tests {
                 value_in: 0,
                 modified_size: 0,
                 priority: 0.0,
+                was_clear_at_entry: false,
                 fee_delta: 0,
                 priority_delta: 0.0,
                 spent_outpoints: vec![OutPoint {
@@ -21394,6 +21372,7 @@ mod tests {
                 value_in: 0,
                 modified_size: 0,
                 priority: 0.0,
+                was_clear_at_entry: true,
                 fee_delta: 0,
                 priority_delta: 0.0,
                 spent_outpoints: vec![incoming_prevout],
@@ -21969,6 +21948,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -22075,6 +22055,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: vec![prevout],
@@ -22183,6 +22164,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: vec![prevout],
@@ -22296,6 +22278,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: vec![prevout],
@@ -22456,6 +22439,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -22563,6 +22547,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -22700,6 +22685,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: vec![prevout],
@@ -22789,6 +22775,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -22913,6 +22900,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -24179,6 +24167,7 @@ mod tests {
                     value_in: 0,
                     modified_size: 0,
                     priority,
+                    was_clear_at_entry: true,
                     fee_delta: 0,
                     priority_delta: 0.0,
                     spent_outpoints: Vec::new(),

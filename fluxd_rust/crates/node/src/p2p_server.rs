@@ -497,27 +497,29 @@ async fn handle_tx<S: KeyValueStore>(
         }
     };
 
-    {
+    let current_estimate = crate::current_fee_estimate(chainstate);
+    let tx_info = crate::fee_estimator::MempoolTxInfo {
+        txid,
+        height: u32::try_from(entry.height.max(0)).unwrap_or(0),
+        fee: entry.fee,
+        size: entry.size(),
+        starting_priority: entry.starting_priority(),
+        was_clear_at_entry: entry.was_clear_at_entry,
+    };
+    let evicted_txids = {
         let mut guard = mempool
             .lock()
             .map_err(|_| "mempool lock poisoned".to_string())?;
         if guard.contains(&txid) {
             return Ok(());
         }
-        let should_observe_fee = entry.tx.fluxnode.is_none();
-        let entry_fee = entry.fee;
-        let entry_size = entry.size();
         match guard.insert(entry) {
             Ok(outcome) => {
                 mempool_metrics.note_relay_accept();
                 if outcome.evicted > 0 {
                     mempool_metrics.note_evicted(outcome.evicted, outcome.evicted_bytes);
                 }
-                if should_observe_fee {
-                    if let Ok(mut estimator) = fee_estimator.lock() {
-                        estimator.observe_tx(entry_fee, entry_size);
-                    }
-                }
+                outcome.evicted_txids
             }
             Err(err) => {
                 if err.kind == mempool::MempoolErrorKind::Internal {
@@ -530,6 +532,12 @@ async fn handle_tx<S: KeyValueStore>(
                 mempool_metrics.note_relay_reject();
                 return Ok(());
             }
+        }
+    };
+    if let Ok(mut estimator) = fee_estimator.lock() {
+        estimator.process_transaction(tx_info, current_estimate);
+        for txid in evicted_txids {
+            estimator.remove_transaction(&txid);
         }
     }
 
@@ -548,13 +556,26 @@ async fn handle_tx<S: KeyValueStore>(
     if orphan_outcome.evicted > 0 {
         mempool_metrics.note_evicted(orphan_outcome.evicted, orphan_outcome.evicted_bytes);
     }
+    if let Ok(mut estimator) = fee_estimator.lock() {
+        for txid in orphan_outcome.evicted_txids {
+            estimator.remove_transaction(&txid);
+        }
+        for accepted in &orphan_outcome.accepted {
+            estimator.process_transaction(
+                crate::fee_estimator::MempoolTxInfo {
+                    txid: accepted.txid,
+                    height: accepted.height,
+                    fee: accepted.fee,
+                    size: accepted.size,
+                    starting_priority: accepted.starting_priority,
+                    was_clear_at_entry: accepted.was_clear_at_entry,
+                },
+                current_estimate,
+            );
+        }
+    }
     for accepted in orphan_outcome.accepted {
         mempool_metrics.note_relay_accept();
-        if accepted.observe_fee {
-            if let Ok(mut estimator) = fee_estimator.lock() {
-                estimator.observe_tx(accepted.fee, accepted.size);
-            }
-        }
         let _ = tx_announce.send(accepted.txid);
     }
     Ok(())

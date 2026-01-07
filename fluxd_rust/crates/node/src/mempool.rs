@@ -81,6 +81,7 @@ pub struct MempoolEntry {
     pub value_in: i64,
     pub modified_size: usize,
     pub priority: f64,
+    pub was_clear_at_entry: bool,
     pub fee_delta: i64,
     pub priority_delta: f64,
     pub spent_outpoints: Vec<OutPoint>,
@@ -97,12 +98,26 @@ impl MempoolEntry {
     }
 
     pub fn starting_priority(&self) -> f64 {
+        self.priority
+    }
+
+    pub fn modified_starting_priority(&self) -> f64 {
         self.priority + self.priority_delta
     }
 
     pub fn current_priority(&self, current_height: i32) -> f64 {
         if self.modified_size == 0 {
             return self.starting_priority();
+        }
+        let delta = current_height.saturating_sub(self.height).max(0) as f64;
+        let value_in = self.value_in.max(0) as f64;
+        let increased = delta * value_in / (self.modified_size as f64);
+        (self.priority + increased).min(MAX_PRIORITY)
+    }
+
+    pub fn modified_current_priority(&self, current_height: i32) -> f64 {
+        if self.modified_size == 0 {
+            return self.modified_starting_priority();
         }
         let delta = current_height.saturating_sub(self.height).max(0) as f64;
         let value_in = self.value_in.max(0) as f64;
@@ -591,6 +606,7 @@ impl Mempool {
 
         let mut evicted = 0u64;
         let mut evicted_bytes = 0u64;
+        let mut evicted_txids: Vec<Hash256> = Vec::new();
         for candidate in candidates {
             if self.total_bytes <= max_bytes {
                 break;
@@ -599,6 +615,7 @@ impl Mempool {
             if removed.is_empty() {
                 continue;
             }
+            evicted_txids.extend(removed.iter().map(|entry| entry.txid));
             evicted = evicted.saturating_add(removed.len() as u64);
             evicted_bytes = evicted_bytes.saturating_add(
                 removed
@@ -611,6 +628,7 @@ impl Mempool {
         MempoolInsertOutcome {
             evicted,
             evicted_bytes,
+            evicted_txids,
         }
     }
 }
@@ -619,6 +637,7 @@ impl Mempool {
 pub struct MempoolInsertOutcome {
     pub evicted: u64,
     pub evicted_bytes: u64,
+    pub evicted_txids: Vec<Hash256>,
 }
 
 #[derive(Clone, Debug)]
@@ -950,6 +969,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
 
     let mut parents: Vec<Hash256> = parents.into_iter().collect();
     parents.sort();
+    let was_clear_at_entry = parents.is_empty();
 
     Ok(MempoolEntry {
         txid,
@@ -961,6 +981,7 @@ pub fn build_mempool_entry<S: fluxd_storage::KeyValueStore>(
         value_in,
         modified_size,
         priority,
+        was_clear_at_entry,
         fee_delta: 0,
         priority_delta: 0.0,
         spent_outpoints,
@@ -980,6 +1001,7 @@ pub struct OrphanProcessOutcome {
     pub accepted: Vec<OrphanAcceptedTx>,
     pub evicted: u64,
     pub evicted_bytes: u64,
+    pub evicted_txids: Vec<Hash256>,
 }
 
 impl Default for OrphanProcessOutcome {
@@ -988,6 +1010,7 @@ impl Default for OrphanProcessOutcome {
             accepted: Vec::new(),
             evicted: 0,
             evicted_bytes: 0,
+            evicted_txids: Vec::new(),
         }
     }
 }
@@ -995,9 +1018,11 @@ impl Default for OrphanProcessOutcome {
 #[derive(Clone, Debug)]
 pub struct OrphanAcceptedTx {
     pub txid: Hash256,
+    pub height: u32,
     pub fee: i64,
     pub size: usize,
-    pub observe_fee: bool,
+    pub starting_priority: f64,
+    pub was_clear_at_entry: bool,
 }
 
 pub fn process_orphans_after_accept<S: fluxd_storage::KeyValueStore>(
@@ -1065,10 +1090,12 @@ pub fn process_orphans_after_accept<S: fluxd_storage::KeyValueStore>(
                 }
             };
 
-            let observe_fee = entry.tx.fluxnode.is_none();
+            let height = u32::try_from(entry.height.max(0)).unwrap_or(0);
             let fee = entry.fee;
             let size = entry.size();
+            let starting_priority = entry.starting_priority();
             let txid = entry.txid;
+            let was_clear_at_entry = entry.was_clear_at_entry;
 
             let insert_outcome = match mempool.lock() {
                 Ok(mut guard) => guard.insert(entry),
@@ -1081,12 +1108,15 @@ pub fn process_orphans_after_accept<S: fluxd_storage::KeyValueStore>(
                         outcome.evicted = outcome.evicted.saturating_add(inserted.evicted);
                         outcome.evicted_bytes =
                             outcome.evicted_bytes.saturating_add(inserted.evicted_bytes);
+                        outcome.evicted_txids.extend(inserted.evicted_txids);
                     }
                     outcome.accepted.push(OrphanAcceptedTx {
                         txid,
+                        height,
                         fee,
                         size,
-                        observe_fee,
+                        starting_priority,
+                        was_clear_at_entry,
                     });
                     queue.push_back(txid);
                 }
@@ -1646,6 +1676,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -1671,6 +1702,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: false,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: vec![parent_outpoint],
@@ -1719,6 +1751,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: true,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: Vec::new(),
@@ -1744,6 +1777,7 @@ mod tests {
             value_in: 0,
             modified_size: 0,
             priority: 0.0,
+            was_clear_at_entry: false,
             fee_delta: 0,
             priority_delta: 0.0,
             spent_outpoints: vec![parent_outpoint],

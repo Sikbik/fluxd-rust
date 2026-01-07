@@ -69,7 +69,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - sendrawtransaction - Implemented (supports spending mempool parents; C++-style reject-code formatting for common invalid/mempool-conflict failures; honors `allowhighfees` absurd-fee guard)
 - createmultisig - Implemented (accepts Flux addresses or hex pubkeys; wallet lookup works while locked)
 - estimatefee - Implemented
-- estimatepriority - Partial (mempool-based estimate; returns -1.0 when insufficient samples are available or `nblocks > 25`)
+- estimatepriority - Implemented
 - validateaddress - Implemented (includes `pubkey`/`iscompressed` for wallet-owned P2PKH; includes `account` label for wallet-known scripts; includes redeem-script details for known P2SH/multisig scripts)
 - verifymessage - Implemented
 
