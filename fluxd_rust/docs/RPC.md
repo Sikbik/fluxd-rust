@@ -923,13 +923,16 @@ Notes:
 
 ### submitblock
 
-Submits a block for validation and (if it extends the current best chain) connects it.
+Submits a block for validation.
+
+- If it extends the current best chain, it is validated and connected.
+- If it does not extend the best tip but the previous header is known, it is accepted as a side-chain/stale block and stored as unconnected block bytes (it does not change the active chain).
 
 - Params:
   - `hexdata` (string) - raw block bytes in hex
   - optional `parameters` (object) - accepted for parity but currently ignored
 - Result:
-  - `null` when accepted and connected
+  - `null` when accepted (connected or stored)
   - string when rejected (e.g. `"duplicate"`, `"inconclusive"`, or a validation failure reason)
 
 ### estimatefee
@@ -1175,34 +1178,50 @@ For wallet-less start RPCs, `fluxd-rust` also supports optional extra columns:
 
 ### getbenchmarks
 
-Fluxnode-only benchmark query (fluxbenchd integration is not implemented yet).
+- Fluxnode-only benchmark query.
+- If `fluxbenchd` is online, proxies to `fluxbench-cli getbenchmarks`.
 
 - Params: none
-- Result: string (`"Benchmark not running"`)
+- Result:
+  - string (`"Benchmark not running"`) when `fluxbenchd` is offline/unavailable
+  - string containing the `fluxbench-cli` output when online (JSON-encoded string)
 
 ### getbenchstatus
 
-Fluxnode-only benchmark status (fluxbenchd integration is not implemented yet).
+- Fluxnode-only benchmark status.
+- If `fluxbenchd` is online, proxies to `fluxbench-cli getstatus`.
 
 - Params: none
-- Result: string (`"Benchmark not running"`)
+- Result:
+  - string (`"Benchmark not running"`) when `fluxbenchd` is offline/unavailable
+  - string containing the `fluxbench-cli` output when online (JSON-encoded string)
 
 ### startbenchmark / startfluxbenchd / startzelbenchd
 
-Fluxnode-only benchmark daemon control (not implemented yet).
+Fluxnode-only benchmark daemon control.
 
 - Params: none
-- Result: string (`"Benchmark daemon control not implemented"`)
+- Result:
+  - string (`"Already running"`) when `fluxbenchd` is already online
+  - string (`"Starting process"`) when the daemon is spawned successfully
+  - error when the benchmark daemon binary cannot be found
 
 ### stopbenchmark / stopfluxbenchd / stopzelbenchd
 
-Fluxnode-only benchmark daemon control (not implemented yet).
+Fluxnode-only benchmark daemon control.
 
 - Params: none
-- Result: string (`"Benchmark daemon control not implemented"`)
+- Result:
+  - string (`"Not running"`) when `fluxbenchd` is offline/unavailable
+  - string (`"Stopping process"`) when `fluxbenchd` is online (best-effort `fluxbench-cli stop`)
 
 ### zcbenchmark
 
-Zcash benchmark RPC (not implemented yet).
+Zcash benchmark RPC (partial).
 
-- Result: error (`-32603`, `"zcbenchmark not implemented"`)
+- Params:
+  - `benchmarktype` (string)
+  - `samplecount` (numeric)
+- Result:
+  - array of objects for `benchmarktype="sleep"` (each entry has `runningtime`)
+  - error for other benchmark types (e.g. `"Invalid benchmarktype"`)
