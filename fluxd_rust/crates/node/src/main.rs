@@ -2773,9 +2773,22 @@ fn ensure_db_schema_version(store: &Store) -> Result<u32, String> {
         None => {
             let has_any_data = store_has_any_data(store)?;
             if has_any_data {
-                return Err(format!(
-                    "database schema version missing (expected {DB_SCHEMA_VERSION}); this data dir was created by an older build; run with --reindex to rebuild"
-                ));
+                if DB_SCHEMA_VERSION != 1 {
+                    return Err(format!(
+                        "database schema version missing (expected {DB_SCHEMA_VERSION}); this data dir was created by an older build; run with --reindex to rebuild"
+                    ));
+                }
+                log_warn!(
+                    "Database schema version missing; assuming version 1 for a pre-versioned data dir"
+                );
+                store
+                    .put(
+                        fluxd_storage::Column::Meta,
+                        DB_SCHEMA_VERSION_KEY,
+                        &DB_SCHEMA_VERSION.to_le_bytes(),
+                    )
+                    .map_err(|err| err.to_string())?;
+                return Ok(DB_SCHEMA_VERSION);
             }
             store
                 .put(
@@ -2877,9 +2890,14 @@ fn ensure_index_schema_version(
             }
 
             if has_data {
-                return Err(format!(
-                    "{name} schema version missing (expected {expected}); rebuild with {rebuild_hint}",
-                ));
+                if expected != 1 {
+                    return Err(format!(
+                        "{name} schema version missing (expected {expected}); rebuild with {rebuild_hint}",
+                    ));
+                }
+                log_warn!("{name} schema version missing; assuming version 1 for a pre-versioned data dir");
+                set_meta_u32(store, key, expected)?;
+                return Ok(expected);
             }
 
             set_meta_u32(store, key, expected)?;
@@ -9238,14 +9256,17 @@ mod tests {
     }
 
     #[test]
-    fn db_schema_version_missing_on_nonempty_db_errors() {
+    fn db_schema_version_missing_on_nonempty_db_is_initialized() {
         let store = Store::Memory(MemoryStore::new());
         store
             .put(fluxd_storage::Column::HeaderIndex, b"header", b"entry")
             .expect("put header");
-        let err = ensure_db_schema_version(&store).unwrap_err();
-        assert!(err.contains("schema version missing"), "{err}");
-        assert_eq!(meta_u32(&store, DB_SCHEMA_VERSION_KEY).expect("meta"), None);
+        let version = ensure_db_schema_version(&store).expect("db schema version");
+        assert_eq!(version, DB_SCHEMA_VERSION);
+        assert_eq!(
+            meta_u32(&store, DB_SCHEMA_VERSION_KEY).expect("meta"),
+            Some(DB_SCHEMA_VERSION)
+        );
     }
 
     #[test]
@@ -9267,17 +9288,37 @@ mod tests {
     }
 
     #[test]
-    fn index_schema_version_missing_on_nonempty_column_errors() {
+    fn index_schema_version_missing_on_nonempty_column_is_initialized_for_v1() {
         let store = Store::Memory(MemoryStore::new());
         store
             .put(fluxd_storage::Column::TxIndex, b"txid", b"entry")
             .expect("put txindex entry");
         let key = b"test_index_schema_version_nonempty";
-        let err = ensure_index_schema_version(
+        let version = ensure_index_schema_version(
             &store,
             "txindex",
             key,
             1,
+            "--reindex-txindex",
+            &[fluxd_storage::Column::TxIndex],
+        )
+        .expect("index version");
+        assert_eq!(version, 1);
+        assert_eq!(meta_u32(&store, key).expect("meta"), Some(1));
+    }
+
+    #[test]
+    fn index_schema_version_missing_on_nonempty_column_errors_for_newer_versions() {
+        let store = Store::Memory(MemoryStore::new());
+        store
+            .put(fluxd_storage::Column::TxIndex, b"txid", b"entry")
+            .expect("put txindex entry");
+        let key = b"test_index_schema_version_nonempty_new";
+        let err = ensure_index_schema_version(
+            &store,
+            "txindex",
+            key,
+            2,
             "--reindex-txindex",
             &[fluxd_storage::Column::TxIndex],
         )
