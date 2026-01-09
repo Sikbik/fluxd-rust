@@ -1434,9 +1434,15 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
                 miner_address.or(wallet_default.as_deref()),
             )
         }
-        "submitblock" => {
-            rpc_submitblock(chainstate, write_lock, params, chain_params, mempool_flags)
-        }
+        "submitblock" => rpc_submitblock(
+            chainstate,
+            write_lock,
+            mempool,
+            fee_estimator,
+            params,
+            chain_params,
+            mempool_flags,
+        ),
         "getnetworkhashps" => rpc_getnetworkhashps(chainstate, params, chain_params),
         "getnetworksolps" => rpc_getnetworksolps(chainstate, params, chain_params),
         "getlocalsolps" => rpc_getlocalsolps(params, header_metrics),
@@ -12872,9 +12878,157 @@ fn rpc_getmininginfo<S: fluxd_storage::KeyValueStore>(
     }))
 }
 
+fn try_activate_best_header_from_unconnected<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    write_lock: &Mutex<()>,
+    mempool: &Mutex<Mempool>,
+    fee_estimator: &Mutex<FeeEstimator>,
+    chain_params: &ChainParams,
+    flags: &ValidationFlags,
+) -> Result<Option<String>, RpcError> {
+    crate::reorg_to_best_header(chainstate, write_lock).map_err(map_internal)?;
+
+    const MAX_CONNECT_PER_CALL: usize = 512;
+    loop {
+        let missing = crate::collect_missing_blocks(chainstate, MAX_CONNECT_PER_CALL)
+            .map_err(map_internal)?;
+        if missing.is_empty() {
+            return Ok(None);
+        }
+
+        let mut progressed = false;
+        for hash in missing {
+            let bytes = match chainstate
+                .unconnected_block_bytes(&hash)
+                .map_err(map_internal)?
+            {
+                Some(bytes) => bytes,
+                None => return Ok(None),
+            };
+            let block = Block::consensus_decode(&bytes)
+                .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "Block decode failed"))?;
+            let header_entry = chainstate
+                .header_entry(&hash)
+                .map_err(map_internal)?
+                .ok_or_else(|| map_internal("missing header entry for unconnected block"))?;
+
+            let txids = match fluxd_chainstate::validation::validate_block_with_txids(
+                &block,
+                header_entry.height,
+                &chain_params.consensus,
+                flags,
+            ) {
+                Ok(txids) => txids,
+                Err(err) => {
+                    let reason = err.to_string();
+                    return Ok(Some(if reason.is_empty() {
+                        "rejected".to_string()
+                    } else {
+                        reason
+                    }));
+                }
+            };
+
+            let mut batch = match chainstate.connect_block(
+                &block,
+                header_entry.height,
+                chain_params,
+                flags,
+                true,
+                Some(txids.as_slice()),
+                None,
+                Some(bytes.as_slice()),
+                None,
+            ) {
+                Ok(batch) => batch,
+                Err(ChainStateError::InvalidHeader("block does not extend best block tip"))
+                | Err(ChainStateError::InvalidHeader("block height does not match header index")) =>
+                {
+                    crate::reorg_to_best_header(chainstate, write_lock).map_err(map_internal)?;
+                    return Ok(None);
+                }
+                Err(ChainStateError::InvalidHeader(message)) => {
+                    return Ok(Some(message.to_string()));
+                }
+                Err(ChainStateError::Validation(err)) => {
+                    let reason = err.to_string();
+                    return Ok(Some(if reason.is_empty() {
+                        "rejected".to_string()
+                    } else {
+                        reason
+                    }));
+                }
+                Err(ChainStateError::MissingInput) => {
+                    return Ok(Some("missing input".to_string()));
+                }
+                Err(ChainStateError::MissingHeader) => {
+                    return Ok(Some("missing header".to_string()));
+                }
+                Err(ChainStateError::ValueOutOfRange) => {
+                    return Ok(Some("value out of range".to_string()));
+                }
+                Err(err) => return Err(map_internal(err.to_string())),
+            };
+            chainstate.delete_unconnected_block(&mut batch, &hash);
+
+            let should_reorg = {
+                let _guard = write_lock
+                    .lock()
+                    .map_err(|_| map_internal("write lock poisoned"))?;
+                let tip = chainstate.best_block().map_err(map_internal)?;
+                if let Some(tip) = tip {
+                    if tip.hash == hash {
+                        false
+                    } else if tip.hash != block.header.prev_block {
+                        true
+                    } else {
+                        chainstate.commit_batch(batch).map_err(map_internal)?;
+                        false
+                    }
+                } else {
+                    true
+                }
+            };
+            if should_reorg {
+                crate::reorg_to_best_header(chainstate, write_lock).map_err(map_internal)?;
+                return Ok(None);
+            }
+
+            let purge = crate::purge_mempool_for_connected_block(
+                mempool,
+                header_entry.height,
+                &block,
+                txids.as_slice(),
+            )
+            .map_err(map_internal)?;
+            if !purge.removed_txids.is_empty() || !purge.mined_entries.is_empty() {
+                let current_estimate = crate::current_fee_estimate(chainstate);
+                if let Ok(mut estimator) = fee_estimator.lock() {
+                    for txid in &purge.removed_txids {
+                        estimator.remove_transaction(txid);
+                    }
+                    estimator.process_block(
+                        u32::try_from(header_entry.height.max(0)).unwrap_or(0),
+                        purge.mined_entries.as_slice(),
+                        current_estimate,
+                    );
+                }
+            }
+
+            progressed = true;
+        }
+
+        if !progressed {
+            return Ok(None);
+        }
+    }
+}
+
 fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     write_lock: &Mutex<()>,
+    mempool: &Mutex<Mempool>,
+    fee_estimator: &Mutex<FeeEstimator>,
     params: Vec<Value>,
     chain_params: &ChainParams,
     flags: &ValidationFlags,
@@ -12932,13 +13086,30 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
             return Ok(Value::String("inconclusive".to_string()));
         }
 
+        let txids = match fluxd_chainstate::validation::validate_block_with_txids(
+            &block,
+            height,
+            &chain_params.consensus,
+            flags,
+        ) {
+            Ok(txids) => txids,
+            Err(err) => {
+                let reason = err.to_string();
+                return Ok(Value::String(if reason.is_empty() {
+                    "rejected".to_string()
+                } else {
+                    reason
+                }));
+            }
+        };
+
         let mut batch = match chainstate.connect_block(
             &block,
             height,
             chain_params,
             flags,
-            false,
-            None,
+            true,
+            Some(txids.as_slice()),
             None,
             Some(bytes.as_slice()),
             None,
@@ -12972,19 +13143,38 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         };
         chainstate.delete_unconnected_block(&mut batch, &hash);
 
-        let _guard = write_lock
-            .lock()
-            .map_err(|_| map_internal("write lock poisoned"))?;
-        let current_tip = chainstate.best_block().map_err(map_internal)?;
-        if let Some(tip) = current_tip {
-            if tip.hash == hash {
-                return Ok(Value::String("duplicate".to_string()));
+        {
+            let _guard = write_lock
+                .lock()
+                .map_err(|_| map_internal("write lock poisoned"))?;
+            let current_tip = chainstate.best_block().map_err(map_internal)?;
+            if let Some(tip) = current_tip {
+                if tip.hash == hash {
+                    return Ok(Value::String("duplicate".to_string()));
+                }
+                if tip.hash != prev_hash {
+                    return Ok(Value::String("inconclusive".to_string()));
+                }
             }
-            if tip.hash != prev_hash {
-                return Ok(Value::String("inconclusive".to_string()));
+            chainstate.commit_batch(batch).map_err(map_internal)?;
+        }
+
+        let purge =
+            crate::purge_mempool_for_connected_block(mempool, height, &block, txids.as_slice())
+                .map_err(map_internal)?;
+        if !purge.removed_txids.is_empty() || !purge.mined_entries.is_empty() {
+            let current_estimate = crate::current_fee_estimate(chainstate);
+            if let Ok(mut estimator) = fee_estimator.lock() {
+                for txid in &purge.removed_txids {
+                    estimator.remove_transaction(txid);
+                }
+                estimator.process_block(
+                    u32::try_from(height.max(0)).unwrap_or(0),
+                    purge.mined_entries.as_slice(),
+                    current_estimate,
+                );
             }
         }
-        chainstate.commit_batch(batch).map_err(map_internal)?;
         return Ok(Value::Null);
     }
 
@@ -13029,24 +13219,37 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
 
     chainstate.store_unconnected_block_bytes(&mut batch, &hash, bytes.as_slice());
 
-    let _guard = write_lock
-        .lock()
-        .map_err(|_| map_internal("write lock poisoned"))?;
-    if chainstate
-        .header_entry(&hash)
-        .map_err(map_internal)?
-        .is_some_and(|entry| entry.has_block())
     {
-        return Ok(Value::String("duplicate".to_string()));
+        let _guard = write_lock
+            .lock()
+            .map_err(|_| map_internal("write lock poisoned"))?;
+        if chainstate
+            .header_entry(&hash)
+            .map_err(map_internal)?
+            .is_some_and(|entry| entry.has_block())
+        {
+            return Ok(Value::String("duplicate".to_string()));
+        }
+        if chainstate
+            .unconnected_block_bytes(&hash)
+            .map_err(map_internal)?
+            .is_some()
+        {
+            return Ok(Value::String("duplicate".to_string()));
+        }
+        chainstate.commit_batch(batch).map_err(map_internal)?;
     }
-    if chainstate
-        .unconnected_block_bytes(&hash)
-        .map_err(map_internal)?
-        .is_some()
-    {
-        return Ok(Value::String("duplicate".to_string()));
+
+    if let Some(reason) = try_activate_best_header_from_unconnected(
+        chainstate,
+        write_lock,
+        mempool,
+        fee_estimator,
+        chain_params,
+        flags,
+    )? {
+        return Ok(Value::String(reason));
     }
-    chainstate.commit_batch(batch).map_err(map_internal)?;
     Ok(Value::Null)
 }
 
@@ -17578,10 +17781,14 @@ mod tests {
         let block_hex = hex_bytes(&bytes);
 
         let write_lock = Mutex::new(());
+        let mempool = Mutex::new(Mempool::new(0));
+        let fee_estimator = Mutex::new(FeeEstimator::new(0));
         let flags = ValidationFlags::default();
         let value = rpc_submitblock(
             &chainstate,
             &write_lock,
+            &mempool,
+            &fee_estimator,
             vec![Value::String(block_hex)],
             &params,
             &flags,
@@ -17696,10 +17903,14 @@ mod tests {
             .expect("commit header");
 
         let write_lock = Mutex::new(());
+        let mempool = Mutex::new(Mempool::new(0));
+        let fee_estimator = Mutex::new(FeeEstimator::new(0));
         let flags = ValidationFlags::default();
         let value = rpc_submitblock(
             &chainstate,
             &write_lock,
+            &mempool,
+            &fee_estimator,
             vec![Value::String(block_hex)],
             &params,
             &flags,
@@ -17774,10 +17985,14 @@ mod tests {
         let block_hex = hex_bytes(&block.consensus_encode().expect("encode block"));
 
         let write_lock = Mutex::new(());
+        let mempool = Mutex::new(Mempool::new(0));
+        let fee_estimator = Mutex::new(FeeEstimator::new(0));
         let flags = ValidationFlags::default();
         let value = rpc_submitblock(
             &chainstate,
             &write_lock,
+            &mempool,
+            &fee_estimator,
             vec![Value::String(block_hex)],
             &params,
             &flags,
@@ -17897,10 +18112,14 @@ mod tests {
             .expect("best block present");
 
         let write_lock = Mutex::new(());
+        let mempool = Mutex::new(Mempool::new(0));
+        let fee_estimator = Mutex::new(FeeEstimator::new(0));
         let flags = ValidationFlags::default();
         let value = rpc_submitblock(
             &chainstate,
             &write_lock,
+            &mempool,
+            &fee_estimator,
             vec![Value::String(block_hex.clone())],
             &params,
             &flags,
@@ -17929,12 +18148,290 @@ mod tests {
         let dup = rpc_submitblock(
             &chainstate,
             &write_lock,
+            &mempool,
+            &fee_estimator,
             vec![Value::String(block_hex)],
             &params,
             &flags,
         )
         .expect("rpc");
         assert_eq!(dup.as_str(), Some("duplicate"));
+    }
+
+    #[test]
+    fn submitblock_reorgs_to_stronger_side_chain_when_blocks_available() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+        extend_regtest_chain_to_height(&chainstate, &params, 1);
+
+        let genesis = params.consensus.hash_genesis_block;
+        let genesis_entry = chainstate
+            .header_entry(&genesis)
+            .expect("header entry")
+            .expect("header entry present");
+
+        let write_lock = Mutex::new(());
+        let mempool = Mutex::new(Mempool::new(0));
+        let fee_estimator = Mutex::new(FeeEstimator::new(0));
+        let flags = ValidationFlags::default();
+
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let fork_height_1 = 1;
+        let fork_time_1 = genesis_entry.time.saturating_add(spacing);
+        let fork_bits_1 = chainstate
+            .next_work_required_bits(
+                &genesis,
+                fork_height_1,
+                fork_time_1 as i64,
+                &params.consensus,
+            )
+            .expect("next bits");
+
+        let miner_value_1 = block_subsidy(fork_height_1, &params.consensus);
+        let exchange_amount_1 = exchange_fund_amount(fork_height_1, &params.funding);
+        let foundation_amount_1 = foundation_fund_amount(fork_height_1, &params.funding);
+        let swap_amount_1 = swap_pool_amount(fork_height_1 as i64, &params.swap_pool);
+        let mut vout_1 = Vec::new();
+        vout_1.push(TxOut {
+            value: miner_value_1,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount_1 > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout_1.push(TxOut {
+                value: exchange_amount_1,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount_1 > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout_1.push(TxOut {
+                value: foundation_amount_1,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount_1 > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout_1.push(TxOut {
+                value: swap_amount_1,
+                script_pubkey: script,
+            });
+        }
+        let coinbase_1 = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: vec![1u8; 2],
+                sequence: u32::MAX,
+            }],
+            vout: vout_1,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let coinbase_txid_1 = coinbase_1.txid().expect("coinbase txid");
+        let final_sapling_root_1 = chainstate.sapling_root().expect("sapling root");
+        let header_1 = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: genesis,
+            merkle_root: coinbase_txid_1,
+            final_sapling_root: final_sapling_root_1,
+            time: fork_time_1,
+            bits: fork_bits_1,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let fork_hash_1 = header_1.hash();
+        let fork_block_1 = Block {
+            header: header_1,
+            transactions: vec![coinbase_1],
+        };
+        let fork_hex_1 = hex_bytes(&fork_block_1.consensus_encode().expect("encode fork block"));
+
+        let mut fork_header_batch_1 = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[fork_block_1.header.clone()],
+                &params.consensus,
+                &mut fork_header_batch_1,
+                false,
+            )
+            .expect("insert fork header 1");
+        chainstate
+            .commit_batch(fork_header_batch_1)
+            .expect("commit fork header 1");
+
+        let submitted_1 = rpc_submitblock(
+            &chainstate,
+            &write_lock,
+            &mempool,
+            &fee_estimator,
+            vec![Value::String(fork_hex_1)],
+            &params,
+            &flags,
+        )
+        .expect("rpc");
+        assert!(submitted_1.is_null());
+
+        let best_before = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        assert_eq!(best_before.height, 1);
+
+        let fork_entry_1 = chainstate
+            .header_entry(&fork_hash_1)
+            .expect("header entry")
+            .expect("fork header entry");
+        let fork_height_2 = 2;
+        let fork_time_2 = fork_entry_1.time.saturating_add(spacing);
+        let fork_bits_2 = chainstate
+            .next_work_required_bits(
+                &fork_hash_1,
+                fork_height_2,
+                fork_time_2 as i64,
+                &params.consensus,
+            )
+            .expect("next bits");
+
+        let miner_value_2 = block_subsidy(fork_height_2, &params.consensus);
+        let exchange_amount_2 = exchange_fund_amount(fork_height_2, &params.funding);
+        let foundation_amount_2 = foundation_fund_amount(fork_height_2, &params.funding);
+        let swap_amount_2 = swap_pool_amount(fork_height_2 as i64, &params.swap_pool);
+        let mut vout_2 = Vec::new();
+        vout_2.push(TxOut {
+            value: miner_value_2,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount_2 > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout_2.push(TxOut {
+                value: exchange_amount_2,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount_2 > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout_2.push(TxOut {
+                value: foundation_amount_2,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount_2 > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout_2.push(TxOut {
+                value: swap_amount_2,
+                script_pubkey: script,
+            });
+        }
+        let coinbase_2 = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: vec![1u8; 2],
+                sequence: u32::MAX,
+            }],
+            vout: vout_2,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let coinbase_txid_2 = coinbase_2.txid().expect("coinbase txid");
+        let final_sapling_root_2 = chainstate.sapling_root().expect("sapling root");
+        let header_2 = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: fork_hash_1,
+            merkle_root: coinbase_txid_2,
+            final_sapling_root: final_sapling_root_2,
+            time: fork_time_2,
+            bits: fork_bits_2,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let fork_hash_2 = header_2.hash();
+        let fork_block_2 = Block {
+            header: header_2,
+            transactions: vec![coinbase_2],
+        };
+        let fork_hex_2 = hex_bytes(&fork_block_2.consensus_encode().expect("encode fork block"));
+
+        let mut fork_header_batch_2 = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[fork_block_2.header.clone()],
+                &params.consensus,
+                &mut fork_header_batch_2,
+                false,
+            )
+            .expect("insert fork header 2");
+        chainstate
+            .commit_batch(fork_header_batch_2)
+            .expect("commit fork header 2");
+
+        let submitted_2 = rpc_submitblock(
+            &chainstate,
+            &write_lock,
+            &mempool,
+            &fee_estimator,
+            vec![Value::String(fork_hex_2)],
+            &params,
+            &flags,
+        )
+        .expect("rpc");
+        assert!(submitted_2.is_null());
+
+        let best_after = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        assert_eq!(best_after.hash, fork_hash_2);
+        assert_eq!(best_after.height, 2);
+
+        assert!(chainstate
+            .unconnected_block_bytes(&fork_hash_1)
+            .expect("unconnected bytes")
+            .is_none());
+        assert!(chainstate
+            .unconnected_block_bytes(&fork_hash_2)
+            .expect("unconnected bytes")
+            .is_none());
+        assert!(chainstate
+            .block_location(&fork_hash_1)
+            .expect("block location")
+            .is_some());
+        assert!(chainstate
+            .block_location(&fork_hash_2)
+            .expect("block location")
+            .is_some());
     }
 
     #[test]

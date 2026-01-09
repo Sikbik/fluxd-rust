@@ -953,7 +953,8 @@ Notes:
 Submits a block for validation.
 
 - If it extends the current best chain, it is validated and connected.
-- If it does not extend the best tip but the previous header is known, it is accepted as a side-chain/stale block and stored as unconnected block bytes (it does not change the active chain).
+- If it does not extend the best tip but the previous header is known, it is accepted as a side-chain/stale block and stored as unconnected block bytes.
+  - If the submitted block (or previously submitted unconnected blocks) forms a better-by-work header chain, `fluxd` will disconnect to the common ancestor and connect any now-available unconnected blocks along the best-header chain.
 
 - Params:
   - `hexdata` (string) - raw block bytes in hex
