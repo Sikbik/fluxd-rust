@@ -194,18 +194,19 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Fluxd Node Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
     <style>
       :root {
-        --bg-1: #f6f1e6;
-        --bg-2: #e7f2f1;
-        --bg-3: #f9e9d1;
-        --ink: #1b1b1b;
-        --muted: #5f5f5f;
-        --accent: #d4572f;
-        --accent-2: #1a8b8b;
-        --card: #fffaf0;
-        --ring: rgba(26, 139, 139, 0.25);
-        --shadow: rgba(33, 33, 33, 0.08);
+        --bg-color: #0b0e14;
+        --card-bg: rgba(20, 25, 35, 0.6);
+        --card-border: rgba(255, 255, 255, 0.08);
+        --text-main: #e2e8f0;
+        --text-muted: #94a3b8;
+        --accent-primary: #2d7ff9; /* RunOnFlux Blue */
+        --accent-glow: rgba(45, 127, 249, 0.4);
+        --success: #10b981;
+        --gradient-start: #0f172a;
+        --gradient-end: #020617;
       }
 
       * {
@@ -214,484 +215,406 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
       body {
         margin: 0;
-        font-family: "Space Grotesk", "Satoshi", "Avenir Next", "Trebuchet MS", sans-serif;
-        color: var(--ink);
-        background:
-          radial-gradient(circle at 20% 20%, rgba(212, 87, 47, 0.15), transparent 55%),
-          radial-gradient(circle at 80% 10%, rgba(26, 139, 139, 0.18), transparent 45%),
-          linear-gradient(135deg, var(--bg-1), var(--bg-2) 55%, var(--bg-3));
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        background: radial-gradient(circle at top center, #1e293b 0%, var(--bg-color) 40%);
+        background-color: var(--bg-color);
+        color: var(--text-main);
         min-height: 100vh;
-        overflow-x: hidden;
-      }
-
-      .orb {
-        position: fixed;
-        border-radius: 50%;
-        filter: blur(0.5px);
-        opacity: 0.6;
-        z-index: 0;
-        animation: float 12s ease-in-out infinite;
-      }
-
-      .orb.one {
-        width: 220px;
-        height: 220px;
-        background: rgba(26, 139, 139, 0.18);
-        top: -60px;
-        right: -40px;
-      }
-
-      .orb.two {
-        width: 280px;
-        height: 280px;
-        background: rgba(212, 87, 47, 0.16);
-        bottom: -120px;
-        left: -80px;
-        animation-delay: -4s;
+        -webkit-font-smoothing: antialiased;
       }
 
       main {
-        position: relative;
-        z-index: 1;
-        max-width: 1100px;
+        max-width: 1200px;
         margin: 0 auto;
-        padding: 40px 24px 64px;
+        padding: 40px 20px;
       }
 
       header {
         display: flex;
-        flex-wrap: wrap;
-        align-items: center;
         justify-content: space-between;
-        gap: 16px;
-        margin-bottom: 24px;
+        align-items: center;
+        margin-bottom: 60px;
+        position: relative;
       }
 
-      .title {
+      .brand {
         display: flex;
         flex-direction: column;
-        gap: 8px;
       }
 
       h1 {
+        font-size: 32px;
+        font-weight: 700;
+        letter-spacing: -0.03em;
         margin: 0;
-        font-size: clamp(28px, 3.5vw, 42px);
-        letter-spacing: -0.02em;
+        background: linear-gradient(135deg, #fff 0%, #94a3b8 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
       }
 
       .subtitle {
-        color: var(--muted);
         font-size: 14px;
-        letter-spacing: 0.12em;
+        color: var(--accent-primary);
+        font-weight: 600;
+        letter-spacing: 0.05em;
         text-transform: uppercase;
+        margin-bottom: 4px;
       }
 
-      .status {
-        display: inline-flex;
+      .status-pill {
+        background: rgba(16, 185, 129, 0.1);
+        border: 1px solid rgba(16, 185, 129, 0.2);
+        color: var(--success);
+        padding: 6px 16px;
+        border-radius: 99px;
+        font-size: 13px;
+        font-weight: 500;
+        display: flex;
         align-items: center;
-        gap: 10px;
-        padding: 8px 14px;
-        border-radius: 999px;
-        border: 1px solid var(--ring);
-        background: rgba(255, 255, 255, 0.6);
-        font-size: 14px;
+        gap: 8px;
+        backdrop-filter: blur(4px);
       }
 
-      .dot {
-        width: 10px;
-        height: 10px;
+      .status-pill.syncing {
+        background: rgba(45, 127, 249, 0.1);
+        border: 1px solid rgba(45, 127, 249, 0.2);
+        color: var(--accent-primary);
+      }
+
+      .status-dot {
+        width: 8px;
+        height: 8px;
         border-radius: 50%;
-        background: var(--accent-2);
-        box-shadow: 0 0 0 6px rgba(26, 139, 139, 0.15);
-        animation: pulse 2.5s ease-in-out infinite;
-      }
-
-      .status.syncing .dot {
-        background: var(--accent);
-        box-shadow: 0 0 0 6px rgba(212, 87, 47, 0.15);
+        background: currentColor;
+        box-shadow: 0 0 10px currentColor;
+        animation: pulse 2s infinite;
       }
 
       .grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        gap: 18px;
+        grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+        gap: 24px;
       }
 
       .card {
-        background: var(--card);
+        background: var(--card-bg);
+        border: 1px solid var(--card-border);
         border-radius: 16px;
-        padding: 18px 20px;
-        box-shadow: 0 12px 30px var(--shadow);
-        border: 1px solid rgba(255, 255, 255, 0.7);
-        position: relative;
-        overflow: hidden;
-        min-height: 120px;
-        animation: rise 0.8s ease both;
+        padding: 24px;
+        transition: transform 0.2s, box-shadow 0.2s;
+        backdrop-filter: blur(12px);
       }
 
-      .card::after {
-        content: "";
-        position: absolute;
-        inset: 0;
-        background: linear-gradient(130deg, rgba(255, 255, 255, 0.7), transparent 60%);
-        opacity: 0.6;
-        pointer-events: none;
+      .card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 30px rgba(0,0,0,0.2);
+        border-color: rgba(255,255,255,0.15);
+      }
+
+      .card.wide {
+        grid-column: span 2;
       }
 
       .label {
         font-size: 12px;
+        font-weight: 600;
+        color: var(--text-muted);
         text-transform: uppercase;
-        letter-spacing: 0.16em;
-        color: var(--muted);
+        letter-spacing: 0.05em;
+        margin-bottom: 12px;
       }
 
       .value {
-        font-size: 26px;
+        font-size: 24px;
         font-weight: 600;
-        margin-top: 10px;
+        color: #fff;
+        font-feature-settings: "tnum";
       }
 
-      .value.small {
-        font-size: 16px;
+      .value.mono {
+        font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace;
+        font-size: 15px;
+        color: var(--accent-primary);
         word-break: break-all;
-        font-family: "IBM Plex Mono", "SFMono-Regular", "Courier New", monospace;
-      }
-
-      .wide {
-        grid-column: span 2;
+        line-height: 1.4;
       }
 
       .footer {
-        margin-top: 24px;
+        margin-top: 60px;
+        padding-top: 20px;
+        border-top: 1px solid var(--card-border);
         display: flex;
-        flex-wrap: wrap;
         justify-content: space-between;
-        gap: 8px;
-        color: var(--muted);
+        color: var(--text-muted);
         font-size: 13px;
       }
 
-      @keyframes rise {
-        from {
-          opacity: 0;
-          transform: translateY(14px);
-        }
-        to {
-          opacity: 1;
-          transform: translateY(0);
-        }
-      }
-
       @keyframes pulse {
-        0%, 100% {
-          transform: scale(1);
-          opacity: 0.9;
-        }
-        50% {
-          transform: scale(1.2);
-          opacity: 0.6;
-        }
+        0% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.5; transform: scale(0.8); }
+        100% { opacity: 1; transform: scale(1); }
       }
 
-      @keyframes float {
-        0%, 100% {
-          transform: translateY(0);
-        }
-        50% {
-          transform: translateY(18px);
-        }
-      }
-
-      @media (max-width: 720px) {
-        .wide {
+      @media (max-width: 768px) {
+        .card.wide {
           grid-column: span 1;
-        }
-      }
-
-      @media (prefers-reduced-motion: reduce) {
-        .orb,
-        .card,
-        .dot {
-          animation: none !important;
         }
       }
     </style>
   </head>
   <body>
-    <div class="orb one"></div>
-    <div class="orb two"></div>
     <main>
       <header>
-        <div class="title">
-          <div class="subtitle">Fluxd Node Dashboard</div>
-          <h1>Chain Sync Overview</h1>
+        <div class="brand">
+          <span class="subtitle">Fluxd Node</span>
+          <h1>Dashboard</h1>
         </div>
-        <div class="status syncing" id="syncStatus">
-          <span class="dot"></span>
-          <span id="syncState">syncing</span>
+        <div class="status-pill syncing" id="syncStatus">
+          <span class="status-dot"></span>
+          <span id="syncState">INITIALIZING</span>
         </div>
       </header>
 
-      <section class="grid">
+      <div class="grid">
         <div class="card">
           <div class="label">Network</div>
-          <div class="value" id="network">-</div>
+          <div class="value" id="network">--</div>
         </div>
         <div class="card">
           <div class="label">Backend</div>
-          <div class="value" id="backend">-</div>
+          <div class="value" id="backend">--</div>
         </div>
         <div class="card">
+          <div class="label">Uptime</div>
+          <div class="value" id="uptime">--</div>
+        </div>
+        
+        <div class="card">
           <div class="label">Best Header Height</div>
-          <div class="value" id="bestHeaderHeight">-</div>
+          <div class="value" id="bestHeaderHeight">0</div>
         </div>
         <div class="card">
           <div class="label">Best Block Height</div>
-          <div class="value" id="bestBlockHeight">-</div>
+          <div class="value" id="bestBlockHeight">0</div>
         </div>
         <div class="card">
-          <div class="label">Header Gap</div>
-          <div class="value" id="headerGap">-</div>
+          <div class="label">Sync Gap</div>
+          <div class="value" id="headerGap">0</div>
         </div>
+
         <div class="card">
-          <div class="label">Indexed Blocks</div>
-          <div class="value" id="blockCount">-</div>
+          <div class="label">Headers / Sec</div>
+          <div class="value" id="headersPerSec">0</div>
         </div>
         <div class="card">
           <div class="label">Blocks / Sec</div>
-          <div class="value" id="blocksPerSec">-</div>
+          <div class="value" id="blocksPerSec">0</div>
         </div>
         <div class="card">
-          <div class="label">Total Headers</div>
-          <div class="value" id="headerCount">-</div>
+          <div class="label">Header Count</div>
+          <div class="value" id="headerCount">0</div>
+        </div>
+
+        <div class="card">
+          <div class="label">Download (ms)</div>
+          <div class="value" id="downloadMs">0</div>
         </div>
         <div class="card">
-          <div class="label">Headers / Sec</div>
-          <div class="value" id="headersPerSec">-</div>
+          <div class="label">Verify (ms)</div>
+          <div class="value" id="verifyMs">0</div>
         </div>
         <div class="card">
-          <div class="label">Download ms / Block</div>
-          <div class="value" id="downloadMs">-</div>
+          <div class="label">Storage (ms)</div>
+          <div class="value" id="commitMs">0</div>
+        </div>
+        
+        <div class="card">
+          <div class="label">Validation (ms)</div>
+          <div class="value" id="validateMs">0</div>
         </div>
         <div class="card">
-          <div class="label">Verify ms / Block</div>
-          <div class="value" id="verifyMs">-</div>
+          <div class="label">Script (ms)</div>
+          <div class="value" id="scriptMs">0</div>
         </div>
         <div class="card">
-          <div class="label">DB ms / Block</div>
-          <div class="value" id="commitMs">-</div>
+          <div class="label">Shielded (ms)</div>
+          <div class="value" id="shieldedMs">0</div>
+        </div>
+
+        <div class="card">
+          <div class="label">UTXO (ms)</div>
+          <div class="value" id="utxoMs">0</div>
         </div>
         <div class="card">
-          <div class="label">Validate ms / Block</div>
-          <div class="value" id="validateMs">-</div>
+          <div class="label">Index (ms)</div>
+          <div class="value" id="indexMs">0</div>
         </div>
         <div class="card">
-          <div class="label">Script ms / Block</div>
-          <div class="value" id="scriptMs">-</div>
-        </div>
-        <div class="card">
-          <div class="label">Shielded ms / Tx</div>
-          <div class="value" id="shieldedMs">-</div>
-        </div>
-        <div class="card">
-          <div class="label">UTXO ms / Block</div>
-          <div class="value" id="utxoMs">-</div>
-        </div>
-        <div class="card">
-          <div class="label">Index ms / Block</div>
-          <div class="value" id="indexMs">-</div>
-        </div>
-        <div class="card">
-          <div class="label">Anchor ms / Block</div>
-          <div class="value" id="anchorMs">-</div>
+          <div class="label">Anchor (ms)</div>
+          <div class="value" id="anchorMs">0</div>
         </div>
 	        <div class="card">
-	          <div class="label">Flatfile ms / Block</div>
-	          <div class="value" id="flatfileMs">-</div>
+	          <div class="label">Flatfile (ms)</div>
+	          <div class="value" id="flatfileMs">0</div>
 	        </div>
 	        <div class="card">
-	          <div class="label">Fluxnode Tx ms / Block</div>
-	          <div class="value" id="fluxnodeTxMs">-</div>
+	          <div class="label">Fluxnode Tx (ms)</div>
+	          <div class="value" id="fluxnodeTxMs">0</div>
 	        </div>
 	        <div class="card">
-	          <div class="label">Fluxnode Sig ms / Block</div>
-	          <div class="value" id="fluxnodeSigMs">-</div>
+	          <div class="label">Fluxnode Sig (ms)</div>
+	          <div class="value" id="fluxnodeSigMs">0</div>
 	        </div>
 	        <div class="card">
-	          <div class="label">PoN Sig ms / PoN Block</div>
-	          <div class="value" id="ponSigMs">-</div>
+	          <div class="label">PoN Sig (ms)</div>
+	          <div class="value" id="ponSigMs">0</div>
 	        </div>
 	        <div class="card">
-	          <div class="label">Payout ms / Block</div>
-	          <div class="value" id="payoutMs">-</div>
+	          <div class="label">Payout (ms)</div>
+	          <div class="value" id="payoutMs">0</div>
 	        </div>
-	        <div class="card">
-	          <div class="label">Uptime</div>
-	          <div class="value" id="uptime">-</div>
-	        </div>
+
         <div class="card wide">
           <div class="label">Best Header Hash</div>
-          <div class="value small" id="bestHeaderHash">-</div>
+          <div class="value mono" id="bestHeaderHash">--</div>
         </div>
         <div class="card wide">
           <div class="label">Best Block Hash</div>
-          <div class="value small" id="bestBlockHash">-</div>
+          <div class="value mono" id="bestBlockHash">--</div>
         </div>
-      </section>
+      </div>
 
       <div class="footer">
-        <div>Last update: <span id="lastUpdate">-</span></div>
-        <div>Server time: <span id="serverTime">-</span></div>
+        <div id="lastUpdate">Connecting...</div>
+        <div>Fluxd Rust Node</div>
       </div>
     </main>
 
     <script>
-      const el = (id) => document.getElementById(id);
-      const syncStatus = el("syncStatus");
+      const $ = (id) => document.getElementById(id);
+      const syncStatus = $("syncStatus");
       let lastSample = null;
 
-      function formatUptime(total) {
-        const days = Math.floor(total / 86400);
-        const hours = Math.floor((total % 86400) / 3600);
-        const minutes = Math.floor((total % 3600) / 60);
-        const seconds = total % 60;
-        const parts = [];
-        if (days > 0) parts.push(days + "d");
-        parts.push(String(hours).padStart(2, "0") + "h");
-        parts.push(String(minutes).padStart(2, "0") + "m");
-        parts.push(String(seconds).padStart(2, "0") + "s");
-        return parts.join(" ");
+      function formatUptime(totalSecs) {
+        if (!totalSecs) return "-";
+        const d = Math.floor(totalSecs / 86400);
+        const h = Math.floor((totalSecs % 86400) / 3600);
+        const m = Math.floor((totalSecs % 3600) / 60);
+        if (d > 0) return `${d}d ${h}h ${m}m`;
+        if (h > 0) return `${h}h ${m}m`;
+        return `${m}m ${Math.floor(totalSecs % 60)}s`;
       }
 
-      function applyStats(data) {
-        let blocksPerSec = "-";
-        let headersPerSec = "-";
-        let downloadMs = "-";
-        let verifyMs = "-";
-        let commitMs = "-";
-        let validateMs = "-";
-        let scriptMs = "-";
-        let shieldedMs = "-";
-	        let utxoMs = "-";
-	        let indexMs = "-";
-	        let anchorMs = "-";
-	        let flatfileMs = "-";
-	        let fluxnodeTxMs = "-";
-	        let fluxnodeSigMs = "-";
-	        let ponSigMs = "-";
-	        let payoutMs = "-";
-	        if (lastSample && data.unix_time_secs > lastSample.unix_time_secs) {
-	          const dt = data.unix_time_secs - lastSample.unix_time_secs;
-	          const blocksDelta = data.block_count - lastSample.block_count;
-          const headersDelta = data.header_count - lastSample.header_count;
-          blocksPerSec = (blocksDelta / dt).toFixed(2);
-          headersPerSec = (headersDelta / dt).toFixed(2);
-          const downloadBlocks = data.download_blocks - lastSample.download_blocks;
-          const verifyBlocks = data.verify_blocks - lastSample.verify_blocks;
-          const commitBlocks = data.commit_blocks - lastSample.commit_blocks;
-          const validateBlocks = data.validate_blocks - lastSample.validate_blocks;
-          const scriptBlocks = data.script_blocks - lastSample.script_blocks;
-          const shieldedTxs = data.shielded_txs - lastSample.shielded_txs;
-          const utxoBlocks = data.utxo_blocks - lastSample.utxo_blocks;
-          const indexBlocks = data.index_blocks - lastSample.index_blocks;
-          const anchorBlocks = data.anchor_blocks - lastSample.anchor_blocks;
-          const flatfileBlocks = data.flatfile_blocks - lastSample.flatfile_blocks;
-          if (downloadBlocks > 0) {
-            downloadMs = ((data.download_us - lastSample.download_us) / 1000 / downloadBlocks).toFixed(2);
-          }
-          if (verifyBlocks > 0) {
-            verifyMs = ((data.verify_us - lastSample.verify_us) / 1000 / verifyBlocks).toFixed(2);
-          }
-          if (commitBlocks > 0) {
-            commitMs = ((data.commit_us - lastSample.commit_us) / 1000 / commitBlocks).toFixed(2);
-          }
-          if (validateBlocks > 0) {
-            validateMs = ((data.validate_us - lastSample.validate_us) / 1000 / validateBlocks).toFixed(2);
-          }
-          if (scriptBlocks > 0) {
-            scriptMs = ((data.script_us - lastSample.script_us) / 1000 / scriptBlocks).toFixed(2);
-          }
-          if (shieldedTxs > 0) {
-            shieldedMs = ((data.shielded_us - lastSample.shielded_us) / 1000 / shieldedTxs).toFixed(2);
-          }
-          if (utxoBlocks > 0) {
-            utxoMs = ((data.utxo_us - lastSample.utxo_us) / 1000 / utxoBlocks).toFixed(2);
-          }
-          if (indexBlocks > 0) {
-            indexMs = ((data.index_us - lastSample.index_us) / 1000 / indexBlocks).toFixed(2);
-          }
-          if (anchorBlocks > 0) {
-            anchorMs = ((data.anchor_us - lastSample.anchor_us) / 1000 / anchorBlocks).toFixed(2);
-          }
-	          if (flatfileBlocks > 0) {
-	            flatfileMs = ((data.flatfile_us - lastSample.flatfile_us) / 1000 / flatfileBlocks).toFixed(2);
-	          }
-	          if (verifyBlocks > 0) {
-	            fluxnodeTxMs = ((data.fluxnode_tx_us - lastSample.fluxnode_tx_us) / 1000 / verifyBlocks).toFixed(2);
-	            fluxnodeSigMs = ((data.fluxnode_sig_us - lastSample.fluxnode_sig_us) / 1000 / verifyBlocks).toFixed(2);
-	          }
-	          const ponBlocks = data.pon_sig_blocks - lastSample.pon_sig_blocks;
-	          if (ponBlocks > 0) {
-	            ponSigMs = ((data.pon_sig_us - lastSample.pon_sig_us) / 1000 / ponBlocks).toFixed(2);
-	          }
-	          const payoutBlocks = data.payout_blocks - lastSample.payout_blocks;
-	          if (payoutBlocks > 0) {
-	            payoutMs = ((data.payout_us - lastSample.payout_us) / 1000 / payoutBlocks).toFixed(2);
-	          }
-	        }
+      function updateUI(data) {
+        // Calculate rates
+        let blocksPerSec = 0;
+        let headersPerSec = 0;
+        
+        // Timings
+        let downloadMs = 0;
+        let verifyMs = 0;
+        let commitMs = 0;
+        let validateMs = 0;
+        let scriptMs = 0;
+        let shieldedMs = 0;
+        let utxoMs = 0;
+        let indexMs = 0;
+        let anchorMs = 0;
+        let flatfileMs = 0;
+        let fluxnodeTxMs = 0;
+        let fluxnodeSigMs = 0;
+        let ponSigMs = 0;
+        let payoutMs = 0;
 
-        el("network").textContent = data.network;
-        el("backend").textContent = data.backend;
-        el("bestHeaderHeight").textContent = data.best_header_height;
-        el("bestBlockHeight").textContent = data.best_block_height;
-        el("headerGap").textContent = data.header_gap;
-        el("headerCount").textContent = data.header_count;
-        el("blockCount").textContent = data.block_count;
-        el("blocksPerSec").textContent = blocksPerSec;
-        el("headersPerSec").textContent = headersPerSec;
-        el("downloadMs").textContent = downloadMs;
-        el("verifyMs").textContent = verifyMs;
-        el("commitMs").textContent = commitMs;
-        el("validateMs").textContent = validateMs;
-        el("scriptMs").textContent = scriptMs;
-        el("shieldedMs").textContent = shieldedMs;
-	        el("utxoMs").textContent = utxoMs;
-	        el("indexMs").textContent = indexMs;
-	        el("anchorMs").textContent = anchorMs;
-	        el("flatfileMs").textContent = flatfileMs;
-	        el("fluxnodeTxMs").textContent = fluxnodeTxMs;
-	        el("fluxnodeSigMs").textContent = fluxnodeSigMs;
-	        el("ponSigMs").textContent = ponSigMs;
-	        el("payoutMs").textContent = payoutMs;
-	        el("bestHeaderHash").textContent = data.best_header_hash || "-";
-	        el("bestBlockHash").textContent = data.best_block_hash || "-";
-	        el("uptime").textContent = formatUptime(data.uptime_secs);
-        el("serverTime").textContent = new Date(data.unix_time_secs * 1000).toLocaleString();
-        el("lastUpdate").textContent = new Date().toLocaleTimeString();
+        if (lastSample && data.unix_time_secs > lastSample.unix_time_secs) {
+          const dt = data.unix_time_secs - lastSample.unix_time_secs;
+          
+          if (dt > 0) {
+            blocksPerSec = ((data.block_count - lastSample.block_count) / dt).toFixed(1);
+            headersPerSec = ((data.header_count - lastSample.header_count) / dt).toFixed(1);
+          }
 
-        el("syncState").textContent = data.sync_state;
+          const calcMs = (keyPrefix, countKey) => {
+             const deltaUs = data[`${keyPrefix}_us`] - lastSample[`${keyPrefix}_us`];
+             const deltaCount = data[countKey] - lastSample[countKey];
+             return deltaCount > 0 ? (deltaUs / 1000 / deltaCount).toFixed(2) : 0;
+          };
+
+          downloadMs = calcMs('download', 'download_blocks');
+          verifyMs = calcMs('verify', 'verify_blocks');
+          commitMs = calcMs('commit', 'commit_blocks');
+          validateMs = calcMs('validate', 'validate_blocks');
+          scriptMs = calcMs('script', 'script_blocks');
+          shieldedMs = calcMs('shielded', 'shielded_txs');
+          utxoMs = calcMs('utxo', 'utxo_blocks');
+          indexMs = calcMs('index', 'index_blocks');
+          anchorMs = calcMs('anchor', 'anchor_blocks');
+          flatfileMs = calcMs('flatfile', 'flatfile_blocks');
+          fluxnodeTxMs = calcMs('fluxnode_tx', 'verify_blocks');
+          fluxnodeSigMs = calcMs('fluxnode_sig', 'verify_blocks');
+          ponSigMs = calcMs('pon_sig', 'pon_sig_blocks');
+          payoutMs = calcMs('payout', 'payout_blocks');
+        }
+
+        // Update DOM
+        $("network").textContent = data.network;
+        $("backend").textContent = data.backend;
+        $("uptime").textContent = formatUptime(data.uptime_secs);
+        
+        $("bestHeaderHeight").textContent = data.best_header_height.toLocaleString();
+        $("bestBlockHeight").textContent = data.best_block_height.toLocaleString();
+        $("headerGap").textContent = data.header_gap.toLocaleString();
+        $("headerCount").textContent = data.header_count.toLocaleString();
+        
+        $("blocksPerSec").textContent = blocksPerSec;
+        $("headersPerSec").textContent = headersPerSec;
+
+        const setMs = (id, val) => $(id).textContent = val > 0 ? val : "-";
+        
+        setMs("downloadMs", downloadMs);
+        setMs("verifyMs", verifyMs);
+        setMs("commitMs", commitMs);
+        setMs("validateMs", validateMs);
+        setMs("scriptMs", scriptMs);
+        setMs("shieldedMs", shieldedMs);
+        setMs("utxoMs", utxoMs);
+        setMs("indexMs", indexMs);
+        setMs("anchorMs", anchorMs);
+        setMs("flatfileMs", flatfileMs);
+        setMs("fluxnodeTxMs", fluxnodeTxMs);
+        setMs("fluxnodeSigMs", fluxnodeSigMs);
+        setMs("ponSigMs", ponSigMs);
+        setMs("payoutMs", payoutMs);
+
+        $("bestHeaderHash").textContent = data.best_header_hash || "-";
+        $("bestBlockHash").textContent = data.best_block_hash || "-";
+
+        $("lastUpdate").textContent = "Updated: " + new Date().toLocaleTimeString();
+        $("syncState").textContent = data.sync_state.toUpperCase();
+
         if (data.sync_state === "synced") {
-          syncStatus.classList.remove("syncing");
+          syncStatus.className = "status-pill";
         } else {
-          syncStatus.classList.add("syncing");
+          syncStatus.className = "status-pill syncing";
         }
 
         lastSample = data;
       }
 
-      async function refresh() {
+      async function fetchStats() {
         try {
           const res = await fetch("/stats", { cache: "no-store" });
-          if (!res.ok) return;
-          const data = await res.json();
-          applyStats(data);
-        } catch (err) {
-          // ignore transient fetch errors
+          if (res.ok) {
+            const data = await res.json();
+            updateUI(data);
+          }
+        } catch (e) {
+          console.error("Stats fetch failed", e);
         }
       }
 
-      refresh();
-      setInterval(refresh, 3000);
+      fetchStats();
+      setInterval(fetchStats, 2000);
     </script>
   </body>
 </html>
