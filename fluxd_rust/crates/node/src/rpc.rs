@@ -4149,11 +4149,25 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         }
     };
     let count = match params.get(1) {
-        Some(value) if !value.is_null() => parse_u32(value, "count")?,
+        Some(value) if !value.is_null() => {
+            if let Some(num) = value.as_i64() {
+                if num < 0 {
+                    return Err(RpcError::new(RPC_INVALID_PARAMETER, "Negative count"));
+                }
+            }
+            parse_u32(value, "count")?
+        }
         _ => 10,
     };
-    let skip = match params.get(2) {
-        Some(value) if !value.is_null() => parse_u32(value, "skip")?,
+    let from = match params.get(2) {
+        Some(value) if !value.is_null() => {
+            if let Some(num) = value.as_i64() {
+                if num < 0 {
+                    return Err(RpcError::new(RPC_INVALID_PARAMETER, "Negative from"));
+                }
+            }
+            parse_u32(value, "from")?
+        }
         _ => 0,
     };
 
@@ -4317,13 +4331,13 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
     candidates.extend(unconfirmed_candidates);
     candidates.extend(chain_candidates);
 
-    let skip = usize::try_from(skip).unwrap_or(usize::MAX);
+    let from = usize::try_from(from).unwrap_or(usize::MAX);
     let count = usize::try_from(count).unwrap_or(0);
     if count == 0 {
         return Ok(Value::Array(Vec::new()));
     }
 
-    let target = skip.saturating_add(count);
+    let target = from.saturating_add(count);
     let mut newest_to_oldest = Vec::new();
 
     'outer: for cand in candidates {
@@ -4473,11 +4487,11 @@ fn rpc_listtransactions<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    let skip = skip.min(newest_to_oldest.len());
-    let count = count.min(newest_to_oldest.len().saturating_sub(skip));
+    let from = from.min(newest_to_oldest.len());
+    let count = count.min(newest_to_oldest.len().saturating_sub(from));
     let mut out = newest_to_oldest
         .into_iter()
-        .skip(skip)
+        .skip(from)
         .take(count)
         .collect::<Vec<_>>();
     out.reverse();
@@ -4502,18 +4516,25 @@ fn rpc_listsinceblock<S: fluxd_storage::KeyValueStore>(
 
     let start_height = match params.first() {
         None | Some(Value::Null) => None,
-        Some(value) => {
-            let hash = parse_hash(value)?;
-            chainstate
+        Some(value) => match parse_hash_sethex(value)? {
+            Some(hash) => chainstate
                 .header_entry(&hash)
                 .map_err(map_internal)?
-                .map(|entry| entry.height)
-        }
+                .map(|entry| entry.height),
+            None => None,
+        },
     };
 
     let target_confirmations = match params.get(1) {
         None | Some(Value::Null) => 1u32,
-        Some(value) => parse_u32(value, "target-confirmations")?,
+        Some(value) => {
+            if let Some(num) = value.as_i64() {
+                if num < 0 {
+                    return Err(RpcError::new(RPC_INVALID_PARAMETER, "Invalid parameter"));
+                }
+            }
+            parse_u32(value, "target-confirmations")?
+        }
     };
     if target_confirmations < 1 {
         return Err(RpcError::new(RPC_INVALID_PARAMETER, "Invalid parameter"));
@@ -23292,7 +23313,55 @@ mod tests {
             &chainstate,
             &mempool,
             &wallet,
+            vec![json!("not-a-blockhash")],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(
+            obj.get("lastblock").and_then(Value::as_str),
+            Some(blockhash_b_hex.as_str())
+        );
+        let txs = obj
+            .get("transactions")
+            .and_then(Value::as_array)
+            .expect("transactions array");
+        assert_eq!(txs.len(), 3);
+        let last = txs[2].as_object().expect("object");
+        assert_eq!(
+            last.get("txid").and_then(Value::as_str),
+            Some(mempool_txid_hex.as_str())
+        );
+
+        let value = rpc_listsinceblock(
+            &chainstate,
+            &mempool,
+            &wallet,
             vec![Value::String(blockhash_a_hex.clone())],
+            &params,
+        )
+        .expect("rpc");
+        let obj = value.as_object().expect("object");
+        assert_eq!(
+            obj.get("lastblock").and_then(Value::as_str),
+            Some(blockhash_b_hex.as_str())
+        );
+        let txs = obj
+            .get("transactions")
+            .and_then(Value::as_array)
+            .expect("transactions array");
+        assert_eq!(txs.len(), 2);
+        let first = txs[0].as_object().expect("object");
+        assert_eq!(
+            first.get("txid").and_then(Value::as_str),
+            Some(txid_b_hex.as_str())
+        );
+
+        let value = rpc_listsinceblock(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![Value::String(format!("{blockhash_a_hex} trailing"))],
             &params,
         )
         .expect("rpc");
@@ -23597,6 +23666,118 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(txids.contains(hash256_to_hex(&txid_a).as_str()));
         assert!(!txids.contains(hash256_to_hex(&txid_b).as_str()));
+    }
+
+    #[test]
+    fn listtransactions_applies_from_and_count() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address_1 = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_1 = address_to_script_pubkey(&address_1, params.network).expect("address script");
+
+        let address_2 = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_2 = address_to_script_pubkey(&address_2, params.network).expect("address script");
+
+        let address_3 = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_3 = address_to_script_pubkey(&address_3, params.network).expect("address script");
+
+        let (_txid_1, _vout_1, height_1, _value_1) =
+            mine_regtest_block_to_script(&chainstate, &params, script_1);
+        assert_eq!(height_1, 1);
+        let (txid_2, _vout_2, height_2, _value_2) =
+            mine_regtest_block_to_script(&chainstate, &params, script_2);
+        assert_eq!(height_2, 2);
+        let (txid_3, _vout_3, height_3, _value_3) =
+            mine_regtest_block_to_script(&chainstate, &params, script_3);
+        assert_eq!(height_3, 3);
+
+        let mempool = Mutex::new(Mempool::new(0));
+
+        let expected_txid_2 = hash256_to_hex(&txid_2);
+        let expected_txid_3 = hash256_to_hex(&txid_3);
+
+        let value = rpc_listtransactions(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!("*"), json!(2), json!(0)],
+            &params,
+        )
+        .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(
+            arr[0].get("txid").and_then(Value::as_str),
+            Some(expected_txid_2.as_str())
+        );
+        assert_eq!(
+            arr[1].get("txid").and_then(Value::as_str),
+            Some(expected_txid_3.as_str())
+        );
+
+        let value = rpc_listtransactions(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![json!("*"), json!(1), json!(1)],
+            &params,
+        )
+        .expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("txid").and_then(Value::as_str),
+            Some(expected_txid_2.as_str())
+        );
+    }
+
+    #[test]
+    fn listtransactions_rejects_negative_count() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let mempool = Mutex::new(Mempool::new(0));
+
+        let err = rpc_listtransactions(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![Value::Null, json!(-1)],
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert_eq!(err.message, "Negative count");
+    }
+
+    #[test]
+    fn listtransactions_rejects_negative_from() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let mempool = Mutex::new(Mempool::new(0));
+
+        let err = rpc_listtransactions(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![Value::Null, json!(1), json!(-1)],
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert_eq!(err.message, "Negative from");
     }
 
     #[test]
@@ -24835,6 +25016,35 @@ fn parse_hash(value: &Value) -> Result<Hash256, RpcError> {
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hash must be a string"))?;
     hash256_from_hex(text).map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "invalid hash"))
+}
+
+fn parse_hash_sethex(value: &Value) -> Result<Option<Hash256>, RpcError> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hash must be a string"))?;
+
+    let mut text = text.trim_start();
+    if let Some(stripped) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        text = stripped;
+    }
+
+    let bytes = text.as_bytes();
+    let mut end = 0usize;
+    while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+        end += 1;
+    }
+
+    let mut hex = &text[..end];
+    if hex.is_empty() {
+        return Ok(None);
+    }
+    if hex.len() > 64 {
+        hex = &hex[hex.len() - 64..];
+    }
+
+    let hash =
+        hash256_from_hex(hex).map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "invalid hash"))?;
+    Ok(Some(hash))
 }
 
 fn parse_height(value: &Value) -> Result<i32, RpcError> {

@@ -130,7 +130,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 
 - `getwalletinfo` (partial)
 - `gettransaction <txid> [include_watchonly]`
-- `listtransactions [account] [count] [skip] [include_watchonly]` (partial)
+- `listtransactions [account] [count] [from] [include_watchonly]` (partial)
 - `listsinceblock [blockhash] [target_confirmations] [include_watchonly]` (partial)
 - `addmultisigaddress <nrequired> <keys> [account]` (partial; adds a P2SH redeem script + watch script; stores optional `account` label)
 - `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]`
@@ -422,7 +422,7 @@ Notes:
 
 ### listtransactions
 
-- Params: `[account] [count] [skip] [include_watchonly]` (partial; `account="*"` returns all, otherwise filters entries by wallet label/account; `include_watchonly` is honored).
+- Params: `[account] [count] [from] [include_watchonly]` (partial; `account="*"` returns all, otherwise filters entries by wallet label/account; `include_watchonly` is honored).
 - Result: array of wallet transaction entries (ordered oldest → newest; unconfirmed entries appear last). Each entry corresponds to a wallet-relevant output (send/receive/generate/etc), similar to `fluxd`.
 
 Notes:
@@ -441,7 +441,7 @@ Notes:
 - Result: object `{ "transactions": array, "lastblock": string }`.
 
 Notes:
-- If `blockhash` is omitted (or unknown), returns all wallet transactions.
+- If `blockhash` is omitted, unknown, or invalid, returns all wallet transactions (matches `fluxd`’s lenient `SetHex` parsing).
 - `lastblock` is the best block at depth `target_confirmations` (1 = chain tip).
 - `fee` / `fee_zat` is included for `send` entries when available.
 - `vout` is included per entry (index of the referenced output in the transaction).
