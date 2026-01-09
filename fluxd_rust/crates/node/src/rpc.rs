@@ -9190,15 +9190,37 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
 
     let mut errors: Vec<Value> = Vec::new();
 
-    let wallet_guard = if given_keys {
-        None
-    } else {
-        Some(
-            wallet
-                .lock()
-                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?,
-        )
-    };
+    let wallet_guard = wallet
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+
+    let wallet_signing_key_for_script_pubkey =
+        |script_pubkey: &[u8]| -> Result<Option<(SecretKey, Vec<u8>)>, RpcError> {
+            match wallet_guard.signing_key_for_script_pubkey(script_pubkey) {
+                Ok(key) => Ok(key),
+                Err(err) => {
+                    if given_keys {
+                        Ok(None)
+                    } else {
+                        Err(map_wallet_error(err))
+                    }
+                }
+            }
+        };
+
+    let wallet_signing_key_for_pubkey =
+        |pubkey: &PublicKey| -> Result<Option<SecretKey>, RpcError> {
+            match wallet_guard.signing_key_for_pubkey(pubkey) {
+                Ok(key) => Ok(key),
+                Err(err) => {
+                    if given_keys {
+                        Ok(None)
+                    } else {
+                        Err(map_wallet_error(err))
+                    }
+                }
+            }
+        };
 
     for input_index in 0..tx.vin.len() {
         let outpoint = tx
@@ -9224,8 +9246,9 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
             ScriptType::P2Pkh => {
                 let (secret, pubkey_bytes) = match key_overrides.get(&prevout.script_pubkey) {
                     Some((secret, pubkey)) => (secret.clone(), pubkey.clone()),
-                    None => {
-                        if given_keys {
+                    None => match wallet_signing_key_for_script_pubkey(&prevout.script_pubkey)? {
+                        Some((secret, pubkey)) => (secret, pubkey),
+                        None => {
                             errors.push(json!({
                                 "txid": hash256_to_hex(&outpoint.hash),
                                 "vout": outpoint.index,
@@ -9235,27 +9258,7 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                             }));
                             continue;
                         }
-                        match wallet_guard
-                            .as_ref()
-                            .ok_or_else(|| {
-                                RpcError::new(RPC_INTERNAL_ERROR, "wallet guard missing")
-                            })?
-                            .signing_key_for_script_pubkey(&prevout.script_pubkey)
-                            .map_err(map_wallet_error)?
-                        {
-                            Some((secret, pubkey)) => (secret, pubkey),
-                            None => {
-                                errors.push(json!({
-                                    "txid": hash256_to_hex(&outpoint.hash),
-                                    "vout": outpoint.index,
-                                    "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
-                                    "sequence": tx.vin[input_index].sequence,
-                                    "error": "Private key not available for this input",
-                                }));
-                                continue;
-                            }
-                        }
-                    }
+                    },
                 };
 
                 let sighash = match signature_hash(
@@ -9313,13 +9316,7 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
             }
             ScriptType::P2Sh => {
                 let redeem_script = prevout.redeem_script.clone().or_else(|| {
-                    if given_keys {
-                        None
-                    } else {
-                        wallet_guard.as_ref().and_then(|guard| {
-                            guard.redeem_script_for_p2sh_script_pubkey(&prevout.script_pubkey)
-                        })
-                    }
+                    wallet_guard.redeem_script_for_p2sh_script_pubkey(&prevout.script_pubkey)
                 });
                 let Some(redeem_script) = redeem_script else {
                     errors.push(json!({
@@ -9362,22 +9359,7 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                     for pubkey in pubkeys {
                         let secret = match key_overrides_by_pubkey.get(&pubkey.serialize()) {
                             Some(secret) => Some(secret.clone()),
-                            None => {
-                                if given_keys {
-                                    None
-                                } else {
-                                    wallet_guard
-                                        .as_ref()
-                                        .ok_or_else(|| {
-                                            RpcError::new(
-                                                RPC_INTERNAL_ERROR,
-                                                "wallet guard missing",
-                                            )
-                                        })?
-                                        .signing_key_for_pubkey(&pubkey)
-                                        .map_err(map_wallet_error)?
-                                }
-                            }
+                            None => wallet_signing_key_for_pubkey(&pubkey)?,
                         };
                         let Some(secret) = secret else {
                             continue;
@@ -9436,8 +9418,9 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                 if classify_script_pubkey(&redeem_script) == ScriptType::P2Pkh {
                     let (secret, pubkey_bytes) = match key_overrides.get(redeem_script.as_slice()) {
                         Some((secret, pubkey)) => (secret.clone(), pubkey.clone()),
-                        None => {
-                            if given_keys {
+                        None => match wallet_signing_key_for_script_pubkey(&redeem_script)? {
+                            Some((secret, pubkey)) => (secret, pubkey),
+                            None => {
                                 errors.push(json!({
                                     "txid": hash256_to_hex(&outpoint.hash),
                                     "vout": outpoint.index,
@@ -9447,27 +9430,7 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                                 }));
                                 continue;
                             }
-                            match wallet_guard
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    RpcError::new(RPC_INTERNAL_ERROR, "wallet guard missing")
-                                })?
-                                .signing_key_for_script_pubkey(&redeem_script)
-                                .map_err(map_wallet_error)?
-                            {
-                                Some((secret, pubkey)) => (secret, pubkey),
-                                None => {
-                                    errors.push(json!({
-                                        "txid": hash256_to_hex(&outpoint.hash),
-                                        "vout": outpoint.index,
-                                        "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
-                                        "sequence": tx.vin[input_index].sequence,
-                                        "error": "Private key not available for this input",
-                                    }));
-                                    continue;
-                                }
-                            }
-                        }
+                        },
                     };
 
                     let sighash = match signature_hash(
@@ -20268,7 +20231,7 @@ mod tests {
     }
 
     #[test]
-    fn signrawtransaction_privkeys_do_not_use_wallet_fallback() {
+    fn signrawtransaction_privkeys_use_wallet_fallback() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
@@ -20371,13 +20334,10 @@ mod tests {
         .expect("rpc");
 
         let obj = signed.as_object().expect("object");
-        assert_eq!(obj.get("complete").and_then(Value::as_bool), Some(false));
-        let errors = obj.get("errors").and_then(Value::as_array).expect("errors");
-        assert_eq!(errors.len(), 1);
-        let first_error = errors[0].as_object().expect("error object");
-        assert_eq!(
-            first_error.get("error").and_then(Value::as_str),
-            Some("Private key not available for this input")
+        assert_eq!(obj.get("complete").and_then(Value::as_bool), Some(true));
+        assert!(
+            obj.get("errors").is_none(),
+            "expected no errors when wallet can sign remaining inputs"
         );
 
         let signed_hex = obj.get("hex").and_then(Value::as_str).expect("hex");
@@ -20386,7 +20346,7 @@ mod tests {
             Transaction::consensus_decode(&signed_bytes).expect("decode signed transaction");
         assert_eq!(signed_tx.vin.len(), 2);
         assert!(!signed_tx.vin[0].script_sig.is_empty());
-        assert!(signed_tx.vin[1].script_sig.is_empty());
+        assert!(!signed_tx.vin[1].script_sig.is_empty());
     }
 
     #[test]

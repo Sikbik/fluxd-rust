@@ -116,7 +116,7 @@ Type notes:
 - `createmultisig <nrequired> <keys>`
 - `getrawtransaction <txid> [verbose]`
 - `fundrawtransaction <hexstring>` (partial)
-- `signrawtransaction <hexstring> [prevtxs] [privkeys] [sighashtype] [branchid]` (partial)
+- `signrawtransaction <hexstring> [prevtxs] [privkeys] [sighashtype] [branchid]`
 - `sendrawtransaction <hexstring> [allowhighfees]`
 - `gettxout <txid> <vout> [include_mempool]`
 - `gettxoutsetinfo`
@@ -772,7 +772,7 @@ Notes:
 - Supports signing P2PKH inputs and P2SH inputs with either a multisig redeem script or a P2PKH redeem script.
 - For P2SH inputs, the redeem script is loaded from the wallet when known; otherwise provide `prevtxs[].redeemScript`.
 - `prevtxs[].amount` is optional and defaults to `0` (legacy `fluxd` behavior).
-- Uses wallet keys by default; when `privkeys` is provided (even an empty array), wallet keys/redeem scripts are not consulted.
+- Wallet keys/redeem scripts are consulted when available; `privkeys` provides additional WIF keys (useful when the wallet is locked or missing a key).
 
 ### sendrawtransaction
 

@@ -387,7 +387,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`estimatepriority`<br>`validateaddress`<br>`verifymessage`<br>`signmessage` | `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs; non-P2PKH inputs must be pre-signed)<br>`signrawtransaction` (supports P2SH/multisig; may return incomplete signatures) | - |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`estimatepriority`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`signrawtransaction` | `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs; non-P2PKH inputs must be pre-signed) | - |
 
 ### Mempool and relay
 
@@ -429,7 +429,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill`<br>`getwalletinfo`<br>`sendfrom`<br>`getreceivedbyaddress`<br>`listreceivedbyaddress` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`gettransaction`<br>`listtransactions`<br>`listsinceblock`<br>`addmultisigaddress`<br>`settxfee`<br>`listunspent`<br>`fundrawtransaction`<br>`signrawtransaction`<br>`sendtoaddress`<br>`sendmany`<br>`importwallet`<br>`listaddressgroupings` | - |
+| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`importwallet`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill`<br>`getwalletinfo`<br>`gettransaction`<br>`listunspent`<br>`signrawtransaction`<br>`sendfrom`<br>`sendtoaddress`<br>`sendmany`<br>`getreceivedbyaddress`<br>`listreceivedbyaddress` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`listtransactions`<br>`listsinceblock`<br>`addmultisigaddress`<br>`settxfee`<br>`fundrawtransaction`<br>`listaddressgroupings` | - |
 
 ### Wallet (shielded)
 
