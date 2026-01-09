@@ -747,6 +747,9 @@ Notes:
 
 - Params:
   - `hexstring` (string)
+- optional `options` (object):
+  - `minconf` (number, default 1)
+  - `subtractFeeFromOutputs` (array of output indices; fee is split and subtracted across these outputs)
 - Result: `{ "hex": "<funded_tx_hex>", "fee": <amount>, "changepos": <n> }`
 
 Notes:

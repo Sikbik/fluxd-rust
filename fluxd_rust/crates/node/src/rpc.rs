@@ -9646,6 +9646,46 @@ impl Default for FundRawTransactionOptions {
     }
 }
 
+fn parse_fundrawtransaction_options(value: &Value) -> Result<FundRawTransactionOptions, RpcError> {
+    let obj = value.as_object().ok_or_else(|| {
+        RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "fundrawtransaction options must be an object",
+        )
+    })?;
+
+    let mut options = FundRawTransactionOptions::default();
+
+    if let Some(value) = obj.get("minconf") {
+        if !value.is_null() {
+            let minconf_u32 = parse_u32(value, "minconf")?;
+            options.minconf = i32::try_from(minconf_u32)
+                .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "minconf out of range"))?;
+        }
+    }
+
+    if let Some(value) = obj.get("subtractFeeFromOutputs") {
+        if !value.is_null() {
+            let arr = value.as_array().ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "subtractFeeFromOutputs must be an array of numbers",
+                )
+            })?;
+            let mut indexes = Vec::with_capacity(arr.len());
+            for entry in arr {
+                let raw = parse_u32(entry, "subtractFeeFromOutputs")?;
+                indexes.push(usize::try_from(raw).map_err(|_| {
+                    RpcError::new(RPC_INVALID_PARAMETER, "subtractFeeFromOutputs out of range")
+                })?);
+            }
+            options.subtract_fee_from_outputs = indexes;
+        }
+    }
+
+    Ok(options)
+}
+
 fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
@@ -9657,15 +9697,19 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     chain_params: &ChainParams,
     fund_control: FundTransactionControl,
 ) -> Result<Value, RpcError> {
-    if params.len() != 1 {
+    if params.is_empty() || params.len() > 2 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
-            "fundrawtransaction expects 1 parameter",
+            "fundrawtransaction expects 1 or 2 parameters",
         ));
     }
     let hex = params[0]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
+    let options = match params.get(1) {
+        None | Some(Value::Null) => FundRawTransactionOptions::default(),
+        Some(value) => parse_fundrawtransaction_options(value)?,
+    };
     fundrawtransaction_with_options(
         chainstate,
         mempool,
@@ -9674,7 +9718,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         tx_confirm_target,
         wallet,
         hex,
-        FundRawTransactionOptions::default(),
+        options,
         chain_params,
         fund_control,
     )
@@ -21720,6 +21764,170 @@ mod tests {
         )
         .expect("rpc");
         assert!(value.get("hex").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn fundrawtransaction_options_minconf_filters_utxos() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x11u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let fee_estimator = Mutex::new(FeeEstimator::new(mempool_policy.min_relay_fee_per_kb));
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: vec![TxOut {
+                value: 1 * COIN,
+                script_pubkey: p2pkh_script([0x22u8; 20]),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let err = rpc_fundrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &fee_estimator,
+            2,
+            &wallet,
+            vec![json!(raw_hex), json!({"minconf": 2})],
+            &params,
+            FundTransactionControl::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_ERROR);
+        assert!(err.message.contains("insufficient funds"));
+    }
+
+    #[test]
+    fn fundrawtransaction_options_subtract_fee_from_outputs_adjusts_recipient_value() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x11u8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: from_script.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&from_script, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let fee_estimator = Mutex::new(FeeEstimator::new(mempool_policy.min_relay_fee_per_kb));
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: Vec::new(),
+            vout: vec![TxOut {
+                value: 1 * COIN,
+                script_pubkey: p2pkh_script([0x22u8; 20]),
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let value = rpc_fundrawtransaction(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &fee_estimator,
+            2,
+            &wallet,
+            vec![json!(raw_hex), json!({"subtractFeeFromOutputs": [0]})],
+            &params,
+            FundTransactionControl::default(),
+        )
+        .expect("rpc");
+
+        assert_eq!(
+            value.get("changepos").and_then(Value::as_i64),
+            Some(1),
+            "subtractFeeFromOutputs disables change randomization"
+        );
+        let fee_zat = value
+            .get("fee_zat")
+            .and_then(Value::as_i64)
+            .expect("fee_zat");
+        assert!(fee_zat > 0, "expected non-zero fee");
+
+        let funded_hex = value.get("hex").and_then(Value::as_str).expect("hex");
+        let funded_bytes = bytes_from_hex(funded_hex).expect("hex decode");
+        let funded_tx = Transaction::consensus_decode(&funded_bytes).expect("decode funded tx");
+        assert_eq!(funded_tx.vout.len(), 2);
+        assert_eq!(funded_tx.vout[0].value, COIN - fee_zat);
+        assert_eq!(funded_tx.vout[1].value, 4 * COIN);
     }
 
     #[test]
