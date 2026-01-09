@@ -265,12 +265,18 @@ Returns a summary similar to the C++ daemon:
 Fields:
 - `version` - numeric version from crate version.
 - `protocolversion`
+- `walletversion` - wallet file format version.
+- `balance` - confirmed wallet balance (mature coinbase only; excludes locked coins).
 - `blocks` - best block height.
 - `timeoffset` - currently 0.
 - `connections`
 - `proxy` - empty string.
 - `difficulty`
 - `testnet` - boolean.
+- `keypoololdest` - unix timestamp of oldest pre-generated key (0 when empty).
+- `keypoolsize` - number of pre-generated keys.
+- `unlocked_until` - unix timestamp (only present for encrypted wallets).
+- `paytxfee` - wallet fee-rate in FLUX/kB.
 - `relayfee` - min relay fee-rate in FLUX/kB (from `--minrelaytxfee`).
 - `errors` - empty string.
 

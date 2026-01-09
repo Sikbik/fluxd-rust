@@ -332,7 +332,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] RPC golden tests against C++ behavior (owner: TBD)
   - [x] Schema parity: `getblockchaininfo` required keys
   - [x] Schema parity: `gettxoutsetinfo` required keys
-  - [x] Schema parity: `getinfo` required keys
+  - [x] Schema parity: `getinfo` required keys (incl wallet fields)
   - [x] Schema parity: `getnetworkinfo` required keys
   - [x] Schema parity: `getnettotals` required keys
   - [x] Schema parity: `getpeerinfo` required keys

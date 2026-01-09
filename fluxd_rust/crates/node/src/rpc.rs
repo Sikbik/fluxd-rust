@@ -1273,6 +1273,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "help" => rpc_help(params),
         "getinfo" => rpc_getinfo(
             chainstate,
+            mempool,
+            wallet,
             params,
             chain_params,
             data_dir,
@@ -5388,6 +5390,8 @@ fn rpc_help(params: Vec<Value>) -> Result<Value, RpcError> {
 
 fn rpc_getinfo<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
     rpc_params: Vec<Value>,
     chain_params: &ChainParams,
     _data_dir: &Path,
@@ -5396,6 +5400,45 @@ fn rpc_getinfo<S: fluxd_storage::KeyValueStore>(
     mempool_policy: &MempoolPolicy,
 ) -> Result<Value, RpcError> {
     ensure_no_params(&rpc_params)?;
+    let (scripts, locked_outpoints, keypool_oldest, keypool_size, unlocked_until, encrypted) = {
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let encrypted = guard.is_encrypted();
+        let unlocked_until = if encrypted { guard.unlocked_until() } else { 0 };
+        (
+            guard.all_script_pubkeys().map_err(map_wallet_error)?,
+            guard.locked_outpoints(),
+            guard.keypool_oldest(),
+            guard.keypool_size(),
+            unlocked_until,
+            encrypted,
+        )
+    };
+    let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
+    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, false)?;
+    let mut balance: i64 = 0;
+    for utxo in utxos {
+        if utxo.confirmations < 1 {
+            continue;
+        }
+        if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        if locked_set.contains(&utxo.outpoint) {
+            continue;
+        }
+        balance = balance
+            .checked_add(utxo.value)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+    }
+
+    let (walletversion, paytxfee) = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        (WALLET_FILE_VERSION, guard.pay_tx_fee_per_kb())
+    };
     let connections = net_totals.snapshot().connections.max(peer_registry.count());
     let best_block = chainstate
         .best_block()
@@ -5417,18 +5460,29 @@ fn rpc_getinfo<S: fluxd_storage::KeyValueStore>(
         None => 0.0,
     };
 
-    Ok(json!({
+    let mut out = json!({
         "version": node_version(),
         "protocolversion": PROTOCOL_VERSION,
+        "walletversion": walletversion,
+        "balance": amount_to_value(balance),
         "blocks": best_block,
         "timeoffset": 0,
         "connections": connections,
         "proxy": "",
         "difficulty": difficulty,
         "testnet": chain_params.network != Network::Mainnet,
+        "keypoololdest": keypool_oldest,
+        "keypoolsize": keypool_size,
+        "paytxfee": amount_to_value(paytxfee),
         "relayfee": amount_to_value(mempool_policy.min_relay_fee_per_kb),
         "errors": ""
-    }))
+    });
+
+    if encrypted {
+        out["unlocked_until"] = Value::Number(unlocked_until.into());
+    }
+
+    Ok(out)
 }
 
 fn rpc_getblockcount<S: fluxd_storage::KeyValueStore>(
@@ -16983,12 +17037,17 @@ mod tests {
     #[test]
     fn getinfo_has_cpp_schema_keys() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let mempool = Mutex::new(Mempool::new(0));
+        let wallet =
+            Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("create wallet"));
         let net_totals = NetTotals::default();
         let peer_registry = PeerRegistry::default();
         let mempool_policy = MempoolPolicy::standard(0, false);
 
         let value = rpc_getinfo(
             &chainstate,
+            &mempool,
+            &wallet,
             Vec::new(),
             &params,
             &data_dir,
@@ -17002,12 +17061,17 @@ mod tests {
         for key in [
             "version",
             "protocolversion",
+            "walletversion",
+            "balance",
             "blocks",
             "timeoffset",
             "connections",
             "proxy",
             "difficulty",
             "testnet",
+            "keypoololdest",
+            "keypoolsize",
+            "paytxfee",
             "relayfee",
             "errors",
         ] {
@@ -17016,6 +17080,8 @@ mod tests {
 
         assert!(obj.get("version").and_then(Value::as_i64).is_some());
         assert!(obj.get("protocolversion").and_then(Value::as_i64).is_some());
+        assert!(obj.get("walletversion").and_then(Value::as_i64).is_some());
+        assert!(obj.get("balance").and_then(Value::as_f64).is_some());
         assert!(obj.get("blocks").and_then(Value::as_i64).is_some());
         assert!(obj.get("connections").and_then(Value::as_i64).is_some());
     }

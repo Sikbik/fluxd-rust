@@ -10,7 +10,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## General
 
 - help - Implemented
-- getinfo - Implemented
+- getinfo - Implemented (includes walletversion/balance/keypool/paytxfee; unlocked_until when encrypted)
 - getfluxnodestatus - Implemented (supports optional alias/outpoint lookup; IP fields stored from confirm txs)
 - listfluxnodes - Implemented (via deterministic list)
 - viewdeterministicfluxnodelist - Implemented

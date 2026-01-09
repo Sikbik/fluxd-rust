@@ -235,7 +235,8 @@ fi
 echo "Checking verifychain ..."
 rpc_get "verifychain?checklevel=5&numblocks=1" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; assert obj.get("result") is True, obj'
 
-rpc_get "getinfo" >/dev/null
+echo "Checking getinfo ..."
+rpc_get "getinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("version","protocolversion","walletversion","balance","blocks","timeoffset","connections","proxy","difficulty","testnet","keypoololdest","keypoolsize","paytxfee","relayfee","errors"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"; assert isinstance(res.get("version"), int); assert isinstance(res.get("protocolversion"), int); assert isinstance(res.get("walletversion"), int); assert isinstance(res.get("blocks"), int); assert isinstance(res.get("connections"), int)'
 
 echo "Checking validateaddress ..."
 taddr="$(rpc_get "getnewaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
