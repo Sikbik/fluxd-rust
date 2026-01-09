@@ -706,12 +706,16 @@ Notes:
 
 - Params:
   - `hexstring` (string)
-  - optional `options` object (partial; supports `minconf`)
+  - optional `options` object (partial; supports `minconf`, `subtractFeeFromOutputs`)
 - Result: `{ "hex": "<funded_tx_hex>", "fee": <amount>, "changepos": <n> }`
 
 Notes:
 - Selects spendable wallet UTXOs via the address index and adds inputs + a change output when needed.
 - Supports funding with spendable P2PKH and P2SH (multisig) wallet UTXOs.
+- Fee selection matches legacy `fluxd` wallet behavior:
+  - If wallet `paytxfee` is set (`settxfee`), it is used.
+  - Otherwise uses the fee estimator for a ~2-block target (falls back to a hard-coded minimum).
+  - Always enforces the min relay fee and clamps to a max fee (0.1 FLUX).
 
 ### signrawtransaction
 

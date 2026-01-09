@@ -1335,6 +1335,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             chainstate,
             mempool,
             mempool_policy,
+            fee_estimator,
             wallet,
             params,
             chain_params,
@@ -9464,6 +9465,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
     mempool_policy: &MempoolPolicy,
+    fee_estimator: &Mutex<FeeEstimator>,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
     chain_params: &ChainParams,
@@ -9617,15 +9619,48 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     };
     let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
 
-    let fee_for_size = |size: usize| -> i64 {
-        let min_fee = mempool_policy.min_relay_fee_for_size(size);
-        if pay_tx_fee_per_kb <= 0 {
-            return min_fee;
-        }
+    const DEFAULT_TX_CONFIRM_TARGET: u32 = 2;
+    const DEFAULT_MIN_TX_FEE_PER_KB: i64 = 1000;
+    const DEFAULT_MAX_TX_FEE: i64 = COIN / 10;
+
+    let estimated_fee_per_kb = fee_estimator
+        .lock()
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "fee estimator lock poisoned"))?
+        .estimate_fee_per_kb(DEFAULT_TX_CONFIRM_TARGET)
+        .unwrap_or(0);
+
+    let fee_for_size = |size: usize| -> Result<i64, RpcError> {
+        let base_fee_rate_per_kb = if pay_tx_fee_per_kb > 0 {
+            pay_tx_fee_per_kb
+        } else if estimated_fee_per_kb > 0 {
+            estimated_fee_per_kb
+        } else {
+            DEFAULT_MIN_TX_FEE_PER_KB
+        };
+
         let size_i64 = i64::try_from(size).unwrap_or(i64::MAX);
-        let kb = size_i64.saturating_add(999).saturating_div(1000).max(1);
-        let pay_fee = pay_tx_fee_per_kb.saturating_mul(kb);
-        min_fee.max(pay_fee)
+        let mut fee = 0i64;
+        if base_fee_rate_per_kb > 0 {
+            fee = base_fee_rate_per_kb
+                .saturating_mul(size_i64)
+                .saturating_div(1000);
+            if fee == 0 {
+                fee = base_fee_rate_per_kb;
+            }
+        }
+
+        let min_relay_fee = mempool_policy.min_relay_fee_for_size(size);
+        fee = fee.max(min_relay_fee);
+        if fee > DEFAULT_MAX_TX_FEE {
+            fee = DEFAULT_MAX_TX_FEE;
+        }
+        if fee < min_relay_fee {
+            return Err(RpcError::new(
+                RPC_INTERNAL_ERROR,
+                "Transaction too large for fee policy",
+            ));
+        }
+        Ok(fee)
     };
 
     let mut candidates = collect_wallet_utxos(chainstate, mempool, &wallet_scripts, false)?;
@@ -9659,7 +9694,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
 
     for _ in 0..512 {
         let estimated_size = estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?;
-        let target_fee = fee_for_size(estimated_size);
+        let target_fee = fee_for_size(estimated_size)?;
         if target_fee > fee {
             fee = target_fee;
         }
@@ -9704,7 +9739,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
                 script_sig: Vec::new(),
                 sequence: u32::MAX,
             });
-            fee = fee_for_size(estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?);
+            fee = fee_for_size(estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?)?;
             continue;
         }
 
@@ -9746,7 +9781,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             }
         }
 
-        let new_fee = fee_for_size(estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?);
+        let new_fee = fee_for_size(estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?)?;
         if new_fee > fee {
             fee = new_fee;
             continue;
@@ -9942,6 +9977,7 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         chainstate,
         mempool,
         mempool_policy,
+        fee_estimator,
         wallet,
         vec![Value::String(unsigned_hex), json!({ "minconf": minconf })],
         chain_params,
@@ -10125,6 +10161,7 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         chainstate,
         mempool,
         mempool_policy,
+        fee_estimator,
         wallet,
         fund_params,
         chain_params,
@@ -10349,6 +10386,7 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         chainstate,
         mempool,
         mempool_policy,
+        fee_estimator,
         wallet,
         vec![Value::String(unsigned_hex), Value::Object(options)],
         chain_params,
@@ -20156,6 +20194,7 @@ mod tests {
 
         let mempool = Mutex::new(Mempool::new(0));
         let mempool_policy = MempoolPolicy::standard(1000, true);
+        let fee_estimator = Mutex::new(FeeEstimator::new(mempool_policy.min_relay_fee_per_kb));
 
         let to_script = p2pkh_script([0x22u8; 20]);
         let tx = Transaction {
@@ -20184,6 +20223,7 @@ mod tests {
             &chainstate,
             &mempool,
             &mempool_policy,
+            &fee_estimator,
             &wallet,
             vec![json!(raw_hex.clone())],
             &params,
@@ -20205,6 +20245,7 @@ mod tests {
             &chainstate,
             &mempool,
             &mempool_policy,
+            &fee_estimator,
             &wallet,
             vec![json!(raw_hex)],
             &params,
@@ -20273,6 +20314,7 @@ mod tests {
 
         let mempool = Mutex::new(Mempool::new(0));
         let mempool_policy = MempoolPolicy::standard(1000, true);
+        let fee_estimator = Mutex::new(FeeEstimator::new(mempool_policy.min_relay_fee_per_kb));
 
         let value =
             rpc_listunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
@@ -20307,6 +20349,7 @@ mod tests {
             &chainstate,
             &mempool,
             &mempool_policy,
+            &fee_estimator,
             &wallet,
             vec![json!(raw_hex)],
             &params,
@@ -20381,6 +20424,7 @@ mod tests {
         assert_eq!(arr.len(), 0, "locked coins are excluded from listunspent");
 
         let mempool_policy = MempoolPolicy::standard(1000, true);
+        let fee_estimator = Mutex::new(FeeEstimator::new(mempool_policy.min_relay_fee_per_kb));
         let to_script = p2pkh_script([0x22u8; 20]);
         let tx = Transaction {
             f_overwintered: false,
@@ -20408,6 +20452,7 @@ mod tests {
             &chainstate,
             &mempool,
             &mempool_policy,
+            &fee_estimator,
             &wallet,
             vec![json!(raw_hex.clone())],
             &params,
@@ -20421,6 +20466,7 @@ mod tests {
             &chainstate,
             &mempool,
             &mempool_policy,
+            &fee_estimator,
             &wallet,
             vec![json!(raw_hex)],
             &params,
@@ -20475,6 +20521,7 @@ mod tests {
 
         let mempool = Mutex::new(Mempool::new(0));
         let mempool_policy = MempoolPolicy::standard(1000, true);
+        let fee_estimator = Mutex::new(FeeEstimator::new(mempool_policy.min_relay_fee_per_kb));
 
         let to_script = p2pkh_script([0x22u8; 20]);
         let tx = Transaction {
@@ -20507,6 +20554,7 @@ mod tests {
             &chainstate,
             &mempool,
             &mempool_policy,
+            &fee_estimator,
             &wallet,
             vec![json!(raw_hex)],
             &params,
