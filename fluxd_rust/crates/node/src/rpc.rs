@@ -8880,9 +8880,7 @@ fn parse_prevtxs_map(value: &Value) -> Result<HashMap<OutPoint, PrevoutInfo>, Rp
         let script_value = obj
             .get("scriptPubKey")
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing scriptPubKey"))?;
-        let amount_value = obj
-            .get("amount")
-            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "missing amount"))?;
+        let amount_value = obj.get("amount");
         let redeem_script_value = obj.get("redeemScript");
 
         let txid = parse_hash(txid_value)?;
@@ -8892,7 +8890,10 @@ fn parse_prevtxs_map(value: &Value) -> Result<HashMap<OutPoint, PrevoutInfo>, Rp
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "scriptPubKey must be a string"))?;
         let script_pubkey = bytes_from_hex(script_hex)
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "scriptPubKey must be hex"))?;
-        let value = parse_amount(amount_value)?;
+        let value = match amount_value {
+            Some(value) if !value.is_null() => parse_amount(value)?,
+            _ => 0,
+        };
         let redeem_script = match redeem_script_value {
             None | Some(Value::Null) => None,
             Some(value) => {
@@ -8919,6 +8920,34 @@ fn parse_prevtxs_map(value: &Value) -> Result<HashMap<OutPoint, PrevoutInfo>, Rp
         );
     }
     Ok(out)
+}
+
+fn parse_branch_id(value: Option<&Value>) -> Result<Option<u32>, RpcError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value.as_str().ok_or_else(|| {
+        RpcError::new(RPC_INVALID_PARAMETER, "branchid must be a string (hex u32)")
+    })?;
+    let mut text = text.trim();
+    if let Some(stripped) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        text = stripped;
+    }
+    if text.is_empty() {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "branchid is empty"));
+    }
+    let branch_id = u32::from_str_radix(text, 16)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "invalid branchid"))?;
+    if !fluxd_consensus::upgrades::is_consensus_branch_id(branch_id) {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            format!("{text} is not a valid consensus branch id"),
+        ));
+    }
+    Ok(Some(branch_id))
 }
 
 fn resolve_prevout_info<S: fluxd_storage::KeyValueStore>(
@@ -9020,10 +9049,10 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
-    if params.is_empty() || params.len() > 4 {
+    if params.is_empty() || params.len() > 5 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
-            "signrawtransaction expects 1 to 4 parameters",
+            "signrawtransaction expects 1 to 5 parameters",
         ));
     }
     let hex = params[0]
@@ -9053,6 +9082,7 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
 
     let secp = Secp256k1::signing_only();
 
+    let given_keys = params.get(2).is_some_and(|value| !value.is_null());
     let mut key_overrides: HashMap<Vec<u8>, (SecretKey, Vec<u8>)> = HashMap::new();
     let mut key_overrides_by_pubkey: HashMap<[u8; 33], SecretKey> = HashMap::new();
     if let Some(value) = params.get(2) {
@@ -9086,19 +9116,33 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
         ));
     }
 
-    let best_height = chainstate
+    let best_block_height = chainstate
         .best_block()
         .map_err(map_internal)?
         .map(|tip| tip.height)
         .unwrap_or(0);
-    let next_height = best_height.saturating_add(1);
-    let branch_id = current_epoch_branch_id(next_height, &chain_params.consensus.upgrades);
+    let best_header_height = chainstate
+        .best_header()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(best_block_height);
+    let next_height = best_block_height.max(best_header_height).saturating_add(1);
+    let mut branch_id = current_epoch_branch_id(next_height, &chain_params.consensus.upgrades);
+    if let Some(override_branch_id) = parse_branch_id(params.get(4))? {
+        branch_id = override_branch_id;
+    }
 
     let mut errors: Vec<Value> = Vec::new();
 
-    let wallet_guard = wallet
-        .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    let wallet_guard = if given_keys {
+        None
+    } else {
+        Some(
+            wallet
+                .lock()
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?,
+        )
+    };
 
     for input_index in 0..tx.vin.len() {
         let outpoint = tx
@@ -9124,12 +9168,8 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
             ScriptType::P2Pkh => {
                 let (secret, pubkey_bytes) = match key_overrides.get(&prevout.script_pubkey) {
                     Some((secret, pubkey)) => (secret.clone(), pubkey.clone()),
-                    None => match wallet_guard
-                        .signing_key_for_script_pubkey(&prevout.script_pubkey)
-                        .map_err(map_wallet_error)?
-                    {
-                        Some((secret, pubkey)) => (secret, pubkey),
-                        None => {
+                    None => {
+                        if given_keys {
                             errors.push(json!({
                                 "txid": hash256_to_hex(&outpoint.hash),
                                 "vout": outpoint.index,
@@ -9139,7 +9179,27 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                             }));
                             continue;
                         }
-                    },
+                        match wallet_guard
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RpcError::new(RPC_INTERNAL_ERROR, "wallet guard missing")
+                            })?
+                            .signing_key_for_script_pubkey(&prevout.script_pubkey)
+                            .map_err(map_wallet_error)?
+                        {
+                            Some((secret, pubkey)) => (secret, pubkey),
+                            None => {
+                                errors.push(json!({
+                                    "txid": hash256_to_hex(&outpoint.hash),
+                                    "vout": outpoint.index,
+                                    "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                                    "sequence": tx.vin[input_index].sequence,
+                                    "error": "Private key not available for this input",
+                                }));
+                                continue;
+                            }
+                        }
+                    }
                 };
 
                 let sighash = match signature_hash(
@@ -9197,7 +9257,13 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
             }
             ScriptType::P2Sh => {
                 let redeem_script = prevout.redeem_script.clone().or_else(|| {
-                    wallet_guard.redeem_script_for_p2sh_script_pubkey(&prevout.script_pubkey)
+                    if given_keys {
+                        None
+                    } else {
+                        wallet_guard.as_ref().and_then(|guard| {
+                            guard.redeem_script_for_p2sh_script_pubkey(&prevout.script_pubkey)
+                        })
+                    }
                 });
                 let Some(redeem_script) = redeem_script else {
                     errors.push(json!({
@@ -9240,9 +9306,22 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                     for pubkey in pubkeys {
                         let secret = match key_overrides_by_pubkey.get(&pubkey.serialize()) {
                             Some(secret) => Some(secret.clone()),
-                            None => wallet_guard
-                                .signing_key_for_pubkey(&pubkey)
-                                .map_err(map_wallet_error)?,
+                            None => {
+                                if given_keys {
+                                    None
+                                } else {
+                                    wallet_guard
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            RpcError::new(
+                                                RPC_INTERNAL_ERROR,
+                                                "wallet guard missing",
+                                            )
+                                        })?
+                                        .signing_key_for_pubkey(&pubkey)
+                                        .map_err(map_wallet_error)?
+                                }
+                            }
                         };
                         let Some(secret) = secret else {
                             continue;
@@ -9301,12 +9380,8 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                 if classify_script_pubkey(&redeem_script) == ScriptType::P2Pkh {
                     let (secret, pubkey_bytes) = match key_overrides.get(redeem_script.as_slice()) {
                         Some((secret, pubkey)) => (secret.clone(), pubkey.clone()),
-                        None => match wallet_guard
-                            .signing_key_for_script_pubkey(&redeem_script)
-                            .map_err(map_wallet_error)?
-                        {
-                            Some((secret, pubkey)) => (secret, pubkey),
-                            None => {
+                        None => {
+                            if given_keys {
                                 errors.push(json!({
                                     "txid": hash256_to_hex(&outpoint.hash),
                                     "vout": outpoint.index,
@@ -9316,7 +9391,27 @@ fn rpc_signrawtransaction<S: fluxd_storage::KeyValueStore>(
                                 }));
                                 continue;
                             }
-                        },
+                            match wallet_guard
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    RpcError::new(RPC_INTERNAL_ERROR, "wallet guard missing")
+                                })?
+                                .signing_key_for_script_pubkey(&redeem_script)
+                                .map_err(map_wallet_error)?
+                            {
+                                Some((secret, pubkey)) => (secret, pubkey),
+                                None => {
+                                    errors.push(json!({
+                                        "txid": hash256_to_hex(&outpoint.hash),
+                                        "vout": outpoint.index,
+                                        "scriptSig": hex_bytes(&tx.vin[input_index].script_sig),
+                                        "sequence": tx.vin[input_index].sequence,
+                                        "error": "Private key not available for this input",
+                                    }));
+                                    continue;
+                                }
+                            }
+                        }
                     };
 
                     let sighash = match signature_hash(
@@ -19598,6 +19693,278 @@ mod tests {
     }
 
     #[test]
+    fn signrawtransaction_accepts_prevtx_without_amount() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_addr = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_addr, params.network).expect("from script_pubkey");
+
+        let recipient = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let recipient_script =
+            address_to_script_pubkey(&recipient, params.network).expect("recipient script_pubkey");
+
+        let outpoint = OutPoint {
+            hash: [0x24u8; 32],
+            index: 0,
+        };
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: outpoint.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey: recipient_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let signed = rpc_signrawtransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![
+                json!(raw_hex),
+                json!([{
+                    "txid": hash256_to_hex(&outpoint.hash),
+                    "vout": outpoint.index,
+                    "scriptPubKey": hex_bytes(&from_script),
+                }]),
+            ],
+            &params,
+        )
+        .expect("rpc");
+
+        let obj = signed.as_object().expect("object");
+        assert_eq!(obj.get("complete").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn signrawtransaction_privkeys_do_not_use_wallet_fallback() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let wif_a = rpc_dumpprivkey(&wallet, vec![json!(addr_a.clone())], &params)
+            .expect("rpc")
+            .as_str()
+            .expect("wif")
+            .to_string();
+
+        let script_a = address_to_script_pubkey(&addr_a, params.network).expect("script a");
+        let script_b = address_to_script_pubkey(&addr_b, params.network).expect("script b");
+
+        let outpoint_a = OutPoint {
+            hash: [0x11u8; 32],
+            index: 0,
+        };
+        let outpoint_b = OutPoint {
+            hash: [0x12u8; 32],
+            index: 1,
+        };
+        let prev_value = 2 * COIN;
+
+        let recipient = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let recipient_script =
+            address_to_script_pubkey(&recipient, params.network).expect("recipient script");
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![
+                TxIn {
+                    prevout: outpoint_a.clone(),
+                    script_sig: Vec::new(),
+                    sequence: u32::MAX,
+                },
+                TxIn {
+                    prevout: outpoint_b.clone(),
+                    script_sig: Vec::new(),
+                    sequence: u32::MAX,
+                },
+            ],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey: recipient_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let signed = rpc_signrawtransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![
+                json!(raw_hex),
+                json!([
+                    {
+                        "txid": hash256_to_hex(&outpoint_a.hash),
+                        "vout": outpoint_a.index,
+                        "scriptPubKey": hex_bytes(&script_a),
+                        "amount": amount_to_value(prev_value),
+                    },
+                    {
+                        "txid": hash256_to_hex(&outpoint_b.hash),
+                        "vout": outpoint_b.index,
+                        "scriptPubKey": hex_bytes(&script_b),
+                        "amount": amount_to_value(prev_value),
+                    }
+                ]),
+                json!([wif_a]),
+            ],
+            &params,
+        )
+        .expect("rpc");
+
+        let obj = signed.as_object().expect("object");
+        assert_eq!(obj.get("complete").and_then(Value::as_bool), Some(false));
+        let errors = obj.get("errors").and_then(Value::as_array).expect("errors");
+        assert_eq!(errors.len(), 1);
+        let first_error = errors[0].as_object().expect("error object");
+        assert_eq!(
+            first_error.get("error").and_then(Value::as_str),
+            Some("Private key not available for this input")
+        );
+
+        let signed_hex = obj.get("hex").and_then(Value::as_str).expect("hex");
+        let signed_bytes = bytes_from_hex(signed_hex).expect("hex decode");
+        let signed_tx =
+            Transaction::consensus_decode(&signed_bytes).expect("decode signed transaction");
+        assert_eq!(signed_tx.vin.len(), 2);
+        assert!(!signed_tx.vin[0].script_sig.is_empty());
+        assert!(signed_tx.vin[1].script_sig.is_empty());
+    }
+
+    #[test]
+    fn signrawtransaction_rejects_invalid_branchid() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let from_addr = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let from_script =
+            address_to_script_pubkey(&from_addr, params.network).expect("from script_pubkey");
+
+        let recipient = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let recipient_script =
+            address_to_script_pubkey(&recipient, params.network).expect("recipient script_pubkey");
+
+        let outpoint = OutPoint {
+            hash: [0x33u8; 32],
+            index: 0,
+        };
+        let prev_value = COIN;
+
+        let tx = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: outpoint.clone(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: vec![TxOut {
+                value: COIN,
+                script_pubkey: recipient_script,
+            }],
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let raw_hex = hex_bytes(&tx.consensus_encode().expect("encode tx"));
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let err = rpc_signrawtransaction(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![
+                json!(raw_hex),
+                json!([{
+                    "txid": hash256_to_hex(&outpoint.hash),
+                    "vout": outpoint.index,
+                    "scriptPubKey": hex_bytes(&from_script),
+                    "amount": amount_to_value(prev_value),
+                }]),
+                Value::Null,
+                json!("ALL"),
+                json!("deadbeef"),
+            ],
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("not a valid consensus branch id"));
+    }
+
+    #[test]
     fn fluxnode_rpcs_have_cpp_schema_keys() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         extend_regtest_chain_to_height(&chainstate, &params, 69);
@@ -23678,21 +24045,24 @@ mod tests {
             .as_str()
             .expect("address string")
             .to_string();
-        let script_1 = address_to_script_pubkey(&address_1, params.network).expect("address script");
+        let script_1 =
+            address_to_script_pubkey(&address_1, params.network).expect("address script");
 
         let address_2 = rpc_getnewaddress(&wallet, Vec::new())
             .expect("rpc")
             .as_str()
             .expect("address string")
             .to_string();
-        let script_2 = address_to_script_pubkey(&address_2, params.network).expect("address script");
+        let script_2 =
+            address_to_script_pubkey(&address_2, params.network).expect("address script");
 
         let address_3 = rpc_getnewaddress(&wallet, Vec::new())
             .expect("rpc")
             .as_str()
             .expect("address string")
             .to_string();
-        let script_3 = address_to_script_pubkey(&address_3, params.network).expect("address script");
+        let script_3 =
+            address_to_script_pubkey(&address_3, params.network).expect("address script");
 
         let (_txid_1, _vout_1, height_1, _value_1) =
             mine_regtest_block_to_script(&chainstate, &params, script_1);
