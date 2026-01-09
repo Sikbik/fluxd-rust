@@ -13048,21 +13048,21 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "Block decode failed"))?;
     let hash = block.header.hash();
 
-    match chainstate.header_entry(&hash).map_err(map_internal)? {
-        Some(entry) => {
-            if entry.has_block() {
-                return Ok(Value::String("duplicate".to_string()));
-            }
+    let mut block_present = false;
+    if let Some(entry) = chainstate.header_entry(&hash).map_err(map_internal)? {
+        block_present = true;
+        if entry.has_block() {
+            return Ok(Value::String("duplicate".to_string()));
         }
-        None => {}
     }
-    if chainstate
-        .unconnected_block_bytes(&hash)
-        .map_err(map_internal)?
-        .is_some()
-    {
-        return Ok(Value::String("duplicate".to_string()));
-    }
+    let duplicate_value = Value::String("duplicate".to_string());
+    let map_result = |value: Value| {
+        if block_present {
+            duplicate_value.clone()
+        } else {
+            value
+        }
+    };
 
     let prev_hash = block.header.prev_block;
     let best = chainstate.best_block().map_err(map_internal)?;
@@ -13083,7 +13083,7 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
 
     if extends_tip {
         if height < 0 {
-            return Ok(Value::String("inconclusive".to_string()));
+            return Ok(map_result(Value::String("inconclusive".to_string())));
         }
 
         let txids = match fluxd_chainstate::validation::validate_block_with_txids(
@@ -13095,11 +13095,11 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
             Ok(txids) => txids,
             Err(err) => {
                 let reason = err.to_string();
-                return Ok(Value::String(if reason.is_empty() {
+                return Ok(map_result(Value::String(if reason.is_empty() {
                     "rejected".to_string()
                 } else {
                     reason
-                }));
+                })));
             }
         };
 
@@ -13117,27 +13117,27 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
             Ok(batch) => batch,
             Err(ChainStateError::InvalidHeader("block does not extend best block tip"))
             | Err(ChainStateError::InvalidHeader("block height does not match header index")) => {
-                return Ok(Value::String("inconclusive".to_string()))
+                return Ok(map_result(Value::String("inconclusive".to_string())))
             }
             Err(ChainStateError::InvalidHeader(message)) => {
-                return Ok(Value::String(message.to_string()))
+                return Ok(map_result(Value::String(message.to_string())))
             }
             Err(ChainStateError::Validation(err)) => {
                 let reason = err.to_string();
-                return Ok(Value::String(if reason.is_empty() {
+                return Ok(map_result(Value::String(if reason.is_empty() {
                     "rejected".to_string()
                 } else {
                     reason
-                }));
+                })));
             }
             Err(ChainStateError::MissingInput) => {
-                return Ok(Value::String("missing input".to_string()))
+                return Ok(map_result(Value::String("missing input".to_string())))
             }
             Err(ChainStateError::MissingHeader) => {
-                return Ok(Value::String("missing header".to_string()))
+                return Ok(map_result(Value::String("missing header".to_string())))
             }
             Err(ChainStateError::ValueOutOfRange) => {
-                return Ok(Value::String("value out of range".to_string()))
+                return Ok(map_result(Value::String("value out of range".to_string())))
             }
             Err(err) => return Err(map_internal(err.to_string())),
         };
@@ -13153,7 +13153,7 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
                     return Ok(Value::String("duplicate".to_string()));
                 }
                 if tip.hash != prev_hash {
-                    return Ok(Value::String("inconclusive".to_string()));
+                    return Ok(map_result(Value::String("inconclusive".to_string())));
                 }
             }
             chainstate.commit_batch(batch).map_err(map_internal)?;
@@ -13175,11 +13175,11 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
                 );
             }
         }
-        return Ok(Value::Null);
+        return Ok(map_result(Value::Null));
     }
 
     if !is_genesis && best.is_none() {
-        return Ok(Value::String("inconclusive".to_string()));
+        return Ok(map_result(Value::String("inconclusive".to_string())));
     }
 
     let mut batch = fluxd_storage::WriteBatch::new();
@@ -13187,18 +13187,18 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         match chainstate.insert_header(&block.header, &chain_params.consensus, &mut batch) {
             Ok(entry) => entry,
             Err(ChainStateError::MissingHeader) => {
-                return Ok(Value::String("inconclusive".to_string()))
+                return Ok(map_result(Value::String("inconclusive".to_string())))
             }
             Err(ChainStateError::InvalidHeader(message)) => {
-                return Ok(Value::String(message.to_string()))
+                return Ok(map_result(Value::String(message.to_string())))
             }
             Err(ChainStateError::Validation(err)) => {
                 let reason = err.to_string();
-                return Ok(Value::String(if reason.is_empty() {
+                return Ok(map_result(Value::String(if reason.is_empty() {
                     "rejected".to_string()
                 } else {
                     reason
-                }));
+                })));
             }
             Err(err) => return Err(map_internal(err.to_string())),
         };
@@ -13210,11 +13210,11 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         flags,
     ) {
         let reason = err.to_string();
-        return Ok(Value::String(if reason.is_empty() {
+        return Ok(map_result(Value::String(if reason.is_empty() {
             "rejected".to_string()
         } else {
             reason
-        }));
+        })));
     }
 
     chainstate.store_unconnected_block_bytes(&mut batch, &hash, bytes.as_slice());
@@ -13230,13 +13230,6 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         {
             return Ok(Value::String("duplicate".to_string()));
         }
-        if chainstate
-            .unconnected_block_bytes(&hash)
-            .map_err(map_internal)?
-            .is_some()
-        {
-            return Ok(Value::String("duplicate".to_string()));
-        }
         chainstate.commit_batch(batch).map_err(map_internal)?;
     }
 
@@ -13248,9 +13241,9 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         chain_params,
         flags,
     )? {
-        return Ok(Value::String(reason));
+        return Ok(map_result(Value::String(reason)));
     }
-    Ok(Value::Null)
+    Ok(map_result(Value::Null))
 }
 
 fn rpc_getfluxnodecount<S: fluxd_storage::KeyValueStore>(
@@ -17798,7 +17791,7 @@ mod tests {
     }
 
     #[test]
-    fn submitblock_header_present_returns_null() {
+    fn submitblock_header_present_returns_duplicate() {
         let (chainstate, params, _data_dir) = setup_regtest_chainstate();
 
         let tip = chainstate
@@ -17916,7 +17909,13 @@ mod tests {
             &flags,
         )
         .expect("rpc");
-        assert!(value.is_null());
+        assert_eq!(value.as_str(), Some("duplicate"));
+
+        let best_after = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        assert_eq!(best_after.height, 1);
     }
 
     #[test]
@@ -18125,7 +18124,7 @@ mod tests {
             &flags,
         )
         .expect("rpc");
-        assert!(value.is_null());
+        assert_eq!(value.as_str(), Some("duplicate"));
 
         let best_after = chainstate
             .best_block()
@@ -18285,7 +18284,7 @@ mod tests {
             &flags,
         )
         .expect("rpc");
-        assert!(submitted_1.is_null());
+        assert_eq!(submitted_1.as_str(), Some("duplicate"));
 
         let best_before = chainstate
             .best_block()
@@ -18407,7 +18406,7 @@ mod tests {
             &flags,
         )
         .expect("rpc");
-        assert!(submitted_2.is_null());
+        assert_eq!(submitted_2.as_str(), Some("duplicate"));
 
         let best_after = chainstate
             .best_block()

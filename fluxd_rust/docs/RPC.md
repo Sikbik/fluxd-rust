@@ -960,8 +960,11 @@ Submits a block for validation.
   - `hexdata` (string) - raw block bytes in hex
   - optional `parameters` (object) - accepted for parity but currently ignored
 - Result:
-  - `null` when accepted (connected or stored)
-  - string when rejected (e.g. `"duplicate"`, `"inconclusive"`, or a validation failure reason)
+  - `null` when accepted (connected or stored) and the block hash was not already known
+  - string when rejected or when the block was already known (BIP22-style), e.g.:
+    - `"duplicate"`
+    - `"inconclusive"`
+    - `"rejected"` (or a validation failure reason string)
 
 ### estimatefee
 
