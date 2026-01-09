@@ -91,7 +91,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Node control
 
-- sendfrom - Implemented (fromaccount ignored; minconf supported)
+- sendfrom - Implemented (fromaccount treated as optional wallet address filter; when non-empty, restricts funding to that address and sends change back to it; minconf supported)
 - submitblock - Partial (BIP22 return values; returns `duplicate` when the header is already known; side-chain acceptance is still simplified vs C++)
 - zcrawjoinsplit - Implemented (Sprout JoinSplit splice + Groth16 proof; requires shielded params)
 - zcrawreceive - Implemented (Sprout note decrypt + witness existence check; requires shielded params)
@@ -144,8 +144,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - lockunspent - Implemented
 - rescanblockchain - Implemented (scans address delta index; populates wallet tx history)
 
-- sendmany - Partial (supports P2PKH + P2SH destinations; `subtractfeefrom` supported)
-- sendtoaddress - Partial (supports P2PKH + P2SH destinations; `subtractfeefromamount` supported)
+- sendmany - Implemented (supports P2PKH + P2SH destinations; optional fromaccount wallet address filter + change destination; `subtractfeefrom` supported; ignores unknown `subtractfeefrom` entries like `fluxd`)
+- sendtoaddress - Implemented (supports P2PKH + P2SH destinations; `subtractfeefromamount` supported; dust checks when standardness is enabled)
 - settxfee - Partial (sets in-process wallet fee-rate override used by fundrawtransaction/send*)
 - signmessage - Implemented (P2PKH only; compatible with verifymessage)
 

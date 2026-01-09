@@ -493,24 +493,37 @@ Notes:
 
 ### sendtoaddress
 
-- Params: `<address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
+- Params: `<address> <amount> [comment] [comment_to] [subtractfeefromamount]`
 - Result: transaction id hex string.
 
 Notes:
 - Builds a transparent transaction, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
-- Currently only supports P2PKH wallet UTXOs.
+- Funds from spendable wallet UTXOs (P2PKH + wallet-known P2SH).
+- Rejects dust outputs when standardness is enabled.
 - Supports `subtractfeefromamount=true` (fee is deducted from the destination output).
+
+### sendfrom
+
+- Params: `<fromaccount> <tofluxaddress> <amount> [minconf] [comment] [comment_to]` (deprecated)
+- Result: transaction id hex string.
+
+Notes:
+- `fromaccount` is interpreted as a wallet address filter (Flux `fluxd` behavior):
+  - empty string (`""`) spends from any spendable wallet UTXO and uses a wallet change address.
+  - non-empty taddr restricts funding to UTXOs paying to that address and sends change back to it.
 
 ### sendmany
 
-- Params: `<fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]` (partial)
-  - `fromaccount` is accepted for legacy compatibility but ignored.
+- Params: `<fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]`
+  - `fromaccount` is interpreted as a wallet address filter (Flux `fluxd` behavior):
+    - empty string (`""`) spends from any spendable wallet UTXO and uses a wallet change address.
+    - non-empty taddr restricts funding to UTXOs paying to that address and sends change back to it.
   - `amounts` is a JSON object mapping `"taddr": amount`.
 - Result: transaction id hex string.
 
 Notes:
 - Builds a transparent transaction with multiple outputs, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
-- Currently only supports P2PKH wallet UTXOs.
+- Funds from spendable wallet UTXOs (P2PKH + wallet-known P2SH).
 - Supports `subtractfeefrom` (fee is split across the selected destination outputs).
 
 ### getdbinfo

@@ -1347,6 +1347,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             wallet,
             params,
             chain_params,
+            FundTransactionControl::default(),
         ),
         "signrawtransaction" => {
             rpc_signrawtransaction(chainstate, mempool, wallet, params, chain_params)
@@ -9472,6 +9473,12 @@ fn estimate_signed_tx_size_with_prevouts(
     Ok(tmp.consensus_encode().map_err(map_internal)?.len())
 }
 
+#[derive(Clone, Default)]
+struct FundTransactionControl {
+    only_spend_script_pubkey: Option<Vec<u8>>,
+    change_script_pubkey: Option<Vec<u8>>,
+}
+
 fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
@@ -9481,6 +9488,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
     chain_params: &ChainParams,
+    fund_control: FundTransactionControl,
 ) -> Result<Value, RpcError> {
     if params.is_empty() || params.len() > 2 {
         return Err(RpcError::new(
@@ -9621,13 +9629,40 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         }
         let pay_tx_fee_per_kb = guard.pay_tx_fee_per_kb();
         let scripts = guard.all_script_pubkeys().map_err(map_wallet_error)?;
-        let change_address = guard
-            .generate_new_change_address(true)
-            .map_err(map_wallet_error)?;
-        let change_script = address_to_script_pubkey(&change_address, chain_params.network)
-            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid change address"))?;
+        let filter_ok = fund_control
+            .only_spend_script_pubkey
+            .as_ref()
+            .map(|script| scripts.iter().any(|owned| owned == script))
+            .unwrap_or(false);
+        let change_ok = fund_control
+            .change_script_pubkey
+            .as_ref()
+            .map(|script| scripts.iter().any(|owned| owned == script))
+            .unwrap_or(false);
+
+        let wallet_scripts = match fund_control.only_spend_script_pubkey.as_ref() {
+            Some(script) if filter_ok => vec![script.clone()],
+            Some(_) => Vec::new(),
+            None => scripts,
+        };
+
+        let change_script = match fund_control.change_script_pubkey.as_ref() {
+            Some(script) if change_ok => script.clone(),
+            _ => {
+                let change_address = guard
+                    .generate_new_change_address(true)
+                    .map_err(map_wallet_error)?;
+                address_to_script_pubkey(&change_address, chain_params.network)
+                    .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid change address"))?
+            }
+        };
         let locked_outpoints = guard.locked_outpoints();
-        (scripts, change_script, pay_tx_fee_per_kb, locked_outpoints)
+        (
+            wallet_scripts,
+            change_script,
+            pay_tx_fee_per_kb,
+            locked_outpoints,
+        )
     };
     let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
 
@@ -9894,13 +9929,16 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
             "sendfrom expects 3 to 6 parameters",
         ));
     }
-    let _from_account = params[0]
+    let from_account = params[0]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "fromaccount must be a string"))?;
     let address = params[1]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
     let amount = parse_amount(&params[2])?;
+    if amount <= 0 {
+        return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
+    }
 
     let minconf = match params.get(3) {
         Some(value) if !value.is_null() => parse_u32(value, "minconf")?,
@@ -9941,8 +9979,33 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         tx_values.insert("to".to_string(), comment_to);
     }
 
-    let script_pubkey = address_to_script_pubkey(address, chain_params.network)
-        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+    let script_pubkey = address_to_script_pubkey(address, chain_params.network).map_err(|_| {
+        RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Invalid destination Flux address",
+        )
+    })?;
+    if mempool_policy.require_standard
+        && is_dust(amount, &script_pubkey, mempool_policy.min_relay_fee_per_kb)
+    {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "dust"));
+    }
+
+    let fund_control = if from_account.is_empty() {
+        FundTransactionControl::default()
+    } else {
+        let from_script =
+            address_to_script_pubkey(from_account, chain_params.network).map_err(|_| {
+                RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Invalid fromaccount Flux address",
+                )
+            })?;
+        FundTransactionControl {
+            only_spend_script_pubkey: Some(from_script.clone()),
+            change_script_pubkey: Some(from_script),
+        }
+    };
 
     let next_height = chainstate
         .best_block()
@@ -9995,6 +10058,7 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         wallet,
         vec![Value::String(unsigned_hex), json!({ "minconf": minconf })],
         chain_params,
+        fund_control,
     )?;
     let funded_hex = funded
         .get("hex")
@@ -10071,16 +10135,19 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
 ) -> Result<Value, RpcError> {
     const DEFAULT_TX_EXPIRY_DELTA: u32 = 20;
 
-    if params.len() < 2 || params.len() > 9 {
+    if params.len() < 2 || params.len() > 5 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
-            "sendtoaddress expects 2 to 9 parameters",
+            "sendtoaddress expects 2 to 5 parameters",
         ));
     }
     let address = params[0]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
     let amount = parse_amount(&params[1])?;
+    if amount <= 0 {
+        return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
+    }
 
     if let Some(value) = params.get(2) {
         if !value.is_null() && value.as_str().is_none() {
@@ -10123,7 +10190,12 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
     };
 
     let script_pubkey = address_to_script_pubkey(address, chain_params.network)
-        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Flux address"))?;
+    if mempool_policy.require_standard
+        && is_dust(amount, &script_pubkey, mempool_policy.min_relay_fee_per_kb)
+    {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "dust"));
+    }
 
     let next_height = chainstate
         .best_block()
@@ -10181,6 +10253,7 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         wallet,
         fund_params,
         chain_params,
+        FundTransactionControl::default(),
     )?;
     let funded_hex = funded
         .get("hex")
@@ -10263,7 +10336,7 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
             "sendmany expects 2 to 5 parameters",
         ));
     }
-    let _from_account = params[0]
+    let from_account = params[0]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "fromaccount must be a string"))?;
     let outputs = params[1]
@@ -10306,6 +10379,22 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         tx_values.insert("comment".to_string(), comment);
     }
 
+    let fund_control = if from_account.is_empty() {
+        FundTransactionControl::default()
+    } else {
+        let from_script =
+            address_to_script_pubkey(from_account, chain_params.network).map_err(|_| {
+                RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Invalid fromaccount Flux address",
+                )
+            })?;
+        FundTransactionControl {
+            only_spend_script_pubkey: Some(from_script.clone()),
+            change_script_pubkey: Some(from_script),
+        }
+    };
+
     let mut subtract_fee_from_outputs: HashSet<String> = HashSet::new();
     if let Some(value) = params.get(4) {
         if let Some(subtract) = value.as_array() {
@@ -10316,13 +10405,9 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
                         "subtractfeefrom entries must be strings",
                     )
                 })?;
-                if !outputs.contains_key(addr) {
-                    return Err(RpcError::new(
-                        RPC_INVALID_PARAMETER,
-                        "subtractfeefrom address not found in outputs",
-                    ));
+                if outputs.contains_key(addr) {
+                    subtract_fee_from_outputs.insert(addr.to_string());
                 }
-                subtract_fee_from_outputs.insert(addr.to_string());
             }
         }
     }
@@ -10346,8 +10431,16 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
 
     for (address, amount) in ordered {
         let value = parse_amount(amount)?;
-        let script_pubkey = address_to_script_pubkey(address, chain_params.network)
-            .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        if value <= 0 {
+            return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
+        }
+        let script_pubkey =
+            address_to_script_pubkey(address, chain_params.network).map_err(|_| {
+                RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    format!("Invalid Flux address: {address}"),
+                )
+            })?;
         if mempool_policy.require_standard
             && is_dust(value, &script_pubkey, mempool_policy.min_relay_fee_per_kb)
         {
@@ -10408,6 +10501,7 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         wallet,
         vec![Value::String(unsigned_hex), Value::Object(options)],
         chain_params,
+        fund_control,
     )?;
     let funded_hex = funded
         .get("hex")
@@ -20246,6 +20340,7 @@ mod tests {
             &wallet,
             vec![json!(raw_hex.clone())],
             &params,
+            FundTransactionControl::default(),
         )
         .expect("rpc");
         let before_fee = before
@@ -20269,6 +20364,7 @@ mod tests {
             &wallet,
             vec![json!(raw_hex)],
             &params,
+            FundTransactionControl::default(),
         )
         .expect("rpc");
         let after_fee = after
@@ -20374,6 +20470,7 @@ mod tests {
             &wallet,
             vec![json!(raw_hex)],
             &params,
+            FundTransactionControl::default(),
         )
         .expect("rpc");
         let funded_hex = funded
@@ -20478,6 +20575,7 @@ mod tests {
             &wallet,
             vec![json!(raw_hex.clone())],
             &params,
+            FundTransactionControl::default(),
         )
         .unwrap_err();
         assert_eq!(err.code, RPC_WALLET_ERROR);
@@ -20493,6 +20591,7 @@ mod tests {
             &wallet,
             vec![json!(raw_hex)],
             &params,
+            FundTransactionControl::default(),
         )
         .expect("rpc");
         assert!(value.get("hex").and_then(Value::as_str).is_some());
@@ -20582,6 +20681,7 @@ mod tests {
             &wallet,
             vec![json!(raw_hex)],
             &params,
+            FundTransactionControl::default(),
         )
         .expect("rpc");
         assert!(value.get("hex").and_then(Value::as_str).is_some());
@@ -21053,6 +21153,228 @@ mod tests {
         assert!(is_hex_64(txid_hex));
         let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("txid");
         assert!(mempool.lock().expect("mempool lock").contains(&txid));
+    }
+
+    #[test]
+    fn sendfrom_honors_fromaccount_address_filter_and_change_destination() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let script_a = address_to_script_pubkey(&addr_a, params.network).expect("script a");
+        let script_b = address_to_script_pubkey(&addr_b, params.network).expect("script b");
+
+        let outpoint_a = OutPoint {
+            hash: [0xa1u8; 32],
+            index: 0,
+        };
+        let outpoint_b = OutPoint {
+            hash: [0xb2u8; 32],
+            index: 0,
+        };
+
+        let utxo_a = fluxd_chainstate::utxo::UtxoEntry {
+            value: 2 * COIN,
+            script_pubkey: script_a.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_b = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: script_b.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+
+        let utxo_key_a = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint_a);
+        let utxo_key_b = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint_b);
+        let addr_key_a =
+            fluxd_chainstate::address_index::address_outpoint_key(&script_a, &outpoint_a)
+                .expect("address outpoint key a");
+        let addr_key_b =
+            fluxd_chainstate::address_index::address_outpoint_key(&script_b, &outpoint_b)
+                .expect("address outpoint key b");
+
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key_a.as_bytes(), utxo_a.encode());
+        batch.put(Column::AddressOutpoint, addr_key_a, []);
+        batch.put(Column::Utxo, utxo_key_b.as_bytes(), utxo_b.encode());
+        batch.put(Column::AddressOutpoint, addr_key_b, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("to addr");
+        let to_script = address_to_script_pubkey(&to_address, params.network).expect("to script");
+
+        let value = rpc_sendfrom(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            2,
+            &mempool_flags,
+            &wallet,
+            vec![json!(addr_b), json!(to_address), json!("1.0"), json!(1)],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("parse txid");
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("mempool entry");
+
+        assert!(entry.tx.vin.iter().any(|vin| vin.prevout == outpoint_b));
+        assert!(
+            !entry.tx.vin.iter().any(|vin| vin.prevout == outpoint_a),
+            "should not select outpoints from other wallet addresses"
+        );
+        assert!(entry
+            .tx
+            .vout
+            .iter()
+            .any(|out| out.script_pubkey == to_script));
+        assert!(
+            entry
+                .tx
+                .vout
+                .iter()
+                .any(|out| out.script_pubkey == script_b && out.value > 0),
+            "change should return to fromaccount address"
+        );
+    }
+
+    #[test]
+    fn sendmany_honors_fromaccount_address_filter_and_change_destination() {
+        let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Acadia.as_usize()].activation_height = 1;
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let script_a = address_to_script_pubkey(&addr_a, params.network).expect("script a");
+        let script_b = address_to_script_pubkey(&addr_b, params.network).expect("script b");
+
+        let outpoint_a = OutPoint {
+            hash: [0xc3u8; 32],
+            index: 0,
+        };
+        let outpoint_b = OutPoint {
+            hash: [0xd4u8; 32],
+            index: 0,
+        };
+
+        let utxo_a = fluxd_chainstate::utxo::UtxoEntry {
+            value: 5 * COIN,
+            script_pubkey: script_a.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_b = fluxd_chainstate::utxo::UtxoEntry {
+            value: 2 * COIN,
+            script_pubkey: script_b.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+
+        let utxo_key_a = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint_a);
+        let utxo_key_b = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint_b);
+        let addr_key_a =
+            fluxd_chainstate::address_index::address_outpoint_key(&script_a, &outpoint_a)
+                .expect("address outpoint key a");
+        let addr_key_b =
+            fluxd_chainstate::address_index::address_outpoint_key(&script_b, &outpoint_b)
+                .expect("address outpoint key b");
+
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key_a.as_bytes(), utxo_a.encode());
+        batch.put(Column::AddressOutpoint, addr_key_a, []);
+        batch.put(Column::Utxo, utxo_key_b.as_bytes(), utxo_b.encode());
+        batch.put(Column::AddressOutpoint, addr_key_b, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(1000, true);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let to_address =
+            script_pubkey_to_address(&p2pkh_script([0x22u8; 20]), params.network).expect("to addr");
+        let to_script = address_to_script_pubkey(&to_address, params.network).expect("to script");
+        let mut amounts = serde_json::Map::new();
+        amounts.insert(to_address, json!("1.0"));
+
+        let value = rpc_sendmany(
+            &chainstate,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            2,
+            &mempool_flags,
+            &wallet,
+            vec![json!(addr_a), Value::Object(amounts), json!(1)],
+            &params,
+            &tx_announce,
+        )
+        .expect("rpc");
+        let txid_hex = value.as_str().expect("txid string");
+        assert!(is_hex_64(txid_hex));
+
+        let txid = parse_hash(&Value::String(txid_hex.to_string())).expect("parse txid");
+        let guard = mempool.lock().expect("mempool lock");
+        let entry = guard.get(&txid).expect("mempool entry");
+
+        assert!(entry.tx.vin.iter().any(|vin| vin.prevout == outpoint_a));
+        assert!(
+            !entry.tx.vin.iter().any(|vin| vin.prevout == outpoint_b),
+            "should not select outpoints from other wallet addresses"
+        );
+        assert!(entry
+            .tx
+            .vout
+            .iter()
+            .any(|out| out.script_pubkey == to_script));
+        assert!(
+            entry
+                .tx
+                .vout
+                .iter()
+                .any(|out| out.script_pubkey == script_a && out.value > 0),
+            "change should return to fromaccount address"
+        );
     }
 
     #[test]
