@@ -11,13 +11,13 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - help - Implemented
 - getinfo - Implemented (includes walletversion/balance/keypool/paytxfee; unlocked_until when encrypted)
-- getfluxnodestatus - Implemented (supports optional alias/outpoint lookup; IP fields stored from confirm txs)
-- listfluxnodes - Implemented (via deterministic list)
-- viewdeterministicfluxnodelist - Implemented
-- getfluxnodecount - Implemented
+- getfluxnodestatus - Implemented (alias: getzelnodestatus; supports optional alias/outpoint lookup; IP fields stored from confirm txs)
+- listfluxnodes - Implemented (alias: listzelnodes; via deterministic list)
+- viewdeterministicfluxnodelist - Implemented (alias: viewdeterministiczelnodelist)
+- getfluxnodecount - Implemented (alias: getzelnodecount)
 - getdoslist - Implemented
 - getstartlist - Implemented
-- fluxnodecurrentwinner - Implemented (deterministic next payee)
+- fluxnodecurrentwinner - Implemented (alias: zelnodecurrentwinner; deterministic next payee)
 
 ## Chain and block
 
@@ -102,6 +102,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - stop - Implemented
 - createfluxnodekey - Implemented (alias: createzelnodekey)
 - createzelnodekey - Implemented (alias of createfluxnodekey)
+- createdelegatekeypair - Implemented (delegate private key + pubkey pair; matches C++ schema)
 - listfluxnodeconf - Implemented (alias: listzelnodeconf)
 - listzelnodeconf - Implemented (alias of listfluxnodeconf)
 - getfluxnodeoutputs - Implemented (wallet-less; uses fluxnode.conf + UTXO lookups)

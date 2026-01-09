@@ -222,15 +222,16 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 ### Fluxnode
 
 - `createfluxnodekey` / `createzelnodekey`
+- `createdelegatekeypair`
 - `listfluxnodeconf [filter]` / `listzelnodeconf [filter]`
 - `getfluxnodeoutputs` / `getzelnodeoutputs`
 - `startfluxnode <all|alias> <lockwallet> [alias]` / `startzelnode ...` (partial; wallet-less)
 - `startdeterministicfluxnode <alias> <lockwallet> [collateral_privkey_wif] [redeem_script_hex]` / `startdeterministiczelnode ...` (partial; wallet-less)
-- `getfluxnodecount`
-- `listfluxnodes`
-- `viewdeterministicfluxnodelist [filter]`
-- `fluxnodecurrentwinner`
-- `getfluxnodestatus [alias|txid:vout]` (partial; uses `--data-dir/fluxnode.conf` when called with no params)
+- `getfluxnodecount` / `getzelnodecount`
+- `listfluxnodes` / `listzelnodes`
+- `viewdeterministicfluxnodelist [filter]` / `viewdeterministiczelnodelist [filter]`
+- `fluxnodecurrentwinner` / `zelnodecurrentwinner`
+- `getfluxnodestatus [alias|txid:vout]` / `getzelnodestatus ...` (partial; uses `--data-dir/fluxnode.conf` when called with no params)
 - `getdoslist`
 - `getstartlist`
 - `getbenchmarks` (stub; Fluxnode-only)
@@ -1109,6 +1110,16 @@ Generates a new fluxnode private key (WIF), matching the C++ daemon.
 - Notes:
   - Use this value as the `privkey` field in `fluxnode.conf`.
 
+### createdelegatekeypair
+
+Generates a delegate keypair (private key + compressed/uncompressed pubkeys), matching the C++ daemon.
+
+- Params: none
+- Result: object:
+  - `private_key` - WIF-encoded secp256k1 private key string (compressed)
+  - `public_key_compressed` - hex-encoded compressed pubkey (33 bytes)
+  - `public_key_uncompressed` - hex-encoded uncompressed pubkey (65 bytes)
+
 ### listfluxnodeconf / listzelnodeconf
 
 Returns `fluxnode.conf` entries in a JSON array, augmented with best-effort on-chain fluxnode index data.
@@ -1155,7 +1166,7 @@ Starts fluxnodes from `fluxnode.conf`.
 - Notes:
   - Collateral key resolution follows the same order as `startdeterministicfluxnode`; `fluxnode.conf` can include optional extra columns for wallet-less starts.
 
-### getfluxnodecount
+### getfluxnodecount / getzelnodecount
 
 Returns counts of confirmed fluxnodes by tier (Cumulus/Nimbus/Stratus) using the same keys as C++:
 
@@ -1164,7 +1175,7 @@ Returns counts of confirmed fluxnodes by tier (Cumulus/Nimbus/Stratus) using the
 - `cumulus-enabled`, `nimbus-enabled`, `stratus-enabled` (aliases)
 - `ipv4`, `ipv6`, `onion` (derived from stored fluxnode confirm IPs)
 
-### listfluxnodes / viewdeterministicfluxnodelist
+### listfluxnodes / listzelnodes / viewdeterministicfluxnodelist / viewdeterministiczelnodelist
 
 Returns a list of confirmed fluxnodes matching the C++ daemon field shape:
 
@@ -1176,7 +1187,7 @@ Returns a list of confirmed fluxnodes matching the C++ daemon field shape:
 
 Note: `activesince` and `lastpaid` follow C++ behavior: either a string unix timestamp, or `0`.
 
-### fluxnodecurrentwinner
+### fluxnodecurrentwinner / zelnodecurrentwinner
 
 Returns the per-tier deterministic next payee (C++ `fluxnodecurrentwinner` shape).
 
@@ -1204,7 +1215,7 @@ Fields:
 - `eligible_in` (blocks remaining until it can be started again)
 - `amount` (string, collateral amount, FLUX)
 
-### getfluxnodestatus
+### getfluxnodestatus / getzelnodestatus
 
 Parity implementation.
 

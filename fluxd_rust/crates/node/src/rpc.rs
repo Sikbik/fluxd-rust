@@ -234,14 +234,20 @@ const RPC_METHODS: &[&str] = &[
     "getpeerinfo",
     "getdeprecationinfo",
     "getfluxnodecount",
+    "getzelnodecount",
     "listfluxnodes",
+    "listzelnodes",
     "viewdeterministicfluxnodelist",
+    "viewdeterministiczelnodelist",
     "fluxnodecurrentwinner",
+    "zelnodecurrentwinner",
     "getfluxnodestatus",
+    "getzelnodestatus",
     "getdoslist",
     "getstartlist",
     "createfluxnodekey",
     "createzelnodekey",
+    "createdelegatekeypair",
     "listfluxnodeconf",
     "listzelnodeconf",
     "getfluxnodeoutputs",
@@ -1464,13 +1470,19 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "getaddednodeinfo" => {
             rpc_getaddednodeinfo(params, chain_params, peer_registry, added_nodes)
         }
-        "getfluxnodecount" => rpc_getfluxnodecount(chainstate, params),
-        "listfluxnodes" => rpc_viewdeterministicfluxnodelist(chainstate, params, chain_params),
-        "viewdeterministicfluxnodelist" => {
+        "getfluxnodecount" | "getzelnodecount" => rpc_getfluxnodecount(chainstate, params),
+        "listfluxnodes" | "listzelnodes" => {
             rpc_viewdeterministicfluxnodelist(chainstate, params, chain_params)
         }
-        "fluxnodecurrentwinner" => rpc_fluxnodecurrentwinner(chainstate, params, chain_params),
-        "getfluxnodestatus" => rpc_getfluxnodestatus(chainstate, params, chain_params, data_dir),
+        "viewdeterministicfluxnodelist" | "viewdeterministiczelnodelist" => {
+            rpc_viewdeterministicfluxnodelist(chainstate, params, chain_params)
+        }
+        "fluxnodecurrentwinner" | "zelnodecurrentwinner" => {
+            rpc_fluxnodecurrentwinner(chainstate, params, chain_params)
+        }
+        "getfluxnodestatus" | "getzelnodestatus" => {
+            rpc_getfluxnodestatus(chainstate, params, chain_params, data_dir)
+        }
         "getdoslist" => rpc_getdoslist(chainstate, params, chain_params),
         "getstartlist" => rpc_getstartlist(chainstate, params, chain_params),
         "getbenchmarks" => rpc_getbenchmarks(params, data_dir, chain_params),
@@ -1483,6 +1495,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         }
         "zcbenchmark" => rpc_zcbenchmark(params),
         "createfluxnodekey" | "createzelnodekey" => rpc_createfluxnodekey(params, chain_params),
+        "createdelegatekeypair" => rpc_createdelegatekeypair(params, chain_params),
         "listfluxnodeconf" | "listzelnodeconf" => {
             rpc_listfluxnodeconf(chainstate, params, chain_params, data_dir)
         }
@@ -11564,6 +11577,34 @@ fn rpc_createfluxnodekey(
     ))
 }
 
+fn rpc_createdelegatekeypair(
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    ensure_no_params(&params)?;
+
+    let secp = Secp256k1::new();
+    let mut rng = rand::rngs::OsRng;
+    let mut seed = [0u8; 32];
+    for _ in 0..100 {
+        rng.fill_bytes(&mut seed);
+        let Ok(secret) = SecretKey::from_slice(&seed) else {
+            continue;
+        };
+        let pubkey = PublicKey::from_secret_key(&secp, &secret);
+        return Ok(json!({
+            "private_key": secret_key_to_wif(&secret.secret_bytes(), chain_params.network, true),
+            "public_key_compressed": hex_bytes(&pubkey.serialize()),
+            "public_key_uncompressed": hex_bytes(&pubkey.serialize_uncompressed()),
+        }));
+    }
+
+    Err(RpcError::new(
+        RPC_INTERNAL_ERROR,
+        "failed to generate secret key",
+    ))
+}
+
 fn rpc_gettxoutsetinfo<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
@@ -21426,6 +21467,41 @@ mod tests {
         let value = rpc_createfluxnodekey(Vec::new(), &params).expect("rpc");
         let key = value.as_str().expect("string");
         assert!(!key.is_empty());
+    }
+
+    #[test]
+    fn createdelegatekeypair_matches_private_key() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_createdelegatekeypair(Vec::new(), &params).expect("rpc");
+        let obj = value.as_object().expect("object");
+
+        let wif = obj.get("private_key").and_then(Value::as_str).expect("wif");
+        assert!(!wif.is_empty());
+        let pubkey_compressed = obj
+            .get("public_key_compressed")
+            .and_then(Value::as_str)
+            .expect("compressed pubkey");
+        let pubkey_uncompressed = obj
+            .get("public_key_uncompressed")
+            .and_then(Value::as_str)
+            .expect("uncompressed pubkey");
+
+        assert_eq!(pubkey_compressed.len(), 66);
+        assert_eq!(pubkey_uncompressed.len(), 130);
+        assert!(bytes_from_hex(pubkey_compressed).is_some());
+        assert!(bytes_from_hex(pubkey_uncompressed).is_some());
+
+        let (secret, compressed) = wif_to_secret_key(wif, params.network).expect("decode wif");
+        assert!(compressed, "expected a compressed WIF");
+
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&secret).expect("secret key");
+        let pubkey = PublicKey::from_secret_key(&secp, &secret);
+        assert_eq!(pubkey_compressed, hex_bytes(&pubkey.serialize()));
+        assert_eq!(
+            pubkey_uncompressed,
+            hex_bytes(&pubkey.serialize_uncompressed())
+        );
     }
 
     #[test]

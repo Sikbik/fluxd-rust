@@ -238,6 +238,9 @@ rpc_get "verifychain?checklevel=5&numblocks=1" | python3 -c 'import json,sys; ob
 echo "Checking getinfo ..."
 rpc_get "getinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("version","protocolversion","walletversion","balance","blocks","timeoffset","connections","proxy","difficulty","testnet","keypoololdest","keypoolsize","paytxfee","relayfee","errors"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"; assert isinstance(res.get("version"), int); assert isinstance(res.get("protocolversion"), int); assert isinstance(res.get("walletversion"), int); assert isinstance(res.get("blocks"), int); assert isinstance(res.get("connections"), int)'
 
+echo "Checking createdelegatekeypair ..."
+rpc_get "createdelegatekeypair" | python3 -c 'import json,sys,re; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("private_key","public_key_compressed","public_key_uncompressed"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"; pkc=res.get("public_key_compressed",""); pku=res.get("public_key_uncompressed",""); assert isinstance(res.get("private_key"), str) and len(res.get("private_key"))>0; assert isinstance(pkc,str) and re.fullmatch(r"[0-9a-fA-F]+", pkc) and len(pkc)==66; assert isinstance(pku,str) and re.fullmatch(r"[0-9a-fA-F]+", pku) and len(pku)==130'
+
 echo "Checking validateaddress ..."
 taddr="$(rpc_get "getnewaddress" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"
 if [[ -z "$taddr" ]]; then
