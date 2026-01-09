@@ -1076,7 +1076,7 @@ Returns candidate fluxnode collateral outputs.
 
 - Params: none
 - Notes:
-  - Wallet support is not implemented yet. This method currently reads `fluxnode.conf` and returns entries whose collateral outpoint is present in the current UTXO set and matches a valid tier amount.
+  - This method currently reads `fluxnode.conf` and returns entries whose collateral outpoint is present in the current UTXO set and matches a valid tier amount.
 
 ### startdeterministicfluxnode / startdeterministiczelnode
 
@@ -1084,11 +1084,15 @@ Attempts to create, sign, and broadcast a deterministic fluxnode START transacti
 
 - Params:
   - `alias` (string)
-  - `lockwallet` (boolean; accepted for parity but currently ignored)
-  - `collateral_privkey_wif` (optional string; WIF private key controlling the collateral UTXO)
+  - `lockwallet` (boolean; locks the wallet before returning when the wallet is encrypted)
+  - `collateral_privkey_wif` (optional string; WIF private key controlling the collateral UTXO; if omitted, the wallet is used)
   - `redeem_script_hex` (optional string; required for P2SH collateral; multisig redeem script hex)
 - Notes:
-  - Wallet support is not implemented yet. You must provide the collateral private key either as the 3rd parameter or via an optional extra column in `fluxnode.conf` (see below).
+  - Collateral key selection order:
+    1) `collateral_privkey_wif` param (if provided)
+    2) `fluxnode.conf` optional extra column `collateral_privkey_wif` (if present)
+    3) wallet key controlling the collateral UTXO (requires an unlocked encrypted wallet)
+  - For P2SH collateral, the redeem script is required; it can be provided as `redeem_script_hex`, specified in `fluxnode.conf`, or loaded from wallet-known redeem scripts.
   - P2PKH collateral: pubkey compression is inferred by matching the collateral output script hash.
   - P2SH collateral: the redeem script must hash to the collateral output script hash, and the provided key must correspond to a pubkey in the redeem script.
 - Result:
@@ -1100,9 +1104,9 @@ Starts fluxnodes from `fluxnode.conf`.
 
 - Params: `set` (string) `lockwallet` (boolean) `[alias]` (string)
   - `set` must be `"all"` or `"alias"`. When `"alias"`, the 3rd param is required.
-  - `lockwallet` is accepted for parity but currently ignored.
+  - `lockwallet` locks the wallet before returning when the wallet is encrypted.
 - Notes:
-  - Wallet support is not implemented yet. This method requires the collateral private key to be present in `fluxnode.conf` (see below). For one-off starts without modifying config, use `startdeterministicfluxnode` and pass the collateral key as the 3rd param.
+  - Collateral key resolution follows the same order as `startdeterministicfluxnode`; `fluxnode.conf` can include optional extra columns for wallet-less starts.
 
 ### getfluxnodecount
 

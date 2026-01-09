@@ -1483,6 +1483,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         }
         "startfluxnode" | "startzelnode" => rpc_startfluxnode(
             chainstate,
+            wallet,
             mempool,
             mempool_policy,
             mempool_metrics,
@@ -1496,6 +1497,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "startdeterministicfluxnode" | "startdeterministiczelnode" => {
             rpc_startdeterministicfluxnode(
                 chainstate,
+                wallet,
                 mempool,
                 mempool_policy,
                 mempool_metrics,
@@ -13592,12 +13594,130 @@ fn parse_multisig_redeem_script(script: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(pubkeys)
 }
 
+fn lock_wallet_if_requested(wallet: &Mutex<Wallet>, lockwallet: bool) -> Result<(), RpcError> {
+    if !lockwallet {
+        return Ok(());
+    }
+    let mut guard = wallet
+        .lock()
+        .map_err(|_| map_internal("wallet lock poisoned"))?;
+    match guard.walletlock() {
+        Ok(()) => Ok(()),
+        Err(WalletError::WalletNotEncrypted) => Ok(()),
+        Err(err) => Err(map_wallet_error(err)),
+    }
+}
+
+fn decode_redeem_script_hex(hex: &str) -> Result<Vec<u8>, RpcError> {
+    bytes_from_hex(hex)
+        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "redeem script decode failed"))
+}
+
+fn resolve_fluxnode_collateral_secret_and_redeem_script<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
+    entry: &FluxnodeConfEntry,
+    chain_params: &ChainParams,
+    collateral_wif: Option<&str>,
+    redeem_script_hex: Option<&str>,
+) -> Result<(SecretKey, Option<Vec<u8>>), RpcError> {
+    let redeem_script_override = match redeem_script_hex {
+        Some(hex) => Some(decode_redeem_script_hex(hex)?),
+        None => None,
+    };
+
+    let utxo = chainstate
+        .utxo_entry(&entry.collateral)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "collateral output not found"))?;
+
+    let script_type = classify_script_pubkey(&utxo.script_pubkey);
+
+    if let Some(wif) = collateral_wif {
+        let (secret, _compressed) = parse_wif_secret_key(wif, chain_params.network)?;
+        let redeem_script = if script_type == ScriptType::P2Sh {
+            if redeem_script_override.is_some() {
+                redeem_script_override
+            } else {
+                let guard = wallet
+                    .lock()
+                    .map_err(|_| map_internal("wallet lock poisoned"))?;
+                guard.redeem_script_for_p2sh_script_pubkey(&utxo.script_pubkey)
+            }
+        } else {
+            redeem_script_override
+        };
+        return Ok((secret, redeem_script));
+    }
+
+    let guard = wallet
+        .lock()
+        .map_err(|_| map_internal("wallet lock poisoned"))?;
+
+    match script_type {
+        ScriptType::P2Pkh => {
+            let Some((secret, _pubkey)) = guard
+                .signing_key_for_script_pubkey(&utxo.script_pubkey)
+                .map_err(map_wallet_error)?
+            else {
+                return Err(RpcError::new(
+                    RPC_WALLET_ERROR,
+                    "collateral private key not found in wallet",
+                ));
+            };
+            Ok((secret, redeem_script_override))
+        }
+        ScriptType::P2Sh => {
+            let redeem_script = if let Some(script) = redeem_script_override {
+                script
+            } else {
+                guard
+                    .redeem_script_for_p2sh_script_pubkey(&utxo.script_pubkey)
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            RPC_INVALID_PARAMETER,
+                            "missing redeem script for p2sh collateral",
+                        )
+                    })?
+            };
+
+            let pubkeys = parse_multisig_redeem_script(&redeem_script).ok_or_else(|| {
+                RpcError::new(RPC_INVALID_PARAMETER, "redeem script not multisig")
+            })?;
+
+            for pubkey_bytes in pubkeys {
+                let pubkey = PublicKey::from_slice(&pubkey_bytes).map_err(|_| {
+                    RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "redeem script contains invalid pubkey",
+                    )
+                })?;
+                if let Some(secret) = guard
+                    .signing_key_for_pubkey(&pubkey)
+                    .map_err(map_wallet_error)?
+                {
+                    return Ok((secret, Some(redeem_script)));
+                }
+            }
+
+            Err(RpcError::new(
+                RPC_WALLET_ERROR,
+                "collateral private key not found in wallet",
+            ))
+        }
+        _ => Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "collateral output script unsupported",
+        )),
+    }
+}
+
 fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     entry: &FluxnodeConfEntry,
     chain_params: &ChainParams,
-    collateral_wif: &str,
-    redeem_script_hex: Option<&str>,
+    collateral_secret: &SecretKey,
+    redeem_script: Option<Vec<u8>>,
 ) -> Result<Transaction, RpcError> {
     let best_height = best_block_height(chainstate)?;
     let next_height = best_height.saturating_add(1);
@@ -13623,9 +13743,6 @@ fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
         parse_wif_secret_key(&entry.privkey, chain_params.network)?;
     let operator_pubkey = secret_key_pubkey_bytes(&operator_secret, operator_compressed);
 
-    let (collateral_secret, _collateral_wif_compressed) =
-        parse_wif_secret_key(collateral_wif, chain_params.network)?;
-
     let utxo = chainstate
         .utxo_entry(&entry.collateral)
         .map_err(map_internal)?
@@ -13643,8 +13760,8 @@ fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
             let pubkey_hash = extract_p2pkh_hash(&utxo.script_pubkey)
                 .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid p2pkh script"))?;
 
-            let compressed_pubkey = secret_key_pubkey_bytes(&collateral_secret, true);
-            let uncompressed_pubkey = secret_key_pubkey_bytes(&collateral_secret, false);
+            let compressed_pubkey = secret_key_pubkey_bytes(collateral_secret, true);
+            let uncompressed_pubkey = secret_key_pubkey_bytes(collateral_secret, false);
 
             let (collateral_pubkey, collateral_compressed) =
                 if hash160(&compressed_pubkey) == pubkey_hash {
@@ -13716,7 +13833,7 @@ fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
             let txid = tx.txid().map_err(map_internal)?;
             let message = hash256_to_hex(&txid).into_bytes();
             let sig_bytes =
-                sign_compact_message(&collateral_secret, collateral_compressed, &message)?;
+                sign_compact_message(collateral_secret, collateral_compressed, &message)?;
 
             match tx.fluxnode.as_mut() {
                 Some(FluxnodeTx::V5(FluxnodeTxV5::Start(start))) => {
@@ -13742,14 +13859,11 @@ fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
                 ));
             }
 
-            let redeem_script_hex = redeem_script_hex.ok_or_else(|| {
+            let redeem_script = redeem_script.ok_or_else(|| {
                 RpcError::new(
                     RPC_INVALID_PARAMETER,
                     "missing redeem script for p2sh collateral",
                 )
-            })?;
-            let redeem_script = bytes_from_hex(redeem_script_hex).ok_or_else(|| {
-                RpcError::new(RPC_DESERIALIZATION_ERROR, "redeem script decode failed")
             })?;
 
             let script_hash = extract_p2sh_hash(&utxo.script_pubkey)
@@ -13765,8 +13879,8 @@ fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
                 RpcError::new(RPC_INVALID_PARAMETER, "redeem script not multisig")
             })?;
 
-            let compressed_pubkey = secret_key_pubkey_bytes(&collateral_secret, true);
-            let uncompressed_pubkey = secret_key_pubkey_bytes(&collateral_secret, false);
+            let compressed_pubkey = secret_key_pubkey_bytes(collateral_secret, true);
+            let uncompressed_pubkey = secret_key_pubkey_bytes(collateral_secret, false);
 
             let collateral_compressed = if pubkeys.iter().any(|pk| pk == &compressed_pubkey) {
                 true
@@ -13810,7 +13924,7 @@ fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
 
             let txid = tx.txid().map_err(map_internal)?;
             let message = hash256_to_hex(&txid).into_bytes();
-            let sig = sign_compact_message(&collateral_secret, collateral_compressed, &message)?;
+            let sig = sign_compact_message(collateral_secret, collateral_compressed, &message)?;
 
             if let Some(FluxnodeTx::V6(FluxnodeTxV6::Start(start))) = tx.fluxnode.as_mut() {
                 if let FluxnodeStartVariantV6::P2sh { sig: sig_field, .. } = &mut start.variant {
@@ -13829,6 +13943,7 @@ fn build_fluxnode_start_tx<S: fluxd_storage::KeyValueStore>(
 
 fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
     mempool: &Mutex<Mempool>,
     mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
@@ -13850,7 +13965,7 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "alias must be a string"))?
         .to_string();
-    let _lockwallet = parse_bool(&params[1])?;
+    let lockwallet = parse_bool(&params[1])?;
     let collateral_wif_override = params.get(2).and_then(|value| value.as_str());
     let redeem_script_override = params.get(3).and_then(|value| value.as_str());
 
@@ -13872,6 +13987,7 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
                 "could not find alias in config. Verify with listfluxnodeconf.".to_string(),
             ),
         );
+        lock_wallet_if_requested(wallet, lockwallet)?;
         return Ok(json!({
             "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
             "detail": [Value::Object(detail)],
@@ -13934,28 +14050,50 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    let collateral_wif = collateral_wif_override
-        .or(entry.collateral_privkey.as_deref())
-        .ok_or_else(|| {
-            RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "missing collateral private key (provide as 3rd parameter or in fluxnode.conf)",
-            )
-        })?;
+    let collateral_wif = collateral_wif_override.or(entry.collateral_privkey.as_deref());
     let redeem_script_hex = redeem_script_override.or(entry.redeem_script.as_deref());
+
+    let (collateral_secret, redeem_script) =
+        match resolve_fluxnode_collateral_secret_and_redeem_script(
+            chainstate,
+            wallet,
+            entry,
+            chain_params,
+            collateral_wif,
+            redeem_script_hex,
+        ) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                if collateral_wif.is_none()
+                    && err.code == RPC_WALLET_ERROR
+                    && err.message == "wallet is locked"
+                {
+                    return Err(err);
+                }
+                failed = 1;
+                detail.insert("result".to_string(), Value::String("failed".to_string()));
+                detail.insert("errorMessage".to_string(), Value::String(err.message));
+                lock_wallet_if_requested(wallet, lockwallet)?;
+                return Ok(json!({
+                    "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
+                    "detail": [Value::Object(detail)],
+                }));
+            }
+        };
 
     let tx = match build_fluxnode_start_tx(
         chainstate,
         entry,
         chain_params,
-        collateral_wif,
-        redeem_script_hex,
+        &collateral_secret,
+        redeem_script,
     ) {
         Ok(tx) => tx,
         Err(err) => {
             failed = 1;
             detail.insert("result".to_string(), Value::String("failed".to_string()));
             detail.insert("errorMessage".to_string(), Value::String(err.message));
+            lock_wallet_if_requested(wallet, lockwallet)?;
             return Ok(json!({
                 "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
                 "detail": [Value::Object(detail)],
@@ -13992,6 +14130,7 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
         }
     }
 
+    lock_wallet_if_requested(wallet, lockwallet)?;
     Ok(json!({
         "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
         "detail": [Value::Object(detail)],
@@ -14000,6 +14139,7 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
 
 fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
     mempool: &Mutex<Mempool>,
     mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
@@ -14019,7 +14159,7 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
     let set = params[0]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "set must be a string"))?;
-    let _lockwallet = parse_bool(&params[1])?;
+    let lockwallet = parse_bool(&params[1])?;
 
     let conf_entries = read_fluxnode_conf(data_dir)?;
     if conf_entries.is_empty() {
@@ -14040,6 +14180,7 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
                 })?;
             let filtered: Vec<_> = conf_entries.iter().filter(|e| e.alias == alias).collect();
             if filtered.is_empty() {
+                lock_wallet_if_requested(wallet, lockwallet)?;
                 return Ok(json!({
                     "overall": "Successfully started 0 fluxnodes, failed to start 1, total 1",
                     "detail": [{
@@ -14071,30 +14212,40 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
             Value::String(format_outpoint(&entry.collateral)),
         );
 
-        let collateral_wif = match entry.collateral_privkey.as_deref() {
-            Some(wif) => wif,
-            None => {
-                failed += 1;
-                obj.insert("result".to_string(), Value::String("failed".to_string()));
-                obj.insert(
-                    "errorMessage".to_string(),
-                    Value::String(
-                        "missing collateral private key in fluxnode.conf (wallet not implemented)"
-                            .to_string(),
-                    ),
-                );
-                detail.push(Value::Object(obj));
-                continue;
-            }
-        };
+        let collateral_wif = entry.collateral_privkey.as_deref();
         let redeem_script_hex = entry.redeem_script.as_deref();
+
+        let (collateral_secret, redeem_script) =
+            match resolve_fluxnode_collateral_secret_and_redeem_script(
+                chainstate,
+                wallet,
+                entry,
+                chain_params,
+                collateral_wif,
+                redeem_script_hex,
+            ) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    if collateral_wif.is_none()
+                        && err.code == RPC_WALLET_ERROR
+                        && err.message == "wallet is locked"
+                    {
+                        return Err(err);
+                    }
+                    failed += 1;
+                    obj.insert("result".to_string(), Value::String("failed".to_string()));
+                    obj.insert("errorMessage".to_string(), Value::String(err.message));
+                    detail.push(Value::Object(obj));
+                    continue;
+                }
+            };
 
         let tx = match build_fluxnode_start_tx(
             chainstate,
             entry,
             chain_params,
-            collateral_wif,
-            redeem_script_hex,
+            &collateral_secret,
+            redeem_script,
         ) {
             Ok(tx) => tx,
             Err(err) => {
@@ -14147,6 +14298,7 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
         detail.push(Value::Object(obj));
     }
 
+    lock_wallet_if_requested(wallet, lockwallet)?;
     Ok(json!({
         "overall": format!("Successfully started {successful} fluxnodes, failed to start {failed}, total {}", successful + failed),
         "detail": detail,
@@ -20639,6 +20791,7 @@ mod tests {
         )
         .expect("write fluxnode.conf");
 
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
         let mempool = Mutex::new(Mempool::new(0));
         let mempool_policy = MempoolPolicy::standard(0, false);
         let mempool_metrics = MempoolMetrics::default();
@@ -20648,6 +20801,7 @@ mod tests {
 
         let value = rpc_startfluxnode(
             &chainstate,
+            &wallet,
             &mempool,
             &mempool_policy,
             &mempool_metrics,
@@ -20781,6 +20935,7 @@ mod tests {
     fn startdeterministicfluxnode_has_cpp_schema_keys() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
 
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
         let mempool = Mutex::new(Mempool::new(0));
         let mempool_policy = MempoolPolicy::standard(0, false);
         let mempool_metrics = MempoolMetrics::default();
@@ -20790,6 +20945,7 @@ mod tests {
 
         let value = rpc_startdeterministicfluxnode(
             &chainstate,
+            &wallet,
             &mempool,
             &mempool_policy,
             &mempool_metrics,
@@ -20813,6 +20969,99 @@ mod tests {
         for key in ["alias", "result", "error"] {
             assert!(entry.contains_key(key), "missing key {key}");
         }
+    }
+
+    #[test]
+    fn startdeterministicfluxnode_uses_wallet_collateral_key_for_p2pkh() {
+        use fluxd_consensus::upgrades::UpgradeIndex;
+
+        let (chainstate, mut params, data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Kamata.as_usize()].activation_height = 0;
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let operator_wif = rpc_dumpprivkey(&wallet, vec![json!(address.clone())], &params)
+            .expect("rpc")
+            .as_str()
+            .expect("wif string")
+            .to_string();
+        let script_pubkey = address_to_script_pubkey(&address, params.network).expect("script");
+
+        let collateral = OutPoint {
+            hash: [0x44u8; 32],
+            index: 0,
+        };
+        let txhash_hex = hash256_to_hex(&collateral.hash);
+        std::fs::write(
+            data_dir.join("fluxnode.conf"),
+            format!("fn1 127.0.0.1:16125 {operator_wif} {txhash_hex} 0\n"),
+        )
+        .expect("write fluxnode.conf");
+
+        let utxo = fluxd_chainstate::utxo::UtxoEntry {
+            value: 1_000 * COIN,
+            script_pubkey,
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&collateral);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), utxo.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        extend_regtest_chain_to_height(
+            &chainstate,
+            &params,
+            fluxd_consensus::constants::FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC,
+        );
+        let best_height = best_block_height(&chainstate).expect("best height");
+        assert!(
+            best_height >= fluxd_consensus::constants::FLUXNODE_MIN_CONFIRMATION_DETERMINISTIC,
+            "best_height={best_height}"
+        );
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let mempool_policy = MempoolPolicy::standard(0, false);
+        let mempool_metrics = MempoolMetrics::default();
+        let fee_estimator = Mutex::new(FeeEstimator::new(128));
+        let mempool_flags = ValidationFlags::default();
+        let (tx_announce, _rx) = broadcast::channel(16);
+
+        let value = rpc_startdeterministicfluxnode(
+            &chainstate,
+            &wallet,
+            &mempool,
+            &mempool_policy,
+            &mempool_metrics,
+            &fee_estimator,
+            &mempool_flags,
+            vec![json!("fn1"), json!(false)],
+            &params,
+            &tx_announce,
+            &data_dir,
+        )
+        .expect("rpc");
+
+        let detail = value
+            .get("detail")
+            .and_then(Value::as_array)
+            .expect("detail array");
+        assert_eq!(detail.len(), 1);
+        let entry = detail[0].as_object().expect("detail entry");
+        let result = entry.get("result").and_then(Value::as_str);
+        assert_eq!(result, Some("successful"), "entry={entry:?}");
+        assert!(
+            entry
+                .get("txid")
+                .and_then(Value::as_str)
+                .map(is_hex_64)
+                .unwrap_or(false),
+            "entry={entry:?}"
+        );
     }
 
     #[test]

@@ -105,8 +105,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listfluxnodeconf - Implemented (alias: listzelnodeconf)
 - listzelnodeconf - Implemented (alias of listfluxnodeconf)
 - getfluxnodeoutputs - Implemented (wallet-less; uses fluxnode.conf + UTXO lookups)
-- startfluxnode - Partial (wallet-less; uses fluxnode.conf; requires a collateral WIF key)
-- startdeterministicfluxnode - Partial (wallet-less; requires a collateral WIF key; P2SH collateral also requires redeem script)
+- startfluxnode - Partial (uses wallet collateral key when available; supports wallet-less starts via optional `collateral_privkey_wif` + `redeem_script_hex` columns in `fluxnode.conf`; honors `lockwallet` for encrypted wallets; still simplified vs C++ detail fields)
+- startdeterministicfluxnode - Partial (uses wallet collateral key when available; supports wallet-less starts via `collateral_privkey_wif` param or `fluxnode.conf` extra columns; honors `lockwallet`; still simplified vs C++ behavior)
 - verifychain - Partial (checks flatfile decode + header linkage + merkle root + txindex; `checklevel=4` verifies spent-index consistency; `checklevel=5` verifies address index consistency; does not re-apply full UTXO/script validation like C++)
 - addnode - Implemented (IP/IP:PORT only; no DNS resolution yet)
 - clearbanned - Implemented
