@@ -9929,7 +9929,7 @@ fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
             tx.vin.push(TxIn {
                 prevout: next.outpoint,
                 script_sig: Vec::new(),
-                sequence: u32::MAX,
+                sequence: u32::MAX - 1,
             });
             fee = fee_for_size(estimate_signed_tx_size_with_prevouts(&tx, &prevouts)?)?;
             continue;
@@ -10069,6 +10069,16 @@ fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
     }))
 }
 
+fn wallet_tx_lock_time(best_height: i32) -> u32 {
+    let mut lock_time = best_height.saturating_sub(10).max(0) as u32;
+    let mut rng = rand::thread_rng();
+    if rng.next_u32() % 10 == 0 {
+        let back = (rng.next_u32() % 100) as u32;
+        lock_time = lock_time.saturating_sub(back);
+    }
+    lock_time
+}
+
 fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
@@ -10178,6 +10188,7 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         &chain_params.consensus.upgrades,
         UpgradeIndex::Acadia,
     );
+    let lock_time = wallet_tx_lock_time(next_height.saturating_sub(1));
 
     let tx = Transaction {
         f_overwintered: sapling_active,
@@ -10192,7 +10203,7 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
             value: amount,
             script_pubkey,
         }],
-        lock_time: 0,
+        lock_time,
         expiry_height: if sapling_active {
             (next_height as u32).saturating_add(DEFAULT_TX_EXPIRY_DELTA)
         } else {
@@ -10374,6 +10385,7 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         &chain_params.consensus.upgrades,
         UpgradeIndex::Acadia,
     );
+    let lock_time = wallet_tx_lock_time(next_height.saturating_sub(1));
 
     let tx = Transaction {
         f_overwintered: sapling_active,
@@ -10388,7 +10400,7 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
             value: amount,
             script_pubkey,
         }],
-        lock_time: 0,
+        lock_time,
         expiry_height: if sapling_active {
             (next_height as u32).saturating_add(DEFAULT_TX_EXPIRY_DELTA)
         } else {
@@ -10593,6 +10605,7 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         &chain_params.consensus.upgrades,
         UpgradeIndex::Acadia,
     );
+    let lock_time = wallet_tx_lock_time(next_height.saturating_sub(1));
 
     let mut ordered: Vec<(&String, &Value)> = outputs.iter().collect();
     ordered.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -10636,7 +10649,7 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         },
         vin: Vec::new(),
         vout,
-        lock_time: 0,
+        lock_time,
         expiry_height: if sapling_active {
             (next_height as u32).saturating_add(DEFAULT_TX_EXPIRY_DELTA)
         } else {

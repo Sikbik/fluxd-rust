@@ -500,6 +500,7 @@ Notes:
 Notes:
 - Builds a transparent transaction, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
 - Funds from spendable wallet UTXOs (P2PKH + wallet-known P2SH).
+- Uses fee-sniping-discouragement locktime (`best_height-10`, occasionally further back) with `sequence=MAX-1` (legacy `fluxd` behavior).
 - Rejects dust outputs when standardness is enabled.
 - Supports `subtractfeefromamount=true` (fee is deducted from the destination output).
 
@@ -512,6 +513,7 @@ Notes:
 - `fromaccount` is interpreted as a wallet address filter (Flux `fluxd` behavior):
   - empty string (`""`) spends from any spendable wallet UTXO and uses a wallet change address.
   - non-empty taddr restricts funding to UTXOs paying to that address and sends change back to it.
+- Uses fee-sniping-discouragement locktime (`best_height-10`, occasionally further back) with `sequence=MAX-1` (legacy `fluxd` behavior).
 
 ### sendmany
 
@@ -525,6 +527,7 @@ Notes:
 Notes:
 - Builds a transparent transaction with multiple outputs, funds it from wallet UTXOs, signs it, and submits it to the local mempool.
 - Funds from spendable wallet UTXOs (P2PKH + wallet-known P2SH).
+- Uses fee-sniping-discouragement locktime (`best_height-10`, occasionally further back) with `sequence=MAX-1` (legacy `fluxd` behavior).
 - Supports `subtractfeefrom` (fee is split across the selected destination outputs).
 
 ### getdbinfo
