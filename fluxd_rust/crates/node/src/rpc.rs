@@ -9612,6 +9612,21 @@ struct FundTransactionControl {
     change_script_pubkey: Option<Vec<u8>>,
 }
 
+#[derive(Clone)]
+struct FundRawTransactionOptions {
+    minconf: i32,
+    subtract_fee_from_outputs: Vec<usize>,
+}
+
+impl Default for FundRawTransactionOptions {
+    fn default() -> Self {
+        Self {
+            minconf: 1,
+            subtract_fee_from_outputs: Vec::new(),
+        }
+    }
+}
+
 fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
@@ -9623,15 +9638,41 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     chain_params: &ChainParams,
     fund_control: FundTransactionControl,
 ) -> Result<Value, RpcError> {
-    if params.is_empty() || params.len() > 2 {
+    if params.len() != 1 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
-            "fundrawtransaction expects 1 or 2 parameters",
+            "fundrawtransaction expects 1 parameter",
         ));
     }
     let hex = params[0]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "hexstring must be a string"))?;
+    fundrawtransaction_with_options(
+        chainstate,
+        mempool,
+        mempool_policy,
+        fee_estimator,
+        tx_confirm_target,
+        wallet,
+        hex,
+        FundRawTransactionOptions::default(),
+        chain_params,
+        fund_control,
+    )
+}
+
+fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    fee_estimator: &Mutex<FeeEstimator>,
+    tx_confirm_target: u32,
+    wallet: &Mutex<Wallet>,
+    hex: &str,
+    options: FundRawTransactionOptions,
+    chain_params: &ChainParams,
+    fund_control: FundTransactionControl,
+) -> Result<Value, RpcError> {
     let raw = bytes_from_hex(hex)
         .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
     let mut tx = Transaction::consensus_decode(&raw)
@@ -9646,21 +9687,12 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         ));
     }
 
-    let mut minconf = 1i32;
-    if let Some(value) = params.get(1) {
-        if !value.is_null() && !value.is_object() {
-            return Err(RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "options must be an object",
-            ));
-        }
-        if let Some(opts) = value.as_object() {
-            if let Some(raw_minconf) = opts.get("minconf") {
-                let parsed = parse_u32(raw_minconf, "minconf")?;
-                minconf = i32::try_from(parsed)
-                    .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "minconf out of range"))?;
-            }
-        }
+    let FundRawTransactionOptions {
+        minconf,
+        subtract_fee_from_outputs,
+    } = options;
+    if minconf < 0 {
+        return Err(RpcError::new(RPC_INVALID_PARAMETER, "minconf out of range"));
     }
 
     let recipient_vout_len = tx.vout.len();
@@ -9670,44 +9702,24 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))
     })?;
 
-    let mut subtract_fee_from_outputs: Vec<usize> = Vec::new();
-    if let Some(value) = params.get(1) {
-        if let Some(opts) = value.as_object() {
-            if let Some(raw_outputs) = opts.get("subtractFeeFromOutputs") {
-                if !raw_outputs.is_null() {
-                    let outputs = raw_outputs.as_array().ok_or_else(|| {
-                        RpcError::new(
-                            RPC_INVALID_PARAMETER,
-                            "subtractFeeFromOutputs must be an array",
-                        )
-                    })?;
-                    let mut seen = HashSet::new();
-                    for output_index in outputs {
-                        let index = parse_u32(output_index, "subtractFeeFromOutputs")?;
-                        let index = usize::try_from(index).map_err(|_| {
-                            RpcError::new(
-                                RPC_INVALID_PARAMETER,
-                                "subtractFeeFromOutputs out of range",
-                            )
-                        })?;
-                        if index >= recipient_vout_len {
-                            return Err(RpcError::new(
-                                RPC_INVALID_PARAMETER,
-                                "subtractFeeFromOutputs out of range",
-                            ));
-                        }
-                        if !seen.insert(index) {
-                            return Err(RpcError::new(
-                                RPC_INVALID_PARAMETER,
-                                "subtractFeeFromOutputs contains duplicate indices",
-                            ));
-                        }
-                        subtract_fee_from_outputs.push(index);
-                    }
-                }
+    let subtract_fee_from_outputs = {
+        let mut seen = HashSet::new();
+        for &index in &subtract_fee_from_outputs {
+            if index >= recipient_vout_len {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "subtractFeeFromOutputs out of range",
+                ));
+            }
+            if !seen.insert(index) {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "subtractFeeFromOutputs contains duplicate indices",
+                ));
             }
         }
-    }
+        subtract_fee_from_outputs
+    };
 
     let mut used_outpoints: HashSet<OutPoint> = HashSet::new();
     let mut base_inputs_value: i64 = 0;
@@ -10032,6 +10044,22 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
         ));
     }
 
+    if subtract_fee_from_outputs.is_empty()
+        && change_pos >= 0
+        && tx.vout.len() == recipient_vout_len + 1
+    {
+        let mut rng = rand::thread_rng();
+        let new_pos = (rng.next_u32() as usize) % (recipient_vout_len + 1);
+        let old_pos = usize::try_from(change_pos)
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "change position out of range"))?;
+        if new_pos != old_pos {
+            let change_output = tx.vout.remove(old_pos);
+            tx.vout.insert(new_pos, change_output);
+            change_pos = i32::try_from(new_pos)
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "change position out of range"))?;
+        }
+    }
+
     let encoded = tx.consensus_encode().map_err(map_internal)?;
     Ok(json!({
         "hex": hex_bytes(&encoded),
@@ -10182,14 +10210,20 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
 
     let unsigned_hex = hex_bytes(&tx.consensus_encode().map_err(map_internal)?);
 
-    let funded = rpc_fundrawtransaction(
+    let minconf_i32 = i32::try_from(minconf)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "minconf out of range"))?;
+    let funded = fundrawtransaction_with_options(
         chainstate,
         mempool,
         mempool_policy,
         fee_estimator,
         tx_confirm_target,
         wallet,
-        vec![Value::String(unsigned_hex), json!({ "minconf": minconf })],
+        &unsigned_hex,
+        FundRawTransactionOptions {
+            minconf: minconf_i32,
+            ..FundRawTransactionOptions::default()
+        },
         chain_params,
         fund_control,
     )?;
@@ -10372,19 +10406,23 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
 
     let unsigned_hex = hex_bytes(&tx.consensus_encode().map_err(map_internal)?);
 
-    let mut fund_params = vec![Value::String(unsigned_hex)];
-    if subtract_fee {
-        fund_params.push(json!({ "subtractFeeFromOutputs": [0] }));
-    }
-
-    let funded = rpc_fundrawtransaction(
+    let fund_options = if subtract_fee {
+        FundRawTransactionOptions {
+            subtract_fee_from_outputs: vec![0],
+            ..FundRawTransactionOptions::default()
+        }
+    } else {
+        FundRawTransactionOptions::default()
+    };
+    let funded = fundrawtransaction_with_options(
         chainstate,
         mempool,
         mempool_policy,
         fee_estimator,
         tx_confirm_target,
         wallet,
-        fund_params,
+        &unsigned_hex,
+        fund_options,
         chain_params,
         FundTransactionControl::default(),
     )?;
@@ -10616,23 +10654,21 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
 
     let unsigned_hex = hex_bytes(&tx.consensus_encode().map_err(map_internal)?);
 
-    let mut options = serde_json::Map::new();
-    options.insert("minconf".to_string(), json!(minconf));
-    if !subtract_fee_from_vout.is_empty() {
-        options.insert(
-            "subtractFeeFromOutputs".to_string(),
-            json!(subtract_fee_from_vout),
-        );
-    }
-
-    let funded = rpc_fundrawtransaction(
+    let minconf_i32 = i32::try_from(minconf)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "minconf out of range"))?;
+    let fund_options = FundRawTransactionOptions {
+        minconf: minconf_i32,
+        subtract_fee_from_outputs: subtract_fee_from_vout,
+    };
+    let funded = fundrawtransaction_with_options(
         chainstate,
         mempool,
         mempool_policy,
         fee_estimator,
         tx_confirm_target,
         wallet,
-        vec![Value::String(unsigned_hex), Value::Object(options)],
+        &unsigned_hex,
+        fund_options,
         chain_params,
         fund_control,
     )?;

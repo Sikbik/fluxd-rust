@@ -65,7 +65,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - decoderawtransaction - Implemented
 - decodescript - Implemented
 - getrawtransaction - Implemented (chain + mempool)
-- fundrawtransaction - Partial (wallet funding selects spendable P2PKH and P2SH (multisig) UTXOs; supports `minconf`; preserves existing `scriptSig` sizes for fee estimation; fee selection matches `fluxd` wallet: uses `paytxfee` when set, otherwise uses the fee estimator confirm target (`txconfirmtarget`, default 2; with a hard-coded fallback); clamps to a max fee; unsigned P2SH inputs require wallet-known redeem scripts; other non-P2PKH inputs must be pre-signed)
+- fundrawtransaction - Partial (1-arg signature like `fluxd`; wallet funding selects spendable P2PKH and P2SH (multisig) UTXOs; preserves existing `scriptSig` sizes for fee estimation; randomizes change output position; fee selection matches `fluxd` wallet: uses `paytxfee` when set, otherwise uses the fee estimator confirm target (`txconfirmtarget`, default 2; with a hard-coded fallback); clamps to a max fee; unsigned P2SH inputs require wallet-known redeem scripts; other non-P2PKH inputs must be pre-signed)
 - sendrawtransaction - Implemented (supports spending mempool parents; C++-style reject-code formatting for common invalid/mempool-conflict failures; honors `allowhighfees` absurd-fee guard)
 - createmultisig - Implemented (accepts Flux addresses or hex pubkeys; wallet lookup works while locked)
 - estimatefee - Implemented

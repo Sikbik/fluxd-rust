@@ -115,7 +115,7 @@ Type notes:
 - `decodescript <hex>`
 - `createmultisig <nrequired> <keys>`
 - `getrawtransaction <txid> [verbose]`
-- `fundrawtransaction <hexstring> [options]` (partial)
+- `fundrawtransaction <hexstring>` (partial)
 - `signrawtransaction <hexstring> [prevtxs] [privkeys] [sighashtype] [branchid]` (partial)
 - `sendrawtransaction <hexstring> [allowhighfees]`
 - `gettxout <txid> <vout> [include_mempool]`
@@ -720,12 +720,12 @@ Notes:
 
 - Params:
   - `hexstring` (string)
-  - optional `options` object (partial; supports `minconf`, `subtractFeeFromOutputs`)
 - Result: `{ "hex": "<funded_tx_hex>", "fee": <amount>, "changepos": <n> }`
 
 Notes:
 - Selects spendable wallet UTXOs via the address index and adds inputs + a change output when needed.
 - Supports funding with spendable P2PKH and P2SH (multisig) wallet UTXOs.
+- Change output position is randomized (matches legacy `fluxd` wallet behavior).
 - Fee selection matches legacy `fluxd` wallet behavior:
   - If wallet `paytxfee` is set (`settxfee`), it is used.
   - Otherwise uses the fee estimator for the configured confirm target (`txconfirmtarget`, default 2; falls back to a hard-coded minimum).
