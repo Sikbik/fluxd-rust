@@ -750,12 +750,19 @@ Notes:
 - optional `options` (object):
   - `minconf` (number, default 1)
   - `subtractFeeFromOutputs` (array of output indices; fee is split and subtracted across these outputs)
-- Result: `{ "hex": "<funded_tx_hex>", "fee": <amount>, "changepos": <n> }`
+  - `changeAddress` (string; explicit change destination address)
+  - `changePosition` (number; `-1`/omitted = randomized change placement, otherwise 0..N)
+  - `lockUnspents` (boolean, default false)
+  - `includeWatching` (boolean, default false)
+- Result: `{ "hex": "<funded_tx_hex>", "fee": <amount>, "fee_zat": <n>, "changepos": <n> }`
 
 Notes:
 - Selects spendable wallet UTXOs via the address index and adds inputs + a change output when needed.
 - Supports funding with spendable P2PKH and P2SH (multisig) wallet UTXOs.
-- Change output position is randomized (matches legacy `fluxd` wallet behavior).
+- Change output position is randomized by default (matches legacy `fluxd` wallet behavior); override with `options.changePosition`.
+- `subtractFeeFromOutputs` disables change randomization; `changePosition` cannot be used unless it keeps change at the final index.
+- `lockUnspents` locks newly-selected inputs in the wallet.
+- `includeWatching` allows selecting watch-only UTXOs (requires external signing to fully sign these inputs).
 - Fee selection matches legacy `fluxd` wallet behavior:
   - If wallet `paytxfee` is set (`settxfee`), it is used.
   - Otherwise uses the fee estimator for the configured confirm target (`txconfirmtarget`, default 2; falls back to a hard-coded minimum).

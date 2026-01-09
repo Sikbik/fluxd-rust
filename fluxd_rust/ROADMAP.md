@@ -387,7 +387,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`estimatepriority`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`signrawtransaction` | `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs; supports `options.minconf` + `options.subtractFeeFromOutputs`; non-P2PKH inputs must be pre-signed) | - |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`estimatepriority`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`signrawtransaction` | `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs; supports `options.minconf`, `options.subtractFeeFromOutputs`, `options.changeAddress`, `options.changePosition`, `options.lockUnspents`, `options.includeWatching`; non-P2PKH inputs must be pre-signed) | - |
 
 ### Mempool and relay
 
