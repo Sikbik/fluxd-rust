@@ -714,7 +714,7 @@ Notes:
 - Supports funding with spendable P2PKH and P2SH (multisig) wallet UTXOs.
 - Fee selection matches legacy `fluxd` wallet behavior:
   - If wallet `paytxfee` is set (`settxfee`), it is used.
-  - Otherwise uses the fee estimator for a ~2-block target (falls back to a hard-coded minimum).
+  - Otherwise uses the fee estimator for the configured confirm target (`txconfirmtarget`, default 2; falls back to a hard-coded minimum).
   - Always enforces the min relay fee and clamps to a max fee (0.1 FLUX).
 
 ### signrawtransaction

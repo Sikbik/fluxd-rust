@@ -52,6 +52,7 @@ Currently supported keys:
 - `maxmempool` (MiB; maps to `--mempool-max-mb`)
 - `minrelaytxfee` (fee rate; maps to `--minrelaytxfee`)
 - `limitfreerelay` (thousand-bytes-per-minute; maps to `--limitfreerelay`)
+- `txconfirmtarget` (blocks; wallet fee estimator target when `paytxfee` is unset; maps to `--txconfirmtarget`)
 - `listen` (`1|0`; enables/disables inbound P2P listener)
 - `bind` (IP or IP:PORT; binds inbound P2P listener; defaults to network P2P port)
 - `rpcuser`, `rpcpassword`

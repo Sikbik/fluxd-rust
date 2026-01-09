@@ -286,6 +286,7 @@ struct RpcContext<S> {
     mempool_metrics: Arc<MempoolMetrics>,
     header_metrics: Arc<HeaderMetrics>,
     fee_estimator: Arc<Mutex<FeeEstimator>>,
+    tx_confirm_target: u32,
     mempool_flags: ValidationFlags,
     miner_address: Option<String>,
     chain_params: ChainParams,
@@ -677,6 +678,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     mempool_metrics: Arc<MempoolMetrics>,
     header_metrics: Arc<HeaderMetrics>,
     fee_estimator: Arc<Mutex<FeeEstimator>>,
+    tx_confirm_target: u32,
     mempool_flags: ValidationFlags,
     miner_address: Option<String>,
     params: ChainParams,
@@ -719,6 +721,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
         let mempool_metrics = Arc::clone(&mempool_metrics);
         let header_metrics = Arc::clone(&header_metrics);
         let fee_estimator = Arc::clone(&fee_estimator);
+        let tx_confirm_target = tx_confirm_target;
         let mempool_flags = mempool_flags.clone();
         let miner_address = miner_address.clone();
         let params = params.clone();
@@ -744,6 +747,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
                 mempool_metrics,
                 header_metrics,
                 fee_estimator,
+                tx_confirm_target,
                 mempool_flags,
                 miner_address,
                 params,
@@ -778,6 +782,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     mempool_metrics: Arc<MempoolMetrics>,
     header_metrics: Arc<HeaderMetrics>,
     fee_estimator: Arc<Mutex<FeeEstimator>>,
+    tx_confirm_target: u32,
     mempool_flags: ValidationFlags,
     miner_address: Option<String>,
     chain_params: ChainParams,
@@ -826,6 +831,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
         mempool_metrics,
         header_metrics,
         fee_estimator,
+        tx_confirm_target,
         mempool_flags,
         miner_address,
         chain_params,
@@ -1248,6 +1254,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
     let mempool_metrics = ctx.mempool_metrics.as_ref();
     let header_metrics = ctx.header_metrics.as_ref();
     let fee_estimator = ctx.fee_estimator.as_ref();
+    let tx_confirm_target = ctx.tx_confirm_target;
     let mempool_flags = &ctx.mempool_flags;
     let miner_address = ctx.miner_address.as_deref();
     let chain_params = &ctx.chain_params;
@@ -1336,6 +1343,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             mempool,
             mempool_policy,
             fee_estimator,
+            tx_confirm_target,
             wallet,
             params,
             chain_params,
@@ -1360,6 +1368,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             mempool_policy,
             mempool_metrics,
             fee_estimator,
+            tx_confirm_target,
             mempool_flags,
             wallet,
             params,
@@ -1372,6 +1381,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             mempool_policy,
             mempool_metrics,
             fee_estimator,
+            tx_confirm_target,
             mempool_flags,
             wallet,
             params,
@@ -1384,6 +1394,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             mempool_policy,
             mempool_metrics,
             fee_estimator,
+            tx_confirm_target,
             mempool_flags,
             wallet,
             params,
@@ -9466,6 +9477,7 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     mempool: &Mutex<Mempool>,
     mempool_policy: &MempoolPolicy,
     fee_estimator: &Mutex<FeeEstimator>,
+    tx_confirm_target: u32,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
     chain_params: &ChainParams,
@@ -9619,14 +9631,14 @@ fn rpc_fundrawtransaction<S: fluxd_storage::KeyValueStore>(
     };
     let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
 
-    const DEFAULT_TX_CONFIRM_TARGET: u32 = 2;
     const DEFAULT_MIN_TX_FEE_PER_KB: i64 = 1000;
     const DEFAULT_MAX_TX_FEE: i64 = COIN / 10;
 
+    let tx_confirm_target = tx_confirm_target.max(1);
     let estimated_fee_per_kb = fee_estimator
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "fee estimator lock poisoned"))?
-        .estimate_fee_per_kb(DEFAULT_TX_CONFIRM_TARGET)
+        .estimate_fee_per_kb(tx_confirm_target)
         .unwrap_or(0);
 
     let fee_for_size = |size: usize| -> Result<i64, RpcError> {
@@ -9867,6 +9879,7 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
     mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
     fee_estimator: &Mutex<FeeEstimator>,
+    tx_confirm_target: u32,
     mempool_flags: &ValidationFlags,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
@@ -9978,6 +9991,7 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
         mempool,
         mempool_policy,
         fee_estimator,
+        tx_confirm_target,
         wallet,
         vec![Value::String(unsigned_hex), json!({ "minconf": minconf })],
         chain_params,
@@ -10048,6 +10062,7 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
     mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
     fee_estimator: &Mutex<FeeEstimator>,
+    tx_confirm_target: u32,
     mempool_flags: &ValidationFlags,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
@@ -10162,6 +10177,7 @@ fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
         mempool,
         mempool_policy,
         fee_estimator,
+        tx_confirm_target,
         wallet,
         fund_params,
         chain_params,
@@ -10232,6 +10248,7 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
     mempool_policy: &MempoolPolicy,
     mempool_metrics: &MempoolMetrics,
     fee_estimator: &Mutex<FeeEstimator>,
+    tx_confirm_target: u32,
     mempool_flags: &ValidationFlags,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
@@ -10387,6 +10404,7 @@ fn rpc_sendmany<S: fluxd_storage::KeyValueStore>(
         mempool,
         mempool_policy,
         fee_estimator,
+        tx_confirm_target,
         wallet,
         vec![Value::String(unsigned_hex), Value::Object(options)],
         chain_params,
@@ -20224,6 +20242,7 @@ mod tests {
             &mempool,
             &mempool_policy,
             &fee_estimator,
+            2,
             &wallet,
             vec![json!(raw_hex.clone())],
             &params,
@@ -20246,6 +20265,7 @@ mod tests {
             &mempool,
             &mempool_policy,
             &fee_estimator,
+            2,
             &wallet,
             vec![json!(raw_hex)],
             &params,
@@ -20350,6 +20370,7 @@ mod tests {
             &mempool,
             &mempool_policy,
             &fee_estimator,
+            2,
             &wallet,
             vec![json!(raw_hex)],
             &params,
@@ -20453,6 +20474,7 @@ mod tests {
             &mempool,
             &mempool_policy,
             &fee_estimator,
+            2,
             &wallet,
             vec![json!(raw_hex.clone())],
             &params,
@@ -20467,6 +20489,7 @@ mod tests {
             &mempool,
             &mempool_policy,
             &fee_estimator,
+            2,
             &wallet,
             vec![json!(raw_hex)],
             &params,
@@ -20555,6 +20578,7 @@ mod tests {
             &mempool,
             &mempool_policy,
             &fee_estimator,
+            2,
             &wallet,
             vec![json!(raw_hex)],
             &params,
@@ -21001,6 +21025,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![json!(""), json!(to_address.clone()), json!("1.0"), json!(2)],
@@ -21016,6 +21041,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![json!(""), json!(to_address), json!("1.0"), json!(1)],
@@ -21610,6 +21636,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![json!(to_address), json!("1.0")],
@@ -23344,6 +23371,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![json!(to_address), json!("1.0")],
@@ -23428,6 +23456,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![json!(ms_addr), json!("1.0")],
@@ -23499,6 +23528,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![
@@ -23596,6 +23626,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![json!(""), Value::Object(amounts), json!(1)],
@@ -23705,6 +23736,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![json!(""), Value::Object(amounts), json!(1)],
@@ -23794,6 +23826,7 @@ mod tests {
             &mempool_policy,
             &mempool_metrics,
             &fee_estimator,
+            2,
             &mempool_flags,
             &wallet,
             vec![

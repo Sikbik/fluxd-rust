@@ -116,6 +116,7 @@ const DEFAULT_TX_PEERS: usize = 2;
 const DEFAULT_MAX_CONNECTIONS: usize = 125;
 const DEFAULT_MEMPOOL_MAX_MB: u64 = 300;
 const DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS: u64 = 60;
+const DEFAULT_TX_CONFIRM_TARGET: u32 = 2;
 const DEFAULT_UTXO_CACHE_ENTRIES: usize = 200_000;
 const DEFAULT_DB_CACHE_MB: u64 = 256;
 const DEFAULT_DB_WRITE_BUFFER_MB: u64 = 2048;
@@ -261,6 +262,7 @@ struct Config {
     db_info_keys: bool,
     db_integrity: bool,
     miner_address: Option<String>,
+    tx_confirm_target: u32,
     scan_flatfiles: bool,
     scan_supply: bool,
     scan_fluxnodes: bool,
@@ -1378,6 +1380,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         let fee_estimator = Arc::clone(&fee_estimator);
         let mempool_flags = flags.clone();
         let miner_address = config.miner_address.clone();
+        let tx_confirm_target = config.tx_confirm_target;
         let params = params.as_ref().clone();
         let data_dir = data_dir.clone();
         let params_dir = config.params_dir.clone();
@@ -1407,6 +1410,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                     mempool_metrics,
                     header_metrics,
                     fee_estimator,
+                    tx_confirm_target,
                     mempool_flags,
                     miner_address,
                     params,
@@ -7644,6 +7648,8 @@ where
     let mut limit_free_relay_kb_per_minute_set = false;
     let mut miner_address: Option<String> = None;
     let mut miner_address_set = false;
+    let mut tx_confirm_target: u32 = DEFAULT_TX_CONFIRM_TARGET;
+    let mut tx_confirm_target_set = false;
     let mut mempool_max_mb: u64 = DEFAULT_MEMPOOL_MAX_MB;
     let mut mempool_max_mb_set = false;
     let mut mempool_persist_interval_secs: u64 = DEFAULT_MEMPOOL_PERSIST_INTERVAL_SECS;
@@ -7872,6 +7878,18 @@ where
                     .ok_or_else(|| format!("missing value for --miner-address\n{}", usage()))?;
                 miner_address = Some(value);
                 miner_address_set = true;
+            }
+            "--txconfirmtarget" | "--tx-confirm-target" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --txconfirmtarget\n{}", usage()))?;
+                tx_confirm_target = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid txconfirmtarget '{value}'\n{}", usage()))?;
+                if tx_confirm_target == 0 {
+                    return Err(format!("txconfirmtarget must be > 0\n{}", usage()));
+                }
+                tx_confirm_target_set = true;
             }
             "--p2p-addr" | "--p2paddr" => {
                 let value = args
@@ -8356,6 +8374,22 @@ where
             }
         }
 
+        if !tx_confirm_target_set {
+            if let Some(values) = conf.get("txconfirmtarget") {
+                if let Some(raw) = values.last() {
+                    tx_confirm_target = raw.parse::<u32>().map_err(|_| {
+                        format!("invalid txconfirmtarget '{raw}' in {}", conf_file.display())
+                    })?;
+                    if tx_confirm_target == 0 {
+                        return Err(format!(
+                            "invalid txconfirmtarget '{raw}' in {}",
+                            conf_file.display()
+                        ));
+                    }
+                }
+            }
+        }
+
         if !db_cache_set {
             if let Some(values) = conf.get("dbcache") {
                 if let Some(raw) = values.last() {
@@ -8484,6 +8518,7 @@ where
             "rpcuser",
             "regtest",
             "testnet",
+            "txconfirmtarget",
         ];
         let mut unsupported: Vec<String> = conf
             .keys()
@@ -8664,6 +8699,7 @@ where
         db_info_keys,
         db_integrity,
         miner_address,
+        tx_confirm_target,
         scan_flatfiles,
         scan_supply,
         scan_fluxnodes,
@@ -8995,6 +9031,7 @@ fn usage() -> String {
         "  --skip-script  Disable script validation (testing only)",
         "  --network   Network selection (default: mainnet)",
         "  --miner-address  Default miner address for getblocktemplate when wallet is not available",
+        "  --txconfirmtarget  Fee estimation target in blocks when paytxfee is unset (default: 2)",
         "  --p2p-addr  Bind P2P listener (default: 0.0.0.0:16125 mainnet, 26125 testnet)",
         "  --no-p2p-listen  Disable inbound P2P listener",
         "  --rpc-addr  Bind JSON-RPC server (default: 127.0.0.1:16124 mainnet, 26124 testnet)",
