@@ -1286,8 +1286,8 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "restart" => rpc_restart(params, shutdown_tx),
         "reindex" => rpc_reindex(params, data_dir, shutdown_tx),
         "rescanblockchain" => rpc_rescanblockchain(chainstate, wallet, params),
-        "importaddress" => rpc_importaddress(wallet, params, chain_params),
-        "importwallet" => rpc_importwallet(wallet, params),
+        "importaddress" => rpc_importaddress(chainstate, wallet, params, chain_params),
+        "importwallet" => rpc_importwallet(chainstate, wallet, params),
         "getwalletinfo" => rpc_getwalletinfo(chainstate, mempool, wallet, params),
         "encryptwallet" => rpc_encryptwallet(wallet, params),
         "walletpassphrase" => rpc_walletpassphrase(&ctx.wallet, params),
@@ -1295,7 +1295,7 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "walletlock" => rpc_walletlock(wallet, params),
         "getnewaddress" => rpc_getnewaddress(wallet, params),
         "getrawchangeaddress" => rpc_getrawchangeaddress(wallet, params),
-        "importprivkey" => rpc_importprivkey(wallet, params),
+        "importprivkey" => rpc_importprivkey(chainstate, wallet, params),
         "dumpprivkey" => rpc_dumpprivkey(wallet, params, chain_params),
         "signmessage" => rpc_signmessage(wallet, params, chain_params),
         "backupwallet" => rpc_backupwallet(wallet, params),
@@ -1892,7 +1892,8 @@ fn rpc_rescanblockchain<S: fluxd_storage::KeyValueStore>(
     }))
 }
 
-fn rpc_importaddress(
+fn rpc_importaddress<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
     wallet: &Mutex<Wallet>,
     params: Vec<Value>,
     chain_params: &ChainParams,
@@ -1943,6 +1944,8 @@ fn rpc_importaddress(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let rescan = params.get(2).and_then(Value::as_bool).unwrap_or(true);
+
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -1954,11 +1957,19 @@ fn rpc_importaddress(
             .set_label_for_script_pubkey(script_pubkey, label)
             .map_err(map_wallet_error)?;
     }
+    drop(guard);
 
+    if rescan {
+        let _ = rpc_rescanblockchain(chainstate, wallet, Vec::new())?;
+    }
     Ok(Value::Null)
 }
 
-fn rpc_importwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+fn rpc_importwallet<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
     if params.len() != 1 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
@@ -2037,6 +2048,8 @@ fn rpc_importwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value,
             "no keys found in wallet dump",
         ));
     }
+    drop(guard);
+    let _ = rpc_rescanblockchain(chainstate, wallet, Vec::new())?;
     Ok(Value::Null)
 }
 
@@ -2639,7 +2652,11 @@ fn rpc_getrawchangeaddress(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result
     Ok(Value::String(address))
 }
 
-fn rpc_importprivkey(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
+fn rpc_importprivkey<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+) -> Result<Value, RpcError> {
     if params.is_empty() || params.len() > 3 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
@@ -2671,6 +2688,8 @@ fn rpc_importprivkey(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let rescan = params.get(2).and_then(Value::as_bool).unwrap_or(true);
+
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -2694,6 +2713,11 @@ fn rpc_importprivkey(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
         guard
             .set_label_for_script_pubkey(script_pubkey, label)
             .map_err(map_wallet_error)?;
+    }
+    drop(guard);
+
+    if rescan {
+        let _ = rpc_rescanblockchain(chainstate, wallet, Vec::new())?;
     }
     Ok(Value::Null)
 }
@@ -18097,13 +18121,19 @@ mod tests {
 
     #[test]
     fn validateaddress_reports_watchonly_for_imported_script() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
         let watch_script = p2pkh_script([0x55u8; 20]);
         let watch_address =
             script_pubkey_to_address(&watch_script, params.network).expect("watch address");
-        rpc_importaddress(&wallet, vec![json!(watch_address.clone())], &params).expect("rpc");
+        rpc_importaddress(
+            &chainstate,
+            &wallet,
+            vec![json!(watch_address.clone()), Value::Null, json!(false)],
+            &params,
+        )
+        .expect("rpc");
 
         let ok =
             rpc_validateaddress(&wallet, vec![Value::String(watch_address)], &params).expect("rpc");
@@ -21170,7 +21200,7 @@ mod tests {
 
     #[test]
     fn dumpwallet_exports_keypool_and_roundtrips_importwallet() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
         rpc_keypoolrefill(&wallet, vec![json!(2)]).expect("rpc");
@@ -21202,7 +21232,7 @@ mod tests {
         std::fs::create_dir_all(&other_dir).expect("create import dir");
         let wallet_b =
             Mutex::new(Wallet::load_or_create(&other_dir, params.network).expect("wallet"));
-        rpc_importwallet(&wallet_b, vec![json!(dump_string)]).expect("rpc");
+        rpc_importwallet(&chainstate, &wallet_b, vec![json!(dump_string)]).expect("rpc");
         assert_eq!(wallet_b.lock().expect("wallet lock").key_count(), 2);
 
         let err = rpc_dumpwallet(&wallet, vec![json!(dump_path.to_string_lossy())], &data_dir)
@@ -21213,7 +21243,7 @@ mod tests {
 
     #[test]
     fn dumpwallet_exports_labels_and_importwallet_restores_them() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
         rpc_keypoolrefill(&wallet, vec![json!(2)]).expect("rpc");
@@ -21259,7 +21289,7 @@ mod tests {
         std::fs::create_dir_all(&other_dir).expect("create import dir");
         let wallet_b =
             Mutex::new(Wallet::load_or_create(&other_dir, params.network).expect("wallet"));
-        rpc_importwallet(&wallet_b, vec![json!(dump_string)]).expect("rpc");
+        rpc_importwallet(&chainstate, &wallet_b, vec![json!(dump_string)]).expect("rpc");
 
         let ok =
             rpc_validateaddress(&wallet_b, vec![Value::String(address)], &params).expect("rpc");
@@ -21771,6 +21801,7 @@ mod tests {
         assert_eq!(value.as_array().expect("array").len(), 0);
 
         rpc_importaddress(
+            &chainstate,
             &wallet,
             vec![json!(watch_address.clone()), Value::Null, json!(false)],
             &params,
@@ -22424,7 +22455,7 @@ mod tests {
 
     #[test]
     fn wallet_importprivkey_enables_dumpprivkey() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet_a =
             Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
@@ -22443,7 +22474,12 @@ mod tests {
         std::fs::create_dir_all(&data_dir_b).expect("create data dir");
         let wallet_b =
             Mutex::new(Wallet::load_or_create(&data_dir_b, params.network).expect("wallet"));
-        rpc_importprivkey(&wallet_b, vec![json!(wif.clone())]).expect("rpc");
+        rpc_importprivkey(
+            &chainstate,
+            &wallet_b,
+            vec![json!(wif.clone()), Value::Null, json!(false)],
+        )
+        .expect("rpc");
 
         let wif_b = rpc_dumpprivkey(&wallet_b, vec![json!(address)], &params)
             .expect("rpc")
@@ -23778,6 +23814,7 @@ mod tests {
         let watch_address =
             script_pubkey_to_address(&watch_script, params.network).expect("watch address");
         rpc_importaddress(
+            &chainstate,
             &wallet,
             vec![json!(watch_address.clone()), Value::Null, json!(false)],
             &params,
@@ -24473,6 +24510,7 @@ mod tests {
         let watch_address =
             script_pubkey_to_address(&watch_script, params.network).expect("watch address");
         rpc_importaddress(
+            &chainstate,
             &wallet,
             vec![json!(watch_address.clone()), Value::Null, json!(false)],
             &params,
@@ -24812,6 +24850,7 @@ mod tests {
         let watch_address =
             script_pubkey_to_address(&watch_script, params.network).expect("watch address");
         rpc_importaddress(
+            &chainstate,
             &wallet,
             vec![json!(watch_address.clone()), Value::Null, json!(false)],
             &params,

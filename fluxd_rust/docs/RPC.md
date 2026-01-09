@@ -138,8 +138,9 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `settxfee <amount>` (partial)
 - `getnewaddress [label]` (label stored as legacy `account`)
 - `getrawchangeaddress [address_type]` (partial; address_type ignored; marks address as internal change)
-- `importprivkey <wif> [label] [rescan]` (label stored; rescan ignored)
-- `importwallet <filename>` (imports WIFs and `label=` fields from a wallet dump)
+- `importaddress <address_or_script> [label] [rescan] [p2sh]` (watch-only; `rescan=true` triggers `rescanblockchain`)
+- `importprivkey <wif> [label] [rescan]` (label stored; `rescan=true` triggers `rescanblockchain`)
+- `importwallet <filename>` (imports WIFs and `label=` fields from a wallet dump; triggers `rescanblockchain`)
 - `dumpprivkey <address>`
 - `backupwallet <destination>`
 - `dumpwallet <filename>` (exports transparent keys with `label=`; refuses to overwrite an existing file)
@@ -324,10 +325,33 @@ Notes:
 - Params: optional `address_type` (string; currently ignored).
 - Result: new transparent P2PKH address (persisted to `wallet.dat`, marked as internal change).
 
+### importaddress
+
+- Params: `<address_or_script> [label] [rescan] [p2sh]`.
+- Result: `null`
+
+Notes:
+- Accepts a base58 transparent address or a hex-encoded scriptPubKey.
+- Imports the script as watch-only; balances are derived from the address index.
+- When `rescan=true` (default), triggers `rescanblockchain` to populate wallet tx history (`txcount`).
+- `p2sh` is accepted but currently ignored.
+
 ### importprivkey
 
-- Params: `<wif> [label] [rescan]` (`label` accepted; `rescan` ignored).
+- Params: `<wif> [label] [rescan]` (`label` accepted; when `rescan=true` triggers `rescanblockchain`).
 - Result: `null`
+
+Notes:
+- Rescan is address-delta-index driven and persists wallet tx history in `wallet.dat`.
+
+### importwallet
+
+- Params: `<filename>` (wallet dump file path).
+- Result: `null`
+
+Notes:
+- Imports WIFs and optional `label=` metadata from `dumpwallet` output.
+- Triggers `rescanblockchain` to populate wallet tx history (`txcount`).
 
 ### dumpprivkey
 

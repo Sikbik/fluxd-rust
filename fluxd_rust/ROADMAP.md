@@ -217,7 +217,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Keypool/change-address management parity
   - [x] Wallet tx history / persistence (txid set in `wallet.dat` v3; first-seen time v13; raw tx bytes v14 for wallet tx store)
 - [x] [P1] Transparent wallet RPCs (owner: TBD)
-  - [x] `importaddress` (watch-only; rescan is a no-op due to address index)
+  - [x] `importaddress` (watch-only; `rescan=true` triggers `rescanblockchain` to populate wallet tx history)
   - [x] `importwallet` (best-effort WIF import from dump file)
   - [x] `getnewaddress`, `importprivkey`, `dumpprivkey`
   - [x] `getrawchangeaddress`

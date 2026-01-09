@@ -131,9 +131,9 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - getreceivedbyaddress - Implemented (wallet addresses only; uses address deltas for confirmed receives, plus mempool outputs when `minconf=0`)
 - getunconfirmedbalance - Partial (derived from spendable mempool outputs paying to the wallet)
 - getwalletinfo - Implemented (C++ key set + conditional `unlocked_until`; balances derived from the address index; also returns `*_zat` fields for exact amounts)
-- importaddress - Implemented (watch-only; rescan ignored due to address index)
-- importprivkey - Implemented (rescan param accepted but ignored; address index makes it unnecessary)
-- importwallet - Partial (imports WIFs from a wallet dump; also imports `label=` fields)
+- importaddress - Implemented (watch-only; `rescan=true` triggers `rescanblockchain` to populate wallet tx history)
+- importprivkey - Implemented (`rescan=true` triggers `rescanblockchain` to populate wallet tx history)
+- importwallet - Implemented (imports WIFs from a wallet dump; also imports `label=` fields; triggers `rescanblockchain`)
 - keypoolrefill - Implemented (fills persisted keypool; does not create addresses)
 - listaddressgroupings - Partial (clusters co-spent inputs + wallet-owned outputs; heuristic is index-driven vs C++ wallet internals)
 - listlockunspent - Implemented
