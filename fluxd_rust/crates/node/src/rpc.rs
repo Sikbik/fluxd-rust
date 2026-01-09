@@ -7206,27 +7206,23 @@ fn rpc_zgetbalance<S: fluxd_storage::KeyValueStore>(
             .sync_sapling_notes(chainstate)
             .map_err(map_wallet_error)?;
 
-        let is_spendable = guard
-            .sapling_extsk_for_address(&addr_bytes)
-            .map_err(map_wallet_error)?
-            .is_some();
-        if !is_spendable {
-            let has_viewing_key = guard
-                .sapling_extfvk_for_address(&addr_bytes)
-                .map_err(map_wallet_error)?
-                .is_some();
-            if !has_viewing_key {
-                return Err(RpcError::new(
-                    RPC_WALLET_ERROR,
-                    "Wallet does not hold private key or viewing key for this zaddr",
-                ));
-            }
-            if !include_watchonly {
-                return Err(RpcError::new(
-                    RPC_WALLET_ERROR,
-                    "Wallet does not hold private key for this zaddr",
-                ));
-            }
+        let is_mine = guard
+            .sapling_address_is_mine(&addr_bytes)
+            .map_err(map_wallet_error)?;
+        let is_watchonly = guard
+            .sapling_address_is_watchonly(&addr_bytes)
+            .map_err(map_wallet_error)?;
+        if !is_mine && !is_watchonly {
+            return Err(RpcError::new(
+                RPC_WALLET_ERROR,
+                "Wallet does not hold private key or viewing key for this zaddr",
+            ));
+        }
+        if !is_mine && !include_watchonly {
+            return Err(RpcError::new(
+                RPC_WALLET_ERROR,
+                "Wallet does not hold private key for this zaddr",
+            ));
         }
 
         guard
@@ -7320,11 +7316,10 @@ fn rpc_zgettotalbalance<S: fluxd_storage::KeyValueStore>(
         let mut notes = Vec::new();
         for note in guard.sapling_note_map().values() {
             if !include_watchonly {
-                let spendable = guard
-                    .sapling_extsk_for_address(&note.address)
-                    .map_err(map_wallet_error)?
-                    .is_some();
-                if !spendable {
+                let is_mine = guard
+                    .sapling_address_is_mine(&note.address)
+                    .map_err(map_wallet_error)?;
+                if !is_mine {
                     continue;
                 }
             }
@@ -7474,13 +7469,18 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
             if !filter_addresses.is_empty() && !filter_addresses.contains(&note.address) {
                 continue;
             }
-            let spendable = guard
-                .sapling_extsk_for_address(&note.address)
-                .map_err(map_wallet_error)?
-                .is_some();
-            if !include_watchonly && !spendable {
+            let is_mine = guard
+                .sapling_address_is_mine(&note.address)
+                .map_err(map_wallet_error)?;
+            if !include_watchonly && !is_mine {
                 continue;
             }
+            let spendable = match guard.sapling_extsk_for_address(&note.address) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(WalletError::WalletLocked) => false,
+                Err(err) => return Err(map_wallet_error(err)),
+            };
             out.push(NoteRow {
                 txid,
                 out_index,
@@ -7584,7 +7584,7 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
         spendable: bool,
     }
 
-    let notes: Vec<NoteRow> = {
+    let (notes, ivk): (Vec<NoteRow>, PreparedIncomingViewingKey) = {
         let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -7592,30 +7592,41 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
             .sync_sapling_notes(chainstate)
             .map_err(map_wallet_error)?;
 
-        let spendable = guard
-            .sapling_extsk_for_address(&addr_bytes)
-            .map_err(map_wallet_error)?
-            .is_some();
-        if !spendable {
-            let has_viewing_key = guard
-                .sapling_extfvk_for_address(&addr_bytes)
-                .map_err(map_wallet_error)?
-                .is_some();
-            if !has_viewing_key {
-                return Err(RpcError::new(
-                    RPC_WALLET_ERROR,
-                    "Wallet does not hold private key or viewing key for this zaddr",
-                ));
-            }
-            if !include_watchonly {
-                return Err(RpcError::new(
-                    RPC_WALLET_ERROR,
-                    "Wallet does not hold private key for this zaddr",
-                ));
-            }
+        let is_mine = guard
+            .sapling_address_is_mine(&addr_bytes)
+            .map_err(map_wallet_error)?;
+        let is_watchonly = guard
+            .sapling_address_is_watchonly(&addr_bytes)
+            .map_err(map_wallet_error)?;
+        if !is_mine && !is_watchonly {
+            return Err(RpcError::new(
+                RPC_WALLET_ERROR,
+                "Wallet does not hold private key or viewing key for this zaddr",
+            ));
+        }
+        if !is_mine && !include_watchonly {
+            return Err(RpcError::new(
+                RPC_WALLET_ERROR,
+                "Wallet does not hold private key for this zaddr",
+            ));
         }
 
-        guard
+        let spendable = match guard.sapling_extsk_for_address(&addr_bytes) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(WalletError::WalletLocked) => false,
+            Err(err) => return Err(map_wallet_error(err)),
+        };
+
+        let extfvk_bytes = guard
+            .sapling_extfvk_for_address(&addr_bytes)
+            .map_err(map_wallet_error)?
+            .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "missing Sapling viewing key"))?;
+        let extfvk = sapling_crypto::zip32::ExtendedFullViewingKey::read(extfvk_bytes.as_slice())
+            .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "invalid Sapling viewing key"))?;
+        let ivk = PreparedIncomingViewingKey::new(&extfvk.fvk.vk.ivk());
+
+        let notes = guard
             .sapling_note_map()
             .iter()
             .filter_map(|(&(txid, out_index), note)| {
@@ -7629,7 +7640,9 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
                     spendable,
                 })
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+
+        (notes, ivk)
     };
 
     let best_height = chainstate
@@ -7651,11 +7664,28 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
             .sapling_nullifier_spent(&row.note.nullifier)
             .map_err(map_internal)?;
 
+        let output = read_sapling_output_by_key(chainstate, &row.txid, row.out_index)?;
+        let output_ref = SaplingOutputRef { output: &output };
+        let (_note, recipient, memo) =
+            try_sapling_note_decryption(&ivk, &output_ref, Zip212Enforcement::GracePeriod)
+                .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "failed to decrypt Sapling note"))?;
+        if recipient.to_bytes() != row.note.address {
+            return Err(RpcError::new(
+                RPC_INTERNAL_ERROR,
+                "sapling note recipient mismatch",
+            ));
+        }
+        let memo = if memo[0] == 0xF6 {
+            "".to_string()
+        } else {
+            hex_bytes(&memo)
+        };
+
         out.push(json!({
             "txid": hash256_to_hex(&row.txid),
             "amount": amount_to_value(row.note.value),
             "amountZat": row.note.value,
-            "memo": "",
+            "memo": memo,
             "confirmations": confirmations,
             "outindex": row.out_index,
             "blockheight": row.note.height,
@@ -18180,6 +18210,30 @@ mod tests {
         assert_eq!(entry.get("outindex").and_then(Value::as_u64), Some(0));
         assert_eq!(entry.get("amountZat").and_then(Value::as_i64), Some(value));
         assert_eq!(entry.get("spent").and_then(Value::as_bool), Some(false));
+
+        rpc_encryptwallet(&wallet, vec![json!("passphrase")]).expect("encryptwallet");
+        rpc_walletlock(&wallet, Vec::new()).expect("walletlock");
+
+        let balance_locked =
+            rpc_zgetbalance(&chainstate, &mempool, &wallet, vec![json!(zaddr)], &params)
+                .expect("rpc");
+        assert_eq!(balance_locked, amount_to_value(value));
+
+        let total_locked =
+            rpc_zgettotalbalance(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let obj = total_locked.as_object().expect("object");
+        assert_eq!(obj.get("private").cloned(), Some(amount_to_value(value)));
+
+        let unspent_locked =
+            rpc_zlistunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let list = unspent_locked.as_array().expect("array");
+        assert_eq!(list.len(), 1);
+
+        let received_locked =
+            rpc_zlistreceivedbyaddress(&chainstate, &wallet, vec![json!(zaddr)], &params)
+                .expect("rpc");
+        let list = received_locked.as_array().expect("array");
+        assert_eq!(list.len(), 1);
 
         {
             let guard = wallet.lock().expect("wallet lock");
