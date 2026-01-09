@@ -9813,7 +9813,7 @@ fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
     let FundRawTransactionOptions {
         minconf,
         subtract_fee_from_outputs,
-        change_script_pubkey,
+        change_script_pubkey: requested_change_script_pubkey,
         change_position,
         lock_unspents,
         include_watching,
@@ -9910,8 +9910,8 @@ fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
         prevouts.insert(input.prevout.clone(), prevout);
     }
 
-    let (wallet_scripts, change_script_pubkey, pay_tx_fee_per_kb, locked_outpoints) = {
-        let mut guard = wallet
+    let (wallet_scripts, pay_tx_fee_per_kb, locked_outpoints, change_ok) = {
+        let guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
         let pay_tx_fee_per_kb = guard.pay_tx_fee_per_kb();
@@ -9938,29 +9938,25 @@ fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
             Some(_) => Vec::new(),
             None => scripts,
         };
-
-        let change_script = match fund_control.change_script_pubkey.as_ref() {
-            Some(script) if change_ok => script.clone(),
-            _ => match change_script_pubkey.as_ref() {
-                Some(script) => script.clone(),
-                None => {
-                    let change_address = guard
-                        .generate_new_change_address(true)
-                        .map_err(map_wallet_error)?;
-                    address_to_script_pubkey(&change_address, chain_params.network)
-                        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid change address"))?
-                }
-            },
-        };
         let locked_outpoints = guard.locked_outpoints();
         (
             wallet_scripts,
-            change_script,
             pay_tx_fee_per_kb,
             locked_outpoints,
+            change_ok,
         )
     };
     let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
+    let change_script_pubkey = if change_ok {
+        fund_control
+            .change_script_pubkey
+            .clone()
+            .or(requested_change_script_pubkey)
+    } else {
+        requested_change_script_pubkey
+    };
+    let placeholder_key_hash = [0u8; 20];
+    let placeholder_change_script_pubkey = p2pkh_script_pubkey(&placeholder_key_hash);
 
     const DEFAULT_MIN_TX_FEE_PER_KB: i64 = 1000;
     const DEFAULT_MAX_TX_FEE: i64 = COIN / 10;
@@ -10091,10 +10087,13 @@ fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
         let mut change = total_inputs
             .checked_sub(required)
             .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "value out of range"))?;
+        let change_script_for_change = change_script_pubkey
+            .as_ref()
+            .unwrap_or(&placeholder_change_script_pubkey);
         let include_change = change > 0
             && !is_dust(
                 change,
-                &change_script_pubkey,
+                change_script_for_change,
                 mempool_policy.min_relay_fee_per_kb,
             );
         if change > 0 && !include_change && tx.vout.len() == recipient_vout_len + 1 {
@@ -10116,7 +10115,7 @@ fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
             if tx.vout.len() == recipient_vout_len {
                 tx.vout.push(TxOut {
                     value: change,
-                    script_pubkey: change_script_pubkey.clone(),
+                    script_pubkey: change_script_for_change.clone(),
                 });
                 change_pos = recipient_vout_len as i32;
             } else if tx.vout.len() == recipient_vout_len + 1 {
@@ -10233,12 +10232,31 @@ fn fundrawtransaction_with_options<S: fluxd_storage::KeyValueStore>(
         }
     }
 
-    if lock_unspents && !locked_inputs.is_empty() {
+    let needs_change_address = change_pos >= 0
+        && tx.vout.len() == recipient_vout_len + 1
+        && change_script_pubkey.is_none();
+    if needs_change_address || (lock_unspents && !locked_inputs.is_empty()) {
         let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
-        for outpoint in locked_inputs {
-            guard.lock_outpoint(outpoint);
+        if needs_change_address {
+            let change_address = guard
+                .generate_new_change_address(true)
+                .map_err(map_wallet_error)?;
+            let change_script = address_to_script_pubkey(&change_address, chain_params.network)
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid change address"))?;
+            let change_index = usize::try_from(change_pos)
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "change position out of range"))?;
+            let out = tx
+                .vout
+                .get_mut(change_index)
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "change output missing"))?;
+            out.script_pubkey = change_script;
+        }
+        if lock_unspents {
+            for outpoint in locked_inputs {
+                guard.lock_outpoint(outpoint);
+            }
         }
     }
 
