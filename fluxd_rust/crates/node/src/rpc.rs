@@ -5068,14 +5068,32 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
 
     let addresses: Vec<String> = match params.get(2) {
         None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                value.as_str().map(|s| s.to_string()).ok_or_else(|| {
-                    RpcError::new(RPC_INVALID_PARAMETER, "addresses must be strings")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        Some(Value::Array(values)) => {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let address = value
+                    .as_str()
+                    .ok_or_else(|| {
+                        RpcError::new(RPC_INVALID_PARAMETER, "addresses must be strings")
+                    })?
+                    .to_string();
+                address_to_script_pubkey(&address, chain_params.network).map_err(|_| {
+                    RpcError::new(
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        format!("Invalid Flux address: {address}"),
+                    )
+                })?;
+                if !seen.insert(address.clone()) {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        format!("Invalid parameter, duplicated address: {address}"),
+                    ));
+                }
+                out.push(address);
+            }
+            out
+        }
         _ => {
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
@@ -5083,11 +5101,6 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
             ))
         }
     };
-
-    for address in &addresses {
-        address_to_script_pubkey(address, chain_params.network)
-            .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
-    }
 
     let (scripts, owned_scripts, locked_outpoints) = {
         let guard = wallet
@@ -5136,8 +5149,12 @@ fn rpc_listunspent<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "invalid script_pubkey"))?;
         let owned = owned_script_set.contains(&row.script_pubkey);
         let spendable = owned;
-
         let mut entry = serde_json::Map::new();
+        if let Some(label) = wallet_guard.label_for_script_pubkey(&row.script_pubkey) {
+            if !label.is_empty() {
+                entry.insert("account".to_string(), Value::String(label.to_string()));
+            }
+        }
         entry.insert(
             "txid".to_string(),
             Value::String(hash256_to_hex(&row.outpoint.hash)),
@@ -19390,6 +19407,77 @@ mod tests {
             row.get("redeemScript").and_then(Value::as_str).is_some(),
             "P2SH outputs should include redeemScript when known"
         );
+    }
+
+    #[test]
+    fn listunspent_includes_account_for_labeled_address() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address = rpc_getnewaddress(&wallet, vec![json!("example")])
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let script_pubkey =
+            address_to_script_pubkey(&address, params.network).expect("address script");
+
+        let outpoint = OutPoint {
+            hash: [0x1au8; 32],
+            index: 0,
+        };
+        let utxo_entry = fluxd_chainstate::utxo::UtxoEntry {
+            value: 2 * COIN,
+            script_pubkey: script_pubkey.clone(),
+            height: 0,
+            is_coinbase: false,
+        };
+        let utxo_key = fluxd_chainstate::utxo::outpoint_key_bytes(&outpoint);
+        let addr_key =
+            fluxd_chainstate::address_index::address_outpoint_key(&script_pubkey, &outpoint)
+                .expect("address outpoint key");
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, utxo_key.as_bytes(), utxo_entry.encode());
+        batch.put(Column::AddressOutpoint, addr_key, []);
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let value =
+            rpc_listunspent(&chainstate, &mempool, &wallet, Vec::new(), &params).expect("rpc");
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        let row = arr[0].as_object().expect("object");
+        assert_eq!(
+            row.get("account").and_then(Value::as_str),
+            Some("example"),
+            "listunspent should include account label for labeled wallet addresses"
+        );
+    }
+
+    #[test]
+    fn listunspent_rejects_duplicate_address_filters() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let err = rpc_listunspent(
+            &chainstate,
+            &Mutex::new(Mempool::new(0)),
+            &wallet,
+            vec![
+                json!(1),
+                json!(9_999_999),
+                json!([address.clone(), address]),
+            ],
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("duplicated address"));
     }
 
     #[test]

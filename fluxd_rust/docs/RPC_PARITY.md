@@ -140,7 +140,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listreceivedbyaddress - Implemented (transparent only; `include_watchonly` supported; `txids` populated; `account`/`label` populated from wallet address labels)
 - listsinceblock - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `include_watchonly` supported; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
 - listtransactions - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `account="*"` returns all and other values filter entries by wallet label/account; `include_watchonly` supported; ordered oldest → newest; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
-- listunspent - Partial (supports minconf/maxconf/address filter; `minconf=0` includes mempool outputs; includes `redeemScript` for known P2SH; excludes locked coins like C++)
+- listunspent - Implemented (supports minconf/maxconf/address filter; rejects duplicated address filters; `minconf=0` includes mempool outputs; includes `redeemScript` for known P2SH; excludes locked coins like C++; includes `account` label when available)
 - lockunspent - Implemented
 - rescanblockchain - Implemented (scans address delta index; populates wallet tx history)
 

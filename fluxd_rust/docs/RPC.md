@@ -485,11 +485,12 @@ Notes:
 
 ### listunspent
 
-- Params: `[minconf] [maxconf] [addresses]` (partial).
+- Params: `[minconf] [maxconf] [addresses]`
 - Result: array of unspent outputs owned by the wallet.
 
 Notes:
 - If `minconf=0`, includes spendable mempool outputs paying to the wallet (with `confirmations=0`).
+- Includes `account` when the wallet has a label for the address (Flux `fluxd` compatibility).
 
 ### sendtoaddress
 
