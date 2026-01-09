@@ -44,10 +44,11 @@ pub enum Column {
     BlockTimestamp,
     BlockUndo,
     Meta,
+    UnconnectedBlock,
 }
 
 impl Column {
-    pub const ALL: [Column; 19] = [
+    pub const ALL: [Column; 20] = [
         Column::BlockIndex,
         Column::HeaderIndex,
         Column::HeightIndex,
@@ -67,6 +68,7 @@ impl Column {
         Column::BlockTimestamp,
         Column::BlockUndo,
         Column::Meta,
+        Column::UnconnectedBlock,
     ];
 
     pub const fn bit(self) -> u32 {
@@ -90,6 +92,7 @@ impl Column {
             Column::BlockTimestamp => 1 << 16,
             Column::BlockUndo => 1 << 17,
             Column::Meta => 1 << 18,
+            Column::UnconnectedBlock => 1 << 19,
         }
     }
 
@@ -118,6 +121,7 @@ impl Column {
             Column::BlockTimestamp => "block_timestamp",
             Column::BlockUndo => "block_undo",
             Column::Meta => "meta",
+            Column::UnconnectedBlock => "unconnected_block",
         }
     }
 }

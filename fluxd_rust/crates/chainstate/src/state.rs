@@ -3507,6 +3507,26 @@ impl<S: KeyValueStore> ChainState<S> {
         Ok(self.block_index_entry(hash)?.map(|entry| entry.block))
     }
 
+    pub fn unconnected_block_bytes(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Option<Vec<u8>>, ChainStateError> {
+        Ok(self.store.get(Column::UnconnectedBlock, hash)?)
+    }
+
+    pub fn store_unconnected_block_bytes(
+        &self,
+        batch: &mut WriteBatch,
+        hash: &Hash256,
+        bytes: &[u8],
+    ) {
+        batch.put(Column::UnconnectedBlock, *hash, bytes);
+    }
+
+    pub fn delete_unconnected_block(&self, batch: &mut WriteBatch, hash: &Hash256) {
+        batch.delete(Column::UnconnectedBlock, *hash);
+    }
+
     pub fn block_index_entry(
         &self,
         hash: &Hash256,

@@ -92,7 +92,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Node control
 
 - sendfrom - Implemented (fromaccount treated as optional wallet address filter; when non-empty, restricts funding to that address and sends change back to it; minconf supported)
-- submitblock - Partial (BIP22 return values; accepts full block data even when the header is already known; side-chain acceptance is still simplified vs C++)
+- submitblock - Partial (BIP22 return values; accepts full block data even when the header is already known; accepts side-chain/stale blocks by validating + storing them as unconnected block bytes, but does not yet trigger full chain selection/reorg logic like C++)
 - zcrawjoinsplit - Implemented (Sprout JoinSplit splice + Groth16 proof; requires shielded params)
 - zcrawreceive - Implemented (Sprout note decrypt + witness existence check; requires shielded params)
 - zcrawkeygen - Implemented (Sprout key/address generator; deprecated but useful for tooling/regtest)
