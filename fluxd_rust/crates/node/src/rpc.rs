@@ -12831,15 +12831,14 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "Block decode failed"))?;
     let hash = block.header.hash();
 
-    let header_present = match chainstate.header_entry(&hash).map_err(map_internal)? {
+    match chainstate.header_entry(&hash).map_err(map_internal)? {
         Some(entry) => {
             if entry.has_block() {
                 return Ok(Value::String("duplicate".to_string()));
             }
-            true
         }
-        None => false,
-    };
+        None => {}
+    }
 
     let prev_hash = block.header.prev_block;
     let best = chainstate.best_block().map_err(map_internal)?;
@@ -12914,11 +12913,7 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         }
     }
     chainstate.commit_batch(batch).map_err(map_internal)?;
-    if header_present {
-        Ok(Value::String("duplicate".to_string()))
-    } else {
-        Ok(Value::Null)
-    }
+    Ok(Value::Null)
 }
 
 fn rpc_getfluxnodecount<S: fluxd_storage::KeyValueStore>(
@@ -17312,7 +17307,7 @@ mod tests {
     }
 
     #[test]
-    fn submitblock_header_present_returns_duplicate() {
+    fn submitblock_header_present_returns_null() {
         let (chainstate, params, _data_dir) = setup_regtest_chainstate();
 
         let tip = chainstate
@@ -17426,7 +17421,7 @@ mod tests {
             &flags,
         )
         .expect("rpc");
-        assert_eq!(value.as_str(), Some("duplicate"));
+        assert!(value.is_null());
     }
 
     #[test]
