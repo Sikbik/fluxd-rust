@@ -1196,7 +1196,9 @@ Attempts to create, sign, and broadcast a deterministic fluxnode START transacti
   - P2PKH collateral: pubkey compression is inferred by matching the collateral output script hash.
   - P2SH collateral: the redeem script must hash to the collateral output script hash, and the provided key must correspond to a pubkey in the redeem script.
 - Result:
-  - Object with `overall` and `detail`, plus `txid` on success.
+  - Object with `overall` and `detail` (array).
+  - Each `detail` entry includes `alias`, `outpoint`, `result`, `transaction_built`, `transaction_signed`, `transaction_commited`, and `errorMessage`.
+  - Entries may include `reason`/`error` on failure, and `txid` on success.
 
 ### startfluxnode / startzelnode
 

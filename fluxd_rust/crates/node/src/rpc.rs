@@ -14559,13 +14559,27 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
 
     let mut detail = serde_json::Map::new();
     detail.insert("alias".to_string(), Value::String(alias.clone()));
+    detail.insert("outpoint".to_string(), Value::String(String::new()));
+    detail.insert(
+        "transaction_built".to_string(),
+        Value::String("failed".to_string()),
+    );
+    detail.insert(
+        "transaction_signed".to_string(),
+        Value::String("failed".to_string()),
+    );
+    detail.insert(
+        "transaction_commited".to_string(),
+        Value::String("failed".to_string()),
+    );
+    detail.insert("result".to_string(), Value::String("failed".to_string()));
+    detail.insert("errorMessage".to_string(), Value::String(String::new()));
 
     let mut successful = 0;
     let mut failed = 0;
 
     let Some(entry) = selected else {
         failed = 1;
-        detail.insert("result".to_string(), Value::String("failed".to_string()));
         detail.insert(
             "error".to_string(),
             Value::String(
@@ -14578,6 +14592,11 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
             "detail": [Value::Object(detail)],
         }));
     };
+
+    detail.insert(
+        "outpoint".to_string(),
+        Value::String(format_outpoint(&entry.collateral)),
+    );
 
     let best_height = best_block_height(chainstate)?;
     let pon_active = network_upgrade_active(
@@ -14677,7 +14696,6 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
         Ok(tx) => tx,
         Err(err) => {
             failed = 1;
-            detail.insert("result".to_string(), Value::String("failed".to_string()));
             detail.insert("errorMessage".to_string(), Value::String(err.message));
             lock_wallet_if_requested(wallet, lockwallet)?;
             return Ok(json!({
@@ -14686,6 +14704,15 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
             }));
         }
     };
+
+    detail.insert(
+        "transaction_built".to_string(),
+        Value::String("successful".to_string()),
+    );
+    detail.insert(
+        "transaction_signed".to_string(),
+        Value::String("successful".to_string()),
+    );
 
     let raw = tx.consensus_encode().map_err(map_internal)?;
     let raw_hex = hex_bytes(&raw);
@@ -14704,6 +14731,10 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
         Ok(txid) => {
             successful = 1;
             detail.insert(
+                "transaction_commited".to_string(),
+                Value::String("successful".to_string()),
+            );
+            detail.insert(
                 "result".to_string(),
                 Value::String("successful".to_string()),
             );
@@ -14711,7 +14742,6 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
         }
         Err(err) => {
             failed = 1;
-            detail.insert("result".to_string(), Value::String("failed".to_string()));
             detail.insert("errorMessage".to_string(), Value::String(err.message));
         }
     }
@@ -23460,7 +23490,16 @@ mod tests {
             .expect("detail array");
         assert_eq!(detail.len(), 1);
         let entry = detail[0].as_object().expect("detail entry");
-        for key in ["alias", "result", "error"] {
+        for key in [
+            "alias",
+            "outpoint",
+            "transaction_built",
+            "transaction_signed",
+            "transaction_commited",
+            "result",
+            "errorMessage",
+            "error",
+        ] {
             assert!(entry.contains_key(key), "missing key {key}");
         }
     }
