@@ -153,7 +153,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - sendmany - Implemented (supports P2PKH + P2SH destinations; optional fromaccount wallet address filter + change destination; `subtractfeefrom` supported; ignores unknown `subtractfeefrom` entries like `fluxd`)
 - sendtoaddress - Implemented (supports P2PKH + P2SH destinations; `subtractfeefromamount` supported; dust checks when standardness is enabled)
-- settxfee - Partial (sets in-process wallet fee-rate override used by fundrawtransaction/send*)
+- settxfee - Implemented (persists wallet fee-rate override in `wallet.dat`; used by fundrawtransaction/send*)
 - signmessage - Implemented (P2PKH only; compatible with verifymessage)
 
 ## Shielded

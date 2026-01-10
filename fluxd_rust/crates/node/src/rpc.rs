@@ -24331,6 +24331,18 @@ mod tests {
     }
 
     #[test]
+    fn settxfee_persists_across_restart() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        rpc_settxfee(&wallet, vec![json!("0.01")]).expect("rpc");
+        drop(wallet);
+
+        let wallet_reload = Wallet::load_or_create(&data_dir, params.network).expect("wallet");
+        assert_eq!(wallet_reload.pay_tx_fee_per_kb(), 1_000_000);
+    }
+
+    #[test]
     fn fundrawtransaction_can_select_spendable_p2sh_multisig_utxo() {
         let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));

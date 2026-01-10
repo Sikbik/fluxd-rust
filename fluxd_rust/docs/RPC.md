@@ -135,7 +135,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `addmultisigaddress <nrequired> <keys> [account]` (partial; adds a P2SH redeem script + watch script; stores optional `account` label)
 - `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]`
 - `keypoolrefill [newsize]` (partial)
-- `settxfee <amount>` (partial)
+- `settxfee <amount>`
 - `getnewaddress [label]` (label stored as legacy `account`)
 - `getrawchangeaddress [address_type]` (partial; address_type ignored; marks address as internal change)
 - `importaddress <address_or_script> [label] [rescan] [p2sh]` (watch-only; `rescan=true` triggers `rescanblockchain`)
@@ -519,6 +519,9 @@ Notes:
 
 - Params: `<amount>` (fee rate in FLUX/kB).
 - Result: boolean.
+
+Notes:
+- Persists the wallet `paytxfee` setting in `wallet.dat` and uses it for `fundrawtransaction` / `send*` fee selection.
 
 ### listunspent
 
