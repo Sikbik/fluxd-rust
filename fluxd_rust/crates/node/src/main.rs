@@ -3312,6 +3312,14 @@ async fn connect_to_peers(
         return Ok(Vec::new());
     }
 
+    let mut min_height = min_height;
+    if params.network != Network::Regtest {
+        let pon_height = params.consensus.upgrades[UpgradeIndex::Pon.as_usize()].activation_height;
+        if pon_height > 0 && min_height < pon_height {
+            min_height = pon_height;
+        }
+    }
+
     let is_allowed = |addr: SocketAddr| peer_book.map(|book| !book.is_banned(addr)).unwrap_or(true);
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
