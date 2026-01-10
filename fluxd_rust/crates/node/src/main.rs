@@ -3668,16 +3668,17 @@ fn parse_peer_addrs(values: &[String], default_port: u16) -> Result<Vec<SocketAd
     let mut addrs = Vec::new();
     let mut seen = HashSet::new();
     for raw in values {
-        let candidate = if raw.contains(':') {
-            raw.to_string()
-        } else {
-            format!("{raw}:{default_port}")
-        };
-        let addr = candidate
-            .parse::<SocketAddr>()
-            .map_err(|_| format!("invalid header peer '{raw}'"))?;
-        if seen.insert(addr) {
-            addrs.push(addr);
+        let resolved = resolve_node_addrs(raw, default_port);
+        if resolved.is_empty() {
+            return Err(format!("invalid header peer '{raw}'"));
+        }
+        for addr in resolved {
+            if addr.port() == 0 {
+                continue;
+            }
+            if seen.insert(addr) {
+                addrs.push(addr);
+            }
         }
     }
     if addrs.is_empty() {
@@ -9073,7 +9074,7 @@ fn usage() -> String {
         "  --block-peers  Number of parallel peers for block download (default: 3)",
         "  --maxconnections  Maintain at most N total peer connections (default: 125)",
         "  --header-peers  Number of peers to probe for header sync (default: 4)",
-        "  --header-peer  Header peer IP:PORT to pin for header sync (repeatable)",
+        "  --header-peer  Header peer HOST[:PORT] to pin for header sync (repeatable)",
         "  --header-lead  Target header lead over blocks (default: 20000, 0 disables cap)",
         "  --tx-peers  Number of relay peers for tx inventory/tx relay (0 disables, default: 2)",
         "  --inflight-per-peer  Concurrent getdata requests per peer (default: 1)",

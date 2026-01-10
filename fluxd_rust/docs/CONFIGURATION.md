@@ -172,7 +172,7 @@ RPC defaults:
 - `--getdata-batch N` - max blocks per getdata request (default: 128).
 - `--block-peers N` - parallel peers for block download (default: 3).
 - `--header-peers N` - peers to probe for header sync (default: 4).
-- `--header-peer IP:PORT` - pin a specific header peer (repeatable).
+- `--header-peer HOST[:PORT]` - pin a specific header peer (repeatable; hostnames are resolved best-effort).
 - `--header-lead N` - target header lead over blocks (default: 20000, 0 disables cap).
 - `--tx-peers N` - relay peers for transaction inventory/tx relay (default: 2, 0 disables).
 - `--inflight-per-peer N` - concurrent getdata requests per peer (default: 1).
