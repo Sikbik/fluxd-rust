@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -309,7 +309,7 @@ struct RpcContext<S> {
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
     addr_book: Arc<AddrBook>,
-    added_nodes: Arc<Mutex<HashSet<SocketAddr>>>,
+    added_nodes: Arc<Mutex<HashSet<String>>>,
     tx_announce: broadcast::Sender<Hash256>,
     wallet: Arc<Mutex<Wallet>>,
     shutdown_tx: watch::Sender<bool>,
@@ -701,7 +701,7 @@ pub async fn serve_rpc<S: fluxd_storage::KeyValueStore + Send + Sync + 'static>(
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
     addr_book: Arc<AddrBook>,
-    added_nodes: Arc<Mutex<HashSet<SocketAddr>>>,
+    added_nodes: Arc<Mutex<HashSet<String>>>,
     tx_announce: broadcast::Sender<Hash256>,
     wallet: Arc<Mutex<Wallet>>,
     shutdown_tx: watch::Sender<bool>,
@@ -805,7 +805,7 @@ async fn handle_connection<S: fluxd_storage::KeyValueStore + Send + Sync + 'stat
     peer_registry: Arc<PeerRegistry>,
     header_peer_book: Arc<HeaderPeerBook>,
     addr_book: Arc<AddrBook>,
-    added_nodes: Arc<Mutex<HashSet<SocketAddr>>>,
+    added_nodes: Arc<Mutex<HashSet<String>>>,
     tx_announce: broadcast::Sender<Hash256>,
     wallet: Arc<Mutex<Wallet>>,
     shutdown_tx: watch::Sender<bool>,
@@ -17068,6 +17068,31 @@ fn parse_socket_addr_with_default(value: &str, default_port: u16) -> Result<Sock
     ))
 }
 
+fn resolve_node_addrs(value: &str, default_port: u16) -> Vec<SocketAddr> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return vec![addr];
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return vec![SocketAddr::new(ip, default_port)];
+    }
+    let resolved = if value.rfind(':').is_some() {
+        value.to_socket_addrs()
+    } else {
+        (value, default_port).to_socket_addrs()
+    };
+    let mut out: Vec<SocketAddr> = match resolved {
+        Ok(iter) => iter.collect(),
+        Err(_) => Vec::new(),
+    };
+    out.sort_by_key(|addr| addr.to_string());
+    out.dedup();
+    out
+}
+
 fn rpc_clearbanned(
     params: Vec<Value>,
     header_peer_book: &HeaderPeerBook,
@@ -17169,7 +17194,7 @@ fn rpc_addnode(
     params: Vec<Value>,
     chain_params: &ChainParams,
     addr_book: &AddrBook,
-    added_nodes: &Mutex<HashSet<SocketAddr>>,
+    added_nodes: &Mutex<HashSet<String>>,
 ) -> Result<Value, RpcError> {
     if params.len() != 2 {
         return Err(RpcError::new(
@@ -17177,14 +17202,21 @@ fn rpc_addnode(
             "addnode expects 2 parameters",
         ));
     }
-    let addr_raw = params[0]
+    let node_raw = params[0]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "node must be a string"))?;
-    let addr = parse_socket_addr_with_default(addr_raw, chain_params.default_port)?;
+    let node_raw = node_raw.trim();
+    if node_raw.is_empty() {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "node must be a non-empty string",
+        ));
+    }
     let command = params[1]
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "command must be a string"))?;
 
+    let resolved_addrs = resolve_node_addrs(node_raw, chain_params.default_port);
     match command {
         "add" => {
             let Ok(mut guard) = added_nodes.lock() else {
@@ -17193,17 +17225,19 @@ fn rpc_addnode(
                     "added nodes lock poisoned",
                 ));
             };
-            guard.insert(addr);
-            let _ = addr_book.insert_many(vec![addr]);
+            guard.insert(node_raw.to_string());
+            let _ = addr_book.insert_many(resolved_addrs);
         }
         "remove" => {
             if let Ok(mut guard) = added_nodes.lock() {
-                guard.remove(&addr);
+                guard.remove(node_raw);
             }
         }
         "onetry" => {
-            addr_book.record_attempt(addr);
-            let _ = addr_book.insert_many(vec![addr]);
+            for addr in &resolved_addrs {
+                addr_book.record_attempt(*addr);
+            }
+            let _ = addr_book.insert_many(resolved_addrs);
         }
         _ => {
             return Err(RpcError::new(
@@ -17220,19 +17254,19 @@ fn rpc_getaddednodeinfo(
     params: Vec<Value>,
     chain_params: &ChainParams,
     peer_registry: &PeerRegistry,
-    added_nodes: &Mutex<HashSet<SocketAddr>>,
+    added_nodes: &Mutex<HashSet<String>>,
 ) -> Result<Value, RpcError> {
-    let (node_filter, _dns) = match params.len() {
-        0 => (None, false),
+    let (dns, node_filter) = match params.len() {
+        0 => (true, None),
         1 => {
             if let Some(value) = params[0].as_bool() {
-                (None, value)
+                (value, None)
             } else if let Some(value) = params[0].as_str() {
-                (Some(value.to_string()), false)
+                (true, Some(value.to_string()))
             } else {
                 return Err(RpcError::new(
                     RPC_INVALID_PARAMETER,
-                    "getaddednodeinfo expects a boolean or node string",
+                    "getaddednodeinfo expects dns boolean or node string",
                 ));
             }
         }
@@ -17243,7 +17277,7 @@ fn rpc_getaddednodeinfo(
             let node = params[1]
                 .as_str()
                 .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "node must be a string"))?;
-            (Some(node.to_string()), dns)
+            (dns, Some(node.to_string()))
         }
         _ => {
             return Err(RpcError::new(
@@ -17260,37 +17294,61 @@ fn rpc_getaddednodeinfo(
                 "added nodes lock poisoned",
             ));
         };
-        guard.iter().copied().collect::<Vec<_>>()
+        guard.iter().cloned().collect::<Vec<_>>()
     };
-    nodes.sort_by_key(|addr| addr.to_string());
+    nodes.sort_by_key(|node| node.to_string());
 
     if let Some(filter) = node_filter.as_deref() {
-        let addr = parse_socket_addr_with_default(filter, chain_params.default_port)?;
-        if !nodes.contains(&addr) {
+        if !nodes.contains(&filter.to_string()) {
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
                 "node is not in added node list",
             ));
         }
-        nodes = vec![addr];
+        nodes = vec![filter.to_string()];
     }
 
-    let connected: HashSet<SocketAddr> = peer_registry
+    if !dns {
+        let out = nodes
+            .into_iter()
+            .map(|node| json!({ "addednode": node }))
+            .collect();
+        return Ok(Value::Array(out));
+    }
+
+    let connected: HashMap<SocketAddr, &'static str> = peer_registry
         .snapshot()
         .into_iter()
-        .map(|entry| entry.addr)
+        .map(|entry| {
+            (
+                entry.addr,
+                if entry.inbound { "inbound" } else { "outbound" },
+            )
+        })
         .collect();
 
     let mut out = Vec::with_capacity(nodes.len());
-    for addr in nodes {
-        let is_connected = connected.contains(&addr);
-        out.push(json!({
-            "addednode": addr.to_string(),
-            "connected": is_connected,
-            "addresses": [{
+    for node in nodes {
+        let resolved = resolve_node_addrs(&node, chain_params.default_port);
+        let mut connected_any = false;
+        let mut addresses = Vec::with_capacity(resolved.len());
+        for addr in resolved {
+            let status = match connected.get(&addr) {
+                Some(value) => {
+                    connected_any = true;
+                    Value::String((*value).to_string())
+                }
+                None => Value::String("false".to_string()),
+            };
+            addresses.push(json!({
                 "address": addr.to_string(),
-                "connected": is_connected,
-            }]
+                "connected": status,
+            }));
+        }
+        out.push(json!({
+            "addednode": node,
+            "connected": connected_any,
+            "addresses": addresses,
         }));
     }
     Ok(Value::Array(out))
@@ -18597,7 +18655,7 @@ mod tests {
         let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
 
         let addr_book = AddrBook::default();
-        let added_nodes = Mutex::new(HashSet::new());
+        let added_nodes = Mutex::new(HashSet::<String>::new());
 
         rpc_addnode(
             vec![
@@ -18614,8 +18672,27 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:16125".parse().expect("addr");
         peer_registry.register(addr, PeerKind::Header);
 
-        let value = rpc_getaddednodeinfo(Vec::new(), &params, &peer_registry, &added_nodes)
-            .expect("getaddednodeinfo");
+        let value = rpc_getaddednodeinfo(
+            vec![Value::Bool(false)],
+            &params,
+            &peer_registry,
+            &added_nodes,
+        )
+        .expect("getaddednodeinfo");
+        let list = value.as_array().expect("array");
+        assert_eq!(list.len(), 1);
+        let obj = list[0].as_object().expect("object");
+        assert!(obj.contains_key("addednode"), "missing key addednode");
+        assert!(!obj.contains_key("connected"), "unexpected connected key");
+        assert!(!obj.contains_key("addresses"), "unexpected addresses key");
+
+        let value = rpc_getaddednodeinfo(
+            vec![Value::Bool(true)],
+            &params,
+            &peer_registry,
+            &added_nodes,
+        )
+        .expect("getaddednodeinfo");
         let list = value.as_array().expect("array");
         assert_eq!(list.len(), 1);
         let obj = list[0].as_object().expect("object");
@@ -18623,6 +18700,20 @@ mod tests {
             assert!(obj.contains_key(key), "missing key {key}");
         }
         assert_eq!(obj.get("connected").and_then(Value::as_bool), Some(true));
+        let addresses = obj
+            .get("addresses")
+            .and_then(Value::as_array)
+            .expect("addresses array");
+        assert_eq!(addresses.len(), 1);
+        let entry = addresses[0].as_object().expect("address entry");
+        assert_eq!(
+            entry.get("address").and_then(Value::as_str),
+            Some("127.0.0.1:16125")
+        );
+        assert_eq!(
+            entry.get("connected").and_then(Value::as_str),
+            Some("outbound")
+        );
     }
 
     #[test]

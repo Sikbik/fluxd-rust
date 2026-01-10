@@ -115,10 +115,10 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - startfluxnode - Partial (uses wallet collateral key when available; supports wallet-less starts via optional `collateral_privkey_wif` + `redeem_script_hex` columns in `fluxnode.conf`; honors `lockwallet` for encrypted wallets; includes C++-style `transaction_*` detail fields + `reason`/`errorMessage`, plus `txid` on success)
 - startdeterministicfluxnode - Partial (uses wallet collateral key when available; supports wallet-less starts via `collateral_privkey_wif` param or `fluxnode.conf` extra columns; honors `lockwallet`; includes C++-style `transaction_*` detail fields + `errorMessage`, plus `txid` on success; still simplified vs C++ behavior)
 - verifychain - Partial (checks flatfile decode + header linkage + merkle root + txindex; `checklevel=4` verifies spent-index consistency; `checklevel=5` verifies address index consistency; does not re-apply full UTXO/script validation like C++)
-- addnode - Implemented (IP/IP:PORT only; no DNS resolution yet)
+- addnode - Implemented (accepts IPs and hostnames; best-effort DNS resolution used to seed the address book; stores the raw node string in the added-node list like C++)
 - clearbanned - Implemented
 - disconnectnode - Implemented (address-based; best-effort)
-- getaddednodeinfo - Implemented (simplified fields; `dns` param ignored)
+- getaddednodeinfo - Implemented (honors `dns`; C++-style `connected` + `addresses[]` with `"inbound"|"outbound"|"false"` per-address statuses; `dns` remains optional here for convenience)
 - setban - Implemented (SocketAddr bans; `absolute` supported)
 
 ## Wallet

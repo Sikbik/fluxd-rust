@@ -1093,15 +1093,20 @@ Adds/removes a manual peer address, similar to the C++ daemon.
 
 - Params: `<node> <add|remove|onetry>`
 - Notes:
-  - Only numeric IPs are supported right now (no DNS resolution).
+  - `<node>` accepts either a numeric IP (`ip` / `ip:port`) or a hostname (`host` / `host:port`).
+  - Hostname resolution is best-effort and only used to seed the address book; the added-node list stores the raw `<node>` string (like the C++ daemon).
   - `add` updates an in-memory added-node list (used by `getaddednodeinfo`) and seeds the address manager.
   - `onetry` seeds the address manager but does not add to the persistent added-node list.
 
 ### getaddednodeinfo
 
-Returns the current added-node list and whether each node is currently connected.
+Returns information about the current added-node list, matching the C++ daemon shape.
 
-- Params: `[dns] [node]` (`dns` is accepted for parity but currently ignored)
+- Params: `[dns] [node]`
+  - When `dns=false`, returns only the `addednode` list (C++ behavior).
+  - When `dns=true` (default), includes:
+    - top-level `connected` boolean
+    - `addresses[]` with per-resolved-address `connected` values (`"inbound"`, `"outbound"`, or `"false"`)
 
 ### disconnectnode
 

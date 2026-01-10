@@ -1127,7 +1127,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
     let peer_registry = Arc::new(PeerRegistry::default());
     let header_peer_book = Arc::new(HeaderPeerBook::default());
     let addr_book = Arc::new(AddrBook::default());
-    let added_nodes = Arc::new(Mutex::new(HashSet::<SocketAddr>::new()));
+    let added_nodes = Arc::new(Mutex::new(HashSet::<String>::new()));
     let peers_path = data_dir.join(PEERS_FILE_NAME);
     let banlist_path = data_dir.join(BANLIST_FILE_NAME);
     let mempool_path = data_dir.join(MEMPOOL_FILE_NAME);
@@ -1144,7 +1144,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
 
     if !config.addnode_addrs.is_empty() {
         if let Ok(mut guard) = added_nodes.lock() {
-            guard.extend(config.addnode_addrs.iter().copied());
+            guard.extend(config.addnode_addrs.iter().map(|addr| addr.to_string()));
         }
         let inserted = addr_book.insert_many(config.addnode_addrs.clone());
         log_info!(
