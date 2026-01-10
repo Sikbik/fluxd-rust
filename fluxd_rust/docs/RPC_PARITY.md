@@ -134,7 +134,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - dumpprivkey - Implemented (P2PKH only)
 - getbalance - Partial (minconf supported; `minconf=0` includes spendable mempool outputs; `include_watchonly` supported; account param validated like `fluxd` (`""`/`"*"` only))
 - getnewaddress - Implemented (P2PKH only; label ignored; keypool-backed)
-- getrawchangeaddress - Partial (P2PKH only; address_type param ignored; reserves change addresses tracked in wallet.dat)
+- getrawchangeaddress - Implemented (returns a new wallet-owned P2PKH change address; optional arg ignored for `fluxd` compatibility)
 - getreceivedbyaddress - Implemented (wallet addresses only; uses address deltas for confirmed receives, plus mempool outputs when `minconf=0`)
 - getunconfirmedbalance - Partial (derived from spendable mempool outputs paying to the wallet)
 - getwalletinfo - Implemented (C++ key set + conditional `unlocked_until`; balances derived from the address index; also returns `*_zat` fields for exact amounts)

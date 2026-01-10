@@ -137,7 +137,7 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `keypoolrefill [newsize]` (partial)
 - `settxfee <amount>`
 - `getnewaddress [label]` (label stored as legacy `account`)
-- `getrawchangeaddress [address_type]` (partial; address_type ignored; marks address as internal change)
+- `getrawchangeaddress` (returns a new internal change address)
 - `importaddress <address_or_script> [label] [rescan] [p2sh]` (watch-only; `rescan=true` triggers `rescanblockchain`)
 - `importprivkey <wif> [label] [rescan]` (label stored; `rescan=true` triggers `rescanblockchain`)
 - `importwallet <filename>` (imports WIFs and `label=` fields from a wallet dump; triggers `rescanblockchain`)
@@ -335,7 +335,7 @@ Notes:
 
 ### getrawchangeaddress
 
-- Params: optional `address_type` (string; currently ignored).
+- Params: none (an optional unused argument is accepted and ignored for `fluxd` compatibility).
 - Result: new transparent P2PKH address (persisted to `wallet.dat`, marked as internal change).
 
 ### importaddress

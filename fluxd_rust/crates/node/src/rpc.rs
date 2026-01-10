@@ -2714,14 +2714,6 @@ fn rpc_getrawchangeaddress(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result
             "getrawchangeaddress expects 0 or 1 parameter",
         ));
     }
-    if let Some(value) = params.get(0) {
-        if !value.is_null() && value.as_str().is_none() {
-            return Err(RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "address_type must be a string",
-            ));
-        }
-    }
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -24048,6 +24040,26 @@ mod tests {
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
         let address = rpc_getrawchangeaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let wif = rpc_dumpprivkey(&wallet, vec![json!(address)], &params)
+            .expect("rpc")
+            .as_str()
+            .expect("wif string")
+            .to_string();
+
+        let decoded = wif_to_secret_key(&wif, params.network);
+        assert!(decoded.is_ok(), "wif should decode");
+    }
+
+    #[test]
+    fn wallet_getrawchangeaddress_ignores_optional_param() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let address = rpc_getrawchangeaddress(&wallet, vec![json!(123)])
             .expect("rpc")
             .as_str()
             .expect("address string")
