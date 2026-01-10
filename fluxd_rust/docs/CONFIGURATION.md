@@ -168,6 +168,7 @@ RPC defaults:
 
 - `--p2p-addr IP:PORT` - bind address for inbound P2P connections (default: `0.0.0.0:<net p2p port>`).
 - `--no-p2p-listen` - disable inbound P2P listener (useful for running multiple local instances).
+- `--addnode HOST[:PORT]` - add a manual peer (repeatable; can also be set via `flux.conf` `addnode=...`).
 - `--maxconnections N` - maximum total peer connections (inbound + outbound) (default: 125).
 - `--getdata-batch N` - max blocks per getdata request (default: 128).
 - `--block-peers N` - parallel peers for block download (default: 3).

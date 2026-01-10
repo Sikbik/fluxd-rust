@@ -7640,6 +7640,7 @@ where
     let mut header_lead_set = false;
     let mut header_peer_addrs: Vec<String> = Vec::new();
     let mut addnode_nodes: Vec<String> = Vec::new();
+    let mut addnode_nodes_seen: HashSet<String> = HashSet::new();
     let mut max_connections: usize = DEFAULT_MAX_CONNECTIONS;
     let mut max_connections_set = false;
     let mut tx_peers: usize = DEFAULT_TX_PEERS;
@@ -8003,6 +8004,15 @@ where
                     .next()
                     .ok_or_else(|| format!("missing value for --header-peer\n{}", usage()))?;
                 header_peer_addrs.push(value);
+            }
+            "--addnode" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --addnode\n{}", usage()))?;
+                let node = value.trim().to_string();
+                if !node.is_empty() && addnode_nodes_seen.insert(node.clone()) {
+                    addnode_nodes.push(node);
+                }
             }
             "--header-lead" => {
                 let value = args
@@ -8493,14 +8503,10 @@ where
         }
 
         if let Some(values) = conf.get("addnode") {
-            let mut seen = HashSet::new();
             for raw in values {
-                let node = raw.trim();
-                if node.is_empty() {
-                    continue;
-                }
-                if seen.insert(node.to_string()) {
-                    addnode_nodes.push(node.to_string());
+                let node = raw.trim().to_string();
+                if !node.is_empty() && addnode_nodes_seen.insert(node.clone()) {
+                    addnode_nodes.push(node);
                 }
             }
         }
@@ -9066,6 +9072,7 @@ fn usage() -> String {
         "  --txconfirmtarget  Fee estimation target in blocks when paytxfee is unset (default: 2)",
         "  --p2p-addr  Bind P2P listener (default: 0.0.0.0:16125 mainnet, 26125 testnet)",
         "  --no-p2p-listen  Disable inbound P2P listener",
+        "  --addnode  Add a manual peer (HOST[:PORT], repeatable)",
         "  --rpc-addr  Bind JSON-RPC server (default: 127.0.0.1:16124 mainnet, 26124 testnet)",
         "  --rpc-user  JSON-RPC basic auth username (required unless cookie exists)",
         "  --rpc-pass  JSON-RPC basic auth password (required unless cookie exists)",
