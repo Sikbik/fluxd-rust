@@ -7382,12 +7382,22 @@ fn rpc_zgetbalance<S: fluxd_storage::KeyValueStore>(
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "zaddr must be a string"))?;
     let minconf = match params.get(1) {
-        Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
+        Some(value) if !value.is_null() => {
+            let raw = parse_i64(value, "minconf")?;
+            if raw < 0 {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "Minimum number of confirmations cannot be less than 0",
+                ));
+            }
+            i32::try_from(raw)
+                .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "minconf too large"))?
+        }
         _ => 1,
     };
     let include_watchonly = match params.get(2) {
         Some(Value::Bool(value)) => *value,
-        Some(Value::Null) | None => false,
+        Some(Value::Null) | None => true,
         Some(_) => {
             return Err(RpcError::new(
                 RPC_INVALID_PARAMETER,
@@ -7395,6 +7405,55 @@ fn rpc_zgetbalance<S: fluxd_storage::KeyValueStore>(
             ));
         }
     };
+
+    if let Ok(script_pubkey) = address_to_script_pubkey(address, chain_params.network) {
+        let (scripts, locked_outpoints) = {
+            let guard = wallet
+                .lock()
+                .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+            let scripts = if include_watchonly {
+                guard
+                    .all_script_pubkeys_including_watchonly()
+                    .map_err(map_wallet_error)?
+            } else {
+                guard.all_script_pubkeys().map_err(map_wallet_error)?
+            };
+            (scripts, guard.locked_outpoints())
+        };
+
+        if !scripts
+            .iter()
+            .any(|spk| spk.as_slice() == script_pubkey.as_slice())
+        {
+            return Ok(amount_to_value(0));
+        }
+
+        let locked_set: HashSet<OutPoint> = locked_outpoints.into_iter().collect();
+        let include_mempool_outputs = minconf == 0;
+        let utxos = collect_wallet_utxos(
+            chainstate,
+            mempool,
+            &[script_pubkey],
+            include_mempool_outputs,
+        )?;
+
+        let mut total = 0i64;
+        for utxo in utxos {
+            if utxo.confirmations < minconf {
+                continue;
+            }
+            if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
+                continue;
+            }
+            if locked_set.contains(&utxo.outpoint) {
+                continue;
+            }
+            total = total
+                .checked_add(utxo.value)
+                .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
+        }
+        return Ok(amount_to_value(total));
+    }
 
     let addr_bytes = parse_sapling_zaddr_bytes(address, chain_params)?;
     let notes = {
@@ -7413,8 +7472,8 @@ fn rpc_zgetbalance<S: fluxd_storage::KeyValueStore>(
             .map_err(map_wallet_error)?;
         if !is_mine && !is_watchonly {
             return Err(RpcError::new(
-                RPC_WALLET_ERROR,
-                "Wallet does not hold private key or viewing key for this zaddr",
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "From address does not belong to this node, spending key or viewing key not found.",
             ));
         }
         if !is_mine && !include_watchonly {
@@ -21130,6 +21189,30 @@ mod tests {
         assert_eq!(
             note.rseed,
             Some(crate::wallet::SaplingRseedBytes::AfterZip212(rseed))
+        );
+    }
+
+    #[test]
+    fn zgetbalance_supports_watchonly_transparent_addresses() {
+        let (chainstate, params, data_dir, taddr, _coinbase_txid, _coinbase_vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        extend_regtest_chain_to_height(&chainstate, &params, COINBASE_MATURITY);
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        rpc_importaddress(
+            &chainstate,
+            &wallet,
+            vec![json!(taddr), Value::Null, json!(false)],
+            &params,
+        )
+        .expect("importaddress");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let balance = rpc_zgetbalance(&chainstate, &mempool, &wallet, vec![json!(taddr)], &params)
+            .expect("rpc");
+        assert_eq!(
+            balance,
+            amount_to_value(block_subsidy(1, &params.consensus))
         );
     }
 

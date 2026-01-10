@@ -160,7 +160,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - zexportkey - Partial (Sapling only; exports Sapling extended spending key)
 - zexportviewingkey - Partial (Sapling only; exports Sapling full viewing key)
-- zgetbalance - Partial (Sapling only; scans chain for Sapling notes; excludes notes spent by chain nullifiers or mempool nullifiers; supports watch-only via includeWatchonly)
+- zgetbalance - Partial (taddrs supported via wallet UTXO scan; zaddrs Sapling only; excludes notes spent by chain/mempool nullifiers; includes watch-only by default like C++ (override via `includeWatchonly`))
 - zgetmigrationstatus - Implemented (returns disabled migration status; amount fields are strings for C++ parity; migration not supported)
 - zgetnewaddress - Partial (Sapling only; persists a Sapling key in wallet.dat)
 - zgetoperationresult - Implemented (async op manager; returns completed ops and removes them)
