@@ -61,7 +61,7 @@ Currently supported keys:
 - `loglevel` (`error|warn|info|debug|trace`)
 - `logformat` (`text|json`)
 - `logtimestamps` (`1|0`)
-- `addnode` (repeatable)
+- `addnode` (repeatable; `ip`/`ip:port` or `host`/`host:port`)
 - `mineraddress` (default coinbase/miner address for `getblocktemplate`)
 - `testnet=1` / `regtest=1` (network selection; CLI `--network ...` overrides)
 
@@ -71,6 +71,10 @@ RPC allowlist notes:
 
 Unsupported keys are ignored; `fluxd` prints a warning listing the ignored keys to help catch
 misconfigurations.
+
+`addnode` notes:
+- Values are stored as raw strings and can be inspected via `getaddednodeinfo`.
+- Hostnames are resolved best-effort at startup to seed the address book.
 
 ## Run profiles
 

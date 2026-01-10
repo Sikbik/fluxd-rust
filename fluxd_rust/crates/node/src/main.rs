@@ -56,7 +56,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -284,7 +284,7 @@ struct Config {
     header_peers: usize,
     header_lead: i32,
     header_peer_addrs: Vec<String>,
-    addnode_addrs: Vec<SocketAddr>,
+    addnode_nodes: Vec<String>,
     max_connections: usize,
     tx_peers: usize,
     inflight_per_peer: usize,
@@ -1142,14 +1142,18 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         Err(err) => log_warn!("failed to load peers file: {err}"),
     }
 
-    if !config.addnode_addrs.is_empty() {
+    if !config.addnode_nodes.is_empty() {
         if let Ok(mut guard) = added_nodes.lock() {
-            guard.extend(config.addnode_addrs.iter().map(|addr| addr.to_string()));
+            guard.extend(config.addnode_nodes.iter().cloned());
         }
-        let inserted = addr_book.insert_many(config.addnode_addrs.clone());
+        let mut resolved = Vec::new();
+        for node in &config.addnode_nodes {
+            resolved.extend(resolve_node_addrs(node, params.default_port));
+        }
+        let inserted = addr_book.insert_many(resolved);
         log_info!(
             "Loaded {} addnode(s) from flux.conf (new {})",
-            config.addnode_addrs.len(),
+            config.addnode_nodes.len(),
             inserted
         );
     }
@@ -7634,7 +7638,7 @@ where
     let mut header_lead: i32 = DEFAULT_HEADER_LEAD;
     let mut header_lead_set = false;
     let mut header_peer_addrs: Vec<String> = Vec::new();
-    let mut addnode_addrs: Vec<SocketAddr> = Vec::new();
+    let mut addnode_nodes: Vec<String> = Vec::new();
     let mut max_connections: usize = DEFAULT_MAX_CONNECTIONS;
     let mut max_connections_set = false;
     let mut tx_peers: usize = DEFAULT_TX_PEERS;
@@ -8490,10 +8494,12 @@ where
         if let Some(values) = conf.get("addnode") {
             let mut seen = HashSet::new();
             for raw in values {
-                let addr = parse_socket_addr_with_default_port(raw, default_port)
-                    .ok_or_else(|| format!("invalid addnode '{raw}' in {}", conf_file.display()))?;
-                if seen.insert(addr) {
-                    addnode_addrs.push(addr);
+                let node = raw.trim();
+                if node.is_empty() {
+                    continue;
+                }
+                if seen.insert(node.to_string()) {
+                    addnode_nodes.push(node.to_string());
                 }
             }
         }
@@ -8721,7 +8727,7 @@ where
         header_peers,
         header_lead,
         header_peer_addrs,
-        addnode_addrs,
+        addnode_nodes,
         max_connections,
         tx_peers,
         inflight_per_peer,
@@ -8809,6 +8815,31 @@ fn parse_socket_addr_with_default_port(value: &str, default_port: u16) -> Option
         return Some(SocketAddr::new(ip, default_port));
     }
     None
+}
+
+fn resolve_node_addrs(value: &str, default_port: u16) -> Vec<SocketAddr> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return vec![addr];
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return vec![SocketAddr::new(ip, default_port)];
+    }
+    let resolved = if value.rfind(':').is_some() {
+        value.to_socket_addrs()
+    } else {
+        (value, default_port).to_socket_addrs()
+    };
+    let mut out: Vec<SocketAddr> = match resolved {
+        Ok(iter) => iter.collect(),
+        Err(_) => Vec::new(),
+    };
+    out.sort_by_key(|addr| addr.to_string());
+    out.dedup();
+    out
 }
 
 fn mb_to_bytes(mb: u64) -> u64 {
