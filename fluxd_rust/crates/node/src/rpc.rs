@@ -15076,9 +15076,7 @@ fn rpc_createp2shstarttx<S: fluxd_storage::KeyValueStore>(
     let collateral = OutPoint { hash: txid, index };
 
     let mut delegates: Vec<Vec<u8>> = Vec::new();
-    let mut delegates_requested = false;
     if let Some(value) = params.get(4) {
-        delegates_requested = true;
         let list = value.as_array().ok_or_else(|| {
             RpcError::new(
                 RPC_INVALID_PARAMETER,
@@ -15135,7 +15133,7 @@ fn rpc_createp2shstarttx<S: fluxd_storage::KeyValueStore>(
         UpgradeIndex::Pon,
     );
 
-    let using_delegates = pon_active && delegates_requested;
+    let using_delegates = pon_active && !delegates.is_empty();
     let flux_tx_version = if pon_active {
         if using_delegates {
             FLUXNODE_TX_TYPE_P2SH_BIT | FLUXNODE_TX_FEATURE_DELEGATES_BIT
@@ -15423,6 +15421,12 @@ fn rpc_startfluxnodewithdelegates<S: fluxd_storage::KeyValueStore>(
         return Ok(json!({
             "result": "failed",
             "error": format!("Too many delegates. Maximum is {}", FluxnodeDelegates::MAX_PUBKEYS_LENGTH),
+        }));
+    }
+    if delegates_value.is_empty() {
+        return Ok(json!({
+            "result": "failed",
+            "error": "At least one delegate key must be provided",
         }));
     }
 
@@ -22848,7 +22852,7 @@ mod tests {
     }
 
     #[test]
-    fn createp2shstarttx_allows_empty_delegates_array_after_pon() {
+    fn createp2shstarttx_ignores_empty_delegates_array_after_pon() {
         let (chainstate, mut params, _data_dir) = setup_regtest_chainstate();
         params.consensus.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = 1;
 
@@ -22914,15 +22918,9 @@ mod tests {
             FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => start,
             other => panic!("expected v6 start tx, got {other:?}"),
         };
-        assert_eq!(
-            start.flux_tx_version,
-            FLUXNODE_TX_TYPE_P2SH_BIT | FLUXNODE_TX_FEATURE_DELEGATES_BIT
-        );
-        assert!(start.using_delegates);
-        let delegates = start.delegates.as_ref().expect("delegates payload");
-        assert_eq!(delegates.version, FluxnodeDelegates::INITIAL_VERSION);
-        assert_eq!(delegates.kind, FluxnodeDelegates::UPDATE);
-        assert!(delegates.delegate_starting_keys.is_empty());
+        assert_eq!(start.flux_tx_version, FLUXNODE_TX_TYPE_P2SH_BIT);
+        assert!(!start.using_delegates);
+        assert!(start.delegates.is_none());
     }
 
     #[test]

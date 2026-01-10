@@ -1135,7 +1135,7 @@ Creates an unsigned deterministic fluxnode START transaction for P2SH collateral
   - `vpspubkey_hex` (string) - fluxnode operator pubkey (hex, compressed or uncompressed)
   - `txid` (string) - collateral transaction id
   - `index` (number) - collateral vout index
-  - `delegates` (optional array of strings) - compressed delegate pubkeys (hex, up to 4; duplicates rejected); empty array clears delegates
+  - `delegates` (optional array of strings) - compressed delegate pubkeys (hex, up to 4; duplicates rejected)
 - Notes:
   - Validates that the redeem script hash matches the referenced collateral output script hash.
   - Does not sign or broadcast; use `signp2shstarttx` then `sendp2shstarttx`.
@@ -1212,7 +1212,7 @@ Builds and broadcasts a deterministic fluxnode START transaction for a `fluxnode
 
 - Params:
   - `alias` (string)
-  - `delegates` (array of strings) - compressed delegate pubkeys (hex, up to 4; duplicates rejected); empty array clears delegates
+  - `delegates` (array of strings) - compressed delegate pubkeys (hex, up to 4; duplicates rejected)
   - `lockwallet` (boolean)
 - Notes:
   - Requires PoN activation (delegates feature bit is post-PoN).
