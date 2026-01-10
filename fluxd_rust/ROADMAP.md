@@ -405,7 +405,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getfluxnodecount`<br>`getzelnodecount`<br>`listfluxnodes`<br>`listzelnodes`<br>`viewdeterministicfluxnodelist`<br>`viewdeterministiczelnodelist`<br>`getdoslist`<br>`getstartlist`<br>`fluxnodecurrentwinner`<br>`zelnodecurrentwinner`<br>`getfluxnodestatus`<br>`getzelnodestatus`<br>`createfluxnodekey`<br>`createzelnodekey`<br>`createdelegatekeypair`<br>`createp2shstarttx`<br>`signp2shstarttx`<br>`sendp2shstarttx`<br>`listfluxnodeconf`<br>`listzelnodeconf`<br>`getfluxnodeoutputs`<br>`getzelnodeoutputs` | `startfluxnode`<br>`startdeterministicfluxnode` | - |
+| `getfluxnodecount`<br>`getzelnodecount`<br>`listfluxnodes`<br>`listzelnodes`<br>`viewdeterministicfluxnodelist`<br>`viewdeterministiczelnodelist`<br>`getdoslist`<br>`getstartlist`<br>`fluxnodecurrentwinner`<br>`zelnodecurrentwinner`<br>`getfluxnodestatus`<br>`getzelnodestatus`<br>`createfluxnodekey`<br>`createzelnodekey`<br>`createdelegatekeypair`<br>`createp2shstarttx`<br>`signp2shstarttx`<br>`sendp2shstarttx`<br>`startfluxnodewithdelegates`<br>`startfluxnodeasdelegate`<br>`startp2shasdelegate`<br>`listfluxnodeconf`<br>`listzelnodeconf`<br>`getfluxnodeoutputs`<br>`getzelnodeoutputs` | `startfluxnode`<br>`startdeterministicfluxnode` | - |
 
 ### Benchmarking
 

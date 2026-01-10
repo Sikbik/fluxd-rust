@@ -22,6 +22,7 @@ pub struct FluxnodeRecord {
     pub operator_pubkey: KeyId,
     pub collateral_pubkey: Option<KeyId>,
     pub p2sh_script: Option<KeyId>,
+    pub delegates: Option<KeyId>,
     pub ip: String,
 }
 
@@ -39,6 +40,7 @@ impl FluxnodeRecord {
         encoder.write_u32_le(self.confirmed_height);
         encoder.write_i64_le(self.collateral_value);
         encoder.write_var_str(&self.ip);
+        write_optional_key(&mut encoder, self.delegates);
         encoder.into_inner()
     }
 
@@ -71,6 +73,11 @@ impl FluxnodeRecord {
         } else {
             decoder.read_var_str()?
         };
+        let delegates = if decoder.is_empty() {
+            None
+        } else {
+            read_optional_key(&mut decoder)?
+        };
         if !decoder.is_empty() {
             return Err(DecodeError::TrailingBytes);
         }
@@ -85,6 +92,7 @@ impl FluxnodeRecord {
             operator_pubkey,
             collateral_pubkey,
             p2sh_script,
+            delegates,
             ip,
         })
     }

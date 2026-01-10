@@ -9,3 +9,4 @@ publish = false
 fluxd-consensus = { path = "../consensus" }
 fluxd-primitives = { path = "../primitives" }
 fluxd-storage = { path = "../storage" }
+secp256k1 = "0.29"

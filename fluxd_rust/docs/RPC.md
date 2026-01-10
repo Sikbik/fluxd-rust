@@ -230,6 +230,9 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 - `getfluxnodeoutputs` / `getzelnodeoutputs`
 - `startfluxnode <all|alias> <lockwallet> [alias]` / `startzelnode ...` (partial; wallet-less)
 - `startdeterministicfluxnode <alias> <lockwallet> [collateral_privkey_wif] [redeem_script_hex]` / `startdeterministiczelnode ...` (partial; wallet-less)
+- `startfluxnodewithdelegates <alias> <delegates> <lockwallet>`
+- `startfluxnodeasdelegate <txid> <outputindex> <delegatekey_wif> <vpspubkey_hex>`
+- `startp2shasdelegate <redeemscript_hex> <txid> <outputindex> <delegatekey_wif> <vpspubkey_hex>`
 - `getfluxnodecount` / `getzelnodecount`
 - `listfluxnodes` / `listzelnodes`
 - `viewdeterministicfluxnodelist [filter]` / `viewdeterministiczelnodelist [filter]`
@@ -1132,7 +1135,7 @@ Creates an unsigned deterministic fluxnode START transaction for P2SH collateral
   - `vpspubkey_hex` (string) - fluxnode operator pubkey (hex, compressed or uncompressed)
   - `txid` (string) - collateral transaction id
   - `index` (number) - collateral vout index
-  - `delegates` (optional array of strings) - compressed delegate pubkeys (hex, up to 4; duplicates rejected)
+  - `delegates` (optional array of strings) - compressed delegate pubkeys (hex, up to 4; duplicates rejected); empty array clears delegates
 - Notes:
   - Validates that the redeem script hash matches the referenced collateral output script hash.
   - Does not sign or broadcast; use `signp2shstarttx` then `sendp2shstarttx`.
@@ -1202,6 +1205,61 @@ Starts fluxnodes from `fluxnode.conf`.
   - `lockwallet` locks the wallet before returning when the wallet is encrypted.
 - Notes:
   - Collateral key resolution follows the same order as `startdeterministicfluxnode`; `fluxnode.conf` can include optional extra columns for wallet-less starts.
+
+### startfluxnodewithdelegates
+
+Builds and broadcasts a deterministic fluxnode START transaction for a `fluxnode.conf` alias with a delegates UPDATE payload.
+
+- Params:
+  - `alias` (string)
+  - `delegates` (array of strings) - compressed delegate pubkeys (hex, up to 4; duplicates rejected); empty array clears delegates
+  - `lockwallet` (boolean)
+- Notes:
+  - Requires PoN activation (delegates feature bit is post-PoN).
+  - P2PKH/P2SH collateral resolution follows `startdeterministicfluxnode`.
+- Result: object:
+  - `result` - `"success"` or `"failed"`
+  - `txid` (string; on success)
+  - `delegates_count` (number; on success)
+  - `delegates` (array; on success)
+  - `error` (string; on failure)
+
+### startfluxnodeasdelegate
+
+Builds and broadcasts a delegate-signed deterministic fluxnode START transaction for P2PKH collateral.
+
+- Params:
+  - `txid` (string)
+  - `outputindex` (number)
+  - `delegatekey_wif` (string; compressed WIF)
+  - `vpspubkey_hex` (string; hex pubkey)
+- Notes:
+  - Requires delegates to have been set on-chain for this collateral outpoint via a prior delegates UPDATE.
+- Result: object:
+  - `result` - `"success"` or `"failed"`
+  - `txid` (string; on success)
+  - `delegate` (string; on success; delegate P2PKH address)
+  - `error` (string; on failure)
+
+### startp2shasdelegate
+
+Builds and broadcasts a delegate-signed deterministic fluxnode START transaction for P2SH collateral.
+
+- Params:
+  - `redeemscript_hex` (string)
+  - `txid` (string)
+  - `outputindex` (number)
+  - `delegatekey_wif` (string; compressed WIF)
+  - `vpspubkey_hex` (string; hex pubkey)
+- Notes:
+  - Validates the redeemscript hash against the referenced collateral output.
+  - Requires delegates to have been set on-chain for this collateral outpoint via a prior delegates UPDATE.
+- Result: object:
+  - `result` - `"success"` or `"failed"`
+  - `txid` (string; on success)
+  - `delegate` (string; on success; delegate P2PKH address)
+  - `p2sh` (string; on success; collateral P2SH address)
+  - `error` (string; on failure)
 
 ### getfluxnodecount / getzelnodecount
 

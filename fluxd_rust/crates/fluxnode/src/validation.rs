@@ -2,9 +2,10 @@
 
 use fluxd_consensus::{ChainParams, FluxnodeParams, TimedPublicKey};
 use fluxd_primitives::transaction::{
-    has_flux_tx_delegates_feature, is_flux_tx_normal_type, is_flux_tx_p2sh_type, FluxnodeTx,
-    FluxnodeTxV5, FluxnodeTxV6, FLUXNODE_TX_TYPE_P2SH_BIT,
+    has_flux_tx_delegates_feature, is_flux_tx_normal_type, is_flux_tx_p2sh_type, FluxnodeDelegates,
+    FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, FLUXNODE_TX_TYPE_P2SH_BIT,
 };
+use secp256k1::PublicKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FluxnodeTier {
@@ -107,12 +108,30 @@ fn validate_fluxnode_v6(tx: &FluxnodeTxV6, version: i32) -> Result<(), &'static 
                 return Err("fluxnode v6 start has invalid version bits");
             }
             if has_flux_tx_delegates_feature(flux_version) {
-                if start.using_delegates && start.delegates.is_none() {
-                    return Err("fluxnode v6 delegates flag set without payload");
+                if !start.using_delegates {
+                    return Err("fluxnode v6 delegates feature set without flag");
                 }
-                if !start.using_delegates && start.delegates.is_some() {
-                    return Err("fluxnode v6 delegates payload present without flag");
+                let delegates = start
+                    .delegates
+                    .as_ref()
+                    .ok_or("fluxnode v6 delegates flag set without payload")?;
+                if delegates.kind != FluxnodeDelegates::UPDATE
+                    && delegates.kind != FluxnodeDelegates::SIGNING
+                {
+                    return Err("fluxnode v6 delegates has invalid type");
                 }
+                if delegates.delegate_starting_keys.len() > FluxnodeDelegates::MAX_PUBKEYS_LENGTH {
+                    return Err("fluxnode v6 delegates has too many keys");
+                }
+                for pubkey in &delegates.delegate_starting_keys {
+                    if pubkey.len() != 33 {
+                        return Err("fluxnode v6 delegate pubkey must be compressed");
+                    }
+                    PublicKey::from_slice(pubkey)
+                        .map_err(|_| "fluxnode v6 delegate pubkey invalid")?;
+                }
+            } else if start.using_delegates || start.delegates.is_some() {
+                return Err("fluxnode v6 delegates present without feature");
             }
         }
         FluxnodeTxV6::Confirm(_) => {}

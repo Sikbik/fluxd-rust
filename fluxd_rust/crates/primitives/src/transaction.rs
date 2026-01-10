@@ -295,6 +295,7 @@ pub struct FluxnodeDelegates {
 }
 
 impl FluxnodeDelegates {
+    pub const MAX_PUBKEYS_LENGTH: usize = 4;
     pub const INITIAL_VERSION: u8 = 1;
     pub const NONE: u8 = 0;
     pub const UPDATE: u8 = 1;

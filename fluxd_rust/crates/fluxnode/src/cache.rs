@@ -3,7 +3,8 @@
 use fluxd_primitives::encoding::{Encodable, Encoder};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
-    FluxnodeConfirmTx, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
+    FluxnodeConfirmTx, FluxnodeDelegates, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5,
+    FluxnodeTxV6, Transaction,
 };
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch};
 
@@ -31,6 +32,8 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
             let meta = start_meta.ok_or_else(|| {
                 StoreError::Backend("missing fluxnode start metadata".to_string())
             })?;
+            let delegates =
+                load_fluxnode_record(store, &start.collateral)?.and_then(|record| record.delegates);
             let operator_pubkey = start.pubkey.as_slice();
             let collateral_pubkey = Some(start.collateral_pubkey.as_slice());
             store_fluxnode_start(
@@ -39,6 +42,7 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                 operator_pubkey,
                 collateral_pubkey,
                 None,
+                delegates,
                 height,
                 meta,
             )?;
@@ -53,12 +57,14 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                 let meta = start_meta.ok_or_else(|| {
                     StoreError::Backend("missing fluxnode start metadata".to_string())
                 })?;
+                let delegates = delegates_key_for_start(store, batch, collateral, start)?;
                 store_fluxnode_start(
                     batch,
                     collateral,
                     pubkey.as_slice(),
                     Some(collateral_pubkey.as_slice()),
                     None,
+                    delegates,
                     height,
                     meta,
                 )?;
@@ -72,12 +78,14 @@ pub fn apply_fluxnode_tx<S: KeyValueStore>(
                 let meta = start_meta.ok_or_else(|| {
                     StoreError::Backend("missing fluxnode start metadata".to_string())
                 })?;
+                let delegates = delegates_key_for_start(store, batch, collateral, start)?;
                 store_fluxnode_start(
                     batch,
                     collateral,
                     pubkey.as_slice(),
                     None,
                     Some(redeem_script.as_slice()),
+                    delegates,
                     height,
                     meta,
                 )?;
@@ -115,6 +123,7 @@ fn store_fluxnode_start(
     operator_pubkey: &[u8],
     collateral_pubkey: Option<&[u8]>,
     redeem_script: Option<&[u8]>,
+    delegates: Option<KeyId>,
     height: u32,
     meta: FluxnodeStartMeta,
 ) -> Result<(), StoreError> {
@@ -133,11 +142,38 @@ fn store_fluxnode_start(
         operator_pubkey: operator_key,
         collateral_pubkey: collateral_key,
         p2sh_script: p2sh_key,
+        delegates,
         ip: String::new(),
     };
 
     batch.put(Column::Fluxnode, outpoint_key(collateral), record.encode());
     Ok(())
+}
+
+fn delegates_key_for_start<S: KeyValueStore>(
+    store: &S,
+    batch: &mut WriteBatch,
+    collateral: &OutPoint,
+    start: &fluxd_primitives::transaction::FluxnodeStartV6,
+) -> Result<Option<KeyId>, StoreError> {
+    let current = load_fluxnode_record(store, collateral)?.and_then(|record| record.delegates);
+
+    let Some(delegates) = start.delegates.as_ref() else {
+        return Ok(current);
+    };
+    if !start.using_delegates {
+        return Ok(current);
+    }
+    if delegates.kind != FluxnodeDelegates::UPDATE {
+        return Ok(current);
+    }
+    if delegates.delegate_starting_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let mut encoder = Encoder::new();
+    delegates.consensus_encode(&mut encoder);
+    Ok(Some(store_key(batch, &encoder.into_inner())))
 }
 
 fn update_fluxnode_confirm<S: KeyValueStore>(

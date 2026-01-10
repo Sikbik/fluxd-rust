@@ -20,12 +20,12 @@ use fluxd_fluxnode::cache::{apply_fluxnode_tx, FluxnodeStartMeta};
 use fluxd_fluxnode::storage::{FluxnodeRecord, KeyId};
 use fluxd_primitives::address_to_script_pubkey;
 use fluxd_primitives::block::Block;
-use fluxd_primitives::encoding::{DecodeError, Decoder, Encoder};
+use fluxd_primitives::encoding::{Decodable, DecodeError, Decoder, Encoder};
 use fluxd_primitives::hash::hash160;
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
-    FluxnodeConfirmTx, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5, FluxnodeTxV6, Transaction,
-    TransactionEncodeError,
+    FluxnodeConfirmTx, FluxnodeDelegates, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5,
+    FluxnodeTxV6, Transaction, TransactionEncodeError,
 };
 use fluxd_storage::{Column, KeyValueStore, StoreError, WriteBatch, WriteOp};
 use rayon::prelude::*;
@@ -1503,7 +1503,29 @@ impl<S: KeyValueStore> ChainState<S> {
                     }
 
                     let message = hash256_to_hex(txid).into_bytes();
-                    if let Some(signature_checks) = signature_checks {
+                    let signing_as_delegate = start.using_delegates
+                        && start
+                            .delegates
+                            .as_ref()
+                            .is_some_and(|delegates| delegates.kind == FluxnodeDelegates::SIGNING);
+
+                    if signing_as_delegate {
+                        let delegate_pubkeys = self.delegate_pubkeys_for_outpoint(collateral)?;
+                        if let Some(signature_checks) = signature_checks {
+                            signature_checks.push(FluxnodeSigCheck {
+                                pubkeys: FluxnodeSigPubkeys::Any(delegate_pubkeys),
+                                signature: sig.clone(),
+                                message,
+                                error: "fluxnode start signature invalid",
+                            });
+                        } else if !delegate_pubkeys.iter().any(|pubkey| {
+                            verify_signed_message(pubkey.as_ref(), sig, &message).is_ok()
+                        }) {
+                            return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode start signature invalid",
+                            )));
+                        }
+                    } else if let Some(signature_checks) = signature_checks {
                         signature_checks.push(FluxnodeSigCheck {
                             pubkeys: FluxnodeSigPubkeys::Single(Arc::from(
                                 collateral_pubkey.as_slice(),
@@ -1597,7 +1619,29 @@ impl<S: KeyValueStore> ChainState<S> {
                     }
 
                     let message = hash256_to_hex(txid).into_bytes();
-                    if let Some(signature_checks) = signature_checks {
+                    let signing_as_delegate = start.using_delegates
+                        && start
+                            .delegates
+                            .as_ref()
+                            .is_some_and(|delegates| delegates.kind == FluxnodeDelegates::SIGNING);
+
+                    if signing_as_delegate {
+                        let delegate_pubkeys = self.delegate_pubkeys_for_outpoint(collateral)?;
+                        if let Some(signature_checks) = signature_checks {
+                            signature_checks.push(FluxnodeSigCheck {
+                                pubkeys: FluxnodeSigPubkeys::Any(delegate_pubkeys),
+                                signature: sig.clone(),
+                                message,
+                                error: "fluxnode start signature invalid",
+                            });
+                        } else if !delegate_pubkeys.iter().any(|pubkey| {
+                            verify_signed_message(pubkey.as_ref(), sig, &message).is_ok()
+                        }) {
+                            return Err(ChainStateError::Validation(ValidationError::Fluxnode(
+                                "fluxnode start signature invalid",
+                            )));
+                        }
+                    } else if let Some(signature_checks) = signature_checks {
                         let pubkeys = pubkeys
                             .into_iter()
                             .map(|pubkey| Arc::from(pubkey.into_boxed_slice()))
@@ -1767,7 +1811,7 @@ impl<S: KeyValueStore> ChainState<S> {
         })
     }
 
-    fn fluxnode_record(
+    pub fn fluxnode_record(
         &self,
         outpoint: &OutPoint,
     ) -> Result<Option<FluxnodeRecord>, ChainStateError> {
@@ -4244,6 +4288,41 @@ impl<S: KeyValueStore> ChainState<S> {
         self.fluxnode_key_bytes(record.operator_pubkey)
     }
 
+    fn delegate_pubkeys_for_outpoint(
+        &self,
+        collateral: &OutPoint,
+    ) -> Result<Vec<Arc<[u8]>>, ChainStateError> {
+        let Some(record) = self.fluxnode_record(collateral)? else {
+            return Ok(Vec::new());
+        };
+        let Some(key) = record.delegates else {
+            return Ok(Vec::new());
+        };
+        let bytes = self
+            .fluxnode_key_bytes(key)?
+            .ok_or(ChainStateError::CorruptIndex(
+                "fluxnode delegates key missing",
+            ))?;
+        let mut decoder = Decoder::new(bytes.as_ref());
+        let delegates = FluxnodeDelegates::consensus_decode(&mut decoder)
+            .map_err(|_| ChainStateError::CorruptIndex("invalid fluxnode delegates entry"))?;
+        if !decoder.is_empty() {
+            return Err(ChainStateError::CorruptIndex(
+                "invalid fluxnode delegates entry",
+            ));
+        }
+        if delegates.kind != FluxnodeDelegates::UPDATE {
+            return Err(ChainStateError::CorruptIndex(
+                "invalid fluxnode delegates entry",
+            ));
+        }
+        Ok(delegates
+            .delegate_starting_keys
+            .into_iter()
+            .map(|key| Arc::from(key.into_boxed_slice()))
+            .collect())
+    }
+
     pub fn validate_fluxnode_tx_for_mempool(
         &self,
         tx: &Transaction,
@@ -5444,6 +5523,7 @@ mod tests {
                 operator_pubkey: KeyId([0u8; 32]),
                 collateral_pubkey: None,
                 p2sh_script: None,
+                delegates: None,
                 ip: String::new(),
             }
         }
@@ -6708,6 +6788,7 @@ mod tests {
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
+            delegates: None,
             ip: String::new(),
         };
         store
@@ -6812,6 +6893,7 @@ mod tests {
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
+            delegates: None,
             ip: String::new(),
         };
         store
@@ -6923,6 +7005,7 @@ mod tests {
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
+            delegates: None,
             ip: String::new(),
         };
         store
@@ -7018,6 +7101,7 @@ mod tests {
             operator_pubkey: KeyId([0x11; 32]),
             collateral_pubkey: None,
             p2sh_script: None,
+            delegates: None,
             ip: String::new(),
         };
         store
