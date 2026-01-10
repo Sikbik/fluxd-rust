@@ -286,6 +286,9 @@ fn1 127.0.0.1:16125 ${fluxnode_wif} 00000000000000000000000000000000000000000000
 EOF
 rpc_get "startfluxnode?set=all&lockwallet=false" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result", {}) or {}; assert isinstance(res, dict), res; assert "overall" in res and "detail" in res, res; detail=res.get("detail"); assert isinstance(detail, list) and len(detail)==1, detail; entry=detail[0] if detail else {}; assert isinstance(entry, dict), entry; req=("alias","outpoint","result","transaction_built","transaction_signed","transaction_commited","errorMessage"); missing=[k for k in req if k not in entry]; assert not missing, f"missing keys: {missing}"'
 
+echo "Checking startdeterministicfluxnode schema ..."
+rpc_get "startdeterministicfluxnode?alias=fn1&lockwallet=false" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result", {}) or {}; assert isinstance(res, dict), res; assert "overall" in res and "detail" in res, res; detail=res.get("detail"); assert isinstance(detail, list) and len(detail)==1, detail; entry=detail[0] if detail else {}; assert isinstance(entry, dict), entry; req=("alias","result"); missing=[k for k in req if k not in entry]; assert not missing, f"missing keys: {missing}"; assert entry.get("alias") == "fn1"'
+
 echo "Checking multisig RPCs while wallet locked ..."
 ms="$(rpc_post "createmultisig" "[2, [\"${taddr}\", \"${taddr2}\"]]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; assert "address" in res and "redeemScript" in res, res; import json as j; print(j.dumps(res))')"
 ms_addr="$(python3 -c "import json,sys; obj=json.loads(sys.argv[1]); print(obj.get('address',''))" "$ms")"
