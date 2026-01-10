@@ -311,6 +311,19 @@ rpc_get "gettxoutsetinfo" | python3 -c 'import json,sys; obj=json.load(sys.stdin
 echo "Checking getblocktemplate ..."
 rpc_get "getblocktemplate" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result", {}) or {}; req=("previousblockhash","coinbasetxn","transactions","height"); missing=[k for k in req if k not in res]; assert not missing, f"missing keys: {missing}"'
 
+echo "Checking submitblock duplicate ..."
+genesis_hash="$(rpc_get "getblockhash?height=0" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; print(obj.get("result",""))')"
+if [[ -z "$genesis_hash" ]]; then
+  echo "getblockhash returned empty result" >&2
+  exit 1
+fi
+genesis_hex="$(rpc_get "getblock?hash=${genesis_hash}&verbosity=0" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; res=obj.get("result",""); assert isinstance(res,str) and len(res)>0, obj; print(res)')"
+if [[ -z "$genesis_hex" ]]; then
+  echo "getblock verbosity=0 returned empty result" >&2
+  exit 1
+fi
+rpc_post "submitblock" "[\"${genesis_hex}\"]" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; assert obj.get("result") == "duplicate", obj'
+
 echo "Checking getnetworksolps/getnetworkhashps ..."
 rpc_get "getnetworksolps" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, (int,float)), res; assert res >= 0'
 rpc_get "getnetworkhashps" | python3 -c 'import json,sys; obj=json.load(sys.stdin); res=obj.get("result"); assert isinstance(res, (int,float)), res; assert res >= 0'
