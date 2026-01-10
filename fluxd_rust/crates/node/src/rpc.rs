@@ -5874,32 +5874,73 @@ fn rpc_getchaintips<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
 ) -> Result<Value, RpcError> {
-    ensure_no_params(&params)?;
+    if params.len() > 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "getchaintips expects 0 or 1 parameter",
+        ));
+    }
+
+    let current_height = chainstate
+        .best_block()
+        .map_err(map_internal)?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+
+    let min_height = match params.first() {
+        None | Some(Value::Null) => 0,
+        Some(value) => {
+            let requested = parse_i64(value, "blockheight")?;
+            if requested < 0 || requested > current_height as i64 {
+                0
+            } else {
+                requested as i32
+            }
+        }
+    };
+
     let entries = chainstate.scan_headers().map_err(map_internal)?;
     if entries.is_empty() {
         return Ok(Value::Array(Vec::new()));
     }
+
     let best_block = chainstate.best_block().map_err(map_internal)?;
     let best_hash = best_block.as_ref().map(|tip| tip.hash);
-    let _best_height = best_block.as_ref().map(|tip| tip.height).unwrap_or(-1);
 
-    let mut prevs = HashSet::new();
-    for (_, entry) in &entries {
-        prevs.insert(entry.prev_hash);
+    let mut referenced = HashSet::new();
+    let mut candidates = Vec::new();
+    for (hash, entry) in entries {
+        if entry.height < min_height {
+            continue;
+        }
+        if entry.height > min_height {
+            referenced.insert(entry.prev_hash);
+        }
+        candidates.push((hash, entry));
     }
 
     let mut tips = Vec::new();
-    for (hash, entry) in entries {
-        if prevs.contains(&hash) {
+    for (hash, entry) in candidates {
+        if Some(hash) != best_hash && referenced.contains(&hash) {
             continue;
         }
+
         let status = if Some(hash) == best_hash {
             "active"
+        } else if entry.is_failed() {
+            "invalid"
         } else if entry.has_block() {
             "valid-fork"
+        } else if chainstate
+            .unconnected_block_bytes(&hash)
+            .map_err(map_internal)?
+            .is_some()
+        {
+            "valid-headers"
         } else {
             "headers-only"
         };
+
         let branchlen = if status == "active" {
             0
         } else {
@@ -5912,6 +5953,7 @@ fn rpc_getchaintips<S: fluxd_storage::KeyValueStore>(
             "status": status,
         }));
     }
+
     Ok(Value::Array(tips))
 }
 
@@ -18668,6 +18710,84 @@ mod tests {
         for key in ["height", "hash", "branchlen", "status"] {
             assert!(tip.contains_key(key), "missing key {key}");
         }
+    }
+
+    #[test]
+    fn getchaintips_accepts_blockheight_param() {
+        let (chainstate, _params, _data_dir) = setup_regtest_chainstate();
+        let value = rpc_getchaintips(&chainstate, vec![json!(9999)]).expect("rpc");
+        let tips = value.as_array().expect("array");
+        assert!(!tips.is_empty());
+    }
+
+    #[test]
+    fn getchaintips_reports_valid_headers_and_invalid_statuses() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+
+        let genesis = params.consensus.hash_genesis_block;
+        let genesis_entry = chainstate
+            .header_entry(&genesis)
+            .expect("header entry")
+            .expect("genesis header entry");
+
+        let height = 1;
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = genesis_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&genesis, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: genesis,
+            merkle_root: [0x22u8; 32],
+            final_sapling_root: chainstate.sapling_root().expect("sapling root"),
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let hash = header.hash();
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(&[header], &params.consensus, &mut header_batch, false)
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let mut batch = WriteBatch::new();
+        chainstate.store_unconnected_block_bytes(&mut batch, &hash, &[1u8]);
+        chainstate.commit_batch(batch).expect("commit unconnected");
+
+        let value = rpc_getchaintips(&chainstate, Vec::new()).expect("rpc");
+        let tips = value.as_array().expect("array");
+        let statuses: Vec<_> = tips
+            .iter()
+            .filter_map(|entry| entry.as_object())
+            .filter(|entry| entry.get("height").and_then(Value::as_i64) == Some(1))
+            .filter_map(|entry| entry.get("status").and_then(Value::as_str))
+            .collect();
+        assert!(statuses.contains(&"valid-headers"));
+
+        let mut fail_batch = WriteBatch::new();
+        chainstate
+            .mark_header_failed(&mut fail_batch, &hash)
+            .expect("mark failed");
+        chainstate.commit_batch(fail_batch).expect("commit failed");
+
+        let value = rpc_getchaintips(&chainstate, Vec::new()).expect("rpc");
+        let tips = value.as_array().expect("array");
+        let statuses: Vec<_> = tips
+            .iter()
+            .filter_map(|entry| entry.as_object())
+            .filter(|entry| entry.get("height").and_then(Value::as_i64) == Some(1))
+            .filter_map(|entry| entry.get("status").and_then(Value::as_str))
+            .collect();
+        assert!(statuses.contains(&"invalid"));
     }
 
     #[test]

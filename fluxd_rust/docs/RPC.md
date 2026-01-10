@@ -644,8 +644,9 @@ Returns chain metadata:
 
 ### getchaintips
 
+- Params: optional `blockheight` (number, default 0) - earliest height to consider for tip discovery (out of range is treated as `0`, matching `fluxd`).
 - Result: array of tip objects with `height`, `hash`, `branchlen`, and `status`.
-- `status` is one of `active`, `valid-fork`, or `headers-only`.
+- `status` is one of `active`, `valid-fork`, `valid-headers`, `headers-only`, or `invalid`.
 
 ### getblocksubsidy
 
