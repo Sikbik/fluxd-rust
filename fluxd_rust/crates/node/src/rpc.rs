@@ -14747,6 +14747,23 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
     let mut failed = 0;
     let mut detail = Vec::new();
 
+    let best_height = best_block_height(chainstate)?;
+    let pon_active = network_upgrade_active(
+        best_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Pon,
+    );
+    let expiration = if pon_active {
+        FLUXNODE_START_TX_EXPIRATION_HEIGHT_V2
+    } else {
+        FLUXNODE_START_TX_EXPIRATION_HEIGHT
+    };
+    let dos_remove = if pon_active {
+        FLUXNODE_DOS_REMOVE_AMOUNT_V2
+    } else {
+        FLUXNODE_DOS_REMOVE_AMOUNT
+    };
+
     for entry in targets {
         let mut obj = serde_json::Map::new();
         obj.insert("alias".to_string(), Value::String(entry.alias.clone()));
@@ -14754,6 +14771,52 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
             "outpoint".to_string(),
             Value::String(format_outpoint(&entry.collateral)),
         );
+        obj.insert(
+            "transaction_built".to_string(),
+            Value::String("failed".to_string()),
+        );
+        obj.insert(
+            "transaction_signed".to_string(),
+            Value::String("failed".to_string()),
+        );
+        obj.insert(
+            "transaction_commited".to_string(),
+            Value::String("failed".to_string()),
+        );
+        obj.insert("result".to_string(), Value::String("failed".to_string()));
+        obj.insert("errorMessage".to_string(), Value::String(String::new()));
+
+        if let Some(record) = chainstate
+            .fluxnode_record(&entry.collateral)
+            .map_err(map_internal)?
+        {
+            if let Some(reason) =
+                fluxnode_start_blocked_reason(best_height, &record, expiration, dos_remove)
+            {
+                failed += 1;
+                obj.insert("reason".to_string(), Value::String(reason.to_string()));
+                detail.push(Value::Object(obj));
+                continue;
+            }
+        }
+
+        {
+            let guard = mempool
+                .lock()
+                .map_err(|_| map_internal("mempool lock poisoned"))?;
+            if mempool_contains_fluxnode_outpoint(&guard, &entry.collateral) {
+                failed += 1;
+                obj.insert(
+                    "reason".to_string(),
+                    Value::String(
+                        "Mempool already has a fluxnode transaction using this outpoint"
+                            .to_string(),
+                    ),
+                );
+                detail.push(Value::Object(obj));
+                continue;
+            }
+        }
 
         let collateral_wif = entry.collateral_privkey.as_deref();
         let redeem_script_hex = entry.redeem_script.as_deref();
@@ -14800,6 +14863,14 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
                 continue;
             }
         };
+        obj.insert(
+            "transaction_built".to_string(),
+            Value::String("successful".to_string()),
+        );
+        obj.insert(
+            "transaction_signed".to_string(),
+            Value::String("successful".to_string()),
+        );
 
         let raw = match tx.consensus_encode() {
             Ok(bytes) => bytes,
@@ -14830,11 +14901,19 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
                     "result".to_string(),
                     Value::String("successful".to_string()),
                 );
+                obj.insert(
+                    "transaction_commited".to_string(),
+                    Value::String("successful".to_string()),
+                );
                 obj.insert("txid".to_string(), txid);
             }
             Err(err) => {
                 failed += 1;
                 obj.insert("result".to_string(), Value::String("failed".to_string()));
+                obj.insert(
+                    "transaction_commited".to_string(),
+                    Value::String("failed".to_string()),
+                );
                 obj.insert("errorMessage".to_string(), Value::String(err.message));
             }
         }
@@ -23045,7 +23124,15 @@ mod tests {
             .expect("detail array");
         assert_eq!(detail.len(), 1);
         let entry = detail[0].as_object().expect("detail entry");
-        for key in ["alias", "outpoint", "result", "errorMessage"] {
+        for key in [
+            "alias",
+            "outpoint",
+            "result",
+            "transaction_built",
+            "transaction_signed",
+            "transaction_commited",
+            "errorMessage",
+        ] {
             assert!(entry.contains_key(key), "missing key {key}");
         }
     }

@@ -1205,6 +1205,10 @@ Starts fluxnodes from `fluxnode.conf`.
   - `lockwallet` locks the wallet before returning when the wallet is encrypted.
 - Notes:
   - Collateral key resolution follows the same order as `startdeterministicfluxnode`; `fluxnode.conf` can include optional extra columns for wallet-less starts.
+- Result:
+  - Object with `overall` and `detail` (array).
+  - Each `detail` entry includes `alias`, `outpoint`, `result`, `transaction_built`, `transaction_signed`, `transaction_commited`, and `errorMessage`.
+  - Entries may include `reason` for pre-check failures, and `txid` when broadcast succeeds.
 
 ### startfluxnodewithdelegates
 
