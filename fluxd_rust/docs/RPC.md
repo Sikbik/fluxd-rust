@@ -223,6 +223,9 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 
 - `createfluxnodekey` / `createzelnodekey`
 - `createdelegatekeypair`
+- `createp2shstarttx <redeemscript_hex> <vpspubkey_hex> <txid> <index> [delegates]`
+- `signp2shstarttx <rawtransactionhex> [privatekey_wif]`
+- `sendp2shstarttx <rawtransactionhex>`
 - `listfluxnodeconf [filter]` / `listzelnodeconf [filter]`
 - `getfluxnodeoutputs` / `getzelnodeoutputs`
 - `startfluxnode <all|alias> <lockwallet> [alias]` / `startzelnode ...` (partial; wallet-less)
@@ -1119,6 +1122,40 @@ Generates a delegate keypair (private key + compressed/uncompressed pubkeys), ma
   - `private_key` - WIF-encoded secp256k1 private key string (compressed)
   - `public_key_compressed` - hex-encoded compressed pubkey (33 bytes)
   - `public_key_uncompressed` - hex-encoded uncompressed pubkey (65 bytes)
+
+### createp2shstarttx
+
+Creates an unsigned deterministic fluxnode START transaction for P2SH collateral, matching the C++ daemon shape.
+
+- Params:
+  - `redeemscript_hex` (string) - multisig redeem script (hex)
+  - `vpspubkey_hex` (string) - fluxnode operator pubkey (hex, compressed or uncompressed)
+  - `txid` (string) - collateral transaction id
+  - `index` (number) - collateral vout index
+  - `delegates` (optional array of strings) - compressed delegate pubkeys (hex, up to 4; duplicates rejected)
+- Notes:
+  - Validates that the redeem script hash matches the referenced collateral output script hash.
+  - Does not sign or broadcast; use `signp2shstarttx` then `sendp2shstarttx`.
+- Result: hex string of the raw transaction.
+
+### signp2shstarttx
+
+Signs a P2SH deterministic fluxnode START transaction, matching the C++ daemon behavior.
+
+- Params:
+  - `rawtransactionhex` (string)
+  - `privatekey_wif` (optional string; if omitted, the wallet must contain one of the multisig keys and be unlocked)
+- Notes:
+  - Sets `sigTime` to the current time, signs the tx hash (excluding signatures), and verifies the signature against the redeem script pubkeys.
+- Result: hex string of the signed transaction.
+
+### sendp2shstarttx
+
+Broadcasts a signed multisig fluxnode START transaction.
+
+- Params: `rawtransactionhex` (string)
+- Notes: wrapper around `sendrawtransaction` for parity.
+- Result: txid string.
 
 ### listfluxnodeconf / listzelnodeconf
 

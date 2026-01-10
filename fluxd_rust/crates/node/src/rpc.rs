@@ -56,9 +56,10 @@ use fluxd_primitives::hash::{hash160, sha256d};
 use fluxd_primitives::merkleblock::{MerkleBlock, PartialMerkleTree};
 use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{
-    FluxnodeStartV5, FluxnodeStartV6, FluxnodeStartVariantV6, FluxnodeTx, FluxnodeTxV5,
-    FluxnodeTxV6, Transaction, TxIn, TxOut, FLUXNODE_INTERNAL_NORMAL_TX_VERSION,
-    FLUXNODE_INTERNAL_P2SH_TX_VERSION, FLUXNODE_TX_UPGRADEABLE_VERSION, FLUXNODE_TX_VERSION,
+    FluxnodeDelegates, FluxnodeStartV5, FluxnodeStartV6, FluxnodeStartVariantV6, FluxnodeTx,
+    FluxnodeTxV5, FluxnodeTxV6, Transaction, TxIn, TxOut, FLUXNODE_INTERNAL_NORMAL_TX_VERSION,
+    FLUXNODE_INTERNAL_P2SH_TX_VERSION, FLUXNODE_TX_FEATURE_DELEGATES_BIT,
+    FLUXNODE_TX_TYPE_P2SH_BIT, FLUXNODE_TX_UPGRADEABLE_VERSION, FLUXNODE_TX_VERSION,
     SAPLING_VERSION_GROUP_ID,
 };
 use fluxd_primitives::{
@@ -248,6 +249,9 @@ const RPC_METHODS: &[&str] = &[
     "createfluxnodekey",
     "createzelnodekey",
     "createdelegatekeypair",
+    "createp2shstarttx",
+    "signp2shstarttx",
+    "sendp2shstarttx",
     "listfluxnodeconf",
     "listzelnodeconf",
     "getfluxnodeoutputs",
@@ -1496,6 +1500,19 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
         "zcbenchmark" => rpc_zcbenchmark(params),
         "createfluxnodekey" | "createzelnodekey" => rpc_createfluxnodekey(params, chain_params),
         "createdelegatekeypair" => rpc_createdelegatekeypair(params, chain_params),
+        "createp2shstarttx" => rpc_createp2shstarttx(chainstate, params, chain_params),
+        "signp2shstarttx" => rpc_signp2shstarttx(wallet, params, chain_params),
+        "sendp2shstarttx" => rpc_sendp2shstarttx(
+            chainstate,
+            mempool,
+            mempool_policy,
+            mempool_metrics,
+            fee_estimator,
+            mempool_flags,
+            params,
+            chain_params,
+            tx_announce,
+        ),
         "listfluxnodeconf" | "listzelnodeconf" => {
             rpc_listfluxnodeconf(chainstate, params, chain_params, data_dir)
         }
@@ -14951,6 +14968,352 @@ fn ensure_fluxnode_mode(data_dir: &Path) -> Result<(), RpcError> {
     Ok(())
 }
 
+fn rpc_createp2shstarttx<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.len() < 4 || params.len() > 5 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "createp2shstarttx expects 4 or 5 parameters",
+        ));
+    }
+
+    let redeem_script_hex = params[0]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "redeemscript must be a string"))?;
+    let redeem_script = bytes_from_hex(redeem_script_hex)
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "redeemscript must be a hex string"))?;
+
+    let vps_pubkey_hex = params[1]
+        .as_str()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "vpspubkey must be a string"))?;
+    let vps_pubkey = bytes_from_hex(vps_pubkey_hex)
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "vpspubkey must be a hex string"))?;
+    PublicKey::from_slice(&vps_pubkey).map_err(|_| {
+        RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "vpspubkey must be a valid public key",
+        )
+    })?;
+
+    let txid = parse_hash(&params[2])?;
+    let index = parse_u32(&params[3], "index")?;
+    let collateral = OutPoint { hash: txid, index };
+
+    let mut delegates: Vec<Vec<u8>> = Vec::new();
+    if let Some(value) = params.get(4) {
+        let list = value.as_array().ok_or_else(|| {
+            RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "delegates must be an array of pubkeys",
+            )
+        })?;
+        if list.len() > 4 {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "Too many delegates. Maximum is 4",
+            ));
+        }
+        let mut seen = HashSet::new();
+        for (idx, entry) in list.iter().enumerate() {
+            let key_hex = entry.as_str().ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "delegates must be an array of pubkeys",
+                )
+            })?;
+            let key_bytes = bytes_from_hex(key_hex).ok_or_else(|| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    format!("Invalid delegate public key at index {idx}"),
+                )
+            })?;
+            if key_bytes.len() != 33 {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    format!("Delegate public key at index {idx} must be compressed"),
+                ));
+            }
+            PublicKey::from_slice(&key_bytes).map_err(|_| {
+                RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    format!("Invalid delegate public key at index {idx}"),
+                )
+            })?;
+            if !seen.insert(key_bytes.clone()) {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    format!("Duplicate delegate public key at index {idx}"),
+                ));
+            }
+            delegates.push(key_bytes);
+        }
+    }
+
+    let best_height = best_block_height(chainstate)?;
+    let next_height = best_height.saturating_add(1);
+    let pon_active = network_upgrade_active(
+        next_height,
+        &chain_params.consensus.upgrades,
+        UpgradeIndex::Pon,
+    );
+
+    let using_delegates = pon_active && !delegates.is_empty();
+    let flux_tx_version = if pon_active {
+        if using_delegates {
+            FLUXNODE_TX_TYPE_P2SH_BIT | FLUXNODE_TX_FEATURE_DELEGATES_BIT
+        } else {
+            FLUXNODE_TX_TYPE_P2SH_BIT
+        }
+    } else {
+        FLUXNODE_INTERNAL_P2SH_TX_VERSION
+    };
+
+    let utxo = chainstate
+        .utxo_entry(&collateral)
+        .map_err(map_internal)?
+        .ok_or_else(|| RpcError::new(RPC_TRANSACTION_ERROR, "Coins not found in chain"))?;
+    let script_hash = extract_p2sh_hash(&utxo.script_pubkey).ok_or_else(|| {
+        RpcError::new(
+            RPC_TRANSACTION_ERROR,
+            "Couldn't extract destination from coins",
+        )
+    })?;
+    if hash160(&redeem_script) != script_hash {
+        return Err(RpcError::new(
+            RPC_TRANSACTION_ERROR,
+            "Address not matching Redeemscript hash",
+        ));
+    }
+
+    let sig_time = 0;
+    let sig = Vec::new();
+
+    let delegates_payload = if using_delegates {
+        Some(FluxnodeDelegates {
+            version: FluxnodeDelegates::INITIAL_VERSION,
+            kind: FluxnodeDelegates::UPDATE,
+            delegate_starting_keys: delegates,
+        })
+    } else {
+        None
+    };
+
+    let tx = Transaction {
+        f_overwintered: false,
+        version: FLUXNODE_TX_UPGRADEABLE_VERSION,
+        version_group_id: 0,
+        vin: Vec::new(),
+        vout: Vec::new(),
+        lock_time: 0,
+        expiry_height: 0,
+        value_balance: 0,
+        shielded_spends: Vec::new(),
+        shielded_outputs: Vec::new(),
+        join_splits: Vec::new(),
+        join_split_pub_key: [0u8; 32],
+        join_split_sig: [0u8; 64],
+        binding_sig: [0u8; 64],
+        fluxnode: Some(FluxnodeTx::V6(FluxnodeTxV6::Start(FluxnodeStartV6 {
+            flux_tx_version,
+            variant: FluxnodeStartVariantV6::P2sh {
+                collateral,
+                pubkey: vps_pubkey,
+                redeem_script,
+                sig_time,
+                sig,
+            },
+            using_delegates,
+            delegates: delegates_payload,
+        }))),
+    };
+
+    let raw = tx.consensus_encode().map_err(map_internal)?;
+    Ok(Value::String(hex_bytes(&raw)))
+}
+
+fn rpc_signp2shstarttx(
+    wallet: &Mutex<Wallet>,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+) -> Result<Value, RpcError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "signp2shstarttx expects 1 or 2 parameters",
+        ));
+    }
+    let raw_hex = params[0].as_str().ok_or_else(|| {
+        RpcError::new(RPC_INVALID_PARAMETER, "rawtransactionhex must be a string")
+    })?;
+    let raw = bytes_from_hex(raw_hex)
+        .ok_or_else(|| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+    let mut tx = Transaction::consensus_decode(&raw)
+        .map_err(|_| RpcError::new(RPC_DESERIALIZATION_ERROR, "TX decode failed"))?;
+
+    let redeem_script = match tx.fluxnode.as_ref() {
+        Some(FluxnodeTx::V6(FluxnodeTxV6::Start(start))) => match &start.variant {
+            FluxnodeStartVariantV6::P2sh { redeem_script, .. } => redeem_script.clone(),
+            _ => {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "transaction is not a P2SH fluxnode start transaction",
+                ))
+            }
+        },
+        _ => {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "transaction is not a P2SH fluxnode start transaction",
+            ))
+        }
+    };
+
+    let pubkeys = parse_multisig_redeem_script(&redeem_script).ok_or_else(|| {
+        RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Failed to get pubkeys from redeemscript",
+        )
+    })?;
+
+    let (secret, compressed) = if let Some(value) = params.get(1) {
+        let wif = value
+            .as_str()
+            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "privatekey must be a string"))?;
+        let (secret, compressed) = parse_wif_secret_key(wif, chain_params.network)
+            .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key"))?;
+        (secret, compressed)
+    } else {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let mut found = None;
+        for pubkey_bytes in &pubkeys {
+            let pubkey = PublicKey::from_slice(pubkey_bytes).map_err(|_| {
+                RpcError::new(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Failed to get pubkeys from redeemscript",
+                )
+            })?;
+            if let Some(secret) = guard
+                .signing_key_for_pubkey(&pubkey)
+                .map_err(map_wallet_error)?
+            {
+                found = Some((secret, pubkey_bytes.len() == 33));
+                break;
+            }
+        }
+        found.ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "Private key not available"))?
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let sig_time = u32::try_from(now).unwrap_or(u32::MAX);
+    {
+        let start = match tx.fluxnode.as_mut() {
+            Some(FluxnodeTx::V6(FluxnodeTxV6::Start(start))) => start,
+            _ => {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "transaction is not a P2SH fluxnode start transaction",
+                ))
+            }
+        };
+        match &mut start.variant {
+            FluxnodeStartVariantV6::P2sh {
+                sig_time: sig_time_field,
+                sig,
+                ..
+            } => {
+                *sig_time_field = sig_time;
+                sig.clear();
+            }
+            _ => {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "transaction is not a P2SH fluxnode start transaction",
+                ))
+            }
+        }
+    }
+
+    let txid = tx.txid().map_err(map_internal)?;
+    let message = hash256_to_hex(&txid).into_bytes();
+    let signature = sign_compact_message(&secret, compressed, &message)
+        .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Failed to sign transaction"))?;
+    {
+        let start = match tx.fluxnode.as_mut() {
+            Some(FluxnodeTx::V6(FluxnodeTxV6::Start(start))) => start,
+            _ => {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "transaction is not a P2SH fluxnode start transaction",
+                ))
+            }
+        };
+        match &mut start.variant {
+            FluxnodeStartVariantV6::P2sh { sig, .. } => sig.extend_from_slice(&signature),
+            _ => {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "transaction is not a P2SH fluxnode start transaction",
+                ))
+            }
+        }
+    }
+
+    let mut validated = false;
+    for pubkey in &pubkeys {
+        if fluxd_script::message::verify_signed_message(pubkey, &signature, &message).is_ok() {
+            validated = true;
+            break;
+        }
+    }
+    if !validated {
+        return Err(RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Signature Verify Failed",
+        ));
+    }
+
+    let encoded = tx.consensus_encode().map_err(map_internal)?;
+    Ok(Value::String(hex_bytes(&encoded)))
+}
+
+fn rpc_sendp2shstarttx<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    mempool: &Mutex<Mempool>,
+    mempool_policy: &MempoolPolicy,
+    mempool_metrics: &MempoolMetrics,
+    fee_estimator: &Mutex<FeeEstimator>,
+    mempool_flags: &ValidationFlags,
+    params: Vec<Value>,
+    chain_params: &ChainParams,
+    tx_announce: &broadcast::Sender<Hash256>,
+) -> Result<Value, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::new(
+            RPC_INVALID_PARAMETER,
+            "sendp2shstarttx expects 1 parameter",
+        ));
+    }
+    rpc_sendrawtransaction(
+        chainstate,
+        mempool,
+        mempool_policy,
+        mempool_metrics,
+        fee_estimator,
+        mempool_flags,
+        vec![params[0].clone()],
+        chain_params,
+        tx_announce,
+    )
+}
+
 fn bench_testnet_arg(chain_params: &ChainParams) -> Option<&'static str> {
     if chain_params.network == Network::Testnet {
         Some("-testnet")
@@ -21501,6 +21864,213 @@ mod tests {
         assert_eq!(
             pubkey_uncompressed,
             hex_bytes(&pubkey.serialize_uncompressed())
+        );
+    }
+
+    #[test]
+    fn createp2shstarttx_and_signp2shstarttx_roundtrip() {
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let secp = Secp256k1::new();
+        let signing_secret = SecretKey::from_slice(&[0x11u8; 32]).expect("secret");
+        let signing_pubkey = PublicKey::from_secret_key(&secp, &signing_secret)
+            .serialize()
+            .to_vec();
+
+        let redeem_script = {
+            let mut script = Vec::with_capacity(1 + 1 + signing_pubkey.len() + 2);
+            script.push(0x51);
+            script.push(signing_pubkey.len() as u8);
+            script.extend_from_slice(&signing_pubkey);
+            script.push(0x51);
+            script.push(0xae);
+            script
+        };
+
+        let vps_secret = SecretKey::from_slice(&[0x22u8; 32]).expect("secret");
+        let vps_pubkey = PublicKey::from_secret_key(&secp, &vps_secret)
+            .serialize()
+            .to_vec();
+
+        let collateral = OutPoint {
+            hash: [0x42u8; 32],
+            index: 0,
+        };
+
+        let mut script_pubkey = Vec::with_capacity(23);
+        script_pubkey.extend_from_slice(&[0xa9, 0x14]);
+        script_pubkey.extend_from_slice(&hash160(&redeem_script));
+        script_pubkey.push(0x87);
+
+        let utxo = fluxd_chainstate::utxo::UtxoEntry {
+            value: 1_000 * COIN,
+            script_pubkey,
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&collateral);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), utxo.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let raw_tx = rpc_createp2shstarttx(
+            &chainstate,
+            vec![
+                json!(hex_bytes(&redeem_script)),
+                json!(hex_bytes(&vps_pubkey)),
+                json!(hash256_to_hex(&collateral.hash)),
+                json!(collateral.index),
+            ],
+            &params,
+        )
+        .expect("rpc");
+        let raw_tx = raw_tx.as_str().expect("rawtx string");
+        let raw = bytes_from_hex(raw_tx).expect("raw tx bytes");
+        let tx = Transaction::consensus_decode(&raw).expect("decode tx");
+
+        let start = match tx.fluxnode.as_ref().expect("fluxnode") {
+            FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => start,
+            other => panic!("expected v6 start tx, got {other:?}"),
+        };
+        assert_eq!(tx.version, FLUXNODE_TX_UPGRADEABLE_VERSION);
+        assert_eq!(start.flux_tx_version, FLUXNODE_INTERNAL_P2SH_TX_VERSION);
+        assert!(!start.using_delegates);
+        assert!(start.delegates.is_none());
+
+        match &start.variant {
+            FluxnodeStartVariantV6::P2sh {
+                collateral: tx_collateral,
+                pubkey,
+                redeem_script: tx_redeem,
+                sig_time,
+                sig,
+            } => {
+                assert_eq!(tx_collateral, &collateral);
+                assert_eq!(pubkey, &vps_pubkey);
+                assert_eq!(tx_redeem, &redeem_script);
+                assert_eq!(*sig_time, 0);
+                assert!(sig.is_empty());
+            }
+            other => panic!("expected p2sh variant, got {other:?}"),
+        }
+
+        let signing_secret_bytes = signing_secret.secret_bytes();
+        let signing_wif = secret_key_to_wif(&signing_secret_bytes, params.network, true);
+        let signed = rpc_signp2shstarttx(&wallet, vec![json!(raw_tx), json!(signing_wif)], &params)
+            .expect("rpc");
+        let signed = signed.as_str().expect("signed tx string");
+        let signed_bytes = bytes_from_hex(signed).expect("signed tx bytes");
+        let signed_tx = Transaction::consensus_decode(&signed_bytes).expect("decode signed tx");
+
+        let signed_start = match signed_tx.fluxnode.as_ref().expect("fluxnode") {
+            FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => start,
+            other => panic!("expected v6 start tx, got {other:?}"),
+        };
+        let (sig_time, sig) = match &signed_start.variant {
+            FluxnodeStartVariantV6::P2sh { sig_time, sig, .. } => (sig_time, sig),
+            other => panic!("expected p2sh variant, got {other:?}"),
+        };
+        assert!(*sig_time > 0);
+        assert_eq!(sig.len(), 65);
+
+        let txid = signed_tx.txid().expect("txid");
+        let message = hash256_to_hex(&txid).into_bytes();
+        fluxd_script::message::verify_signed_message(&signing_pubkey, sig, &message)
+            .expect("signature verify");
+    }
+
+    #[test]
+    fn createp2shstarttx_sets_delegate_feature_after_pon() {
+        let (chainstate, mut params, _data_dir) = setup_regtest_chainstate();
+        params.consensus.upgrades[UpgradeIndex::Pon.as_usize()].activation_height = 1;
+
+        let secp = Secp256k1::new();
+        let signing_secret = SecretKey::from_slice(&[0x33u8; 32]).expect("secret");
+        let signing_pubkey = PublicKey::from_secret_key(&secp, &signing_secret)
+            .serialize()
+            .to_vec();
+
+        let redeem_script = {
+            let mut script = Vec::with_capacity(1 + 1 + signing_pubkey.len() + 2);
+            script.push(0x51);
+            script.push(signing_pubkey.len() as u8);
+            script.extend_from_slice(&signing_pubkey);
+            script.push(0x51);
+            script.push(0xae);
+            script
+        };
+
+        let vps_secret = SecretKey::from_slice(&[0x44u8; 32]).expect("secret");
+        let vps_pubkey = PublicKey::from_secret_key(&secp, &vps_secret)
+            .serialize()
+            .to_vec();
+
+        let delegate_a = PublicKey::from_secret_key(
+            &secp,
+            &SecretKey::from_slice(&[0x55u8; 32]).expect("secret"),
+        )
+        .serialize()
+        .to_vec();
+        let delegate_b = PublicKey::from_secret_key(
+            &secp,
+            &SecretKey::from_slice(&[0x66u8; 32]).expect("secret"),
+        )
+        .serialize()
+        .to_vec();
+
+        let collateral = OutPoint {
+            hash: [0x77u8; 32],
+            index: 0,
+        };
+
+        let mut script_pubkey = Vec::with_capacity(23);
+        script_pubkey.extend_from_slice(&[0xa9, 0x14]);
+        script_pubkey.extend_from_slice(&hash160(&redeem_script));
+        script_pubkey.push(0x87);
+
+        let utxo = fluxd_chainstate::utxo::UtxoEntry {
+            value: 1_000 * COIN,
+            script_pubkey,
+            height: 0,
+            is_coinbase: false,
+        };
+        let key = fluxd_chainstate::utxo::outpoint_key_bytes(&collateral);
+        let mut batch = WriteBatch::new();
+        batch.put(Column::Utxo, key.as_bytes(), utxo.encode());
+        chainstate.commit_batch(batch).expect("commit utxo");
+
+        let raw_tx = rpc_createp2shstarttx(
+            &chainstate,
+            vec![
+                json!(hex_bytes(&redeem_script)),
+                json!(hex_bytes(&vps_pubkey)),
+                json!(hash256_to_hex(&collateral.hash)),
+                json!(collateral.index),
+                json!([hex_bytes(&delegate_a), hex_bytes(&delegate_b)]),
+            ],
+            &params,
+        )
+        .expect("rpc");
+        let raw_tx = raw_tx.as_str().expect("rawtx string");
+        let raw = bytes_from_hex(raw_tx).expect("raw tx bytes");
+        let tx = Transaction::consensus_decode(&raw).expect("decode tx");
+
+        let start = match tx.fluxnode.as_ref().expect("fluxnode") {
+            FluxnodeTx::V6(FluxnodeTxV6::Start(start)) => start,
+            other => panic!("expected v6 start tx, got {other:?}"),
+        };
+        assert_eq!(
+            start.flux_tx_version,
+            FLUXNODE_TX_TYPE_P2SH_BIT | FLUXNODE_TX_FEATURE_DELEGATES_BIT
+        );
+        assert!(start.using_delegates);
+        let delegates = start.delegates.as_ref().expect("delegates payload");
+        assert_eq!(delegates.version, FluxnodeDelegates::INITIAL_VERSION);
+        assert_eq!(delegates.kind, FluxnodeDelegates::UPDATE);
+        assert_eq!(
+            delegates.delegate_starting_keys,
+            vec![delegate_a, delegate_b]
         );
     }
 
