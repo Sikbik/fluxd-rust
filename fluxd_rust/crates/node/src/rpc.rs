@@ -97,6 +97,9 @@ const RPC_DESERIALIZATION_ERROR: i64 = -22;
 const RPC_TRANSACTION_ERROR: i64 = -25;
 const RPC_TRANSACTION_REJECTED: i64 = -26;
 const RPC_TRANSACTION_ALREADY_IN_CHAIN: i64 = -27;
+const RPC_CLIENT_NODE_ALREADY_ADDED: i64 = -23;
+const RPC_CLIENT_NODE_NOT_ADDED: i64 = -24;
+const RPC_CLIENT_NODE_NOT_CONNECTED: i64 = -29;
 const RPC_METHOD_NOT_FOUND: i64 = -32601;
 const RPC_INVALID_REQUEST: i64 = -32600;
 const RPC_PARSE_ERROR: i64 = -32700;
@@ -17186,6 +17189,16 @@ fn rpc_disconnectnode(
         .as_str()
         .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "address must be a string"))?;
     let addr = parse_socket_addr_with_default(addr_raw, chain_params.default_port)?;
+    if !peer_registry
+        .snapshot()
+        .iter()
+        .any(|peer| peer.addr == addr)
+    {
+        return Err(RpcError::new(
+            RPC_CLIENT_NODE_NOT_CONNECTED,
+            "Node not found in connected nodes",
+        ));
+    }
     peer_registry.request_disconnect(addr);
     Ok(Value::Null)
 }
@@ -17225,12 +17238,27 @@ fn rpc_addnode(
                     "added nodes lock poisoned",
                 ));
             };
+            if guard.contains(node_raw) {
+                return Err(RpcError::new(
+                    RPC_CLIENT_NODE_ALREADY_ADDED,
+                    "Error: Node already added",
+                ));
+            }
             guard.insert(node_raw.to_string());
             let _ = addr_book.insert_many(resolved_addrs);
         }
         "remove" => {
-            if let Ok(mut guard) = added_nodes.lock() {
-                guard.remove(node_raw);
+            let Ok(mut guard) = added_nodes.lock() else {
+                return Err(RpcError::new(
+                    RPC_INTERNAL_ERROR,
+                    "added nodes lock poisoned",
+                ));
+            };
+            if !guard.remove(node_raw) {
+                return Err(RpcError::new(
+                    RPC_CLIENT_NODE_NOT_ADDED,
+                    "Error: Node has not been added.",
+                ));
             }
         }
         "onetry" => {
@@ -17301,8 +17329,8 @@ fn rpc_getaddednodeinfo(
     if let Some(filter) = node_filter.as_deref() {
         if !nodes.contains(&filter.to_string()) {
             return Err(RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "node is not in added node list",
+                RPC_CLIENT_NODE_NOT_ADDED,
+                "Error: Node has not been added.",
             ));
         }
         nodes = vec![filter.to_string()];
@@ -18720,13 +18748,69 @@ mod tests {
     fn disconnectnode_has_cpp_schema() {
         let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
         let peer_registry = PeerRegistry::default();
+        peer_registry.register("127.0.0.1:12345".parse().expect("addr"), PeerKind::Header);
         let value = rpc_disconnectnode(
-            vec![Value::String("127.0.0.1".to_string())],
+            vec![Value::String("127.0.0.1:12345".to_string())],
             &params,
             &peer_registry,
         )
         .expect("disconnectnode");
         assert!(value.is_null());
+    }
+
+    #[test]
+    fn disconnectnode_errors_when_not_connected() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let peer_registry = PeerRegistry::default();
+        let err = rpc_disconnectnode(
+            vec![Value::String("127.0.0.1:12345".to_string())],
+            &params,
+            &peer_registry,
+        )
+        .expect_err("disconnectnode should fail");
+        assert_eq!(err.code, RPC_CLIENT_NODE_NOT_CONNECTED);
+    }
+
+    #[test]
+    fn addnode_errors_on_duplicates_and_missing_removes() {
+        let (_chainstate, params, _data_dir) = setup_regtest_chainstate();
+        let addr_book = AddrBook::default();
+        let added_nodes = Mutex::new(HashSet::<String>::new());
+
+        rpc_addnode(
+            vec![
+                Value::String("127.0.0.1:16125".to_string()),
+                Value::String("add".to_string()),
+            ],
+            &params,
+            &addr_book,
+            &added_nodes,
+        )
+        .expect("addnode");
+
+        let err = rpc_addnode(
+            vec![
+                Value::String("127.0.0.1:16125".to_string()),
+                Value::String("add".to_string()),
+            ],
+            &params,
+            &addr_book,
+            &added_nodes,
+        )
+        .expect_err("duplicate addnode should fail");
+        assert_eq!(err.code, RPC_CLIENT_NODE_ALREADY_ADDED);
+
+        let err = rpc_addnode(
+            vec![
+                Value::String("127.0.0.1:16126".to_string()),
+                Value::String("remove".to_string()),
+            ],
+            &params,
+            &addr_book,
+            &added_nodes,
+        )
+        .expect_err("remove missing addnode should fail");
+        assert_eq!(err.code, RPC_CLIENT_NODE_NOT_ADDED);
     }
 
     #[test]

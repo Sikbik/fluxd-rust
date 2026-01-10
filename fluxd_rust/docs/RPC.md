@@ -1097,6 +1097,9 @@ Adds/removes a manual peer address, similar to the C++ daemon.
   - Hostname resolution is best-effort and only used to seed the address book; the added-node list stores the raw `<node>` string (like the C++ daemon).
   - `add` updates an in-memory added-node list (used by `getaddednodeinfo`) and seeds the address manager.
   - `onetry` seeds the address manager but does not add to the persistent added-node list.
+  - Error parity:
+    - Adding a duplicate node returns `code=-23` (`RPC_CLIENT_NODE_ALREADY_ADDED` in C++).
+    - Removing a node that was never added returns `code=-24` (`RPC_CLIENT_NODE_NOT_ADDED` in C++).
 
 ### getaddednodeinfo
 
@@ -1107,6 +1110,7 @@ Returns information about the current added-node list, matching the C++ daemon s
   - When `dns=true` (default), includes:
     - top-level `connected` boolean
     - `addresses[]` with per-resolved-address `connected` values (`"inbound"`, `"outbound"`, or `"false"`)
+  - If `node` is provided but is not in the added-node list, returns `code=-24` (`RPC_CLIENT_NODE_NOT_ADDED` in C++).
 
 ### disconnectnode
 
@@ -1114,6 +1118,7 @@ Requests disconnect of an active peer connection.
 
 - Params: `<node>`
 - Result: `null`
+- If the peer is not currently connected, returns `code=-29` (`RPC_CLIENT_NODE_NOT_CONNECTED` in C++).
 
 ### createfluxnodekey / createzelnodekey
 

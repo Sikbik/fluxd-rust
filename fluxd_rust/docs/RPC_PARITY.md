@@ -117,7 +117,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - verifychain - Partial (checks flatfile decode + header linkage + merkle root + txindex; `checklevel=4` verifies spent-index consistency; `checklevel=5` verifies address index consistency; does not re-apply full UTXO/script validation like C++)
 - addnode - Implemented (accepts IPs and hostnames; best-effort DNS resolution used to seed the address book; stores the raw node string in the added-node list like C++)
 - clearbanned - Implemented
-- disconnectnode - Implemented (address-based; best-effort)
+- disconnectnode - Implemented (address-based; errors if the peer is not connected, like C++)
 - getaddednodeinfo - Implemented (honors `dns`; C++-style `connected` + `addresses[]` with `"inbound"|"outbound"|"false"` per-address statuses; `dns` remains optional here for convenience)
 - setban - Implemented (SocketAddr bans; `absolute` supported)
 
