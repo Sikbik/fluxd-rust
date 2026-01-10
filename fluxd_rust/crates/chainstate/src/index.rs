@@ -9,6 +9,8 @@ const META_BEST_BLOCK_KEY: &[u8] = b"best_block";
 
 const STATUS_HAS_HEADER: u8 = 1 << 0;
 const STATUS_HAS_BLOCK: u8 = 1 << 1;
+const STATUS_FAILED_VALIDATION: u8 = 1 << 2;
+const STATUS_FAILED_MASK: u8 = STATUS_FAILED_VALIDATION;
 
 #[derive(Clone, Debug)]
 pub struct HeaderEntry {
@@ -28,6 +30,10 @@ impl HeaderEntry {
 
     pub fn has_header(&self) -> bool {
         (self.status & STATUS_HAS_HEADER) != 0
+    }
+
+    pub fn is_failed(&self) -> bool {
+        (self.status & STATUS_FAILED_MASK) != 0
     }
 
     pub fn chainwork_value(&self) -> U256 {
@@ -201,10 +207,18 @@ pub fn status_without_block(status: u8) -> u8 {
     status & !STATUS_HAS_BLOCK
 }
 
+pub fn status_with_failed(status: u8) -> u8 {
+    status | STATUS_FAILED_VALIDATION
+}
+
 pub fn has_header(status: u8) -> bool {
     (status & STATUS_HAS_HEADER) != 0
 }
 
 pub fn has_block(status: u8) -> bool {
     (status & STATUS_HAS_BLOCK) != 0
+}
+
+pub fn is_failed(status: u8) -> bool {
+    (status & STATUS_FAILED_MASK) != 0
 }

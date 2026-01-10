@@ -983,6 +983,8 @@ Submits a block for validation.
   - `null` when accepted (connected or stored) and the block hash was not already known
   - string when rejected or when the block was already known (BIP22-style), e.g.:
     - `"duplicate"`
+    - `"duplicate-invalid"`
+    - `"duplicate-inconclusive"`
     - `"inconclusive"`
     - `"rejected"` (or a validation failure reason string)
 

@@ -13336,6 +13336,16 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         if entry.has_block() {
             return Ok(Value::String("duplicate".to_string()));
         }
+        if entry.is_failed() {
+            return Ok(Value::String("duplicate-invalid".to_string()));
+        }
+        if chainstate
+            .unconnected_block_bytes(&hash)
+            .map_err(map_internal)?
+            .is_some()
+        {
+            return Ok(Value::String("duplicate-inconclusive".to_string()));
+        }
     }
     let duplicate_value = Value::String("duplicate".to_string());
     let map_result = |value: Value| {
@@ -13344,6 +13354,18 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         } else {
             value
         }
+    };
+
+    let mark_block_failed = || -> Result<(), RpcError> {
+        let mut batch = fluxd_storage::WriteBatch::new();
+        chainstate
+            .mark_header_failed(&mut batch, &hash)
+            .map_err(map_internal)?;
+        let _guard = write_lock
+            .lock()
+            .map_err(|_| map_internal("write lock poisoned"))?;
+        chainstate.commit_batch(batch).map_err(map_internal)?;
+        Ok(())
     };
 
     let prev_hash = block.header.prev_block;
@@ -13377,6 +13399,9 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
             Ok(txids) => txids,
             Err(err) => {
                 let reason = err.to_string();
+                if block_present {
+                    mark_block_failed()?;
+                }
                 return Ok(map_result(Value::String(if reason.is_empty() {
                     "rejected".to_string()
                 } else {
@@ -13402,10 +13427,16 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
                 return Ok(map_result(Value::String("inconclusive".to_string())))
             }
             Err(ChainStateError::InvalidHeader(message)) => {
-                return Ok(map_result(Value::String(message.to_string())))
+                if block_present {
+                    mark_block_failed()?;
+                }
+                return Ok(map_result(Value::String(message.to_string())));
             }
             Err(ChainStateError::Validation(err)) => {
                 let reason = err.to_string();
+                if block_present {
+                    mark_block_failed()?;
+                }
                 return Ok(map_result(Value::String(if reason.is_empty() {
                     "rejected".to_string()
                 } else {
@@ -13419,7 +13450,10 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
                 return Ok(map_result(Value::String("missing header".to_string())))
             }
             Err(ChainStateError::ValueOutOfRange) => {
-                return Ok(map_result(Value::String("value out of range".to_string())))
+                if block_present {
+                    mark_block_failed()?;
+                }
+                return Ok(map_result(Value::String("value out of range".to_string())));
             }
             Err(err) => return Err(map_internal(err.to_string())),
         };
@@ -13472,10 +13506,16 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
                 return Ok(map_result(Value::String("inconclusive".to_string())))
             }
             Err(ChainStateError::InvalidHeader(message)) => {
-                return Ok(map_result(Value::String(message.to_string())))
+                if block_present {
+                    mark_block_failed()?;
+                }
+                return Ok(map_result(Value::String(message.to_string())));
             }
             Err(ChainStateError::Validation(err)) => {
                 let reason = err.to_string();
+                if block_present {
+                    mark_block_failed()?;
+                }
                 return Ok(map_result(Value::String(if reason.is_empty() {
                     "rejected".to_string()
                 } else {
@@ -13492,6 +13532,9 @@ fn rpc_submitblock<S: fluxd_storage::KeyValueStore>(
         flags,
     ) {
         let reason = err.to_string();
+        if block_present {
+            mark_block_failed()?;
+        }
         return Ok(map_result(Value::String(if reason.is_empty() {
             "rejected".to_string()
         } else {
@@ -19459,6 +19502,147 @@ mod tests {
     }
 
     #[test]
+    fn submitblock_marks_invalid_header_as_failed() {
+        let (chainstate, params, _data_dir) = setup_regtest_chainstate();
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let exchange_amount = exchange_fund_amount(height, &params.funding);
+        let foundation_amount = foundation_fund_amount(height, &params.funding);
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+        let mut vout = Vec::new();
+        vout.push(TxOut {
+            value: miner_value,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout.push(TxOut {
+                value: exchange_amount,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout.push(TxOut {
+                value: foundation_amount,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout.push(TxOut {
+                value: swap_amount,
+                script_pubkey: script,
+            });
+        }
+
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: vec![0u8; 2],
+                sequence: u32::MAX,
+            }],
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+
+        let final_sapling_root = chainstate.sapling_root().expect("sapling root");
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: [0x42u8; 32],
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+        let block_hash = header.hash();
+        let block = Block {
+            header: header.clone(),
+            transactions: vec![coinbase],
+        };
+        let block_hex = hex_bytes(&block.consensus_encode().expect("encode block"));
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(&[header], &params.consensus, &mut header_batch, false)
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let write_lock = Mutex::new(());
+        let mempool = Mutex::new(Mempool::new(0));
+        let fee_estimator = Mutex::new(FeeEstimator::new(0));
+        let flags = ValidationFlags::default();
+
+        let value = rpc_submitblock(
+            &chainstate,
+            &write_lock,
+            &mempool,
+            &fee_estimator,
+            vec![Value::String(block_hex.clone())],
+            &params,
+            &flags,
+        )
+        .expect("rpc");
+        assert_eq!(value.as_str(), Some("duplicate"));
+
+        let dup = rpc_submitblock(
+            &chainstate,
+            &write_lock,
+            &mempool,
+            &fee_estimator,
+            vec![Value::String(block_hex)],
+            &params,
+            &flags,
+        )
+        .expect("rpc");
+        assert_eq!(dup.as_str(), Some("duplicate-invalid"));
+
+        let entry = chainstate
+            .header_entry(&block_hash)
+            .expect("header entry")
+            .expect("header entry present");
+        assert!(entry.is_failed());
+    }
+
+    #[test]
     fn submitblock_side_chain_is_accepted_and_stored() {
         let (chainstate, params, _data_dir) = setup_regtest_chainstate();
         extend_regtest_chain_to_height(&chainstate, &params, 1);
@@ -19612,7 +19796,7 @@ mod tests {
             &flags,
         )
         .expect("rpc");
-        assert_eq!(dup.as_str(), Some("duplicate"));
+        assert_eq!(dup.as_str(), Some("duplicate-inconclusive"));
     }
 
     #[test]

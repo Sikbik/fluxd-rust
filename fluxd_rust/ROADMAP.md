@@ -399,7 +399,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getblocksubsidy`<br>`getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps`<br>`getmininginfo`<br>`prioritisetransaction` | `submitblock` (simplified return codes) | - |
+| `getblocksubsidy`<br>`getblocktemplate`<br>`getnetworkhashps`<br>`getnetworksolps`<br>`getlocalsolps`<br>`getmininginfo`<br>`prioritisetransaction`<br>`submitblock` | - | - |
 
 ### Fluxnode
 

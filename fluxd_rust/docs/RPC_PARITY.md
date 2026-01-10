@@ -92,7 +92,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Node control
 
 - sendfrom - Implemented (fromaccount treated as optional wallet address filter; when non-empty, restricts funding to that address and sends change back to it; minconf supported)
-- submitblock - Partial (BIP22 return values; now returns `"duplicate"` when the block hash is already known (header present) like C++; still does not surface `"duplicate-invalid"`/`"duplicate-inconclusive"` because fluxd-rust does not yet track invalid/unknown validation states; accepts full block data even when the header is already known; accepts side-chain/stale blocks by validating + storing them as unconnected block bytes; triggers chain selection by disconnecting to the best-header common ancestor and connecting any now-available unconnected blocks along the best-header chain)
+- submitblock - Implemented (BIP22-ish return values including `"duplicate-invalid"` and `"duplicate-inconclusive"`; accepts side-chain/stale blocks by validating + storing them as unconnected block bytes; triggers chain selection by disconnecting to the best-header common ancestor and connecting any now-available unconnected blocks along the best-header chain)
 - zcrawjoinsplit - Implemented (Sprout JoinSplit splice + Groth16 proof; requires shielded params)
 - zcrawreceive - Implemented (Sprout note decrypt + witness existence check; requires shielded params)
 - zcrawkeygen - Implemented (Sprout key/address generator; deprecated but useful for tooling/regtest)

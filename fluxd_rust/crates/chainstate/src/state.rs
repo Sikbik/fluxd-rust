@@ -43,8 +43,8 @@ use crate::filemeta::{
 };
 use crate::flatfiles::{FileLocation, FlatFileError, FlatFileStore};
 use crate::index::{
-    decode_header_entry, has_block as index_has_block, status_with_block, status_with_header,
-    ChainIndex, ChainTip, HeaderEntry,
+    decode_header_entry, has_block as index_has_block, status_with_block, status_with_failed,
+    status_with_header, ChainIndex, ChainTip, HeaderEntry,
 };
 use crate::metrics::{ConnectMetrics, ConnectMetricsDelta};
 use crate::shielded::{
@@ -703,6 +703,25 @@ impl<S: KeyValueStore> ChainState<S> {
             }
         }
         Ok(entry)
+    }
+
+    pub fn mark_header_failed(
+        &self,
+        batch: &mut WriteBatch,
+        hash: &fluxd_consensus::Hash256,
+    ) -> Result<(), ChainStateError> {
+        let Some(mut entry) = self.header_entry(hash)? else {
+            return Ok(());
+        };
+        if entry.is_failed() {
+            return Ok(());
+        }
+        entry.status = status_with_failed(entry.status);
+        self.index.put_header(batch, hash, &entry);
+        if let Ok(mut cache) = self.header_cache.lock() {
+            cache.insert(*hash, entry);
+        }
+        Ok(())
     }
 
     pub fn header_ancestor_hash(
