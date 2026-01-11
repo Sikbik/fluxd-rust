@@ -93,6 +93,7 @@ const RPC_MISC_ERROR: i64 = -1;
 const RPC_TYPE_ERROR: i64 = -3;
 const RPC_WALLET_ERROR: i64 = -4;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
+const RPC_WALLET_KEYPOOL_RAN_OUT: i64 = -12;
 const RPC_DESERIALIZATION_ERROR: i64 = -22;
 const RPC_TRANSACTION_ERROR: i64 = -25;
 const RPC_TRANSACTION_REJECTED: i64 = -26;
@@ -2696,6 +2697,12 @@ fn rpc_getnewaddress(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    if guard.is_encrypted() && guard.unlocked_until() == 0 && guard.keypool_size() == 0 {
+        return Err(RpcError::new(
+            RPC_WALLET_KEYPOOL_RAN_OUT,
+            "Error: Keypool ran out, please call keypoolrefill first",
+        ));
+    }
     let address = guard.generate_new_address(true).map_err(map_wallet_error)?;
     if !label.is_empty() {
         let script_pubkey = address_to_script_pubkey(&address, guard.network())
@@ -2717,6 +2724,12 @@ fn rpc_getrawchangeaddress(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result
     let mut guard = wallet
         .lock()
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    if guard.is_encrypted() && guard.unlocked_until() == 0 && guard.keypool_size() == 0 {
+        return Err(RpcError::new(
+            RPC_WALLET_KEYPOOL_RAN_OUT,
+            "Error: Keypool ran out, please call keypoolrefill first",
+        ));
+    }
     let address = guard
         .generate_new_change_address(true)
         .map_err(map_wallet_error)?;
@@ -24035,6 +24048,17 @@ mod tests {
     }
 
     #[test]
+    fn wallet_getnewaddress_errors_when_keypool_empty_and_wallet_locked() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        rpc_encryptwallet(&wallet, vec![json!("passphrase")]).expect("encryptwallet");
+
+        let err = rpc_getnewaddress(&wallet, Vec::new()).unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_KEYPOOL_RAN_OUT);
+        assert!(err.message.contains("Keypool ran out"));
+    }
+
+    #[test]
     fn wallet_getrawchangeaddress_and_dumpprivkey_roundtrip() {
         let (_chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
@@ -24052,6 +24076,17 @@ mod tests {
 
         let decoded = wif_to_secret_key(&wif, params.network);
         assert!(decoded.is_ok(), "wif should decode");
+    }
+
+    #[test]
+    fn wallet_getrawchangeaddress_errors_when_keypool_empty_and_wallet_locked() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+        rpc_encryptwallet(&wallet, vec![json!("passphrase")]).expect("encryptwallet");
+
+        let err = rpc_getrawchangeaddress(&wallet, Vec::new()).unwrap_err();
+        assert_eq!(err.code, RPC_WALLET_KEYPOOL_RAN_OUT);
+        assert!(err.message.contains("Keypool ran out"));
     }
 
     #[test]
