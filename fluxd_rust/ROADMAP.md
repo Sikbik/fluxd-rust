@@ -302,8 +302,8 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Basic vs advanced mode toggle (non-technical friendly defaults)
   - [ ] Advanced views: peers, mempool, wallet, DB/Fjall health, and live logs
     - [x] Peers view (connections + per-kind counts + net totals)
-    - [ ] Mempool view (size + recent accept/reject + orphan counters)
-    - [ ] DB/Fjall view (write buffer, compactions, per-partition segments/flushes)
+    - [x] Mempool view (size + recent accept/reject + orphan counters)
+    - [x] DB/Fjall view (write buffer, compactions, per-partition segments/flushes)
     - [ ] Wallet view (balances + key state + recent txs)
     - [ ] Logs view (in-TUI ring buffer + filters)
   - [ ] Guided setup wizard (network/data-dir/RPC auth/profile) + config file write-back

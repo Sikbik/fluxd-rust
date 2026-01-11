@@ -37,6 +37,8 @@ const UI_TICK: Duration = Duration::from_millis(200);
 enum Screen {
     Monitor,
     Peers,
+    Db,
+    Mempool,
     Help,
 }
 
@@ -98,6 +100,8 @@ struct TuiState {
     last_error: Option<String>,
     blocks_per_sec: Option<f64>,
     headers_per_sec: Option<f64>,
+    orphan_count: Option<usize>,
+    orphan_bytes: Option<usize>,
     bps_history: RateHistory,
     hps_history: RateHistory,
 }
@@ -113,6 +117,8 @@ impl TuiState {
             last_error: None,
             blocks_per_sec: None,
             headers_per_sec: None,
+            orphan_count: None,
+            orphan_bytes: None,
             bps_history: RateHistory::new(HISTORY_SAMPLES),
             hps_history: RateHistory::new(HISTORY_SAMPLES),
         }
@@ -133,7 +139,9 @@ impl TuiState {
     fn cycle_screen(&mut self) {
         self.screen = match self.screen {
             Screen::Monitor => Screen::Peers,
-            Screen::Peers => Screen::Monitor,
+            Screen::Peers => Screen::Db,
+            Screen::Db => Screen::Mempool,
+            Screen::Mempool => Screen::Monitor,
             Screen::Help => self.help_return,
         };
     }
@@ -178,6 +186,11 @@ impl TuiState {
 
     fn update_error(&mut self, err: String) {
         self.last_error = Some(err);
+    }
+
+    fn update_orphans(&mut self, orphan_count: Option<usize>, orphan_bytes: Option<usize>) {
+        self.orphan_count = orphan_count;
+        self.orphan_bytes = orphan_bytes;
     }
 }
 
@@ -246,8 +259,18 @@ pub fn run_tui(
                 Some(mempool.as_ref()),
                 Some(mempool_metrics.as_ref()),
             ) {
-                Ok(snapshot) => state.update_snapshot(snapshot),
-                Err(err) => state.update_error(err),
+                Ok(snapshot) => {
+                    state.update_snapshot(snapshot);
+                    let (orphan_count, orphan_bytes) = match mempool.lock() {
+                        Ok(guard) => (Some(guard.orphan_count()), Some(guard.orphan_bytes())),
+                        Err(_) => (None, None),
+                    };
+                    state.update_orphans(orphan_count, orphan_bytes);
+                }
+                Err(err) => {
+                    state.update_error(err);
+                    state.update_orphans(None, None);
+                }
             }
             next_sample = now + SAMPLE_INTERVAL;
         }
@@ -305,6 +328,30 @@ fn handle_key(
             state.screen = Screen::Peers;
             Ok(false)
         }
+        (KeyCode::Char('d'), _) => {
+            state.screen = Screen::Db;
+            Ok(false)
+        }
+        (KeyCode::Char('t'), _) => {
+            state.screen = Screen::Mempool;
+            Ok(false)
+        }
+        (KeyCode::Char('1'), _) => {
+            state.screen = Screen::Monitor;
+            Ok(false)
+        }
+        (KeyCode::Char('2'), _) => {
+            state.screen = Screen::Peers;
+            Ok(false)
+        }
+        (KeyCode::Char('3'), _) => {
+            state.screen = Screen::Db;
+            Ok(false)
+        }
+        (KeyCode::Char('4'), _) => {
+            state.screen = Screen::Mempool;
+            Ok(false)
+        }
         (KeyCode::Char('h'), _) => {
             state.toggle_help();
             Ok(false)
@@ -322,6 +369,8 @@ fn draw(
     match state.screen {
         Screen::Monitor => draw_monitor(frame, state),
         Screen::Peers => draw_peers(frame, state, peer_registry, net_totals),
+        Screen::Db => draw_db(frame, state),
+        Screen::Mempool => draw_mempool(frame, state),
         Screen::Help => draw_help(frame, state),
     }
 }
@@ -337,8 +386,10 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Line::raw("Keys:"),
         Line::raw("  q / Esc     Quit (requests daemon shutdown)"),
         Line::raw("  Tab         Cycle views"),
-        Line::raw("  m           Monitor view"),
-        Line::raw("  p           Peers view"),
+        Line::raw("  1 / m       Monitor view"),
+        Line::raw("  2 / p       Peers view"),
+        Line::raw("  3 / d       DB view"),
+        Line::raw("  4 / t       Mempool view"),
         Line::raw("  ? / h       Toggle help"),
         Line::raw("  a           Toggle advanced metrics"),
         Line::raw(""),
@@ -372,8 +423,8 @@ fn draw_monitor(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw(" quit  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("p", Style::default().fg(Color::Yellow)),
-        Span::raw(" peers  "),
+        Span::styled("1-4", Style::default().fg(Color::Yellow)),
+        Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
         Span::styled("a", Style::default().fg(Color::Yellow)),
@@ -533,8 +584,8 @@ fn draw_peers(
         Span::raw("  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("m", Style::default().fg(Color::Yellow)),
-        Span::raw(" monitor  "),
+        Span::styled("1-4", Style::default().fg(Color::Yellow)),
+        Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
         Span::styled("q", Style::default().fg(Color::Yellow)),
@@ -622,6 +673,241 @@ fn draw_peers(
     frame.render_widget(table, chunks[1]);
 }
 
+fn draw_db(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(10)])
+        .split(area);
+
+    let header = Line::from(vec![
+        Span::styled("fluxd-rust", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("DB", Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("Tab", Style::default().fg(Color::Yellow)),
+        Span::raw(" views  "),
+        Span::styled("1-4", Style::default().fg(Color::Yellow)),
+        Span::raw(" jump  "),
+        Span::styled("?", Style::default().fg(Color::Yellow)),
+        Span::raw(" help  "),
+        Span::styled("q", Style::default().fg(Color::Yellow)),
+        Span::raw(" quit"),
+    ]);
+
+    let mut summary = Vec::new();
+    summary.push(header);
+    match state.last_snapshot.as_ref() {
+        Some(snapshot) => {
+            let writebuf = fmt_opt_mib(snapshot.db_write_buffer_bytes);
+            let writebuf_max = fmt_opt_mib(snapshot.db_max_write_buffer_bytes);
+            let journal_bytes = fmt_opt_mib(snapshot.db_journal_disk_space_bytes);
+            let journal_max = fmt_opt_mib(snapshot.db_max_journal_bytes);
+            let journals = fmt_opt_u64(snapshot.db_journal_count);
+            let flushes = fmt_opt_u64(snapshot.db_flushes_completed);
+            let compactions_active = fmt_opt_u64(snapshot.db_active_compactions);
+            let compactions_done = fmt_opt_u64(snapshot.db_compactions_completed);
+            let compact_s = snapshot
+                .db_time_compacting_us
+                .map(|us| format!("{:.1}s", us as f64 / 1_000_000.0))
+                .unwrap_or_else(|| "-".to_string());
+
+            summary.push(Line::from(vec![
+                Span::styled("Write buffer:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {writebuf}/{writebuf_max}")),
+            ]));
+            summary.push(Line::from(vec![
+                Span::styled("Journal:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {journals}  {journal_bytes}/{journal_max}")),
+            ]));
+            summary.push(Line::from(vec![
+                Span::styled("Flushes:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {flushes}")),
+                Span::raw("  "),
+                Span::styled("Compactions:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(
+                    " active {compactions_active}  done {compactions_done}  time {compact_s}"
+                )),
+            ]));
+        }
+        None => summary.push(Line::raw("Waiting for stats...")),
+    }
+
+    if let Some(err) = state.last_error.as_ref() {
+        summary.push(Line::from(vec![
+            Span::styled("Error:", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::raw(err),
+        ]));
+    }
+
+    let summary_widget =
+        Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title("Fjall status"));
+    frame.render_widget(summary_widget, chunks[0]);
+
+    let Some(snapshot) = state.last_snapshot.as_ref() else {
+        return;
+    };
+
+    let rows = vec![
+        (
+            "utxo",
+            fmt_opt_u64(snapshot.db_utxo_segments),
+            fmt_opt_u64(snapshot.db_utxo_flushes_completed),
+        ),
+        (
+            "txindex",
+            fmt_opt_u64(snapshot.db_tx_index_segments),
+            fmt_opt_u64(snapshot.db_tx_index_flushes_completed),
+        ),
+        (
+            "spentindex",
+            fmt_opt_u64(snapshot.db_spent_index_segments),
+            fmt_opt_u64(snapshot.db_spent_index_flushes_completed),
+        ),
+        (
+            "address_outpoint",
+            fmt_opt_u64(snapshot.db_address_outpoint_segments),
+            fmt_opt_u64(snapshot.db_address_outpoint_flushes_completed),
+        ),
+        (
+            "address_delta",
+            fmt_opt_u64(snapshot.db_address_delta_segments),
+            fmt_opt_u64(snapshot.db_address_delta_flushes_completed),
+        ),
+        (
+            "header_index",
+            fmt_opt_u64(snapshot.db_header_index_segments),
+            fmt_opt_u64(snapshot.db_header_index_flushes_completed),
+        ),
+    ];
+
+    let header_row = Row::new(vec![
+        Cell::from("partition"),
+        Cell::from("segments"),
+        Cell::from("flushes"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+    .bottom_margin(1);
+
+    let table_rows = rows.into_iter().map(|(name, segments, flushes)| {
+        Row::new(vec![
+            Cell::from(name),
+            Cell::from(segments),
+            Cell::from(flushes),
+        ])
+    });
+
+    let widths = [
+        Constraint::Length(20),
+        Constraint::Length(12),
+        Constraint::Length(12),
+    ];
+    let table = Table::new(table_rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title("Partitions"))
+        .column_spacing(1);
+    frame.render_widget(table, chunks[1]);
+}
+
+fn draw_mempool(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let header = Line::from(vec![
+        Span::styled("fluxd-rust", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("Mempool", Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("Tab", Style::default().fg(Color::Yellow)),
+        Span::raw(" views  "),
+        Span::styled("1-4", Style::default().fg(Color::Yellow)),
+        Span::raw(" jump  "),
+        Span::styled("?", Style::default().fg(Color::Yellow)),
+        Span::raw(" help  "),
+        Span::styled("q", Style::default().fg(Color::Yellow)),
+        Span::raw(" quit"),
+    ]);
+
+    let mut lines = Vec::new();
+    lines.push(header);
+
+    match state.last_snapshot.as_ref() {
+        Some(snapshot) => {
+            let mempool_mb = snapshot.mempool_bytes as f64 / (1024.0 * 1024.0);
+            let mempool_cap_mb = snapshot.mempool_max_bytes as f64 / (1024.0 * 1024.0);
+            let orphan_count = state
+                .orphan_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let orphan_mb = state
+                .orphan_bytes
+                .map(|bytes| bytes as f64 / (1024.0 * 1024.0))
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "-".to_string());
+
+            lines.push(Line::from(vec![
+                Span::styled("Mempool:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(
+                    " {} tx  {:.1}/{:.0} MiB",
+                    snapshot.mempool_size, mempool_mb, mempool_cap_mb
+                )),
+                Span::raw("  "),
+                Span::styled("Orphans:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {orphan_count} tx  {orphan_mb} MiB")),
+            ]));
+
+            lines.push(Line::from(vec![
+                Span::styled("RPC:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(
+                    " accept {}  reject {}",
+                    snapshot.mempool_rpc_accept, snapshot.mempool_rpc_reject
+                )),
+                Span::raw("  "),
+                Span::styled("Relay:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(
+                    " accept {}  reject {}",
+                    snapshot.mempool_relay_accept, snapshot.mempool_relay_reject
+                )),
+            ]));
+
+            if state.advanced {
+                let evicted_mb = snapshot.mempool_evicted_bytes as f64 / (1024.0 * 1024.0);
+                let persisted_mb = snapshot.mempool_persisted_bytes as f64 / (1024.0 * 1024.0);
+                lines.push(Line::from(vec![
+                    Span::styled("Evicted:", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!(
+                        " {} ({:.2} MiB)",
+                        snapshot.mempool_evicted, evicted_mb
+                    )),
+                    Span::raw("  "),
+                    Span::styled("Loaded:", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!(
+                        " {}  (reject {})",
+                        snapshot.mempool_loaded, snapshot.mempool_load_reject
+                    )),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Persist:", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!(
+                        " writes {}  {:.2} MiB",
+                        snapshot.mempool_persisted_writes, persisted_mb
+                    )),
+                ]));
+            }
+        }
+        None => lines.push(Line::raw("Waiting for stats...")),
+    }
+
+    if let Some(err) = state.last_error.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("Error:", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::raw(err),
+        ]));
+    }
+
+    let widget = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Pool"));
+    frame.render_widget(widget, frame.area());
+}
+
 fn peer_kind_sort_key(kind: PeerKind) -> u8 {
     match kind {
         PeerKind::Block => 0,
@@ -649,4 +935,17 @@ fn shorten(value: &str, max: usize) -> String {
         .map(|(idx, _)| idx)
         .unwrap_or(trimmed.len());
     format!("{}…", trimmed[..end].trim_end())
+}
+
+fn fmt_opt_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn fmt_opt_mib(value: Option<u64>) -> String {
+    value
+        .map(|bytes| bytes as f64 / (1024.0 * 1024.0))
+        .map(|mib| format!("{mib:.0} MiB"))
+        .unwrap_or_else(|| "-".to_string())
 }
