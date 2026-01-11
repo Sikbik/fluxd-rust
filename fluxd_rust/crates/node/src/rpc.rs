@@ -2346,11 +2346,23 @@ fn rpc_listaddressgroupings<S: fluxd_storage::KeyValueStore>(
 ) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
 
-    let scripts = wallet
-        .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .all_script_pubkeys_including_watchonly()
-        .map_err(map_wallet_error)?;
+    let (scripts, labels_by_index) = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        let scripts = guard
+            .all_script_pubkeys_including_watchonly()
+            .map_err(map_wallet_error)?;
+        let labels_by_index = scripts
+            .iter()
+            .map(|script_pubkey| {
+                guard
+                    .label_for_script_pubkey(script_pubkey)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        (scripts, labels_by_index)
+    };
     if scripts.is_empty() {
         return Ok(Value::Array(Vec::new()));
     }
@@ -2521,7 +2533,7 @@ fn rpc_listaddressgroupings<S: fluxd_storage::KeyValueStore>(
             .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "balance overflow"))?;
     }
 
-    let mut groups: HashMap<usize, Vec<(String, i64)>> = HashMap::new();
+    let mut groups: HashMap<usize, Vec<(usize, String, i64)>> = HashMap::new();
     for (idx, value) in balances_zat.into_iter().enumerate() {
         if value <= 0 {
             continue;
@@ -2534,20 +2546,24 @@ fn rpc_listaddressgroupings<S: fluxd_storage::KeyValueStore>(
             continue;
         };
         let root = dsu.find(idx);
-        groups.entry(root).or_default().push((address, value));
+        groups.entry(root).or_default().push((idx, address, value));
     }
 
     let mut out_groups: Vec<Value> = Vec::new();
     for mut entries in groups.into_values() {
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
         out_groups.push(Value::Array(
             entries
                 .into_iter()
-                .map(|(address, value)| {
+                .map(|(idx, address, value)| {
+                    let label = labels_by_index
+                        .get(idx)
+                        .and_then(|label| label.as_deref())
+                        .unwrap_or("");
                     Value::Array(vec![
                         Value::String(address),
                         amount_to_value(value),
-                        Value::String(String::new()),
+                        Value::String(label.to_string()),
                     ])
                 })
                 .collect(),
@@ -25311,6 +25327,16 @@ mod tests {
         let script_a = address_to_script_pubkey(&addr_a, params.network).expect("script a");
         let script_b = address_to_script_pubkey(&addr_b, params.network).expect("script b");
 
+        {
+            let mut guard = wallet.lock().expect("wallet lock");
+            guard
+                .set_label_for_script_pubkey(script_a.clone(), "alpha".to_string())
+                .expect("set label a");
+            guard
+                .set_label_for_script_pubkey(script_b.clone(), "beta".to_string())
+                .expect("set label b");
+        }
+
         let outpoint_a = OutPoint {
             hash: [0xaau8; 32],
             index: 0,
@@ -25355,19 +25381,34 @@ mod tests {
         let groups = value.as_array().expect("array");
         assert_eq!(groups.len(), 2);
 
-        let mut totals: HashMap<String, i64> = HashMap::new();
+        let mut totals: HashMap<String, (i64, String)> = HashMap::new();
         for group in groups {
             let entries = group.as_array().expect("group array");
             for entry in entries {
                 let arr = entry.as_array().expect("entry array");
                 let address = arr[0].as_str().expect("address").to_string();
                 let amount = parse_amount(&arr[1]).expect("amount");
-                totals.insert(address, amount);
+                let label = arr.get(2).and_then(Value::as_str).unwrap_or("").to_string();
+                totals.insert(address, (amount, label));
             }
         }
 
-        assert_eq!(totals.get(&addr_a).copied(), Some(1 * COIN));
-        assert_eq!(totals.get(&addr_b).copied(), Some(2 * COIN));
+        assert_eq!(
+            totals.get(&addr_a).map(|(amount, _)| *amount),
+            Some(1 * COIN)
+        );
+        assert_eq!(
+            totals.get(&addr_b).map(|(amount, _)| *amount),
+            Some(2 * COIN)
+        );
+        assert_eq!(
+            totals.get(&addr_a).map(|(_, label)| label.as_str()),
+            Some("alpha")
+        );
+        assert_eq!(
+            totals.get(&addr_b).map(|(_, label)| label.as_str()),
+            Some("beta")
+        );
     }
 
     #[test]

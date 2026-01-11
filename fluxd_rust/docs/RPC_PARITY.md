@@ -142,7 +142,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - importprivkey - Implemented (`rescan=true` triggers `rescanblockchain` to populate wallet tx history)
 - importwallet - Implemented (imports WIFs from a wallet dump; also imports `label=` fields; triggers `rescanblockchain`)
 - keypoolrefill - Implemented (fills persisted keypool; does not create addresses)
-- listaddressgroupings - Partial (clusters co-spent inputs + wallet-owned outputs; heuristic is index-driven vs C++ wallet internals)
+- listaddressgroupings - Implemented (clusters co-spent inputs + wallet-owned outputs; index-driven heuristic; includes wallet label in the third tuple field)
 - listlockunspent - Implemented
 - listreceivedbyaddress - Implemented (transparent only; `include_watchonly` supported; `txids` populated; `account`/`label` populated from wallet address labels)
 - listsinceblock - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `include_watchonly` supported; `blockhash` parsing matches `fluxd` (`SetHex`-style leniency: invalid/unknown treated as omitted, trailing junk ignored); returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
