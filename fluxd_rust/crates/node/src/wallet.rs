@@ -2804,10 +2804,15 @@ fn scan_sapling_output(
 ) -> Option<SaplingNoteRecord> {
     let output_ref = SaplingOutputRef { output };
     for key in keys {
-        let (note, recipient, _memo) =
-            try_sapling_note_decryption(&key.ivk, &output_ref, Zip212Enforcement::GracePeriod)?;
+        let Some((note, recipient, _memo)) =
+            try_sapling_note_decryption(&key.ivk, &output_ref, Zip212Enforcement::GracePeriod)
+        else {
+            continue;
+        };
         let value_u64 = note.value().inner();
-        let value = i64::try_from(value_u64).ok()?;
+        let Ok(value) = i64::try_from(value_u64) else {
+            continue;
+        };
         let nullifier = note.nf(&key.nk, position).0;
         return Some(SaplingNoteRecord {
             address: recipient.to_bytes(),

@@ -21421,6 +21421,538 @@ mod tests {
     }
 
     #[test]
+    fn zlistunspent_and_zlistreceivedbyaddress_mark_sapling_change_by_nullifier_group() {
+        let (chainstate, params, data_dir, _taddr, coinbase_txid, coinbase_vout) =
+            setup_regtest_chain_with_p2pkh_utxo();
+        extend_regtest_chain_to_height(&chainstate, &params, COINBASE_MATURITY);
+
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let zaddr1 = rpc_zgetnewaddress(&chainstate, &wallet, Vec::new(), &params)
+            .expect("rpc")
+            .as_str()
+            .expect("zaddr string")
+            .to_string();
+
+        let (zaddr2, addr2_bytes) = {
+            let seed = [42u8; 32];
+            let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&seed);
+            let extsk_bytes = extsk.to_bytes();
+            {
+                let mut guard = wallet.lock().expect("wallet lock");
+                let imported = guard
+                    .import_sapling_extsk(extsk_bytes)
+                    .expect("import extsk");
+                assert!(imported, "sapling spending key already in wallet");
+            }
+
+            #[allow(deprecated)]
+            let extfvk = extsk.to_extended_full_viewing_key();
+            let dfvk = extfvk.to_diversifiable_full_viewing_key();
+            let (_default_index, address) = dfvk.default_address();
+            let address_bytes = address.to_bytes();
+            let hrp = bech32::Hrp::parse("zregtestsapling").expect("hrp");
+            let encoded =
+                bech32::encode::<bech32::Bech32>(hrp, address_bytes.as_slice()).expect("encode");
+            {
+                let guard = wallet.lock().expect("wallet lock");
+                assert!(
+                    guard
+                        .sapling_address_is_mine(&address_bytes)
+                        .expect("sapling is mine"),
+                    "sapling address derived from imported key should belong to wallet"
+                );
+            }
+            (encoded, address_bytes)
+        };
+
+        let addr1_bytes = parse_sapling_zaddr_bytes(&zaddr1, &params).expect("sapling bytes");
+        let to1 = PaymentAddress::from_bytes(&addr1_bytes).expect("payment address");
+        let to2 = PaymentAddress::from_bytes(&addr2_bytes).expect("payment address");
+
+        let value = block_subsidy(1, &params.consensus);
+        let note_value = NoteValue::from_raw(u64::try_from(value).expect("note value"));
+        let mut rng = rand::rngs::OsRng;
+        let mut rseed = [0u8; 32];
+        rng.fill_bytes(&mut rseed);
+        let note = to1.create_note(note_value, Rseed::AfterZip212(rseed));
+
+        let enc = sapling_note_encryption(None, note.clone(), [0u8; 512], &mut rng);
+        let epk_bytes = <SaplingDomain as Domain>::epk_bytes(enc.epk()).0;
+
+        let output = fluxd_primitives::transaction::OutputDescription {
+            cv: [0u8; 32],
+            cm: note.cmu().to_bytes(),
+            ephemeral_key: epk_bytes,
+            enc_ciphertext: enc.encrypt_note_plaintext(),
+            out_ciphertext: [0u8; fluxd_primitives::transaction::SAPLING_OUT_CIPHERTEXT_SIZE],
+            zkproof: [0u8; fluxd_primitives::transaction::GROTH_PROOF_SIZE],
+        };
+
+        let shield_tx = Transaction {
+            f_overwintered: true,
+            version: 4,
+            version_group_id: fluxd_primitives::transaction::SAPLING_VERSION_GROUP_ID,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    hash: coinbase_txid,
+                    index: coinbase_vout,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: -value,
+            shielded_spends: Vec::new(),
+            shielded_outputs: vec![output.clone()],
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let shield_txid = shield_tx.txid().expect("txid");
+
+        let flags = ValidationFlags::default();
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let spacing = params.consensus.pow_target_spacing.max(1) as u32;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let exchange_amount = exchange_fund_amount(height, &params.funding);
+        let foundation_amount = foundation_fund_amount(height, &params.funding);
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+        let mut vout = Vec::new();
+        vout.push(TxOut {
+            value: miner_value,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout.push(TxOut {
+                value: exchange_amount,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout.push(TxOut {
+                value: foundation_amount,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout.push(TxOut {
+                value: swap_amount,
+                script_pubkey: script,
+            });
+        }
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate
+            .sapling_root_after_commitments(&[output.cm])
+            .expect("sapling root");
+
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase, shield_tx],
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                &params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+                None,
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+
+        let (spend_anchor, spent_nullifier) = {
+            let mut guard = wallet.lock().expect("wallet lock");
+            guard
+                .sync_sapling_notes(&chainstate)
+                .expect("sync sapling notes");
+            let note = guard
+                .sapling_note_map()
+                .get(&(shield_txid, 0))
+                .expect("sapling note record");
+            (
+                chainstate.sapling_root().expect("sapling root"),
+                note.nullifier,
+            )
+        };
+
+        let change_amount = 100_000;
+        assert!(
+            value > change_amount,
+            "shielded note value should exceed change amount"
+        );
+        let send_amount = value - change_amount;
+
+        let send_value = NoteValue::from_raw(u64::try_from(send_amount).expect("send note value"));
+        let change_value =
+            NoteValue::from_raw(u64::try_from(change_amount).expect("change note value"));
+
+        let mut send_rseed = [0u8; 32];
+        rng.fill_bytes(&mut send_rseed);
+        let send_note = to2.create_note(send_value, Rseed::AfterZip212(send_rseed));
+        let send_enc = sapling_note_encryption(None, send_note.clone(), [0u8; 512], &mut rng);
+        let send_epk_bytes = <SaplingDomain as Domain>::epk_bytes(send_enc.epk()).0;
+        let send_output = fluxd_primitives::transaction::OutputDescription {
+            cv: [0u8; 32],
+            cm: send_note.cmu().to_bytes(),
+            ephemeral_key: send_epk_bytes,
+            enc_ciphertext: send_enc.encrypt_note_plaintext(),
+            out_ciphertext: [0u8; fluxd_primitives::transaction::SAPLING_OUT_CIPHERTEXT_SIZE],
+            zkproof: [0u8; fluxd_primitives::transaction::GROTH_PROOF_SIZE],
+        };
+
+        let mut change_rseed = [0u8; 32];
+        rng.fill_bytes(&mut change_rseed);
+        let change_note = to1.create_note(change_value, Rseed::AfterZip212(change_rseed));
+        let change_enc = sapling_note_encryption(None, change_note.clone(), [0u8; 512], &mut rng);
+        let change_epk_bytes = <SaplingDomain as Domain>::epk_bytes(change_enc.epk()).0;
+        let change_output = fluxd_primitives::transaction::OutputDescription {
+            cv: [0u8; 32],
+            cm: change_note.cmu().to_bytes(),
+            ephemeral_key: change_epk_bytes,
+            enc_ciphertext: change_enc.encrypt_note_plaintext(),
+            out_ciphertext: [0u8; fluxd_primitives::transaction::SAPLING_OUT_CIPHERTEXT_SIZE],
+            zkproof: [0u8; fluxd_primitives::transaction::GROTH_PROOF_SIZE],
+        };
+
+        let spend_desc = fluxd_primitives::transaction::SpendDescription {
+            cv: [0u8; 32],
+            anchor: spend_anchor,
+            nullifier: spent_nullifier,
+            rk: [0u8; 32],
+            zkproof: [0u8; fluxd_primitives::transaction::GROTH_PROOF_SIZE],
+            spend_auth_sig: [0u8; 64],
+        };
+
+        let spend_tx = Transaction {
+            f_overwintered: true,
+            version: 4,
+            version_group_id: fluxd_primitives::transaction::SAPLING_VERSION_GROUP_ID,
+            vin: Vec::new(),
+            vout: Vec::new(),
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: vec![spend_desc],
+            shielded_outputs: vec![send_output.clone(), change_output.clone()],
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let spend_txid = spend_tx.txid().expect("spend txid");
+
+        let tip = chainstate
+            .best_block()
+            .expect("best block")
+            .expect("best block present");
+        let tip_entry = chainstate
+            .header_entry(&tip.hash)
+            .expect("header entry")
+            .expect("header entry present");
+        let height = tip.height + 1;
+        let time = tip_entry.time.saturating_add(spacing);
+        let bits = chainstate
+            .next_work_required_bits(&tip.hash, height, time as i64, &params.consensus)
+            .expect("next bits");
+
+        let miner_value = block_subsidy(height, &params.consensus);
+        let exchange_amount = exchange_fund_amount(height, &params.funding);
+        let foundation_amount = foundation_fund_amount(height, &params.funding);
+        let swap_amount = swap_pool_amount(height as i64, &params.swap_pool);
+
+        let mut vout = Vec::new();
+        vout.push(TxOut {
+            value: miner_value,
+            script_pubkey: Vec::new(),
+        });
+        if exchange_amount > 0 {
+            let script = address_to_script_pubkey(params.funding.exchange_address, params.network)
+                .expect("exchange address script");
+            vout.push(TxOut {
+                value: exchange_amount,
+                script_pubkey: script,
+            });
+        }
+        if foundation_amount > 0 {
+            let script =
+                address_to_script_pubkey(params.funding.foundation_address, params.network)
+                    .expect("foundation address script");
+            vout.push(TxOut {
+                value: foundation_amount,
+                script_pubkey: script,
+            });
+        }
+        if swap_amount > 0 {
+            let script = address_to_script_pubkey(params.swap_pool.address, params.network)
+                .expect("swap pool address script");
+            vout.push(TxOut {
+                value: swap_amount,
+                script_pubkey: script,
+            });
+        }
+        let coinbase = Transaction {
+            f_overwintered: false,
+            version: 1,
+            version_group_id: 0,
+            vin: vec![TxIn {
+                prevout: OutPoint::null(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vout,
+            lock_time: 0,
+            expiry_height: 0,
+            value_balance: 0,
+            shielded_spends: Vec::new(),
+            shielded_outputs: Vec::new(),
+            join_splits: Vec::new(),
+            join_split_pub_key: [0u8; 32],
+            join_split_sig: [0u8; 64],
+            binding_sig: [0u8; 64],
+            fluxnode: None,
+        };
+        let coinbase_txid = coinbase.txid().expect("coinbase txid");
+        let final_sapling_root = chainstate
+            .sapling_root_after_commitments(&[send_output.cm, change_output.cm])
+            .expect("sapling root");
+
+        let header = BlockHeader {
+            version: CURRENT_VERSION,
+            prev_block: tip.hash,
+            merkle_root: coinbase_txid,
+            final_sapling_root,
+            time,
+            bits,
+            nonce: [0u8; 32],
+            solution: Vec::new(),
+            nodes_collateral: OutPoint::null(),
+            block_sig: Vec::new(),
+        };
+
+        let mut header_batch = WriteBatch::new();
+        chainstate
+            .insert_headers_batch_with_pow(
+                &[header.clone()],
+                &params.consensus,
+                &mut header_batch,
+                false,
+            )
+            .expect("insert header");
+        chainstate
+            .commit_batch(header_batch)
+            .expect("commit header");
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase, spend_tx],
+        };
+        let block_bytes = block.consensus_encode().expect("encode block");
+        let batch = chainstate
+            .connect_block(
+                &block,
+                height,
+                &params,
+                &flags,
+                true,
+                None,
+                None,
+                Some(block_bytes.as_slice()),
+                None,
+            )
+            .expect("connect block");
+        chainstate.commit_batch(batch).expect("commit block");
+
+        let mempool = Mutex::new(Mempool::new(0));
+        let unspent = rpc_zlistunspent(
+            &chainstate,
+            &mempool,
+            &wallet,
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                json!([zaddr1.clone(), zaddr2.clone()]),
+            ],
+            &params,
+        )
+        .expect("rpc");
+        let list = unspent.as_array().expect("array");
+
+        let addr1_entry = list
+            .iter()
+            .find(|entry| entry.get("address").and_then(Value::as_str) == Some(zaddr1.as_str()))
+            .and_then(Value::as_object)
+            .expect("zaddr1 entry");
+        assert_eq!(
+            addr1_entry.get("amountZat").and_then(Value::as_i64),
+            Some(change_amount)
+        );
+        assert_eq!(
+            addr1_entry.get("change").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let addr2_entry = list
+            .iter()
+            .find(|entry| entry.get("address").and_then(Value::as_str) == Some(zaddr2.as_str()))
+            .and_then(Value::as_object)
+            .expect("zaddr2 entry");
+        assert_eq!(
+            addr2_entry.get("amountZat").and_then(Value::as_i64),
+            Some(send_amount)
+        );
+        assert_eq!(
+            addr2_entry.get("change").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(list.len(), 2);
+
+        let received =
+            rpc_zlistreceivedbyaddress(&chainstate, &wallet, vec![json!(zaddr1.clone())], &params)
+                .expect("rpc");
+        let list = received.as_array().expect("array");
+        assert_eq!(list.len(), 2);
+
+        let shield_txid_hex = hash256_to_hex(&shield_txid);
+        let spend_txid_hex = hash256_to_hex(&spend_txid);
+        let original_entry = list
+            .iter()
+            .find(|entry| {
+                entry.get("txid").and_then(Value::as_str) == Some(shield_txid_hex.as_str())
+                    && entry.get("outindex").and_then(Value::as_u64) == Some(0)
+            })
+            .and_then(Value::as_object)
+            .expect("original note entry");
+        assert_eq!(
+            original_entry.get("change").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            original_entry.get("spent").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let change_entry = list
+            .iter()
+            .find(|entry| {
+                entry.get("txid").and_then(Value::as_str) == Some(spend_txid_hex.as_str())
+                    && entry.get("outindex").and_then(Value::as_u64) == Some(1)
+            })
+            .and_then(Value::as_object)
+            .expect("change note entry");
+        assert_eq!(
+            change_entry.get("amountZat").and_then(Value::as_i64),
+            Some(change_amount)
+        );
+        assert_eq!(
+            change_entry.get("change").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            change_entry.get("spent").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let received =
+            rpc_zlistreceivedbyaddress(&chainstate, &wallet, vec![json!(zaddr2.clone())], &params)
+                .expect("rpc");
+        let list = received.as_array().expect("array");
+        assert_eq!(list.len(), 1);
+        let entry = list[0].as_object().expect("object");
+        assert_eq!(
+            entry.get("txid").and_then(Value::as_str),
+            Some(spend_txid_hex.as_str())
+        );
+        assert_eq!(entry.get("outindex").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            entry.get("amountZat").and_then(Value::as_i64),
+            Some(send_amount)
+        );
+        assert_eq!(entry.get("change").and_then(Value::as_bool), Some(false));
+        assert_eq!(entry.get("spent").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
     fn zgetbalance_supports_watchonly_transparent_addresses() {
         let (chainstate, params, data_dir, taddr, _coinbase_txid, _coinbase_vout) =
             setup_regtest_chain_with_p2pkh_utxo();

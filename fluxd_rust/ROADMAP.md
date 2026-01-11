@@ -362,6 +362,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] VPS progress gate (`scripts/progress_gate.sh`) to detect stalls/regressions during sync
   - [x] VPS watchdog loop (`scripts/longrun_watchdog.sh`) to combine stall detection + fatal log pattern checks
 - [x] [P1] Shielded wallet RPC smoke test (`scripts/shielded_wallet_smoke_test.sh`) (owner: TBD)
+- [x] [P1] Sapling change-indicator regression test (multi-key wallet scan) (owner: TBD)
 - [x] [P1] Reorg and fork simulation tests (owner: TBD)
 - [x] [P2] Snapshot/fast-sync evaluation (optional) (owner: TBD)
 - [x] [P2] Performance profiling harness (owner: TBD)
