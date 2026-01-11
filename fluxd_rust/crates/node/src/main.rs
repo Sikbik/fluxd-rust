@@ -48,6 +48,7 @@ mod p2p_server;
 mod peer_book;
 mod rpc;
 mod stats;
+mod tui;
 mod tx_relay;
 mod verify_chain;
 mod wallet;
@@ -295,6 +296,7 @@ struct Config {
     mempool_persist_interval_secs: u64,
     fee_estimates_persist_interval_secs: u64,
     status_interval_secs: u64,
+    tui: bool,
     dashboard_addr: Option<SocketAddr>,
     db_cache_bytes: Option<u64>,
     db_write_buffer_bytes: Option<u64>,
@@ -1656,6 +1658,38 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         start_time,
         status_interval_secs,
     );
+
+    if config.tui {
+        let chainstate = Arc::clone(&chainstate);
+        let store = Arc::clone(&store);
+        let sync_metrics = Arc::clone(&sync_metrics);
+        let header_metrics = Arc::clone(&header_metrics);
+        let validation_metrics = Arc::clone(&validation_metrics);
+        let connect_metrics = Arc::clone(&connect_metrics);
+        let mempool = Arc::clone(&mempool);
+        let mempool_metrics = Arc::clone(&mempool_metrics);
+        let shutdown_rx = shutdown_rx.clone();
+        let shutdown_tx = shutdown_tx.clone();
+        thread::spawn(move || {
+            if let Err(err) = tui::run_tui(
+                chainstate,
+                store,
+                sync_metrics,
+                header_metrics,
+                validation_metrics,
+                connect_metrics,
+                mempool,
+                mempool_metrics,
+                network,
+                backend,
+                start_time,
+                shutdown_rx,
+                shutdown_tx,
+            ) {
+                log_warn!("TUI exited: {err}");
+            }
+        });
+    }
     if let Some(addr) = dashboard_addr {
         let chainstate = Arc::clone(&chainstate);
         let store = Arc::clone(&store);
@@ -7621,6 +7655,7 @@ where
     let mut check_script = true;
     let mut log_level = logging::Level::Info;
     let mut log_level_set = false;
+    let mut log_level_explicit = false;
     let mut log_format = logging::Format::Text;
     let mut log_format_set = false;
     let mut log_timestamps = true;
@@ -7672,6 +7707,7 @@ where
     let mut fee_estimates_persist_interval_set = false;
     let mut status_interval_secs: u64 = 15;
     let mut status_interval_set = false;
+    let mut tui = false;
     let mut dashboard_addr: Option<SocketAddr> = None;
     let mut db_cache_mb: u64 = DEFAULT_DB_CACHE_MB;
     let mut db_cache_set = false;
@@ -7866,6 +7902,7 @@ where
                 log_level = logging::Level::parse(&value)
                     .ok_or_else(|| format!("invalid log level '{value}'\n{}", usage()))?;
                 log_level_set = true;
+                log_level_explicit = true;
             }
             "--log-format" | "--logformat" => {
                 let value = args
@@ -8119,6 +8156,9 @@ where
                     .parse::<u64>()
                     .map_err(|_| format!("invalid status interval '{value}'\n{}", usage()))?;
                 status_interval_set = true;
+            }
+            "--tui" => {
+                tui = true;
             }
             "--db-cache-mb" => {
                 let value = args
@@ -8480,6 +8520,7 @@ where
                     log_level = logging::Level::parse(raw).ok_or_else(|| {
                         format!("invalid loglevel '{raw}' in {}", conf_file.display())
                     })?;
+                    log_level_explicit = true;
                 }
             }
         }
@@ -8705,6 +8746,15 @@ where
     let db_flush_workers = Some(db_flush_workers);
     let db_compaction_workers = Some(db_compaction_workers);
 
+    if tui {
+        if !log_level_explicit {
+            log_level = logging::Level::Warn;
+        }
+        if !status_interval_set {
+            status_interval_secs = 0;
+        }
+    }
+
     Ok(CliAction::Run(Config {
         backend,
         data_dir,
@@ -8753,6 +8803,7 @@ where
         mempool_persist_interval_secs,
         fee_estimates_persist_interval_secs,
         status_interval_secs,
+        tui,
         dashboard_addr,
         db_cache_bytes,
         db_write_buffer_bytes,
@@ -9101,6 +9152,7 @@ fn usage() -> String {
         "  --mempool-persist-interval  Persist mempool to disk every N seconds (0 disables, default: 60)",
         "  --fee-estimates-persist-interval  Persist fee estimates every N seconds (0 disables, default: 300)",
         "  --status-interval  Status log interval in seconds (default: 15, 0 disables)",
+        "  --tui  Launch terminal UI monitor (press q to quit; lowers default log noise)",
         "  --db-cache-mb  Fjall block cache size in MiB (default: 256)",
         "  --db-write-buffer-mb  Fjall max write buffer in MiB (default: 2048)",
         "  --db-journal-mb  Fjall max journaling size in MiB (default: 2048)",

@@ -296,6 +296,14 @@ Owner format: `owner: <name>` or `owner: TBD`.
 
 ## UX, ops, and tooling
 
+- [ ] [P2] Next-gen TUI (optional terminal UI) (owner: TBD)
+  - [x] Add `--tui` flag (and/or `fluxd tui`) to launch the TUI monitor
+  - [x] Monitor view: sync state + historical b/s + h/s chart (trading-style)
+  - [x] Basic vs advanced mode toggle (non-technical friendly defaults)
+  - [ ] Advanced views: peers, mempool, wallet, DB/Fjall health, and live logs
+  - [ ] Guided setup wizard (network/data-dir/RPC auth/profile) + config file write-back
+  - [ ] Optional remote attach mode (read-only via `/stats`/`/metrics`)
+  - [ ] Document TUI usage + screenshots in `docs/`
 - [x] [P2] Sync/run profiles (`--profile low|default|high`) for worker + DB presets (owner: TBD)
 - [x] [P1] Data-dir lock file (`--data-dir/.lock`) to prevent multi-instance corruption (owner: TBD)
 - [x] [P2] Graceful shutdown on SIGINT/SIGTERM (owner: TBD)
