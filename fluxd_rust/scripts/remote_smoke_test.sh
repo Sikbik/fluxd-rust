@@ -260,7 +260,7 @@ rpc_get "validateaddress?address=notanaddress" | python3 -c 'import json,sys; ob
 
 echo "Checking wallet encryption/locking ..."
 rpc_post "encryptwallet" '["test-passphrase"]' | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
-rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
+rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-13, obj'
 rpc_post "walletpassphrase" '["test-passphrase", 15]' | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
 wif1="$(rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj; print(obj.get("result",""))')"
 if [[ -z "$wif1" ]]; then
@@ -273,7 +273,7 @@ if [[ -z "$wif2" ]]; then
   exit 1
 fi
 rpc_get "walletlock" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("error") is None, obj'
-rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-4, obj'
+rpc_get "dumpprivkey?address=${taddr}" | python3 -c 'import json,sys; obj=json.load(sys.stdin); err=obj.get("error") or {}; assert err.get("code")==-13, obj'
 
 echo "Checking startfluxnode schema ..."
 fluxnode_wif="$(rpc_get "createfluxnodekey" | python3 -c 'import json,sys; obj=json.load(sys.stdin); print(obj.get("result",""))')"

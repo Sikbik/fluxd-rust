@@ -94,6 +94,7 @@ const RPC_TYPE_ERROR: i64 = -3;
 const RPC_WALLET_ERROR: i64 = -4;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 const RPC_WALLET_KEYPOOL_RAN_OUT: i64 = -12;
+const RPC_WALLET_UNLOCK_NEEDED: i64 = -13;
 const RPC_DESERIALIZATION_ERROR: i64 = -22;
 const RPC_TRANSACTION_ERROR: i64 = -25;
 const RPC_TRANSACTION_REJECTED: i64 = -26;
@@ -2592,6 +2593,10 @@ fn rpc_listaddressgroupings<S: fluxd_storage::KeyValueStore>(
 
 fn map_wallet_error(err: WalletError) -> RpcError {
     match err {
+        WalletError::WalletLocked => RpcError::new(
+            RPC_WALLET_UNLOCK_NEEDED,
+            "Error: Please enter the wallet passphrase with walletpassphrase first.",
+        ),
         WalletError::InvalidData("invalid wif") => {
             RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "invalid private key encoding")
         }
@@ -14793,10 +14798,7 @@ fn rpc_startdeterministicfluxnode<S: fluxd_storage::KeyValueStore>(
         ) {
             Ok(resolved) => resolved,
             Err(err) => {
-                if collateral_wif.is_none()
-                    && err.code == RPC_WALLET_ERROR
-                    && err.message == "wallet is locked"
-                {
+                if collateral_wif.is_none() && err.code == RPC_WALLET_UNLOCK_NEEDED {
                     return Err(err);
                 }
                 failed = 1;
@@ -15030,10 +15032,7 @@ fn rpc_startfluxnode<S: fluxd_storage::KeyValueStore>(
             ) {
                 Ok(resolved) => resolved,
                 Err(err) => {
-                    if collateral_wif.is_none()
-                        && err.code == RPC_WALLET_ERROR
-                        && err.message == "wallet is locked"
-                    {
+                    if collateral_wif.is_none() && err.code == RPC_WALLET_UNLOCK_NEEDED {
                         return Err(err);
                     }
                     failed += 1;

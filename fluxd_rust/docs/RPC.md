@@ -67,6 +67,7 @@ Type notes:
 - `-32700` parse error
 - `-8` invalid parameter
 - `-12` keypool ran out
+- `-13` wallet unlock needed
 - `-4` wallet error
 - `-5` invalid address or key
 
