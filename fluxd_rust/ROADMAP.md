@@ -275,7 +275,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] `zgetbalance` (Sapling only; scans chain for Sapling notes; excludes notes spent by mempool txs; supports watch-only via `includeWatchonly`)
   - [x] `zgettotalbalance` (Sapling only for private balance; scans chain for Sapling notes; excludes notes spent by mempool txs; supports watch-only via `includeWatchonly`)
   - [x] `zlistunspent` (Sapling only; lists unspent Sapling notes; excludes notes spent by mempool txs; supports watch-only via `includeWatchonly`)
-  - [x] `zlistreceivedbyaddress` (Sapling only; lists received Sapling notes; supports watch-only via `includeWatchonly`)
+  - [x] `zlistreceivedbyaddress` (Sapling only; lists received Sapling notes; watch-only is allowed by default like C++)
   - [x] `zlistoperationids` (tracks async ops; `zgetoperationresult` removes completed ops)
   - [x] `zgetoperationstatus` (tracks async ops; supports optional filter)
   - [x] `zgetoperationresult` (returns completed ops and removes them)

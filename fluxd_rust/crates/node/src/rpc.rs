@@ -7996,10 +7996,10 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
-    if params.is_empty() || params.len() > 3 {
+    if params.is_empty() || params.len() > 2 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
-            "zlistreceivedbyaddress expects 1 to 3 parameters",
+            "zlistreceivedbyaddress expects 1 to 2 parameters",
         ));
     }
 
@@ -8010,17 +8010,6 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
         Some(value) if !value.is_null() => parse_u32(value, "minconf")? as i32,
         _ => 1,
     };
-    let include_watchonly = match params.get(2) {
-        Some(Value::Bool(value)) => *value,
-        Some(Value::Null) | None => false,
-        Some(_) => {
-            return Err(RpcError::new(
-                RPC_INVALID_PARAMETER,
-                "includeWatchonly must be a boolean",
-            ));
-        }
-    };
-
     let addr_bytes = parse_sapling_zaddr_bytes(address, chain_params)?;
 
     #[derive(Clone)]
@@ -8053,12 +8042,6 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
             return Err(RpcError::new(
                 RPC_WALLET_ERROR,
                 "Wallet does not hold private key or viewing key for this zaddr",
-            ));
-        }
-        if !is_mine && !include_watchonly {
-            return Err(RpcError::new(
-                RPC_WALLET_ERROR,
-                "Wallet does not hold private key for this zaddr",
             ));
         }
 
