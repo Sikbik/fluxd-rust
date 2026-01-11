@@ -1668,6 +1668,8 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         let connect_metrics = Arc::clone(&connect_metrics);
         let mempool = Arc::clone(&mempool);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let net_totals = Arc::clone(&net_totals);
+        let peer_registry = Arc::clone(&peer_registry);
         let shutdown_rx = shutdown_rx.clone();
         let shutdown_tx = shutdown_tx.clone();
         thread::spawn(move || {
@@ -1680,6 +1682,8 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                 connect_metrics,
                 mempool,
                 mempool_metrics,
+                net_totals,
+                peer_registry,
                 network,
                 backend,
                 start_time,

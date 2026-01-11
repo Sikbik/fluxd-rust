@@ -301,6 +301,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
   - [x] Monitor view: sync state + historical b/s + h/s chart (trading-style)
   - [x] Basic vs advanced mode toggle (non-technical friendly defaults)
   - [ ] Advanced views: peers, mempool, wallet, DB/Fjall health, and live logs
+    - [x] Peers view (connections + per-kind counts + net totals)
+    - [ ] Mempool view (size + recent accept/reject + orphan counters)
+    - [ ] DB/Fjall view (write buffer, compactions, per-partition segments/flushes)
+    - [ ] Wallet view (balances + key state + recent txs)
+    - [ ] Logs view (in-TUI ring buffer + filters)
   - [ ] Guided setup wizard (network/data-dir/RPC auth/profile) + config file write-back
   - [ ] Optional remote attach mode (read-only via `/stats`/`/metrics`)
   - [ ] Document TUI usage + screenshots in `docs/`

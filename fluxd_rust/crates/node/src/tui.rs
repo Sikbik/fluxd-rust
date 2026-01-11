@@ -13,7 +13,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table,
+};
 use ratatui::Terminal;
 use tokio::sync::watch;
 
@@ -23,6 +25,7 @@ use fluxd_chainstate::validation::ValidationMetrics;
 use fluxd_consensus::params::Network;
 
 use crate::mempool::Mempool;
+use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::stats::{self, HeaderMetrics, MempoolMetrics, StatsSnapshot, SyncMetrics};
 use crate::{Backend, Store};
 
@@ -33,6 +36,7 @@ const UI_TICK: Duration = Duration::from_millis(200);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
     Monitor,
+    Peers,
     Help,
 }
 
@@ -87,6 +91,7 @@ impl RateHistory {
 
 struct TuiState {
     screen: Screen,
+    help_return: Screen,
     advanced: bool,
     last_snapshot: Option<StatsSnapshot>,
     last_rate_snapshot: Option<StatsSnapshot>,
@@ -101,6 +106,7 @@ impl TuiState {
     fn new() -> Self {
         Self {
             screen: Screen::Monitor,
+            help_return: Screen::Monitor,
             advanced: false,
             last_snapshot: None,
             last_rate_snapshot: None,
@@ -113,9 +119,22 @@ impl TuiState {
     }
 
     fn toggle_help(&mut self) {
+        match self.screen {
+            Screen::Help => {
+                self.screen = self.help_return;
+            }
+            other => {
+                self.help_return = other;
+                self.screen = Screen::Help;
+            }
+        }
+    }
+
+    fn cycle_screen(&mut self) {
         self.screen = match self.screen {
-            Screen::Monitor => Screen::Help,
-            Screen::Help => Screen::Monitor,
+            Screen::Monitor => Screen::Peers,
+            Screen::Peers => Screen::Monitor,
+            Screen::Help => self.help_return,
         };
     }
 
@@ -190,6 +209,8 @@ pub fn run_tui(
     connect_metrics: Arc<ConnectMetrics>,
     mempool: Arc<Mutex<Mempool>>,
     mempool_metrics: Arc<MempoolMetrics>,
+    net_totals: Arc<NetTotals>,
+    peer_registry: Arc<PeerRegistry>,
     network: Network,
     storage_backend: Backend,
     start_time: Instant,
@@ -232,7 +253,7 @@ pub fn run_tui(
         }
 
         terminal
-            .draw(|frame| draw(frame, &state))
+            .draw(|frame| draw(frame, &state, peer_registry.as_ref(), net_totals.as_ref()))
             .map_err(|err| err.to_string())?;
 
         if event::poll(UI_TICK).map_err(|err| err.to_string())? {
@@ -269,20 +290,38 @@ fn handle_key(
             Ok(false)
         }
         (KeyCode::Tab, _) => {
-            state.toggle_help();
+            state.cycle_screen();
             Ok(false)
         }
         (KeyCode::Char('a'), _) => {
             state.toggle_advanced();
             Ok(false)
         }
+        (KeyCode::Char('m'), _) => {
+            state.screen = Screen::Monitor;
+            Ok(false)
+        }
+        (KeyCode::Char('p'), _) => {
+            state.screen = Screen::Peers;
+            Ok(false)
+        }
+        (KeyCode::Char('h'), _) => {
+            state.toggle_help();
+            Ok(false)
+        }
         _ => Ok(false),
     }
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+fn draw(
+    frame: &mut ratatui::Frame<'_>,
+    state: &TuiState,
+    peer_registry: &PeerRegistry,
+    net_totals: &NetTotals,
+) {
     match state.screen {
         Screen::Monitor => draw_monitor(frame, state),
+        Screen::Peers => draw_peers(frame, state, peer_registry, net_totals),
         Screen::Help => draw_help(frame, state),
     }
 }
@@ -297,7 +336,10 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Line::raw(""),
         Line::raw("Keys:"),
         Line::raw("  q / Esc     Quit (requests daemon shutdown)"),
-        Line::raw("  Tab / ?     Toggle help"),
+        Line::raw("  Tab         Cycle views"),
+        Line::raw("  m           Monitor view"),
+        Line::raw("  p           Peers view"),
+        Line::raw("  ? / h       Toggle help"),
         Line::raw("  a           Toggle advanced metrics"),
         Line::raw(""),
         Line::raw("Notes:"),
@@ -328,6 +370,10 @@ fn draw_monitor(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw("  "),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::raw(" quit  "),
+        Span::styled("Tab", Style::default().fg(Color::Yellow)),
+        Span::raw(" views  "),
+        Span::styled("p", Style::default().fg(Color::Yellow)),
+        Span::raw(" peers  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
         Span::styled("a", Style::default().fg(Color::Yellow)),
@@ -453,4 +499,154 @@ fn draw_monitor(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         );
 
     frame.render_widget(chart, chunks[1]);
+}
+
+fn draw_peers(
+    frame: &mut ratatui::Frame<'_>,
+    state: &TuiState,
+    peer_registry: &PeerRegistry,
+    net_totals: &NetTotals,
+) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(10)])
+        .split(area);
+
+    let totals = net_totals.snapshot();
+    let peers = peer_registry.snapshot();
+    let mut block_peers = 0usize;
+    let mut header_peers = 0usize;
+    let mut relay_peers = 0usize;
+    for peer in &peers {
+        match peer.kind {
+            PeerKind::Block => block_peers += 1,
+            PeerKind::Header => header_peers += 1,
+            PeerKind::Relay => relay_peers += 1,
+        }
+    }
+
+    let header = Line::from(vec![
+        Span::styled("fluxd-rust", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("Peers", Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("Tab", Style::default().fg(Color::Yellow)),
+        Span::raw(" views  "),
+        Span::styled("m", Style::default().fg(Color::Yellow)),
+        Span::raw(" monitor  "),
+        Span::styled("?", Style::default().fg(Color::Yellow)),
+        Span::raw(" help  "),
+        Span::styled("q", Style::default().fg(Color::Yellow)),
+        Span::raw(" quit"),
+    ]);
+
+    let recv_mb = totals.bytes_recv as f64 / (1024.0 * 1024.0);
+    let sent_mb = totals.bytes_sent as f64 / (1024.0 * 1024.0);
+    let mut summary = Vec::new();
+    summary.push(header);
+    summary.push(Line::from(vec![
+        Span::styled("Connections:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(
+            " {}  (block {block_peers}  header {header_peers}  relay {relay_peers})",
+            totals.connections
+        )),
+    ]));
+    summary.push(Line::from(vec![
+        Span::styled("Net totals:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" recv {:.1} MiB  sent {:.1} MiB", recv_mb, sent_mb)),
+    ]));
+    if let Some(snapshot) = state.last_snapshot.as_ref() {
+        summary.push(Line::from(vec![
+            Span::styled("Tip:", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                " headers {}  blocks {}",
+                snapshot.best_header_height, snapshot.best_block_height
+            )),
+        ]));
+    }
+
+    let summary_widget =
+        Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title("Network"));
+    frame.render_widget(summary_widget, chunks[0]);
+
+    let mut rows = peers;
+    rows.sort_by(|a, b| {
+        let kind_a = peer_kind_sort_key(a.kind);
+        let kind_b = peer_kind_sort_key(b.kind);
+        kind_a
+            .cmp(&kind_b)
+            .then_with(|| a.inbound.cmp(&b.inbound))
+            .then_with(|| a.addr.cmp(&b.addr))
+    });
+
+    let max_rows = chunks[1].height.saturating_sub(3) as usize;
+    rows.truncate(max_rows);
+
+    let header_row = Row::new(vec![
+        Cell::from("kind"),
+        Cell::from("dir"),
+        Cell::from("addr"),
+        Cell::from("height"),
+        Cell::from("ver"),
+        Cell::from("ua"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+    .bottom_margin(1);
+
+    let table_rows = rows.into_iter().map(|peer| {
+        let dir = if peer.inbound { "in" } else { "out" };
+        let ua = shorten(&peer.user_agent, 32);
+        Row::new(vec![
+            Cell::from(peer_kind_label(peer.kind)),
+            Cell::from(dir),
+            Cell::from(peer.addr.to_string()),
+            Cell::from(peer.start_height.to_string()),
+            Cell::from(peer.version.to_string()),
+            Cell::from(ua),
+        ])
+    });
+
+    let widths = [
+        Constraint::Length(6),
+        Constraint::Length(4),
+        Constraint::Length(22),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Min(10),
+    ];
+    let table = Table::new(table_rows, widths)
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title("Peer list"))
+        .column_spacing(1);
+    frame.render_widget(table, chunks[1]);
+}
+
+fn peer_kind_sort_key(kind: PeerKind) -> u8 {
+    match kind {
+        PeerKind::Block => 0,
+        PeerKind::Header => 1,
+        PeerKind::Relay => 2,
+    }
+}
+
+fn peer_kind_label(kind: PeerKind) -> &'static str {
+    match kind {
+        PeerKind::Block => "block",
+        PeerKind::Header => "header",
+        PeerKind::Relay => "relay",
+    }
+}
+
+fn shorten(value: &str, max: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= max {
+        return trimmed.to_string();
+    }
+    let end = trimmed
+        .char_indices()
+        .nth(max)
+        .map(|(idx, _)| idx)
+        .unwrap_or(trimmed.len());
+    format!("{}…", trimmed[..end].trim_end())
 }
