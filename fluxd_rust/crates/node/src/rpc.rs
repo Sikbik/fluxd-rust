@@ -6842,6 +6842,19 @@ fn read_sapling_output_by_key<S: fluxd_storage::KeyValueStore>(
     txid: &Hash256,
     out_index: u32,
 ) -> Result<fluxd_primitives::transaction::OutputDescription, RpcError> {
+    let tx = read_transaction_by_id(chainstate, txid)?;
+    let idx = usize::try_from(out_index)
+        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "output index out of range"))?;
+    tx.shielded_outputs
+        .get(idx)
+        .cloned()
+        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "sapling output not found"))
+}
+
+fn read_transaction_by_id<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+    txid: &Hash256,
+) -> Result<Transaction, RpcError> {
     let location = chainstate
         .tx_location(txid)
         .map_err(map_internal)?
@@ -6855,7 +6868,8 @@ fn read_sapling_output_by_key<S: fluxd_storage::KeyValueStore>(
         .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid tx location"))?;
     let tx = block
         .transactions
-        .get(tx_index)
+        .into_iter()
+        .nth(tx_index)
         .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "missing transaction in block"))?;
     let actual_txid = tx
         .txid()
@@ -6866,12 +6880,7 @@ fn read_sapling_output_by_key<S: fluxd_storage::KeyValueStore>(
             "tx index mismatch (reorg?)",
         ));
     }
-    let idx = usize::try_from(out_index)
-        .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "output index out of range"))?;
-    tx.shielded_outputs
-        .get(idx)
-        .cloned()
-        .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "sapling output not found"))
+    Ok(tx)
 }
 
 #[derive(Clone)]
@@ -7743,12 +7752,21 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
     };
     let filter_addresses: HashSet<[u8; 43]> = match params.get(3) {
         Some(Value::Array(values)) => {
+            if values.is_empty() {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "addresses array is empty",
+                ));
+            }
             let mut out = HashSet::new();
             for value in values {
                 let addr = value.as_str().ok_or_else(|| {
                     RpcError::new(RPC_INVALID_PARAMETER, "addresses must be strings")
                 })?;
-                out.insert(parse_sapling_zaddr_bytes(addr, chain_params)?);
+                let bytes = parse_sapling_zaddr_bytes(addr, chain_params)?;
+                if !out.insert(bytes) {
+                    return Err(RpcError::new(RPC_INVALID_PARAMETER, "duplicated address"));
+                }
             }
             out
         }
@@ -7769,7 +7787,11 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
         spendable: bool,
     }
 
-    let notes: Vec<NoteRow> = {
+    let (notes, ivk_by_address, nullifier_set): (
+        Vec<NoteRow>,
+        HashMap<[u8; 43], PreparedIncomingViewingKey>,
+        HashSet<([u8; 43], [u8; 32])>,
+    ) = {
         let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -7778,6 +7800,22 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
             .map_err(map_wallet_error)?;
 
         let mut out = Vec::new();
+        let mut address_set = HashSet::new();
+
+        if !include_watchonly && !filter_addresses.is_empty() {
+            for address in &filter_addresses {
+                let is_mine = guard
+                    .sapling_address_is_mine(address)
+                    .map_err(map_wallet_error)?;
+                if !is_mine {
+                    return Err(RpcError::new(
+                        RPC_INVALID_PARAMETER,
+                        "spending key for address does not belong to wallet",
+                    ));
+                }
+            }
+        }
+
         for (&(txid, out_index), note) in guard.sapling_note_map() {
             if !filter_addresses.is_empty() && !filter_addresses.contains(&note.address) {
                 continue;
@@ -7788,12 +7826,8 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
             if !include_watchonly && !is_mine {
                 continue;
             }
-            let spendable = match guard.sapling_extsk_for_address(&note.address) {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
-                Err(WalletError::WalletLocked) => false,
-                Err(err) => return Err(map_wallet_error(err)),
-            };
+            let spendable = is_mine;
+            address_set.insert(note.address);
             out.push(NoteRow {
                 txid,
                 out_index,
@@ -7801,7 +7835,54 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
                 spendable,
             });
         }
-        out
+
+        let mut extfvk_to_addresses: HashMap<[u8; 169], Vec<[u8; 43]>> = HashMap::new();
+        let mut ivk_by_address: HashMap<[u8; 43], PreparedIncomingViewingKey> = HashMap::new();
+        for address in &address_set {
+            let extfvk_bytes = guard
+                .sapling_extfvk_for_address(address)
+                .map_err(map_wallet_error)?
+                .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "missing Sapling viewing key"))?;
+            extfvk_to_addresses
+                .entry(extfvk_bytes)
+                .or_default()
+                .push(*address);
+
+            let extfvk =
+                sapling_crypto::zip32::ExtendedFullViewingKey::read(extfvk_bytes.as_slice())
+                    .map_err(|_| RpcError::new(RPC_WALLET_ERROR, "invalid Sapling viewing key"))?;
+            ivk_by_address.insert(
+                *address,
+                PreparedIncomingViewingKey::new(&extfvk.fvk.vk.ivk()),
+            );
+        }
+
+        let mut nullifier_set: HashSet<([u8; 43], [u8; 32])> = HashSet::new();
+        let mut extfvk_cache: HashMap<[u8; 43], [u8; 169]> = HashMap::new();
+        for (_key, note) in guard.sapling_note_map().iter() {
+            let extfvk = match extfvk_cache.get(&note.address) {
+                Some(bytes) => *bytes,
+                None => {
+                    let Some(bytes) = guard
+                        .sapling_extfvk_for_address(&note.address)
+                        .map_err(map_wallet_error)?
+                    else {
+                        continue;
+                    };
+                    extfvk_cache.insert(note.address, bytes);
+                    bytes
+                }
+            };
+
+            let Some(addresses) = extfvk_to_addresses.get(&extfvk) else {
+                continue;
+            };
+            for address in addresses {
+                nullifier_set.insert((*address, note.nullifier));
+            }
+        }
+
+        (out, ivk_by_address, nullifier_set)
     };
 
     let best_height = chainstate
@@ -7817,6 +7898,10 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
     };
     let hrp = Hrp::parse(hrp).map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "invalid hrp"))?;
 
+    let mempool_guard = mempool
+        .lock()
+        .map_err(|_| map_internal("mempool lock poisoned"))?;
+    let mut tx_cache: HashMap<Hash256, Transaction> = HashMap::new();
     let mut out = Vec::new();
     for row in notes {
         let confirmations = best_height
@@ -7831,9 +7916,7 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
         {
             continue;
         }
-        if mempool
-            .lock()
-            .map_err(|_| map_internal("mempool lock poisoned"))?
+        if mempool_guard
             .sapling_nullifier_spender(&row.note.nullifier)
             .is_some()
         {
@@ -7842,15 +7925,66 @@ fn rpc_zlistunspent<S: fluxd_storage::KeyValueStore>(
 
         let address = bech32::encode::<Bech32>(hrp, row.note.address.as_slice())
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "failed to encode sapling address"))?;
-        out.push(json!({
-            "txid": hash256_to_hex(&row.txid),
-            "outindex": row.out_index,
-            "address": address,
-            "amount": amount_to_value(row.note.value),
-            "amountZat": row.note.value,
-            "confirmations": confirmations,
-            "spendable": row.spendable,
-        }));
+
+        let ivk = ivk_by_address.get(&row.note.address).ok_or_else(|| {
+            RpcError::new(
+                RPC_WALLET_ERROR,
+                "missing Sapling incoming viewing key for note address",
+            )
+        })?;
+
+        let tx = match tx_cache.entry(row.txid) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(read_transaction_by_id(chainstate, &row.txid)?)
+            }
+        };
+        let idx = usize::try_from(row.out_index)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "output index out of range"))?;
+        let output = tx
+            .shielded_outputs
+            .get(idx)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "sapling output not found"))?;
+        let output_ref = SaplingOutputRef { output };
+        let (_note, recipient, memo) =
+            try_sapling_note_decryption(ivk, &output_ref, Zip212Enforcement::GracePeriod)
+                .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "failed to decrypt Sapling note"))?;
+        if recipient.to_bytes() != row.note.address {
+            return Err(RpcError::new(
+                RPC_INTERNAL_ERROR,
+                "sapling note recipient mismatch",
+            ));
+        }
+        let memo = hex_bytes(&memo);
+
+        if row.spendable {
+            let change = tx
+                .shielded_spends
+                .iter()
+                .any(|spend| nullifier_set.contains(&(row.note.address, spend.nullifier)));
+            out.push(json!({
+                "txid": hash256_to_hex(&row.txid),
+                "outindex": row.out_index,
+                "address": address,
+                "amount": amount_to_value(row.note.value),
+                "amountZat": row.note.value,
+                "memo": memo,
+                "confirmations": confirmations,
+                "spendable": row.spendable,
+                "change": change,
+            }));
+        } else {
+            out.push(json!({
+                "txid": hash256_to_hex(&row.txid),
+                "outindex": row.out_index,
+                "address": address,
+                "amount": amount_to_value(row.note.value),
+                "amountZat": row.note.value,
+                "memo": memo,
+                "confirmations": confirmations,
+                "spendable": row.spendable,
+            }));
+        }
     }
 
     Ok(Value::Array(out))
@@ -7897,7 +8031,11 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
         spendable: bool,
     }
 
-    let (notes, ivk): (Vec<NoteRow>, PreparedIncomingViewingKey) = {
+    let (notes, ivk, nullifier_set): (
+        Vec<NoteRow>,
+        PreparedIncomingViewingKey,
+        HashSet<([u8; 43], [u8; 32])>,
+    ) = {
         let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
@@ -7924,12 +8062,7 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
             ));
         }
 
-        let spendable = match guard.sapling_extsk_for_address(&addr_bytes) {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(WalletError::WalletLocked) => false,
-            Err(err) => return Err(map_wallet_error(err)),
-        };
+        let spendable = is_mine;
 
         let extfvk_bytes = guard
             .sapling_extfvk_for_address(&addr_bytes)
@@ -7955,7 +8088,31 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
             })
             .collect::<Vec<_>>();
 
-        (notes, ivk)
+        let mut nullifier_set = HashSet::new();
+        if spendable {
+            let mut extfvk_cache: HashMap<[u8; 43], [u8; 169]> = HashMap::new();
+            for (_key, note) in guard.sapling_note_map().iter() {
+                let extfvk = match extfvk_cache.get(&note.address) {
+                    Some(bytes) => *bytes,
+                    None => {
+                        let Some(bytes) = guard
+                            .sapling_extfvk_for_address(&note.address)
+                            .map_err(map_wallet_error)?
+                        else {
+                            continue;
+                        };
+                        extfvk_cache.insert(note.address, bytes);
+                        bytes
+                    }
+                };
+                if extfvk != extfvk_bytes {
+                    continue;
+                }
+                nullifier_set.insert((addr_bytes, note.nullifier));
+            }
+        }
+
+        (notes, ivk, nullifier_set)
     };
 
     let best_height = chainstate
@@ -7964,6 +8121,7 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
         .map(|tip| tip.height)
         .unwrap_or(0);
 
+    let mut tx_cache: HashMap<Hash256, Transaction> = HashMap::new();
     let mut out = Vec::new();
     for row in notes {
         let confirmations = best_height
@@ -7977,8 +8135,19 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
             .sapling_nullifier_spent(&row.note.nullifier)
             .map_err(map_internal)?;
 
-        let output = read_sapling_output_by_key(chainstate, &row.txid, row.out_index)?;
-        let output_ref = SaplingOutputRef { output: &output };
+        let tx = match tx_cache.entry(row.txid) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(read_transaction_by_id(chainstate, &row.txid)?)
+            }
+        };
+        let idx = usize::try_from(row.out_index)
+            .map_err(|_| RpcError::new(RPC_INVALID_PARAMETER, "output index out of range"))?;
+        let output = tx
+            .shielded_outputs
+            .get(idx)
+            .ok_or_else(|| RpcError::new(RPC_INTERNAL_ERROR, "sapling output not found"))?;
+        let output_ref = SaplingOutputRef { output };
         let (_note, recipient, memo) =
             try_sapling_note_decryption(&ivk, &output_ref, Zip212Enforcement::GracePeriod)
                 .ok_or_else(|| RpcError::new(RPC_WALLET_ERROR, "failed to decrypt Sapling note"))?;
@@ -7988,24 +8157,38 @@ fn rpc_zlistreceivedbyaddress<S: fluxd_storage::KeyValueStore>(
                 "sapling note recipient mismatch",
             ));
         }
-        let memo = if memo[0] == 0xF6 {
-            "".to_string()
-        } else {
-            hex_bytes(&memo)
-        };
+        let memo = hex_bytes(&memo);
 
-        out.push(json!({
-            "txid": hash256_to_hex(&row.txid),
-            "amount": amount_to_value(row.note.value),
-            "amountZat": row.note.value,
-            "memo": memo,
-            "confirmations": confirmations,
-            "outindex": row.out_index,
-            "blockheight": row.note.height,
-            "spent": spent,
-            "spendable": row.spendable,
-            "change": false,
-        }));
+        if row.spendable {
+            let change = tx
+                .shielded_spends
+                .iter()
+                .any(|spend| nullifier_set.contains(&(addr_bytes, spend.nullifier)));
+            out.push(json!({
+                "txid": hash256_to_hex(&row.txid),
+                "amount": amount_to_value(row.note.value),
+                "amountZat": row.note.value,
+                "memo": memo,
+                "confirmations": confirmations,
+                "outindex": row.out_index,
+                "blockheight": row.note.height,
+                "spent": spent,
+                "spendable": row.spendable,
+                "change": change,
+            }));
+        } else {
+            out.push(json!({
+                "txid": hash256_to_hex(&row.txid),
+                "amount": amount_to_value(row.note.value),
+                "amountZat": row.note.value,
+                "memo": memo,
+                "confirmations": confirmations,
+                "outindex": row.out_index,
+                "blockheight": row.note.height,
+                "spent": spent,
+                "spendable": row.spendable,
+            }));
+        }
     }
 
     out.sort_by(|a, b| {
@@ -21173,11 +21356,18 @@ mod tests {
         assert_eq!(list.len(), 1);
         let entry = list[0].as_object().expect("object");
         let shield_txid_hex = hash256_to_hex(&shield_txid);
+        let memo_hex = "00".repeat(512);
         assert_eq!(
             entry.get("txid").and_then(Value::as_str),
             Some(shield_txid_hex.as_str())
         );
         assert_eq!(entry.get("amountZat").and_then(Value::as_i64), Some(value));
+        assert_eq!(
+            entry.get("memo").and_then(Value::as_str),
+            Some(memo_hex.as_str())
+        );
+        assert_eq!(entry.get("spendable").and_then(Value::as_bool), Some(true));
+        assert_eq!(entry.get("change").and_then(Value::as_bool), Some(false));
 
         let received =
             rpc_zlistreceivedbyaddress(&chainstate, &wallet, vec![json!(zaddr)], &params)
@@ -21191,7 +21381,13 @@ mod tests {
         );
         assert_eq!(entry.get("outindex").and_then(Value::as_u64), Some(0));
         assert_eq!(entry.get("amountZat").and_then(Value::as_i64), Some(value));
+        assert_eq!(
+            entry.get("memo").and_then(Value::as_str),
+            Some(memo_hex.as_str())
+        );
         assert_eq!(entry.get("spent").and_then(Value::as_bool), Some(false));
+        assert_eq!(entry.get("spendable").and_then(Value::as_bool), Some(true));
+        assert_eq!(entry.get("change").and_then(Value::as_bool), Some(false));
 
         rpc_encryptwallet(&wallet, vec![json!("passphrase")]).expect("encryptwallet");
         rpc_walletlock(&wallet, Vec::new()).expect("walletlock");
