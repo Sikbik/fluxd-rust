@@ -27,6 +27,7 @@ use fluxd_consensus::params::Network;
 use crate::mempool::Mempool;
 use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::stats::{self, HeaderMetrics, MempoolMetrics, StatsSnapshot, SyncMetrics};
+use crate::wallet::Wallet;
 use crate::{Backend, Store};
 
 const HISTORY_SAMPLES: usize = 300;
@@ -39,6 +40,7 @@ enum Screen {
     Peers,
     Db,
     Mempool,
+    Wallet,
     Help,
 }
 
@@ -102,6 +104,13 @@ struct TuiState {
     headers_per_sec: Option<f64>,
     orphan_count: Option<usize>,
     orphan_bytes: Option<usize>,
+    wallet_encrypted: Option<bool>,
+    wallet_unlocked_until: Option<u64>,
+    wallet_key_count: Option<usize>,
+    wallet_keypool_size: Option<usize>,
+    wallet_tx_count: Option<usize>,
+    wallet_pay_tx_fee_per_kb: Option<i64>,
+    wallet_has_sapling_keys: Option<bool>,
     bps_history: RateHistory,
     hps_history: RateHistory,
 }
@@ -119,6 +128,13 @@ impl TuiState {
             headers_per_sec: None,
             orphan_count: None,
             orphan_bytes: None,
+            wallet_encrypted: None,
+            wallet_unlocked_until: None,
+            wallet_key_count: None,
+            wallet_keypool_size: None,
+            wallet_tx_count: None,
+            wallet_pay_tx_fee_per_kb: None,
+            wallet_has_sapling_keys: None,
             bps_history: RateHistory::new(HISTORY_SAMPLES),
             hps_history: RateHistory::new(HISTORY_SAMPLES),
         }
@@ -141,7 +157,8 @@ impl TuiState {
             Screen::Monitor => Screen::Peers,
             Screen::Peers => Screen::Db,
             Screen::Db => Screen::Mempool,
-            Screen::Mempool => Screen::Monitor,
+            Screen::Mempool => Screen::Wallet,
+            Screen::Wallet => Screen::Monitor,
             Screen::Help => self.help_return,
         };
     }
@@ -192,6 +209,25 @@ impl TuiState {
         self.orphan_count = orphan_count;
         self.orphan_bytes = orphan_bytes;
     }
+
+    fn update_wallet(
+        &mut self,
+        wallet_encrypted: Option<bool>,
+        wallet_unlocked_until: Option<u64>,
+        wallet_key_count: Option<usize>,
+        wallet_keypool_size: Option<usize>,
+        wallet_tx_count: Option<usize>,
+        wallet_pay_tx_fee_per_kb: Option<i64>,
+        wallet_has_sapling_keys: Option<bool>,
+    ) {
+        self.wallet_encrypted = wallet_encrypted;
+        self.wallet_unlocked_until = wallet_unlocked_until;
+        self.wallet_key_count = wallet_key_count;
+        self.wallet_keypool_size = wallet_keypool_size;
+        self.wallet_tx_count = wallet_tx_count;
+        self.wallet_pay_tx_fee_per_kb = wallet_pay_tx_fee_per_kb;
+        self.wallet_has_sapling_keys = wallet_has_sapling_keys;
+    }
 }
 
 struct TerminalGuard;
@@ -222,6 +258,7 @@ pub fn run_tui(
     connect_metrics: Arc<ConnectMetrics>,
     mempool: Arc<Mutex<Mempool>>,
     mempool_metrics: Arc<MempoolMetrics>,
+    wallet: Arc<Mutex<Wallet>>,
     net_totals: Arc<NetTotals>,
     peer_registry: Arc<PeerRegistry>,
     network: Network,
@@ -266,10 +303,33 @@ pub fn run_tui(
                         Err(_) => (None, None),
                     };
                     state.update_orphans(orphan_count, orphan_bytes);
+
+                    let wallet_snapshot = match wallet.lock() {
+                        Ok(mut guard) => (
+                            Some(guard.is_encrypted()),
+                            Some(guard.unlocked_until()),
+                            Some(guard.key_count()),
+                            Some(guard.keypool_size()),
+                            Some(guard.tx_count()),
+                            Some(guard.pay_tx_fee_per_kb()),
+                            Some(guard.has_sapling_keys()),
+                        ),
+                        Err(_) => (None, None, None, None, None, None, None),
+                    };
+                    state.update_wallet(
+                        wallet_snapshot.0,
+                        wallet_snapshot.1,
+                        wallet_snapshot.2,
+                        wallet_snapshot.3,
+                        wallet_snapshot.4,
+                        wallet_snapshot.5,
+                        wallet_snapshot.6,
+                    );
                 }
                 Err(err) => {
                     state.update_error(err);
                     state.update_orphans(None, None);
+                    state.update_wallet(None, None, None, None, None, None, None);
                 }
             }
             next_sample = now + SAMPLE_INTERVAL;
@@ -336,6 +396,10 @@ fn handle_key(
             state.screen = Screen::Mempool;
             Ok(false)
         }
+        (KeyCode::Char('w'), _) => {
+            state.screen = Screen::Wallet;
+            Ok(false)
+        }
         (KeyCode::Char('1'), _) => {
             state.screen = Screen::Monitor;
             Ok(false)
@@ -350,6 +414,10 @@ fn handle_key(
         }
         (KeyCode::Char('4'), _) => {
             state.screen = Screen::Mempool;
+            Ok(false)
+        }
+        (KeyCode::Char('5'), _) => {
+            state.screen = Screen::Wallet;
             Ok(false)
         }
         (KeyCode::Char('h'), _) => {
@@ -371,6 +439,7 @@ fn draw(
         Screen::Peers => draw_peers(frame, state, peer_registry, net_totals),
         Screen::Db => draw_db(frame, state),
         Screen::Mempool => draw_mempool(frame, state),
+        Screen::Wallet => draw_wallet(frame, state),
         Screen::Help => draw_help(frame, state),
     }
 }
@@ -390,6 +459,7 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Line::raw("  2 / p       Peers view"),
         Line::raw("  3 / d       DB view"),
         Line::raw("  4 / t       Mempool view"),
+        Line::raw("  5 / w       Wallet view"),
         Line::raw("  ? / h       Toggle help"),
         Line::raw("  a           Toggle advanced metrics"),
         Line::raw(""),
@@ -423,7 +493,7 @@ fn draw_monitor(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw(" quit  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-4", Style::default().fg(Color::Yellow)),
+        Span::styled("1-5", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -584,7 +654,7 @@ fn draw_peers(
         Span::raw("  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-4", Style::default().fg(Color::Yellow)),
+        Span::styled("1-5", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -687,7 +757,7 @@ fn draw_db(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw("  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-4", Style::default().fg(Color::Yellow)),
+        Span::styled("1-5", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -818,7 +888,7 @@ fn draw_mempool(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw("  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-4", Style::default().fg(Color::Yellow)),
+        Span::styled("1-5", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -908,6 +978,119 @@ fn draw_mempool(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     frame.render_widget(widget, frame.area());
 }
 
+fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let header = Line::from(vec![
+        Span::styled("fluxd-rust", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("Wallet", Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("Tab", Style::default().fg(Color::Yellow)),
+        Span::raw(" views  "),
+        Span::styled("1-5", Style::default().fg(Color::Yellow)),
+        Span::raw(" jump  "),
+        Span::styled("?", Style::default().fg(Color::Yellow)),
+        Span::raw(" help  "),
+        Span::styled("q", Style::default().fg(Color::Yellow)),
+        Span::raw(" quit"),
+    ]);
+
+    let mut lines = Vec::new();
+    lines.push(header);
+
+    let now = unix_seconds();
+    let encrypted = state.wallet_encrypted;
+    let unlocked_until = state.wallet_unlocked_until.unwrap_or(0);
+    let locked = encrypted.unwrap_or(false) && (unlocked_until == 0 || unlocked_until <= now);
+    let unlocked_left = unlocked_until.saturating_sub(now);
+
+    let encrypted_label = match encrypted {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "-",
+    };
+    let status = if encrypted == Some(false) {
+        "unlocked (unencrypted)"
+    } else if locked {
+        "locked"
+    } else if encrypted == Some(true) && unlocked_until > now {
+        "unlocked"
+    } else {
+        "-"
+    };
+    let unlocked_for = if encrypted == Some(true) && unlocked_until > now {
+        format!("{unlocked_left}s")
+    } else {
+        "-".to_string()
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("Encrypted:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {encrypted_label}  ")),
+        Span::styled("Status:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {status}  ")),
+        Span::styled("Unlocked for:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {unlocked_for}")),
+    ]));
+
+    let key_count = state
+        .wallet_key_count
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let keypool = state
+        .wallet_keypool_size
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let tx_count = state
+        .wallet_tx_count
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let sapling = match state.wallet_has_sapling_keys {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "-",
+    };
+    let paytxfee = state
+        .wallet_pay_tx_fee_per_kb
+        .map(|value| format!("{value} zats/kB"))
+        .unwrap_or_else(|| "-".to_string());
+
+    lines.push(Line::from(vec![
+        Span::styled("Keys:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {key_count}  ")),
+        Span::styled("Keypool:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {keypool}  ")),
+        Span::styled("Sapling:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {sapling}  ")),
+        Span::styled("Wallet txs:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {tx_count}")),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("paytxfee:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {paytxfee}")),
+    ]));
+
+    if let Some(snapshot) = state.last_snapshot.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("Tip:", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                " headers {}  blocks {}",
+                snapshot.best_header_height, snapshot.best_block_height
+            )),
+        ]));
+    }
+
+    if let Some(err) = state.last_error.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("Error:", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::raw(err),
+        ]));
+    }
+
+    let widget = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Info"));
+    frame.render_widget(widget, frame.area());
+}
+
 fn peer_kind_sort_key(kind: PeerKind) -> u8 {
     match kind {
         PeerKind::Block => 0,
@@ -948,4 +1131,13 @@ fn fmt_opt_mib(value: Option<u64>) -> String {
         .map(|bytes| bytes as f64 / (1024.0 * 1024.0))
         .map(|mib| format!("{mib:.0} MiB"))
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn unix_seconds() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

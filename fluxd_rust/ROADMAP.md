@@ -305,6 +305,11 @@ Owner format: `owner: <name>` or `owner: TBD`.
     - [x] Mempool view (size + recent accept/reject + orphan counters)
     - [x] DB/Fjall view (write buffer, compactions, per-partition segments/flushes)
     - [ ] Wallet view (balances + key state + recent txs)
+      - [x] Show encryption/lock state + unlock remaining time
+      - [x] Show key/keypool counts + wallet tx count + paytxfee
+      - [ ] Show transparent (taddr) balance summary
+      - [ ] Show Sapling balance summary (spendable + watch-only)
+      - [ ] Show recent wallet tx list + pending ops
     - [ ] Logs view (in-TUI ring buffer + filters)
   - [ ] Guided setup wizard (network/data-dir/RPC auth/profile) + config file write-back
   - [ ] Optional remote attach mode (read-only via `/stats`/`/metrics`)

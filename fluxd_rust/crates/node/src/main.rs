@@ -1668,6 +1668,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         let connect_metrics = Arc::clone(&connect_metrics);
         let mempool = Arc::clone(&mempool);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let wallet = Arc::clone(&wallet);
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
         let shutdown_rx = shutdown_rx.clone();
@@ -1682,6 +1683,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                 connect_metrics,
                 mempool,
                 mempool_metrics,
+                wallet,
                 net_totals,
                 peer_registry,
                 network,
