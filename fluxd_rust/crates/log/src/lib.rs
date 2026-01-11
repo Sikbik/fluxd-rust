@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -64,10 +66,59 @@ static LOG_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static LOG_FORMAT: AtomicU8 = AtomicU8::new(Format::Text as u8);
 static LOG_TIMESTAMPS: AtomicBool = AtomicBool::new(true);
 
+#[derive(Clone, Debug)]
+pub struct CapturedLog {
+    pub ts_ms: u64,
+    pub level: Level,
+    pub target: &'static str,
+    pub file: &'static str,
+    pub line: u32,
+    pub msg: String,
+}
+
+static LOG_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+static LOG_CAPTURE_CAPACITY: AtomicUsize = AtomicUsize::new(0);
+static LOG_CAPTURE: OnceLock<Mutex<VecDeque<CapturedLog>>> = OnceLock::new();
+
 pub fn init(config: LogConfig) {
     LOG_LEVEL.store(config.level as u8, Ordering::Relaxed);
     LOG_FORMAT.store(config.format as u8, Ordering::Relaxed);
     LOG_TIMESTAMPS.store(config.timestamps, Ordering::Relaxed);
+}
+
+pub fn enable_capture(capacity: usize) {
+    if capacity == 0 {
+        disable_capture();
+        return;
+    }
+    LOG_CAPTURE_CAPACITY.store(capacity, Ordering::Relaxed);
+    LOG_CAPTURE.get_or_init(|| Mutex::new(VecDeque::with_capacity(capacity.min(4096))));
+    LOG_CAPTURE_ENABLED.store(true, Ordering::Relaxed);
+}
+
+pub fn disable_capture() {
+    LOG_CAPTURE_ENABLED.store(false, Ordering::Relaxed);
+}
+
+pub fn clear_captured_logs() {
+    let Some(buf) = LOG_CAPTURE.get() else {
+        return;
+    };
+    if let Ok(mut guard) = buf.lock() {
+        guard.clear();
+    }
+}
+
+pub fn capture_snapshot(limit: usize) -> Vec<CapturedLog> {
+    let Some(buf) = LOG_CAPTURE.get() else {
+        return Vec::new();
+    };
+    let Ok(guard) = buf.lock() else {
+        return Vec::new();
+    };
+    let len = guard.len();
+    let start = len.saturating_sub(limit);
+    guard.iter().skip(start).cloned().collect()
 }
 
 pub fn enabled(level: Level) -> bool {
@@ -85,6 +136,7 @@ pub fn log(
         return;
     }
 
+    let capture_enabled = LOG_CAPTURE_ENABLED.load(Ordering::Relaxed);
     let format = match LOG_FORMAT.load(Ordering::Relaxed) {
         0 => Format::Text,
         1 => Format::Json,
@@ -95,6 +147,11 @@ pub fn log(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let ts_ms: u64 = now.as_millis().try_into().unwrap_or(u64::MAX);
+    let msg = if matches!(format, Format::Json) || capture_enabled {
+        Some(args.to_string())
+    } else {
+        None
+    };
 
     let mut out = io::stderr().lock();
     match format {
@@ -110,16 +167,39 @@ pub fn log(
             let _ = writeln!(out, "{args}");
         }
         Format::Json => {
-            let msg = args.to_string();
             let line = json!({
                 "ts_ms": ts_ms,
                 "level": level.as_str(),
                 "target": target,
                 "file": file,
                 "line": line,
-                "msg": msg,
+                "msg": msg.as_deref().unwrap_or_default(),
             });
             let _ = writeln!(out, "{line}");
+        }
+    }
+
+    if capture_enabled {
+        let Some(buf) = LOG_CAPTURE.get() else {
+            return;
+        };
+        let Ok(mut guard) = buf.lock() else {
+            return;
+        };
+        let cap = LOG_CAPTURE_CAPACITY.load(Ordering::Relaxed);
+        if cap == 0 {
+            return;
+        }
+        guard.push_back(CapturedLog {
+            ts_ms,
+            level,
+            target,
+            file,
+            line,
+            msg: msg.unwrap_or_default(),
+        });
+        while guard.len() > cap {
+            let _ = guard.pop_front();
         }
     }
 }

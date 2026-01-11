@@ -310,7 +310,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
       - [ ] Show transparent (taddr) balance summary
       - [ ] Show Sapling balance summary (spendable + watch-only)
       - [ ] Show recent wallet tx list + pending ops
-    - [ ] Logs view (in-TUI ring buffer + filters)
+    - [x] Logs view (in-TUI ring buffer + filters)
   - [ ] Guided setup wizard (network/data-dir/RPC auth/profile) + config file write-back
   - [ ] Optional remote attach mode (read-only via `/stats`/`/metrics`)
   - [ ] Document TUI usage + screenshots in `docs/`

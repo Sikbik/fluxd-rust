@@ -985,6 +985,9 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         format: config.log_format,
         timestamps: config.log_timestamps,
     });
+    if config.tui {
+        logging::enable_capture(4096);
+    }
     let params = Arc::new(chain_params(config.network));
     let network = config.network;
     let backend = config.backend;

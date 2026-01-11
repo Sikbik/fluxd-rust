@@ -19,6 +19,8 @@ use ratatui::widgets::{
 use ratatui::Terminal;
 use tokio::sync::watch;
 
+use fluxd_log as logging;
+
 use fluxd_chainstate::metrics::ConnectMetrics;
 use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::ValidationMetrics;
@@ -33,6 +35,7 @@ use crate::{Backend, Store};
 const HISTORY_SAMPLES: usize = 300;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const UI_TICK: Duration = Duration::from_millis(200);
+const LOG_SNAPSHOT_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -41,6 +44,7 @@ enum Screen {
     Db,
     Mempool,
     Wallet,
+    Logs,
     Help,
 }
 
@@ -104,6 +108,11 @@ struct TuiState {
     headers_per_sec: Option<f64>,
     orphan_count: Option<usize>,
     orphan_bytes: Option<usize>,
+    logs_min_level: logging::Level,
+    logs_follow: bool,
+    logs_paused: bool,
+    logs_scroll: u16,
+    logs: Vec<logging::CapturedLog>,
     wallet_encrypted: Option<bool>,
     wallet_unlocked_until: Option<u64>,
     wallet_key_count: Option<usize>,
@@ -128,6 +137,11 @@ impl TuiState {
             headers_per_sec: None,
             orphan_count: None,
             orphan_bytes: None,
+            logs_min_level: logging::Level::Info,
+            logs_follow: true,
+            logs_paused: false,
+            logs_scroll: 0,
+            logs: Vec::new(),
             wallet_encrypted: None,
             wallet_unlocked_until: None,
             wallet_key_count: None,
@@ -158,7 +172,8 @@ impl TuiState {
             Screen::Peers => Screen::Db,
             Screen::Db => Screen::Mempool,
             Screen::Mempool => Screen::Wallet,
-            Screen::Wallet => Screen::Monitor,
+            Screen::Wallet => Screen::Logs,
+            Screen::Logs => Screen::Monitor,
             Screen::Help => self.help_return,
         };
     }
@@ -227,6 +242,30 @@ impl TuiState {
         self.wallet_tx_count = wallet_tx_count;
         self.wallet_pay_tx_fee_per_kb = wallet_pay_tx_fee_per_kb;
         self.wallet_has_sapling_keys = wallet_has_sapling_keys;
+    }
+
+    fn update_logs(&mut self, logs: Vec<logging::CapturedLog>) {
+        self.logs = logs;
+    }
+
+    fn cycle_logs_min_level(&mut self) {
+        self.logs_min_level = match self.logs_min_level {
+            logging::Level::Error => logging::Level::Warn,
+            logging::Level::Warn => logging::Level::Info,
+            logging::Level::Info => logging::Level::Debug,
+            logging::Level::Debug => logging::Level::Trace,
+            logging::Level::Trace => logging::Level::Error,
+        };
+    }
+
+    fn toggle_logs_pause(&mut self) {
+        self.logs_paused = !self.logs_paused;
+        if self.logs_paused {
+            self.logs_follow = false;
+        } else {
+            self.logs_follow = true;
+            self.logs_scroll = 0;
+        }
     }
 }
 
@@ -332,6 +371,10 @@ pub fn run_tui(
                     state.update_wallet(None, None, None, None, None, None, None);
                 }
             }
+
+            if matches!(state.screen, Screen::Logs) && !state.logs_paused {
+                state.update_logs(logging::capture_snapshot(LOG_SNAPSHOT_LIMIT));
+            }
             next_sample = now + SAMPLE_INTERVAL;
         }
 
@@ -380,6 +423,72 @@ fn handle_key(
             state.toggle_advanced();
             Ok(false)
         }
+        (KeyCode::Char('f'), _) => {
+            if matches!(state.screen, Screen::Logs) {
+                state.cycle_logs_min_level();
+            }
+            Ok(false)
+        }
+        (KeyCode::Char(' '), _) => {
+            if matches!(state.screen, Screen::Logs) {
+                state.toggle_logs_pause();
+            }
+            Ok(false)
+        }
+        (KeyCode::Char('c'), _) => {
+            if matches!(state.screen, Screen::Logs) {
+                logging::clear_captured_logs();
+                state.logs.clear();
+                state.logs_scroll = 0;
+                state.logs_follow = true;
+                state.logs_paused = false;
+            }
+            Ok(false)
+        }
+        (KeyCode::Up, _) => {
+            if matches!(state.screen, Screen::Logs) {
+                state.logs_follow = false;
+                state.logs_scroll = state.logs_scroll.saturating_sub(1);
+            }
+            Ok(false)
+        }
+        (KeyCode::Down, _) => {
+            if matches!(state.screen, Screen::Logs) {
+                state.logs_follow = false;
+                state.logs_scroll = state.logs_scroll.saturating_add(1);
+            }
+            Ok(false)
+        }
+        (KeyCode::PageUp, _) => {
+            if matches!(state.screen, Screen::Logs) {
+                state.logs_follow = false;
+                state.logs_scroll = state.logs_scroll.saturating_sub(10);
+            }
+            Ok(false)
+        }
+        (KeyCode::PageDown, _) => {
+            if matches!(state.screen, Screen::Logs) {
+                state.logs_follow = false;
+                state.logs_scroll = state.logs_scroll.saturating_add(10);
+            }
+            Ok(false)
+        }
+        (KeyCode::Home, _) => {
+            if matches!(state.screen, Screen::Logs) {
+                state.logs_follow = false;
+                state.logs_paused = true;
+                state.logs_scroll = 0;
+            }
+            Ok(false)
+        }
+        (KeyCode::End, _) => {
+            if matches!(state.screen, Screen::Logs) {
+                state.logs_paused = false;
+                state.logs_follow = true;
+                state.logs_scroll = 0;
+            }
+            Ok(false)
+        }
         (KeyCode::Char('m'), _) => {
             state.screen = Screen::Monitor;
             Ok(false)
@@ -398,6 +507,10 @@ fn handle_key(
         }
         (KeyCode::Char('w'), _) => {
             state.screen = Screen::Wallet;
+            Ok(false)
+        }
+        (KeyCode::Char('l'), _) => {
+            state.screen = Screen::Logs;
             Ok(false)
         }
         (KeyCode::Char('1'), _) => {
@@ -420,6 +533,10 @@ fn handle_key(
             state.screen = Screen::Wallet;
             Ok(false)
         }
+        (KeyCode::Char('6'), _) => {
+            state.screen = Screen::Logs;
+            Ok(false)
+        }
         (KeyCode::Char('h'), _) => {
             state.toggle_help();
             Ok(false)
@@ -440,6 +557,7 @@ fn draw(
         Screen::Db => draw_db(frame, state),
         Screen::Mempool => draw_mempool(frame, state),
         Screen::Wallet => draw_wallet(frame, state),
+        Screen::Logs => draw_logs(frame, state),
         Screen::Help => draw_help(frame, state),
     }
 }
@@ -460,8 +578,16 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Line::raw("  3 / d       DB view"),
         Line::raw("  4 / t       Mempool view"),
         Line::raw("  5 / w       Wallet view"),
+        Line::raw("  6 / l       Logs view"),
         Line::raw("  ? / h       Toggle help"),
         Line::raw("  a           Toggle advanced metrics"),
+        Line::raw(""),
+        Line::raw("Logs view:"),
+        Line::raw("  f           Cycle level filter"),
+        Line::raw("  Space       Pause/follow toggle"),
+        Line::raw("  c           Clear captured logs"),
+        Line::raw("  Up/Down     Scroll"),
+        Line::raw("  Home/End    Top/Follow"),
         Line::raw(""),
         Line::raw("Notes:"),
         Line::raw("  - This TUI is in-process; it uses internal stats (no HTTP)."),
@@ -493,7 +619,7 @@ fn draw_monitor(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw(" quit  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-5", Style::default().fg(Color::Yellow)),
+        Span::styled("1-6", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -654,7 +780,7 @@ fn draw_peers(
         Span::raw("  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-5", Style::default().fg(Color::Yellow)),
+        Span::styled("1-6", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -757,7 +883,7 @@ fn draw_db(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw("  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-5", Style::default().fg(Color::Yellow)),
+        Span::styled("1-6", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -888,7 +1014,7 @@ fn draw_mempool(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw("  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-5", Style::default().fg(Color::Yellow)),
+        Span::styled("1-6", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -986,7 +1112,7 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Span::raw("  "),
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" views  "),
-        Span::styled("1-5", Style::default().fg(Color::Yellow)),
+        Span::styled("1-6", Style::default().fg(Color::Yellow)),
         Span::raw(" jump  "),
         Span::styled("?", Style::default().fg(Color::Yellow)),
         Span::raw(" help  "),
@@ -1091,6 +1217,114 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     frame.render_widget(widget, frame.area());
 }
 
+fn draw_logs(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(10)])
+        .split(area);
+
+    let header = Line::from(vec![
+        Span::styled("fluxd-rust", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("Logs", Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("Tab", Style::default().fg(Color::Yellow)),
+        Span::raw(" views  "),
+        Span::styled("1-6", Style::default().fg(Color::Yellow)),
+        Span::raw(" jump  "),
+        Span::styled("q", Style::default().fg(Color::Yellow)),
+        Span::raw(" quit"),
+    ]);
+
+    let paused = if state.logs_paused { "yes" } else { "no" };
+    let follow = if state.logs_follow { "yes" } else { "no" };
+    let min_level = state.logs_min_level.as_str();
+    let total = state.logs.len();
+
+    let mut summary = Vec::new();
+    summary.push(header);
+    summary.push(Line::from(vec![
+        Span::styled("Filter:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" <= {min_level}  ")),
+        Span::styled("Paused:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {paused}  ")),
+        Span::styled("Follow:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {follow}  ")),
+        Span::styled("Lines:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {total}")),
+    ]));
+    summary.push(Line::from(vec![
+        Span::styled("Keys:", Style::default().fg(Color::DarkGray)),
+        Span::raw(" f filter  Space pause/follow  c clear  Up/Down scroll  End follow"),
+    ]));
+
+    if let Some(err) = state.last_error.as_ref() {
+        summary.push(Line::from(vec![
+            Span::styled("Error:", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::raw(err),
+        ]));
+    }
+
+    let summary_widget =
+        Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title("Log capture"));
+    frame.render_widget(summary_widget, chunks[0]);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for entry in state.logs.iter() {
+        if (entry.level as u8) > (state.logs_min_level as u8) {
+            continue;
+        }
+        let ts = format_log_ts(entry.ts_ms);
+        let level_style = log_level_style(entry.level);
+        let level = entry.level.as_str();
+        let target = shorten_suffix(entry.target, 36);
+        let msg = sanitize_log_message(&entry.msg);
+        if state.advanced {
+            let location = format!("{}:{}", shorten_suffix(entry.file, 24), entry.line);
+            lines.push(Line::from(vec![
+                Span::styled(ts, Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::styled(level, level_style),
+                Span::raw(" "),
+                Span::styled(target, Style::default().fg(Color::LightBlue)),
+                Span::raw(" "),
+                Span::styled(location, Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::raw(msg),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(ts, Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::styled(level, level_style),
+                Span::raw(" "),
+                Span::styled(target, Style::default().fg(Color::LightBlue)),
+                Span::raw(" "),
+                Span::raw(msg),
+            ]));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw("No captured logs."));
+    }
+
+    let view_height = chunks[1].height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(view_height);
+    let scroll = if state.logs_follow {
+        max_scroll
+    } else {
+        (state.logs_scroll as usize).min(max_scroll)
+    };
+    let scroll_u16 = u16::try_from(scroll).unwrap_or(u16::MAX);
+
+    let widget = Paragraph::new(lines)
+        .scroll((scroll_u16, 0))
+        .block(Block::default().borders(Borders::ALL).title("Log lines"));
+    frame.render_widget(widget, chunks[1]);
+}
+
 fn peer_kind_sort_key(kind: PeerKind) -> u8 {
     match kind {
         PeerKind::Block => 0,
@@ -1118,6 +1352,64 @@ fn shorten(value: &str, max: usize) -> String {
         .map(|(idx, _)| idx)
         .unwrap_or(trimmed.len());
     format!("{}…", trimmed[..end].trim_end())
+}
+
+fn shorten_suffix(value: &str, max: usize) -> String {
+    let trimmed = value.trim();
+    if max == 0 {
+        return String::new();
+    }
+    let char_count = trimmed.chars().count();
+    if char_count <= max {
+        return trimmed.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    if keep == 0 {
+        return "…".to_string();
+    }
+    let skip = char_count.saturating_sub(keep);
+    let start = trimmed
+        .char_indices()
+        .nth(skip)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    format!("…{}", &trimmed[start..])
+}
+
+fn log_level_style(level: logging::Level) -> Style {
+    match level {
+        logging::Level::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        logging::Level::Warn => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        logging::Level::Info => Style::default().fg(Color::White),
+        logging::Level::Debug => Style::default().fg(Color::Cyan),
+        logging::Level::Trace => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn format_log_ts(ts_ms: u64) -> String {
+    const SECS_PER_DAY: u64 = 86_400;
+    let secs = ts_ms / 1000;
+    let millis = ts_ms % 1000;
+    let secs_of_day = secs % SECS_PER_DAY;
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    format!("{hour:02}:{minute:02}:{second:02}.{millis:03}")
+}
+
+fn sanitize_log_message(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for ch in msg.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn fmt_opt_u64(value: Option<u64>) -> String {
