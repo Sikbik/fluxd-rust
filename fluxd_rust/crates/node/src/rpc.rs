@@ -526,6 +526,40 @@ fn async_ops() -> &'static Mutex<AsyncOpManager> {
     ASYNC_OP_MANAGER.get_or_init(|| Mutex::new(AsyncOpManager::default()))
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AsyncOpSnapshot {
+    pub operationid: String,
+    pub status: String,
+    pub method: String,
+    pub creation_time: u64,
+    pub started_time: Option<u64>,
+    pub finished_time: Option<u64>,
+}
+
+pub(crate) fn tui_async_ops_snapshot(limit: usize) -> Vec<AsyncOpSnapshot> {
+    let guard = match async_ops().lock() {
+        Ok(guard) => guard,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<AsyncOpSnapshot> = guard
+        .ops
+        .values()
+        .map(|entry| AsyncOpSnapshot {
+            operationid: entry.operationid.clone(),
+            status: entry.status.as_str().to_string(),
+            method: entry.method.clone(),
+            creation_time: entry.creation_time,
+            started_time: entry.started_time,
+            finished_time: entry.finished_time,
+        })
+        .collect();
+    out.sort_by(|a, b| b.creation_time.cmp(&a.creation_time));
+    if limit > 0 && out.len() > limit {
+        out.truncate(limit);
+    }
+    out
+}
+
 fn current_unix_seconds_u64() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

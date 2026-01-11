@@ -314,6 +314,7 @@ struct Config {
 
 enum CliAction {
     Run(Config),
+    TuiAttach { endpoint: String },
     PrintHelp,
     PrintVersion,
 }
@@ -970,6 +971,10 @@ async fn run() -> Result<(), String> {
         }
         CliAction::PrintVersion => {
             println!("fluxd-rust {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliAction::TuiAttach { endpoint } => {
+            tui::run_remote_tui(endpoint)?;
             return Ok(());
         }
         CliAction::Run(config) => {
@@ -1665,6 +1670,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
     if config.tui {
         let chainstate = Arc::clone(&chainstate);
         let store = Arc::clone(&store);
+        let tui_data_dir = config.data_dir.clone();
         let sync_metrics = Arc::clone(&sync_metrics);
         let header_metrics = Arc::clone(&header_metrics);
         let validation_metrics = Arc::clone(&validation_metrics);
@@ -1680,6 +1686,7 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
             if let Err(err) = tui::run_tui(
                 chainstate,
                 store,
+                tui_data_dir,
                 sync_metrics,
                 header_metrics,
                 validation_metrics,
@@ -7717,6 +7724,7 @@ where
     let mut status_interval_secs: u64 = 15;
     let mut status_interval_set = false;
     let mut tui = false;
+    let mut tui_attach: Option<String> = None;
     let mut dashboard_addr: Option<SocketAddr> = None;
     let mut db_cache_mb: u64 = DEFAULT_DB_CACHE_MB;
     let mut db_cache_set = false;
@@ -8169,6 +8177,12 @@ where
             "--tui" => {
                 tui = true;
             }
+            "--tui-attach" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --tui-attach\n{}", usage()))?;
+                tui_attach = Some(value);
+            }
             "--db-cache-mb" => {
                 let value = args
                     .next()
@@ -8314,6 +8328,15 @@ where
                 return Err(format!("unknown argument '{other}'\n{}", usage()));
             }
         }
+    }
+
+    if let Some(endpoint) = tui_attach {
+        logging::init(logging::LogConfig {
+            level: log_level,
+            format: log_format,
+            timestamps: log_timestamps,
+        });
+        return Ok(CliAction::TuiAttach { endpoint });
     }
 
     let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
@@ -8462,6 +8485,16 @@ where
             }
         }
 
+        if profile.is_none() {
+            if let Some(values) = conf.get("profile") {
+                if let Some(raw) = values.last() {
+                    profile = Some(RunProfile::parse(raw).ok_or_else(|| {
+                        format!("invalid profile '{raw}' in {}", conf_file.display())
+                    })?);
+                }
+            }
+        }
+
         if !db_cache_set {
             if let Some(values) = conf.get("dbcache") {
                 if let Some(raw) = values.last() {
@@ -8582,6 +8615,7 @@ where
             "maxmempool",
             "mineraddress",
             "minrelaytxfee",
+            "profile",
             "rpcallowip",
             "rpcbind",
             "rpcpassword",
@@ -9162,6 +9196,7 @@ fn usage() -> String {
         "  --fee-estimates-persist-interval  Persist fee estimates every N seconds (0 disables, default: 300)",
         "  --status-interval  Status log interval in seconds (default: 15, 0 disables)",
         "  --tui  Launch terminal UI monitor (press q to quit; lowers default log noise)",
+        "  --tui-attach  Launch TUI monitor in remote attach mode via http://HOST[:PORT]/stats (default port: 8080)",
         "  --db-cache-mb  Fjall block cache size in MiB (default: 256)",
         "  --db-write-buffer-mb  Fjall max write buffer in MiB (default: 2048)",
         "  --db-journal-mb  Fjall max journaling size in MiB (default: 2048)",

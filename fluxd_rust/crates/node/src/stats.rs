@@ -8,12 +8,13 @@ use fluxd_chainstate::validation::ValidationMetrics;
 use fluxd_consensus::params::Network;
 use fluxd_consensus::Hash256;
 use fluxd_storage::KeyValueStore;
+use serde::{Deserialize, Serialize};
 
 use crate::mempool::Mempool;
 use crate::Backend;
 use crate::Store;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StatsSnapshot {
     pub network: String,
     pub backend: String,

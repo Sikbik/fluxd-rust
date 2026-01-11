@@ -631,6 +631,25 @@ impl Wallet {
         self.tx_history.len()
     }
 
+    pub fn recent_transactions(&self, limit: usize) -> Vec<(Hash256, u64)> {
+        let mut items: Vec<(Hash256, u64)> = self
+            .tx_received_at
+            .iter()
+            .map(|(txid, received_at)| (*txid, *received_at))
+            .collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        items.truncate(limit);
+        items
+    }
+
+    pub fn sapling_scan_height(&self) -> i32 {
+        self.sapling_scan_height
+    }
+
+    pub fn sapling_note_count(&self) -> usize {
+        self.sapling_notes.len()
+    }
+
     pub fn tx_received_time(&self, txid: &Hash256) -> Option<u64> {
         self.tx_received_at.get(txid).copied()
     }

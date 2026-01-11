@@ -1,5 +1,9 @@
-use std::collections::VecDeque;
-use std::io;
+use std::collections::{HashSet, VecDeque};
+use std::fmt::Write as FmtWrite;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -9,6 +13,8 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use rand::distributions::Alphanumeric;
+use rand::Rng;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -17,6 +23,7 @@ use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table,
 };
 use ratatui::Terminal;
+use serde_json;
 use tokio::sync::watch;
 
 use fluxd_log as logging;
@@ -24,18 +31,25 @@ use fluxd_log as logging;
 use fluxd_chainstate::metrics::ConnectMetrics;
 use fluxd_chainstate::state::ChainState;
 use fluxd_chainstate::validation::ValidationMetrics;
+use fluxd_consensus::constants::COINBASE_MATURITY;
 use fluxd_consensus::params::Network;
+use fluxd_consensus::Hash256;
+use fluxd_primitives::OutPoint;
 
 use crate::mempool::Mempool;
 use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::stats::{self, HeaderMetrics, MempoolMetrics, StatsSnapshot, SyncMetrics};
 use crate::wallet::Wallet;
+use crate::RunProfile;
 use crate::{Backend, Store};
 
 const HISTORY_SAMPLES: usize = 300;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const UI_TICK: Duration = Duration::from_millis(200);
 const LOG_SNAPSHOT_LIMIT: usize = 4096;
+const WALLET_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const WALLET_RECENT_TXS: usize = 12;
+const WALLET_PENDING_OPS: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -45,7 +59,183 @@ enum Screen {
     Mempool,
     Wallet,
     Logs,
+    Setup,
     Help,
+}
+
+#[derive(Clone, Debug)]
+struct WalletTxRow {
+    txid: Hash256,
+    received_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SaplingNoteOwnership {
+    Spendable,
+    WatchOnly,
+}
+
+#[derive(Clone, Debug)]
+struct SaplingNoteSummary {
+    ownership: SaplingNoteOwnership,
+    value: i64,
+    height: i32,
+    nullifier: Hash256,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WalletBalanceBucket {
+    confirmed: i64,
+    unconfirmed: i64,
+    immature: i64,
+}
+
+#[derive(Clone, Debug)]
+struct SetupWizard {
+    data_dir: PathBuf,
+    conf_path: PathBuf,
+    network: Network,
+    profile: RunProfile,
+    rpc_user: String,
+    rpc_pass: String,
+    show_pass: bool,
+    status: Option<String>,
+}
+
+impl SetupWizard {
+    fn new(data_dir: PathBuf, network: Network) -> Self {
+        let conf_path = data_dir.join("flux.conf");
+        let mut wizard = Self {
+            data_dir,
+            conf_path,
+            network,
+            profile: RunProfile::Default,
+            rpc_user: String::new(),
+            rpc_pass: String::new(),
+            show_pass: false,
+            status: None,
+        };
+        wizard.regenerate_auth();
+        wizard
+    }
+
+    fn cycle_network(&mut self) {
+        self.network = match self.network {
+            Network::Mainnet => Network::Testnet,
+            Network::Testnet => Network::Regtest,
+            Network::Regtest => Network::Mainnet,
+        };
+    }
+
+    fn cycle_profile(&mut self) {
+        self.profile = match self.profile {
+            RunProfile::Low => RunProfile::Default,
+            RunProfile::Default => RunProfile::High,
+            RunProfile::High => RunProfile::Low,
+        };
+    }
+
+    fn regenerate_auth(&mut self) {
+        let mut rng = rand::thread_rng();
+        let user_suffix: String = (&mut rng)
+            .sample_iter(&Alphanumeric)
+            .take(6)
+            .map(char::from)
+            .collect();
+        let pass: String = (&mut rng)
+            .sample_iter(&Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect();
+        self.rpc_user = format!("rpc{user_suffix}");
+        self.rpc_pass = pass;
+        self.status = None;
+    }
+
+    fn toggle_pass_visible(&mut self) {
+        self.show_pass = !self.show_pass;
+    }
+
+    fn masked_pass(&self) -> String {
+        if self.show_pass {
+            return self.rpc_pass.clone();
+        }
+        if self.rpc_pass.is_empty() {
+            return "-".to_string();
+        }
+        let shown = self.rpc_pass.chars().take(4).collect::<String>();
+        format!("{shown}…")
+    }
+
+    fn write_config(&mut self) -> Result<(), String> {
+        fs::create_dir_all(&self.data_dir)
+            .map_err(|err| format!("failed to create data dir: {err}"))?;
+
+        let mut contents = String::new();
+        writeln!(&mut contents, "# fluxd-rust configuration file").ok();
+        writeln!(
+            &mut contents,
+            "# Generated by the in-process TUI setup wizard."
+        )
+        .ok();
+        writeln!(&mut contents, "").ok();
+        writeln!(&mut contents, "profile={}", self.profile.as_str()).ok();
+        match self.network {
+            Network::Mainnet => {}
+            Network::Testnet => {
+                writeln!(&mut contents, "testnet=1").ok();
+            }
+            Network::Regtest => {
+                writeln!(&mut contents, "regtest=1").ok();
+            }
+        }
+        writeln!(&mut contents, "").ok();
+        writeln!(&mut contents, "rpcuser={}", self.rpc_user).ok();
+        writeln!(&mut contents, "rpcpassword={}", self.rpc_pass).ok();
+        writeln!(&mut contents, "rpcbind=127.0.0.1").ok();
+        writeln!(
+            &mut contents,
+            "rpcport={}",
+            crate::default_rpc_addr(self.network).port()
+        )
+        .ok();
+        writeln!(&mut contents, "rpcallowip=127.0.0.1").ok();
+
+        let mut backup: Option<PathBuf> = None;
+        if self.conf_path.exists() {
+            let suffix = unix_seconds();
+            let backup_name = format!("flux.conf.bak.{suffix}");
+            let backup_path = self.data_dir.join(backup_name);
+            if let Err(_err) = fs::rename(&self.conf_path, &backup_path) {
+                fs::copy(&self.conf_path, &backup_path)
+                    .map_err(|err| format!("failed to backup existing flux.conf: {err}"))?;
+                fs::remove_file(&self.conf_path)
+                    .map_err(|err| format!("failed to remove old flux.conf: {err}"))?;
+            }
+            backup = Some(backup_path);
+        }
+
+        fs::write(&self.conf_path, contents)
+            .map_err(|err| format!("failed to write flux.conf: {err}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.conf_path, fs::Permissions::from_mode(0o600));
+        }
+
+        self.status = Some(match backup {
+            Some(path) => format!(
+                "Wrote {} (backed up previous to {}). Restart the daemon to apply.",
+                self.conf_path.display(),
+                path.display()
+            ),
+            None => format!(
+                "Wrote {}. Restart the daemon to apply.",
+                self.conf_path.display()
+            ),
+        });
+        Ok(())
+    }
 }
 
 struct RatePoint {
@@ -100,6 +290,7 @@ impl RateHistory {
 struct TuiState {
     screen: Screen,
     help_return: Screen,
+    setup_return: Screen,
     advanced: bool,
     last_snapshot: Option<StatsSnapshot>,
     last_rate_snapshot: Option<StatsSnapshot>,
@@ -120,6 +311,16 @@ struct TuiState {
     wallet_tx_count: Option<usize>,
     wallet_pay_tx_fee_per_kb: Option<i64>,
     wallet_has_sapling_keys: Option<bool>,
+    wallet_transparent: Option<WalletBalanceBucket>,
+    wallet_transparent_watchonly: Option<WalletBalanceBucket>,
+    wallet_sapling_spendable: Option<i64>,
+    wallet_sapling_watchonly: Option<i64>,
+    wallet_sapling_scan_height: Option<i32>,
+    wallet_sapling_note_count: Option<usize>,
+    wallet_recent_txs: Vec<WalletTxRow>,
+    wallet_pending_ops: Vec<crate::rpc::AsyncOpSnapshot>,
+    wallet_detail_error: Option<String>,
+    setup: Option<SetupWizard>,
     bps_history: RateHistory,
     hps_history: RateHistory,
 }
@@ -129,6 +330,7 @@ impl TuiState {
         Self {
             screen: Screen::Monitor,
             help_return: Screen::Monitor,
+            setup_return: Screen::Monitor,
             advanced: false,
             last_snapshot: None,
             last_rate_snapshot: None,
@@ -149,6 +351,16 @@ impl TuiState {
             wallet_tx_count: None,
             wallet_pay_tx_fee_per_kb: None,
             wallet_has_sapling_keys: None,
+            wallet_transparent: None,
+            wallet_transparent_watchonly: None,
+            wallet_sapling_spendable: None,
+            wallet_sapling_watchonly: None,
+            wallet_sapling_scan_height: None,
+            wallet_sapling_note_count: None,
+            wallet_recent_txs: Vec::new(),
+            wallet_pending_ops: Vec::new(),
+            wallet_detail_error: None,
+            setup: None,
             bps_history: RateHistory::new(HISTORY_SAMPLES),
             hps_history: RateHistory::new(HISTORY_SAMPLES),
         }
@@ -166,6 +378,18 @@ impl TuiState {
         }
     }
 
+    fn toggle_setup(&mut self) {
+        match self.screen {
+            Screen::Setup => {
+                self.screen = self.setup_return;
+            }
+            other => {
+                self.setup_return = other;
+                self.screen = Screen::Setup;
+            }
+        }
+    }
+
     fn cycle_screen(&mut self) {
         self.screen = match self.screen {
             Screen::Monitor => Screen::Peers,
@@ -174,6 +398,7 @@ impl TuiState {
             Screen::Mempool => Screen::Wallet,
             Screen::Wallet => Screen::Logs,
             Screen::Logs => Screen::Monitor,
+            Screen::Setup => self.setup_return,
             Screen::Help => self.help_return,
         };
     }
@@ -291,6 +516,7 @@ impl Drop for TerminalGuard {
 pub fn run_tui(
     chainstate: Arc<ChainState<Store>>,
     store: Arc<Store>,
+    data_dir: PathBuf,
     sync_metrics: Arc<SyncMetrics>,
     header_metrics: Arc<HeaderMetrics>,
     validation_metrics: Arc<ValidationMetrics>,
@@ -313,7 +539,9 @@ pub fn run_tui(
     terminal.clear().map_err(|err| err.to_string())?;
 
     let mut state = TuiState::new();
+    state.setup = Some(SetupWizard::new(data_dir, network));
     let mut next_sample = Instant::now();
+    let mut next_wallet_refresh = Instant::now();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -375,6 +603,42 @@ pub fn run_tui(
             if matches!(state.screen, Screen::Logs) && !state.logs_paused {
                 state.update_logs(logging::capture_snapshot(LOG_SNAPSHOT_LIMIT));
             }
+            if matches!(state.screen, Screen::Wallet) && now >= next_wallet_refresh {
+                let tip_height = state
+                    .last_snapshot
+                    .as_ref()
+                    .map(|snap| snap.best_block_height);
+                match refresh_wallet_details(
+                    chainstate.as_ref(),
+                    mempool.as_ref(),
+                    wallet.as_ref(),
+                    tip_height,
+                ) {
+                    Ok(details) => {
+                        state.wallet_transparent = Some(details.transparent_owned);
+                        state.wallet_transparent_watchonly = Some(details.transparent_watchonly);
+                        state.wallet_sapling_spendable = Some(details.sapling_spendable);
+                        state.wallet_sapling_watchonly = Some(details.sapling_watchonly);
+                        state.wallet_sapling_scan_height = Some(details.sapling_scan_height);
+                        state.wallet_sapling_note_count = Some(details.sapling_note_count);
+                        state.wallet_recent_txs = details.recent_txs;
+                        state.wallet_pending_ops = details.pending_ops;
+                        state.wallet_detail_error = None;
+                    }
+                    Err(err) => {
+                        state.wallet_transparent = None;
+                        state.wallet_transparent_watchonly = None;
+                        state.wallet_sapling_spendable = None;
+                        state.wallet_sapling_watchonly = None;
+                        state.wallet_sapling_scan_height = None;
+                        state.wallet_sapling_note_count = None;
+                        state.wallet_recent_txs.clear();
+                        state.wallet_pending_ops.clear();
+                        state.wallet_detail_error = Some(err);
+                    }
+                }
+                next_wallet_refresh = now + WALLET_REFRESH_INTERVAL;
+            }
             next_sample = now + SAMPLE_INTERVAL;
         }
 
@@ -397,11 +661,425 @@ pub fn run_tui(
     Ok(())
 }
 
+pub fn run_remote_tui(endpoint: String) -> Result<(), String> {
+    let endpoint = endpoint.trim().to_string();
+    if endpoint.is_empty() {
+        return Err("missing --tui-attach endpoint".to_string());
+    }
+
+    let _guard = TerminalGuard::enter()?;
+    let stdout = io::stdout();
+    let term_backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(term_backend).map_err(|err| err.to_string())?;
+    terminal.clear().map_err(|err| err.to_string())?;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let peer_registry = PeerRegistry::default();
+    let net_totals = NetTotals::default();
+
+    let mut state = TuiState::new();
+    state.logs_min_level = logging::Level::Warn;
+    let mut next_sample = Instant::now();
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let now = Instant::now();
+        if now >= next_sample {
+            match fetch_remote_stats_snapshot(&endpoint) {
+                Ok(snapshot) => {
+                    state.update_snapshot(snapshot);
+                }
+                Err(err) => {
+                    state.update_error(err);
+                }
+            }
+            next_sample = now + SAMPLE_INTERVAL;
+        }
+
+        terminal
+            .draw(|frame| draw(frame, &state, &peer_registry, &net_totals))
+            .map_err(|err| err.to_string())?;
+
+        if event::poll(UI_TICK).map_err(|err| err.to_string())? {
+            if let Event::Key(key) = event::read().map_err(|err| err.to_string())? {
+                if key.kind == KeyEventKind::Press {
+                    if handle_key(key, &mut state, &shutdown_tx)? {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    terminal.show_cursor().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn fetch_remote_stats_snapshot(endpoint: &str) -> Result<StatsSnapshot, String> {
+    let endpoint = endpoint.trim();
+    let endpoint = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    let endpoint = endpoint.trim_end_matches('/');
+
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+        .unwrap_or((endpoint, 8080));
+    if host.is_empty() {
+        return Err("invalid --tui-attach endpoint".to_string());
+    }
+
+    let addr = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&addr).map_err(|err| format!("connect {addr}: {err}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let request = format!("GET /stats HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("write request: {err}"))?;
+    let mut response_bytes = Vec::new();
+    stream
+        .read_to_end(&mut response_bytes)
+        .map_err(|err| format!("read response: {err}"))?;
+
+    let response = String::from_utf8(response_bytes)
+        .map_err(|_| "remote response not valid utf-8".to_string())?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "invalid http response".to_string())?;
+    let status_line = head.lines().next().unwrap_or_default();
+    if !status_line.contains("200") {
+        return Err(format!("remote returned '{status_line}'"));
+    }
+
+    serde_json::from_str::<StatsSnapshot>(body).map_err(|err| format!("invalid stats json: {err}"))
+}
+
+struct WalletDetails {
+    transparent_owned: WalletBalanceBucket,
+    transparent_watchonly: WalletBalanceBucket,
+    sapling_spendable: i64,
+    sapling_watchonly: i64,
+    sapling_scan_height: i32,
+    sapling_note_count: usize,
+    recent_txs: Vec<WalletTxRow>,
+    pending_ops: Vec<crate::rpc::AsyncOpSnapshot>,
+}
+
+fn refresh_wallet_details(
+    chainstate: &ChainState<Store>,
+    mempool: &Mutex<Mempool>,
+    wallet: &Mutex<Wallet>,
+    tip_height: Option<i32>,
+) -> Result<WalletDetails, String> {
+    let (
+        scripts,
+        watch_script_set,
+        sapling_scan_height,
+        sapling_note_count,
+        sapling_notes,
+        recent_txs,
+    ) = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| "wallet lock poisoned".to_string())?;
+        let scripts = guard
+            .all_script_pubkeys_including_watchonly()
+            .map_err(|err| err.to_string())?;
+        let mut watch_scripts = HashSet::new();
+        for script in &scripts {
+            if guard.script_pubkey_is_watchonly(script) {
+                watch_scripts.insert(script.clone());
+            }
+        }
+
+        let sapling_scan_height = guard.sapling_scan_height();
+        let sapling_note_count = guard.sapling_note_count();
+        let mut sapling_notes = Vec::new();
+        if guard.has_sapling_keys() {
+            for note in guard.sapling_note_map().values() {
+                let is_mine = guard
+                    .sapling_address_is_mine(&note.address)
+                    .map_err(|err| err.to_string())?;
+                let ownership = if is_mine {
+                    Some(SaplingNoteOwnership::Spendable)
+                } else if guard
+                    .sapling_address_is_watchonly(&note.address)
+                    .map_err(|err| err.to_string())?
+                {
+                    Some(SaplingNoteOwnership::WatchOnly)
+                } else {
+                    None
+                };
+                let Some(ownership) = ownership else {
+                    continue;
+                };
+                sapling_notes.push(SaplingNoteSummary {
+                    ownership,
+                    value: note.value,
+                    height: note.height,
+                    nullifier: note.nullifier,
+                });
+            }
+        }
+
+        let recent_txs = guard
+            .recent_transactions(WALLET_RECENT_TXS)
+            .into_iter()
+            .map(|(txid, received_at)| WalletTxRow { txid, received_at })
+            .collect::<Vec<_>>();
+
+        (
+            scripts,
+            watch_scripts,
+            sapling_scan_height,
+            sapling_note_count,
+            sapling_notes,
+            recent_txs,
+        )
+    };
+
+    let utxos = collect_wallet_utxos(chainstate, mempool, &scripts, true)?;
+    let mut owned = WalletBalanceBucket::default();
+    let mut watch = WalletBalanceBucket::default();
+    for utxo in utxos {
+        let bucket = if watch_script_set.contains(&utxo.script_pubkey) {
+            &mut watch
+        } else {
+            &mut owned
+        };
+
+        if utxo.confirmations == 0 {
+            bucket.unconfirmed = bucket
+                .unconfirmed
+                .checked_add(utxo.value)
+                .ok_or_else(|| "wallet balance overflow".to_string())?;
+            continue;
+        }
+        if utxo.is_coinbase && utxo.confirmations < COINBASE_MATURITY {
+            bucket.immature = bucket
+                .immature
+                .checked_add(utxo.value)
+                .ok_or_else(|| "wallet balance overflow".to_string())?;
+            continue;
+        }
+        bucket.confirmed = bucket
+            .confirmed
+            .checked_add(utxo.value)
+            .ok_or_else(|| "wallet balance overflow".to_string())?;
+    }
+
+    let best_height = tip_height
+        .or_else(|| chainstate.best_block().ok().flatten().map(|tip| tip.height))
+        .unwrap_or(0);
+    let mut sapling_spendable = 0i64;
+    let mut sapling_watchonly = 0i64;
+    let mut chain_spend_status: Vec<(SaplingNoteSummary, bool)> = Vec::new();
+    chain_spend_status.reserve(sapling_notes.len());
+    for note in sapling_notes {
+        let confirmations = best_height.saturating_sub(note.height).saturating_add(1);
+        if confirmations < 1 {
+            continue;
+        }
+        let spent = chainstate
+            .sapling_nullifier_spent(&note.nullifier)
+            .map_err(|err| err.to_string())?;
+        chain_spend_status.push((note, spent));
+    }
+    let mempool_guard = mempool
+        .lock()
+        .map_err(|_| "mempool lock poisoned".to_string())?;
+    for (note, spent_in_chain) in chain_spend_status {
+        if spent_in_chain {
+            continue;
+        }
+        if mempool_guard
+            .sapling_nullifier_spender(&note.nullifier)
+            .is_some()
+        {
+            continue;
+        }
+        match note.ownership {
+            SaplingNoteOwnership::Spendable => {
+                sapling_spendable = sapling_spendable
+                    .checked_add(note.value)
+                    .ok_or_else(|| "wallet balance overflow".to_string())?;
+            }
+            SaplingNoteOwnership::WatchOnly => {
+                sapling_watchonly = sapling_watchonly
+                    .checked_add(note.value)
+                    .ok_or_else(|| "wallet balance overflow".to_string())?;
+            }
+        }
+    }
+
+    let pending_ops = crate::rpc::tui_async_ops_snapshot(0)
+        .into_iter()
+        .filter(|op| matches!(op.status.as_str(), "queued" | "executing"))
+        .take(WALLET_PENDING_OPS)
+        .collect::<Vec<_>>();
+
+    Ok(WalletDetails {
+        transparent_owned: owned,
+        transparent_watchonly: watch,
+        sapling_spendable,
+        sapling_watchonly,
+        sapling_scan_height,
+        sapling_note_count,
+        recent_txs,
+        pending_ops,
+    })
+}
+
+#[derive(Clone)]
+struct WalletUtxoRow {
+    outpoint: OutPoint,
+    value: i64,
+    script_pubkey: Vec<u8>,
+    is_coinbase: bool,
+    confirmations: i32,
+}
+
+fn collect_wallet_utxos(
+    chainstate: &ChainState<Store>,
+    mempool: &Mutex<Mempool>,
+    scripts: &[Vec<u8>],
+    include_mempool_outputs: bool,
+) -> Result<Vec<WalletUtxoRow>, String> {
+    if scripts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let best_height = chainstate
+        .best_block()
+        .map_err(|err| err.to_string())?
+        .map(|tip| tip.height)
+        .unwrap_or(0);
+
+    let mut seen: HashSet<OutPoint> = HashSet::new();
+    let mut out = Vec::new();
+    for script_pubkey in scripts {
+        let outpoints = chainstate
+            .address_outpoints(script_pubkey)
+            .map_err(|err| err.to_string())?;
+        for outpoint in outpoints {
+            if !seen.insert(outpoint.clone()) {
+                continue;
+            }
+            let entry = chainstate
+                .utxo_entry(&outpoint)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "missing utxo entry".to_string())?;
+            let height_i32 = i32::try_from(entry.height).unwrap_or(0);
+            let confirmations = if best_height >= height_i32 {
+                best_height.saturating_sub(height_i32).saturating_add(1)
+            } else {
+                0
+            };
+            out.push(WalletUtxoRow {
+                outpoint,
+                value: entry.value,
+                script_pubkey: entry.script_pubkey,
+                is_coinbase: entry.is_coinbase,
+                confirmations,
+            });
+        }
+    }
+
+    let mempool_guard = mempool
+        .lock()
+        .map_err(|_| "mempool lock poisoned".to_string())?;
+    out.retain(|row| !mempool_guard.is_spent(&row.outpoint));
+
+    if include_mempool_outputs {
+        for entry in mempool_guard.entries() {
+            for (output_index, output) in entry.tx.vout.iter().enumerate() {
+                if !scripts
+                    .iter()
+                    .any(|script| script.as_slice() == output.script_pubkey.as_slice())
+                {
+                    continue;
+                }
+                let outpoint = OutPoint {
+                    hash: entry.txid,
+                    index: output_index as u32,
+                };
+                if mempool_guard.is_spent(&outpoint) {
+                    continue;
+                }
+                if !seen.insert(outpoint.clone()) {
+                    continue;
+                }
+                out.push(WalletUtxoRow {
+                    outpoint,
+                    value: output.value,
+                    script_pubkey: output.script_pubkey.clone(),
+                    is_coinbase: false,
+                    confirmations: 0,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn handle_key(
     key: KeyEvent,
     state: &mut TuiState,
     shutdown_tx: &watch::Sender<bool>,
 ) -> Result<bool, String> {
+    if matches!(state.screen, Screen::Setup) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                state.toggle_setup();
+                return Ok(false);
+            }
+            (KeyCode::Char('s'), _) => {
+                state.toggle_setup();
+                return Ok(false);
+            }
+            (KeyCode::Char('n'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.cycle_network();
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('p'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.cycle_profile();
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('g'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.regenerate_auth();
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('v'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.toggle_pass_visible();
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('w'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    if let Err(err) = setup.write_config() {
+                        setup.status = Some(format!("Error: {err}"));
+                    }
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
             let _ = shutdown_tx.send(true);
@@ -413,6 +1091,10 @@ fn handle_key(
         }
         (KeyCode::Char('?'), _) => {
             state.toggle_help();
+            Ok(false)
+        }
+        (KeyCode::Char('s'), _) => {
+            state.toggle_setup();
             Ok(false)
         }
         (KeyCode::Tab, _) => {
@@ -558,6 +1240,7 @@ fn draw(
         Screen::Mempool => draw_mempool(frame, state),
         Screen::Wallet => draw_wallet(frame, state),
         Screen::Logs => draw_logs(frame, state),
+        Screen::Setup => draw_setup(frame, state),
         Screen::Help => draw_help(frame, state),
     }
 }
@@ -580,6 +1263,7 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Line::raw("  5 / w       Wallet view"),
         Line::raw("  6 / l       Logs view"),
         Line::raw("  ? / h       Toggle help"),
+        Line::raw("  s           Toggle setup wizard"),
         Line::raw("  a           Toggle advanced metrics"),
         Line::raw(""),
         Line::raw("Logs view:"),
@@ -590,7 +1274,8 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Line::raw("  Home/End    Top/Follow"),
         Line::raw(""),
         Line::raw("Notes:"),
-        Line::raw("  - This TUI is in-process; it uses internal stats (no HTTP)."),
+        Line::raw("  - Normal mode is in-process (internal stats, no HTTP)."),
+        Line::raw("  - Remote attach mode polls http://HOST:PORT/stats."),
         Line::raw("  - For a clean display, run with --log-level warn (default under --tui)."),
     ];
     let paragraph = Paragraph::new(lines)
@@ -601,6 +1286,78 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     if state.advanced {
         // no-op for now; keeps the state meaningful on the help page.
     }
+}
+
+fn draw_setup(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let title = Line::from(vec![
+        Span::styled("fluxd-rust", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("Setup Wizard", Style::default().fg(Color::Cyan)),
+    ]);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw(""));
+    match state.setup.as_ref() {
+        Some(setup) => {
+            let network = match setup.network {
+                Network::Mainnet => "mainnet",
+                Network::Testnet => "testnet",
+                Network::Regtest => "regtest",
+            };
+            lines.push(Line::raw(
+                "Writes a starter `flux.conf` with RPC auth + basic settings.",
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("Data dir:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {}", setup.data_dir.display())),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("flux.conf:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {}", setup.conf_path.display())),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("Network:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {network}")),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Profile:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {}", setup.profile.as_str())),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("rpcuser:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {}", setup.rpc_user)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("rpcpassword:", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {}", setup.masked_pass())),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("Keys:", Style::default().fg(Color::DarkGray)),
+                Span::raw(" n network  p profile  g regen auth  v show/hide pass  w write flux.conf  Esc back"),
+            ]));
+
+            if let Some(status) = setup.status.as_ref() {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("Status:", Style::default().fg(Color::Yellow)),
+                    Span::raw(" "),
+                    Span::raw(status),
+                ]));
+            }
+        }
+        None => {
+            lines.push(Line::raw("Setup wizard unavailable (remote attach mode)."));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .style(Style::default());
+    frame.render_widget(paragraph, frame.area());
 }
 
 fn draw_monitor(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
@@ -1105,6 +1862,12 @@ fn draw_mempool(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
 }
 
 fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(13), Constraint::Min(10)])
+        .split(area);
+
     let header = Line::from(vec![
         Span::styled("fluxd-rust", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
@@ -1205,6 +1968,71 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         ]));
     }
 
+    let transparent = state.wallet_transparent.as_ref();
+    let watch = state.wallet_transparent_watchonly.as_ref();
+    let sapling_spendable = fmt_opt_amount(state.wallet_sapling_spendable);
+    let sapling_watchonly = fmt_opt_amount(state.wallet_sapling_watchonly);
+    let sapling_notes = state
+        .wallet_sapling_note_count
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let scan_height = state
+        .wallet_sapling_scan_height
+        .and_then(|value| (value >= 0).then_some(value))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let behind = state
+        .last_snapshot
+        .as_ref()
+        .and_then(|snap| {
+            state
+                .wallet_sapling_scan_height
+                .and_then(|h| (h >= 0).then_some(snap.best_block_height - h))
+        })
+        .filter(|delta| *delta >= 0)
+        .map(|delta| delta.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Transparent (owned):", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(
+            " confirmed {}  unconf {}  immature {}",
+            fmt_opt_amount(transparent.map(|b| b.confirmed)),
+            fmt_opt_amount(transparent.map(|b| b.unconfirmed)),
+            fmt_opt_amount(transparent.map(|b| b.immature)),
+        )),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Transparent (watch):", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(
+            " confirmed {}  unconf {}  immature {}",
+            fmt_opt_amount(watch.map(|b| b.confirmed)),
+            fmt_opt_amount(watch.map(|b| b.unconfirmed)),
+            fmt_opt_amount(watch.map(|b| b.immature)),
+        )),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Sapling:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(
+            " spendable {sapling_spendable}  watch {sapling_watchonly}"
+        )),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Sapling scan:", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(
+            " height {scan_height}  behind {behind}  notes {sapling_notes}"
+        )),
+    ]));
+
+    if let Some(err) = state.wallet_detail_error.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("Wallet:", Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::raw(err),
+        ]));
+    }
+
     if let Some(err) = state.last_error.as_ref() {
         lines.push(Line::from(vec![
             Span::styled("Error:", Style::default().fg(Color::Red)),
@@ -1213,8 +2041,76 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         ]));
     }
 
-    let widget = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Info"));
-    frame.render_widget(widget, frame.area());
+    let summary_widget =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Info"));
+    frame.render_widget(summary_widget, chunks[0]);
+
+    let lower_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(chunks[1]);
+
+    let tx_header = Row::new(vec![Cell::from("age"), Cell::from("txid")])
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .bottom_margin(1);
+    let tx_rows = state.wallet_recent_txs.iter().map(|entry| {
+        let age = unix_seconds().saturating_sub(entry.received_at);
+        Row::new(vec![
+            Cell::from(format_age(age)),
+            Cell::from(shorten_suffix(&stats::hash256_to_hex(&entry.txid), 40)),
+        ])
+    });
+    let tx_table = Table::new(tx_rows, [Constraint::Length(10), Constraint::Min(10)])
+        .header(tx_header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Recent wallet transactions"),
+        )
+        .column_spacing(1);
+    frame.render_widget(tx_table, lower_chunks[0]);
+
+    let op_header = Row::new(vec![
+        Cell::from("status"),
+        Cell::from("method"),
+        Cell::from("age"),
+        Cell::from("opid"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+    .bottom_margin(1);
+    let op_rows = state.wallet_pending_ops.iter().map(|entry| {
+        let age_base = entry
+            .finished_time
+            .or(entry.started_time)
+            .unwrap_or(entry.creation_time);
+        let age = unix_seconds().saturating_sub(age_base);
+        let status_style = match entry.status.as_str() {
+            "queued" => Style::default().fg(Color::Yellow),
+            "executing" => Style::default().fg(Color::Cyan),
+            "failed" => Style::default().fg(Color::Red),
+            "success" => Style::default().fg(Color::Green),
+            _ => Style::default().fg(Color::White),
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(entry.status.clone(), status_style)),
+            Cell::from(shorten(&entry.method, 12)),
+            Cell::from(format_age(age)),
+            Cell::from(shorten_suffix(&entry.operationid, 18)),
+        ])
+    });
+    let op_table = Table::new(
+        op_rows,
+        [
+            Constraint::Length(9),
+            Constraint::Length(14),
+            Constraint::Length(8),
+            Constraint::Min(10),
+        ],
+    )
+    .header(op_header)
+    .block(Block::default().borders(Borders::ALL).title("Pending ops"))
+    .column_spacing(1);
+    frame.render_widget(op_table, lower_chunks[1]);
 }
 
 fn draw_logs(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
@@ -1432,4 +2328,26 @@ fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn fmt_opt_amount(value: Option<i64>) -> String {
+    value
+        .map(|value| crate::format_amount(value as i128))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    format!("{days}d")
 }
