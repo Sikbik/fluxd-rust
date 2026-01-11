@@ -95,6 +95,8 @@ const RPC_WALLET_ERROR: i64 = -4;
 const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 const RPC_WALLET_KEYPOOL_RAN_OUT: i64 = -12;
 const RPC_WALLET_UNLOCK_NEEDED: i64 = -13;
+const RPC_WALLET_PASSPHRASE_INCORRECT: i64 = -14;
+const RPC_WALLET_WRONG_ENC_STATE: i64 = -15;
 const RPC_DESERIALIZATION_ERROR: i64 = -22;
 const RPC_TRANSACTION_ERROR: i64 = -25;
 const RPC_TRANSACTION_REJECTED: i64 = -26;
@@ -2148,11 +2150,16 @@ fn rpc_encryptwallet(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value
         return Err(RpcError::new(RPC_INVALID_PARAMETER, "passphrase is empty"));
     }
 
-    wallet
+    let mut guard = wallet
         .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .encryptwallet(passphrase)
-        .map_err(map_wallet_error)?;
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    if guard.is_encrypted() {
+        return Err(RpcError::new(
+            RPC_WALLET_WRONG_ENC_STATE,
+            "Error: running with an encrypted wallet, but encryptwallet was called.",
+        ));
+    }
+    guard.encryptwallet(passphrase).map_err(map_wallet_error)?;
 
     Ok(Value::Null)
 }
@@ -2186,6 +2193,12 @@ fn rpc_walletpassphrase(
         let mut guard = wallet
             .lock()
             .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+        if !guard.is_encrypted() {
+            return Err(RpcError::new(
+                RPC_WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletpassphrase was called.",
+            ));
+        }
         let (_unlocked_until, generation) = guard
             .walletpassphrase(passphrase, timeout_u64)
             .map_err(map_wallet_error)?;
@@ -2230,9 +2243,16 @@ fn rpc_walletpassphrasechange(
             "new passphrase is empty",
         ));
     }
-    wallet
+    let mut guard = wallet
         .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    if !guard.is_encrypted() {
+        return Err(RpcError::new(
+            RPC_WALLET_WRONG_ENC_STATE,
+            "Error: running with an unencrypted wallet, but walletpassphrasechange was called.",
+        ));
+    }
+    guard
         .walletpassphrasechange(old_passphrase, new_passphrase)
         .map_err(map_wallet_error)?;
 
@@ -2241,11 +2261,16 @@ fn rpc_walletpassphrasechange(
 
 fn rpc_walletlock(wallet: &Mutex<Wallet>, params: Vec<Value>) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
-    wallet
+    let mut guard = wallet
         .lock()
-        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?
-        .walletlock()
-        .map_err(map_wallet_error)?;
+        .map_err(|_| RpcError::new(RPC_INTERNAL_ERROR, "wallet lock poisoned"))?;
+    if !guard.is_encrypted() {
+        return Err(RpcError::new(
+            RPC_WALLET_WRONG_ENC_STATE,
+            "Error: running with an unencrypted wallet, but walletlock was called.",
+        ));
+    }
+    guard.walletlock().map_err(map_wallet_error)?;
     Ok(Value::Null)
 }
 
@@ -2596,6 +2621,10 @@ fn map_wallet_error(err: WalletError) -> RpcError {
         WalletError::WalletLocked => RpcError::new(
             RPC_WALLET_UNLOCK_NEEDED,
             "Error: Please enter the wallet passphrase with walletpassphrase first.",
+        ),
+        WalletError::IncorrectPassphrase => RpcError::new(
+            RPC_WALLET_PASSPHRASE_INCORRECT,
+            "Error: The wallet passphrase entered was incorrect.",
         ),
         WalletError::InvalidData("invalid wif") => {
             RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "invalid private key encoding")
