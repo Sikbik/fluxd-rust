@@ -10979,7 +10979,7 @@ fn rpc_sendfrom<S: fluxd_storage::KeyValueStore>(
     })
 }
 
-fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
+pub(crate) fn rpc_sendtoaddress<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     mempool: &Mutex<Mempool>,
     mempool_policy: &MempoolPolicy,
@@ -31267,7 +31267,7 @@ fn write_cookie(path: &Path, user: &str, pass: &str) -> Result<(), String> {
 }
 
 #[derive(Debug)]
-struct RpcError {
+pub(crate) struct RpcError {
     code: i64,
     message: String,
 }
@@ -31280,6 +31280,14 @@ impl RpcError {
         }
     }
 }
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (code {})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 struct HttpRequest {
     method: String,

@@ -300,6 +300,19 @@ pub struct Wallet {
     unlock_generation: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct TransparentAddressInfo {
+    pub address: String,
+    pub label: Option<String>,
+    pub is_change: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SaplingAddressInfo {
+    pub address: String,
+    pub is_watchonly: bool,
+}
+
 impl Wallet {
     pub fn load_or_create(data_dir: &Path, network: Network) -> Result<Self, WalletError> {
         let path = data_dir.join(WALLET_FILE_NAME);
@@ -790,6 +803,54 @@ impl Wallet {
             return Ok(None);
         };
         Ok(Some(key.address(self.network)?))
+    }
+
+    pub(crate) fn transparent_address_infos(
+        &self,
+    ) -> Result<Vec<TransparentAddressInfo>, WalletError> {
+        let mut out = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            let address = key.address(self.network)?;
+            let script_pubkey = key.p2pkh_script_pubkey()?;
+            let label = self.address_labels.get(&script_pubkey).cloned();
+            let is_change = self.change_key_hashes.contains(&key.key_hash);
+            out.push(TransparentAddressInfo {
+                address,
+                label,
+                is_change,
+            });
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn sapling_address_infos(&self) -> Result<Vec<SaplingAddressInfo>, WalletError> {
+        let hrp = match self.network {
+            Network::Mainnet => "za",
+            Network::Testnet => "ztestacadia",
+            Network::Regtest => "zregtestsapling",
+        };
+        let hrp =
+            Hrp::parse(hrp).map_err(|_| WalletError::InvalidData("invalid sapling address hrp"))?;
+
+        let mut out = BTreeMap::<String, bool>::new();
+        for bytes in self.sapling_addresses_bytes()? {
+            let encoded = bech32::encode::<Bech32>(hrp, bytes.as_slice())
+                .map_err(|_| WalletError::InvalidData("failed to encode sapling address"))?;
+            out.insert(encoded, false);
+        }
+        for bytes in self.sapling_viewing_addresses_bytes()? {
+            let encoded = bech32::encode::<Bech32>(hrp, bytes.as_slice())
+                .map_err(|_| WalletError::InvalidData("failed to encode sapling address"))?;
+            out.entry(encoded).or_insert(true);
+        }
+
+        Ok(out
+            .into_iter()
+            .map(|(address, is_watchonly)| SaplingAddressInfo {
+                address,
+                is_watchonly,
+            })
+            .collect())
     }
 
     pub fn can_spend_script_pubkey(&self, script_pubkey: &[u8]) -> bool {

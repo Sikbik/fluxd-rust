@@ -6,12 +6,15 @@
 
 - In-process (recommended): `fluxd --tui [other flags...]`
 - Remote attach (read-only monitor): `fluxd --tui-attach <host[:port]>`
-  - Polls `http://<host[:port]>/stats` (default port: `8080`)
+  - Polls `http://<host[:port]>/{stats,peers,nettotals}` (default port: `8080`)
+  - When `a` (advanced) is enabled and the Mempool view is open, it also polls `http://<host[:port]>/mempool`
 
 ## Navigation
 
 - `q` / `Esc`: quit (requests shutdown in in-process mode)
 - `Tab`: cycle views (Monitor → Peers → DB → Mempool → Wallet → Logs)
+- `Shift+Tab`: cycle views backwards
+- `←/→`: cycle views
 - `1-6`: jump to view (Monitor/Peers/DB/Mempool/Wallet/Logs)
 - `?` / `h`: toggle help
 - `a`: toggle advanced metrics
@@ -20,10 +23,17 @@
 ## Views
 
 - **Monitor**: sync state + historical blocks/sec and headers/sec chart.
-- **Peers**: connection counts and peer list (remote attach mode shows an empty list).
+- **Peers**: connection counts and peer list.
 - **DB**: Fjall telemetry (write buffer, journals, compactions, per-partition segments/flushes).
 - **Mempool**: size and recent accept/reject/orphan counters.
-- **Wallet**: key/encryption state, transparent + Sapling balance summaries, recent wallet txs, and pending async ops.
+  - With `a` (advanced), shows fee/age/version breakdown.
+- **Wallet**: key/encryption state, transparent + Sapling balance summaries, addresses + receive QR, recent wallet txs, and async ops.
+  - Keys (in-process only): `Up/Down` select address, `Enter` toggle QR, `n` new t-addr, `N` new z-addr, `x` open send modal, `i` watch address.
+  - Notes:
+    - `Transparent (watch-only)` tracks imported addresses/scripts you don’t control (visible but not spendable).
+      - Add via the TUI (`i`) or via RPC `importaddress`.
+    - Change addresses are internal; they’re hidden in basic mode unless they currently hold funds (press `a` to show everything).
+    - The `Async ops` panel is for shielded RPC operations that run asynchronously (e.g. `z_sendmany`, `z_shieldcoinbase`); normal transparent sends/receives won’t show up there.
 - **Logs**: in-TUI ring buffer with filter + scroll.
   - Keys: `f` filter, `Space` pause/follow, `c` clear, `Up/Down/PageUp/PageDown/Home/End` scroll.
 
@@ -55,7 +65,7 @@ Changes apply on restart.
 
 ## Remote attach
 
-Remote attach mode requires a running dashboard server on the remote daemon (it serves `/stats`).
+Remote attach mode requires a running dashboard server on the remote daemon (it serves `/stats`, `/peers`, `/nettotals`, and `/mempool`).
 
 Example (remote daemon):
 - Start the daemon with a dashboard bind, e.g. `--dashboard-addr 0.0.0.0:8080`
@@ -63,4 +73,4 @@ Example (remote daemon):
 Example (local machine):
 - `fluxd --tui-attach <remote-host>:8080`
 
-Remote attach mode only has access to what the dashboard exposes; peer lists and logs will be empty.
+Remote attach mode only has access to what the dashboard exposes; wallet controls and log capture are in-process only.

@@ -1676,10 +1676,16 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         let validation_metrics = Arc::clone(&validation_metrics);
         let connect_metrics = Arc::clone(&connect_metrics);
         let mempool = Arc::clone(&mempool);
+        let mempool_policy = Arc::clone(&mempool_policy);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let fee_estimator = Arc::clone(&fee_estimator);
+        let tx_confirm_target = config.tx_confirm_target;
+        let mempool_flags = flags.clone();
         let wallet = Arc::clone(&wallet);
+        let tx_announce = tx_announce.clone();
         let net_totals = Arc::clone(&net_totals);
         let peer_registry = Arc::clone(&peer_registry);
+        let chain_params = Arc::clone(&params);
         let shutdown_rx = shutdown_rx.clone();
         let shutdown_tx = shutdown_tx.clone();
         thread::spawn(move || {
@@ -1692,10 +1698,16 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                 validation_metrics,
                 connect_metrics,
                 mempool,
+                mempool_policy,
                 mempool_metrics,
+                fee_estimator,
+                tx_confirm_target,
+                mempool_flags,
                 wallet,
+                tx_announce,
                 net_totals,
                 peer_registry,
+                chain_params,
                 network,
                 backend,
                 start_time,
@@ -1715,6 +1727,8 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         let connect_metrics = Arc::clone(&connect_metrics);
         let mempool = Arc::clone(&mempool);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let net_totals = Arc::clone(&net_totals);
+        let peer_registry = Arc::clone(&peer_registry);
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1731,6 +1745,8 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
                     connect_metrics,
                     mempool,
                     mempool_metrics,
+                    net_totals,
+                    peer_registry,
                     network,
                     backend,
                     start_time,

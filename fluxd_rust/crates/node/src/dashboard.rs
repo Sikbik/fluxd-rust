@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fluxd_chainstate::metrics::ConnectMetrics;
 use fluxd_chainstate::state::ChainState;
@@ -11,10 +12,12 @@ use tokio::net::TcpListener;
 
 use fluxd_chainstate::validation::ValidationMetrics;
 
+use crate::p2p::{NetTotals, PeerKind, PeerRegistry};
 use crate::stats::{snapshot_stats, HeaderMetrics, SyncMetrics};
 use crate::Backend;
 use crate::Store;
 use crate::{mempool::Mempool, stats::MempoolMetrics};
+use serde_json;
 
 const MAX_REQUEST_BYTES: usize = 8192;
 
@@ -29,6 +32,8 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
     connect_metrics: Arc<ConnectMetrics>,
     mempool: Arc<Mutex<Mempool>>,
     mempool_metrics: Arc<MempoolMetrics>,
+    net_totals: Arc<NetTotals>,
+    peer_registry: Arc<PeerRegistry>,
     network: Network,
     backend: Backend,
     start_time: Instant,
@@ -51,6 +56,8 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
         let connect_metrics = Arc::clone(&connect_metrics);
         let mempool = Arc::clone(&mempool);
         let mempool_metrics = Arc::clone(&mempool_metrics);
+        let net_totals = Arc::clone(&net_totals);
+        let peer_registry = Arc::clone(&peer_registry);
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 stream,
@@ -62,6 +69,8 @@ pub async fn serve_dashboard<S: KeyValueStore + Send + Sync + 'static>(
                 connect_metrics,
                 mempool,
                 mempool_metrics,
+                net_totals,
+                peer_registry,
                 network,
                 backend,
                 start_time,
@@ -85,6 +94,8 @@ async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
     connect_metrics: Arc<ConnectMetrics>,
     mempool: Arc<Mutex<Mempool>>,
     mempool_metrics: Arc<MempoolMetrics>,
+    net_totals: Arc<NetTotals>,
+    peer_registry: Arc<PeerRegistry>,
     network: Network,
     backend: Backend,
     start_time: Instant,
@@ -152,6 +163,143 @@ async fn handle_connection<S: KeyValueStore + Send + Sync + 'static>(
                 "text/plain; charset=utf-8",
                 format!("metrics error: {err}"),
             ),
+        },
+        ("GET", "/nettotals") => {
+            #[derive(serde::Serialize)]
+            struct NetTotalsView {
+                bytes_recv: u64,
+                bytes_sent: u64,
+                connections: usize,
+            }
+            let totals = net_totals.snapshot();
+            match serde_json::to_string(&NetTotalsView {
+                bytes_recv: totals.bytes_recv,
+                bytes_sent: totals.bytes_sent,
+                connections: totals.connections,
+            }) {
+                Ok(body) => ("200 OK", "application/json", body),
+                Err(err) => (
+                    "500 Internal Server Error",
+                    "text/plain; charset=utf-8",
+                    format!("nettotals error: {err}"),
+                ),
+            }
+        }
+        ("GET", "/peers") => {
+            #[derive(serde::Serialize)]
+            struct PeerInfoView {
+                addr: String,
+                kind: String,
+                inbound: bool,
+                version: i32,
+                start_height: i32,
+                user_agent: String,
+            }
+            let peers = peer_registry.snapshot();
+            let view = peers
+                .into_iter()
+                .map(|peer| PeerInfoView {
+                    addr: peer.addr.to_string(),
+                    kind: match peer.kind {
+                        PeerKind::Block => "block",
+                        PeerKind::Header => "header",
+                        PeerKind::Relay => "relay",
+                    }
+                    .to_string(),
+                    inbound: peer.inbound,
+                    version: peer.version,
+                    start_height: peer.start_height,
+                    user_agent: peer.user_agent,
+                })
+                .collect::<Vec<_>>();
+            match serde_json::to_string(&view) {
+                Ok(body) => ("200 OK", "application/json", body),
+                Err(err) => (
+                    "500 Internal Server Error",
+                    "text/plain; charset=utf-8",
+                    format!("peers error: {err}"),
+                ),
+            }
+        }
+        ("GET", "/mempool") => match mempool.lock() {
+            Err(_) => (
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                "mempool lock poisoned".to_string(),
+            ),
+            Ok(guard) => {
+                #[derive(serde::Serialize)]
+                struct VersionCount {
+                    version: i32,
+                    count: u64,
+                }
+
+                #[derive(serde::Serialize)]
+                struct AgeSecs {
+                    newest_secs: u64,
+                    median_secs: u64,
+                    oldest_secs: u64,
+                }
+
+                #[derive(serde::Serialize)]
+                struct MempoolSummaryView {
+                    size: u64,
+                    bytes: u64,
+                    fee_zero: u64,
+                    fee_nonzero: u64,
+                    versions: Vec<VersionCount>,
+                    age_secs: AgeSecs,
+                }
+
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let mut fee_zero = 0u64;
+                let mut fee_nonzero = 0u64;
+                let mut versions: BTreeMap<i32, u64> = BTreeMap::new();
+                let mut ages: Vec<u64> = Vec::with_capacity(guard.size());
+
+                for entry in guard.entries() {
+                    if entry.fee == 0 {
+                        fee_zero = fee_zero.saturating_add(1);
+                    } else {
+                        fee_nonzero = fee_nonzero.saturating_add(1);
+                    }
+                    *versions.entry(entry.tx.version).or_insert(0) += 1;
+                    ages.push(now.saturating_sub(entry.time));
+                }
+
+                ages.sort_unstable();
+                let newest_secs = ages.first().copied().unwrap_or(0);
+                let oldest_secs = ages.last().copied().unwrap_or(0);
+                let median_secs = ages.get(ages.len() / 2).copied().unwrap_or(0);
+                let versions = versions
+                    .into_iter()
+                    .map(|(version, count)| VersionCount { version, count })
+                    .collect::<Vec<_>>();
+
+                match serde_json::to_string(&MempoolSummaryView {
+                    size: guard.size() as u64,
+                    bytes: guard.bytes() as u64,
+                    fee_zero,
+                    fee_nonzero,
+                    versions,
+                    age_secs: AgeSecs {
+                        newest_secs,
+                        median_secs,
+                        oldest_secs,
+                    },
+                }) {
+                    Ok(body) => ("200 OK", "application/json", body),
+                    Err(err) => (
+                        "500 Internal Server Error",
+                        "text/plain; charset=utf-8",
+                        format!("mempool error: {err}"),
+                    ),
+                }
+            }
         },
         ("GET", "/healthz") => ("200 OK", "text/plain; charset=utf-8", "ok".to_string()),
         _ => (
