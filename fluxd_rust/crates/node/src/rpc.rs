@@ -18905,8 +18905,8 @@ mod tests {
     fn getpeerinfo_has_cpp_schema_keys() {
         let peer_registry = PeerRegistry::default();
         let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().expect("addr");
-        peer_registry.register(addr, PeerKind::Header);
-        peer_registry.update_version(addr, 170020, 0x5, "/MagicBean:9.0.6/".to_string(), 123);
+        let id = peer_registry.register(addr, PeerKind::Header);
+        peer_registry.update_version(id, 170020, 0x5, "/MagicBean:9.0.6/".to_string(), 123);
 
         let value = rpc_getpeerinfo(Vec::new(), &peer_registry).expect("rpc");
         let peers = value.as_array().expect("array");

@@ -64,12 +64,13 @@ struct PeerEntry {
 
 #[derive(Debug, Default)]
 pub struct PeerRegistry {
-    peers: Mutex<HashMap<SocketAddr, PeerEntry>>,
+    next_id: AtomicU64,
+    peers: Mutex<HashMap<u64, PeerEntry>>,
     disconnect_requests: Mutex<HashSet<SocketAddr>>,
 }
 
 impl PeerRegistry {
-    fn register_internal(&self, addr: SocketAddr, kind: PeerKind, inbound: bool) {
+    fn register_internal(&self, addr: SocketAddr, kind: PeerKind, inbound: bool) -> u64 {
         let now = SystemTime::now();
         let entry = PeerEntry {
             addr,
@@ -85,9 +86,11 @@ impl PeerRegistry {
             bytes_sent: 0,
             bytes_recv: 0,
         };
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut peers) = self.peers.lock() {
-            peers.insert(addr, entry);
+            peers.insert(id, entry);
         }
+        id
     }
 
     pub fn request_disconnect(&self, addr: SocketAddr) {
@@ -99,28 +102,28 @@ impl PeerRegistry {
     pub fn take_disconnect_request(&self, addr: SocketAddr) -> bool {
         self.disconnect_requests
             .lock()
-            .map(|mut requests| requests.remove(&addr))
+            .map(|requests| requests.contains(&addr))
             .unwrap_or(false)
     }
 
-    pub fn register(&self, addr: SocketAddr, kind: PeerKind) {
-        self.register_internal(addr, kind, false);
+    pub fn register(&self, addr: SocketAddr, kind: PeerKind) -> u64 {
+        self.register_internal(addr, kind, false)
     }
 
-    pub fn register_inbound(&self, addr: SocketAddr, kind: PeerKind) {
-        self.register_internal(addr, kind, true);
+    pub fn register_inbound(&self, addr: SocketAddr, kind: PeerKind) -> u64 {
+        self.register_internal(addr, kind, true)
     }
 
     pub fn update_version(
         &self,
-        addr: SocketAddr,
+        id: u64,
         version: i32,
         services: u64,
         user_agent: String,
         start_height: i32,
     ) {
         if let Ok(mut peers) = self.peers.lock() {
-            if let Some(entry) = peers.get_mut(&addr) {
+            if let Some(entry) = peers.get_mut(&id) {
                 entry.version = version;
                 entry.services = services;
                 entry.user_agent = user_agent;
@@ -129,29 +132,43 @@ impl PeerRegistry {
         }
     }
 
-    pub fn note_send(&self, addr: SocketAddr, bytes: usize) {
+    pub fn note_send(&self, id: u64, bytes: usize) {
         let now = SystemTime::now();
         if let Ok(mut peers) = self.peers.lock() {
-            if let Some(entry) = peers.get_mut(&addr) {
+            if let Some(entry) = peers.get_mut(&id) {
                 entry.last_send = now;
                 entry.bytes_sent = entry.bytes_sent.saturating_add(bytes as u64);
             }
         }
     }
 
-    pub fn note_recv(&self, addr: SocketAddr, bytes: usize) {
+    pub fn note_recv(&self, id: u64, bytes: usize) {
         let now = SystemTime::now();
         if let Ok(mut peers) = self.peers.lock() {
-            if let Some(entry) = peers.get_mut(&addr) {
+            if let Some(entry) = peers.get_mut(&id) {
                 entry.last_recv = now;
                 entry.bytes_recv = entry.bytes_recv.saturating_add(bytes as u64);
             }
         }
     }
 
-    pub fn remove(&self, addr: SocketAddr) {
-        if let Ok(mut peers) = self.peers.lock() {
-            peers.remove(&addr);
+    pub fn remove(&self, id: u64) {
+        let (addr, still_connected) = match self.peers.lock() {
+            Ok(mut peers) => {
+                let Some(entry) = peers.remove(&id) else {
+                    return;
+                };
+                let addr = entry.addr;
+                let still_connected = peers.values().any(|peer| peer.addr == addr);
+                (addr, still_connected)
+            }
+            Err(_) => return,
+        };
+
+        if !still_connected {
+            if let Ok(mut requests) = self.disconnect_requests.lock() {
+                requests.remove(&addr);
+            }
         }
     }
 
@@ -238,6 +255,7 @@ pub struct Peer {
     remote_user_agent: String,
     kind: PeerKind,
     addr: SocketAddr,
+    registry_id: u64,
     registry: Arc<PeerRegistry>,
     net_totals: Arc<NetTotals>,
 }
@@ -254,7 +272,7 @@ impl Peer {
             .await
             .map_err(|err| err.to_string())?;
         net_totals.inc_connections();
-        registry.register(addr, kind);
+        let registry_id = registry.register(addr, kind);
         Ok(Self {
             stream,
             magic,
@@ -264,6 +282,7 @@ impl Peer {
             remote_user_agent: String::new(),
             kind,
             addr,
+            registry_id,
             registry,
             net_totals,
         })
@@ -278,7 +297,7 @@ impl Peer {
         net_totals: Arc<NetTotals>,
     ) -> Self {
         net_totals.inc_connections();
-        registry.register_inbound(addr, kind);
+        let registry_id = registry.register_inbound(addr, kind);
         Self {
             stream,
             magic,
@@ -288,6 +307,7 @@ impl Peer {
             remote_user_agent: String::new(),
             kind,
             addr,
+            registry_id,
             registry,
             net_totals,
         }
@@ -315,7 +335,7 @@ impl Peer {
         .map_err(|_| "peer write timed out".to_string())?
         .map_err(|err| err.to_string())?;
         self.net_totals.add_sent(header.len());
-        self.registry.note_send(self.addr, header.len());
+        self.registry.note_send(self.registry_id, header.len());
         Ok(())
     }
 
@@ -350,7 +370,7 @@ impl Peer {
         }
         let bytes = 24 + payload.len();
         self.net_totals.add_recv(bytes);
-        self.registry.note_recv(self.addr, bytes);
+        self.registry.note_recv(self.registry_id, bytes);
         Ok((command, payload))
     }
 
@@ -378,7 +398,7 @@ impl Peer {
                         self.remote_services = info.services;
                         self.remote_user_agent = info.user_agent;
                         self.registry.update_version(
-                            self.addr,
+                            self.registry_id,
                             self.remote_version,
                             self.remote_services,
                             self.remote_user_agent.clone(),
@@ -468,7 +488,7 @@ impl Peer {
 impl Drop for Peer {
     fn drop(&mut self) {
         self.net_totals.dec_connections();
-        self.registry.remove(self.addr);
+        self.registry.remove(self.registry_id);
     }
 }
 
