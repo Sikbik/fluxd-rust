@@ -4,12 +4,18 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, TryRecvError};
+
 use bech32::{Bech32, Hrp};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -24,8 +30,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, Gauge, GraphType, Paragraph, Row, Table,
-    Wrap,
+    Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Sparkline, SparklineBar, Table, Wrap,
 };
 use ratatui::Terminal;
 use serde::de::DeserializeOwned;
@@ -53,19 +59,24 @@ use crate::wallet::{SaplingAddressInfo, TransparentAddressInfo, Wallet};
 use crate::RunProfile;
 use crate::{Backend, Store};
 
-const HISTORY_SAMPLES: usize = 300;
+const HISTORY_SAMPLES: usize = 900;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-const UI_TICK: Duration = Duration::from_millis(200);
+const UI_TICK: Duration = Duration::from_millis(100);
 const LOG_SNAPSHOT_LIMIT: usize = 4096;
 const WALLET_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const WALLET_RECENT_TXS: usize = 12;
 const WALLET_PENDING_OPS: usize = 12;
 const PEER_SCROLL_STEP: u16 = 1;
 const PEER_PAGE_STEP: u16 = 10;
+const MOUSE_WHEEL_STEP: u16 = 3;
+const QR_MAX_DIM: usize = 48;
+const CTRL_C_GRACE: Duration = Duration::from_secs(2);
+const HEADER_LEAD_STEP: i32 = 5000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
     Monitor,
+    Stats,
     Peers,
     Db,
     Mempool,
@@ -90,16 +101,16 @@ struct Theme {
 }
 
 const THEME: Theme = Theme {
-    bg: Color::Rgb(8, 12, 20),
-    panel: Color::Rgb(17, 24, 39),
-    border: Color::Rgb(51, 65, 85),
-    text: Color::Rgb(226, 232, 240),
-    muted: Color::Rgb(148, 163, 184),
-    accent: Color::Rgb(45, 212, 191),
-    accent_alt: Color::Rgb(56, 189, 248),
-    warning: Color::Rgb(251, 191, 36),
-    danger: Color::Rgb(248, 113, 113),
-    success: Color::Rgb(74, 222, 128),
+    bg: Color::Rgb(0, 0, 0),
+    panel: Color::Rgb(10, 10, 10),
+    border: Color::Rgb(40, 40, 40),
+    text: Color::Rgb(230, 230, 230),
+    muted: Color::Rgb(100, 100, 100),
+    accent: Color::Rgb(0, 122, 204),
+    accent_alt: Color::Rgb(50, 168, 82),
+    warning: Color::Rgb(255, 180, 0),
+    danger: Color::Rgb(255, 60, 60),
+    success: Color::Rgb(80, 200, 80),
 };
 
 fn style_base() -> Style {
@@ -121,13 +132,19 @@ fn style_key() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+fn style_command() -> Style {
+    Style::default()
+        .fg(THEME.accent)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn style_border() -> Style {
     Style::default().fg(THEME.border).bg(THEME.panel)
 }
 
 fn style_title() -> Style {
     Style::default()
-        .fg(THEME.accent_alt)
+        .fg(THEME.text)
         .bg(THEME.panel)
         .add_modifier(Modifier::BOLD)
 }
@@ -149,35 +166,1054 @@ fn style_warn() -> Style {
 fn panel_block(title: impl Into<String>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
         .border_style(style_border())
         .style(Style::default().bg(THEME.panel))
         .title(Span::styled(title.into(), style_title()))
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CommandAction {
+    Navigate(Screen),
+    ToggleHelp,
+    ToggleSetup,
+    ToggleAdvanced,
+    ToggleMouseCapture,
+    Quit,
+    LogLevel(Option<logging::Level>),
+    WalletSend,
+    WalletWatch,
+    WalletNewTransparent,
+    WalletNewSapling,
+    WalletToggleQr,
+    LogsClear,
+    LogsPause,
+    LogsFollow,
+    Hint(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CommandSpec {
+    command: &'static str,
+    aliases: &'static [&'static str],
+    description: &'static str,
+    category: &'static str,
+    quick: bool,
+    action: CommandAction,
+}
+
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        command: "/monitor",
+        aliases: &["/m"],
+        description: "Monitor view",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::Navigate(Screen::Monitor),
+    },
+    CommandSpec {
+        command: "/stats",
+        aliases: &["/coin"],
+        description: "Coin stats view",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::Navigate(Screen::Stats),
+    },
+    CommandSpec {
+        command: "/peers",
+        aliases: &["/p"],
+        description: "Peers view",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::Navigate(Screen::Peers),
+    },
+    CommandSpec {
+        command: "/db",
+        aliases: &["/d"],
+        description: "DB view",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::Navigate(Screen::Db),
+    },
+    CommandSpec {
+        command: "/mempool",
+        aliases: &["/t"],
+        description: "Mempool view",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::Navigate(Screen::Mempool),
+    },
+    CommandSpec {
+        command: "/wallet",
+        aliases: &["/w"],
+        description: "Wallet view",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::Navigate(Screen::Wallet),
+    },
+    CommandSpec {
+        command: "/logs",
+        aliases: &["/l"],
+        description: "Logs view",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::Navigate(Screen::Logs),
+    },
+    CommandSpec {
+        command: "/help",
+        aliases: &["/h", "/?"],
+        description: "Help panel",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::ToggleHelp,
+    },
+    CommandSpec {
+        command: "/setup",
+        aliases: &["/s"],
+        description: "Setup wizard",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::ToggleSetup,
+    },
+    CommandSpec {
+        command: "/quit",
+        aliases: &["/q"],
+        description: "Quit daemon",
+        category: "Quick",
+        quick: true,
+        action: CommandAction::Quit,
+    },
+    CommandSpec {
+        command: "/advanced",
+        aliases: &["/a"],
+        description: "Toggle advanced metrics",
+        category: "System",
+        quick: false,
+        action: CommandAction::ToggleAdvanced,
+    },
+    CommandSpec {
+        command: "/mouse",
+        aliases: &[],
+        description: "Toggle mouse capture for text selection",
+        category: "System",
+        quick: false,
+        action: CommandAction::ToggleMouseCapture,
+    },
+    CommandSpec {
+        command: "/send",
+        aliases: &["/wallet-send"],
+        description: "Send funds (in-process wallet)",
+        category: "Wallet",
+        quick: false,
+        action: CommandAction::WalletSend,
+    },
+    CommandSpec {
+        command: "/watch",
+        aliases: &["/wallet-watch"],
+        description: "Import watch-only address",
+        category: "Wallet",
+        quick: false,
+        action: CommandAction::WalletWatch,
+    },
+    CommandSpec {
+        command: "/new-t",
+        aliases: &["/taddr", "/new-taddr"],
+        description: "New transparent address",
+        category: "Wallet",
+        quick: false,
+        action: CommandAction::WalletNewTransparent,
+    },
+    CommandSpec {
+        command: "/new-z",
+        aliases: &["/zaddr", "/new-zaddr"],
+        description: "New sapling address",
+        category: "Wallet",
+        quick: false,
+        action: CommandAction::WalletNewSapling,
+    },
+    CommandSpec {
+        command: "/qr",
+        aliases: &["/wallet-qr"],
+        description: "Toggle wallet QR code",
+        category: "Wallet",
+        quick: false,
+        action: CommandAction::WalletToggleQr,
+    },
+    CommandSpec {
+        command: "/log",
+        aliases: &[],
+        description: "Set log level: trace|debug|info|warn|error",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogLevel(None),
+    },
+    CommandSpec {
+        command: "/debug",
+        aliases: &[],
+        description: "Log level debug",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogLevel(Some(logging::Level::Debug)),
+    },
+    CommandSpec {
+        command: "/info",
+        aliases: &[],
+        description: "Log level info",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogLevel(Some(logging::Level::Info)),
+    },
+    CommandSpec {
+        command: "/warn",
+        aliases: &[],
+        description: "Log level warn",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogLevel(Some(logging::Level::Warn)),
+    },
+    CommandSpec {
+        command: "/error",
+        aliases: &[],
+        description: "Log level error",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogLevel(Some(logging::Level::Error)),
+    },
+    CommandSpec {
+        command: "/trace",
+        aliases: &[],
+        description: "Log level trace",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogLevel(Some(logging::Level::Trace)),
+    },
+    CommandSpec {
+        command: "/log-clear",
+        aliases: &["/clear"],
+        description: "Clear captured logs",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogsClear,
+    },
+    CommandSpec {
+        command: "/log-pause",
+        aliases: &["/pause"],
+        description: "Pause log capture",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogsPause,
+    },
+    CommandSpec {
+        command: "/log-follow",
+        aliases: &["/follow"],
+        description: "Resume following logs",
+        category: "Logs",
+        quick: false,
+        action: CommandAction::LogsFollow,
+    },
+    CommandSpec {
+        command: "/cli-help",
+        aliases: &["/help-cli"],
+        description: "Show CLI help (run: fluxd --help)",
+        category: "CLI",
+        quick: false,
+        action: CommandAction::Hint("Run: fluxd --help"),
+    },
+    CommandSpec {
+        command: "/version",
+        aliases: &["/cli-version"],
+        description: "Show version (run: fluxd --version)",
+        category: "CLI",
+        quick: false,
+        action: CommandAction::Hint("Run: fluxd --version"),
+    },
+    CommandSpec {
+        command: "/backend",
+        aliases: &[],
+        description: "Storage backend (fjall|memory)",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --backend <fjall|memory>"),
+    },
+    CommandSpec {
+        command: "/data-dir",
+        aliases: &[],
+        description: "Data directory path",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --data-dir <path>"),
+    },
+    CommandSpec {
+        command: "/conf",
+        aliases: &[],
+        description: "Config file path",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --conf <path>"),
+    },
+    CommandSpec {
+        command: "/params-dir",
+        aliases: &[],
+        description: "Shielded params directory",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --params-dir <path>"),
+    },
+    CommandSpec {
+        command: "/profile",
+        aliases: &[],
+        description: "Tuning preset (low|default|high)",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --profile <low|default|high>"),
+    },
+    CommandSpec {
+        command: "/network",
+        aliases: &[],
+        description: "Network (mainnet|testnet|regtest)",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --network <mainnet|testnet|regtest>"),
+    },
+    CommandSpec {
+        command: "/miner-address",
+        aliases: &[],
+        description: "Default miner address",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --miner-address <addr>"),
+    },
+    CommandSpec {
+        command: "/log-level",
+        aliases: &[],
+        description: "Startup log verbosity",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint(
+            "Restart required: fluxd --log-level <error|warn|info|debug|trace>",
+        ),
+    },
+    CommandSpec {
+        command: "/log-format",
+        aliases: &[],
+        description: "Log output format (text|json)",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --log-format <text|json>"),
+    },
+    CommandSpec {
+        command: "/log-timestamps",
+        aliases: &[],
+        description: "Enable timestamps in text logs",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --log-timestamps"),
+    },
+    CommandSpec {
+        command: "/no-log-timestamps",
+        aliases: &[],
+        description: "Disable timestamps in text logs",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --no-log-timestamps"),
+    },
+    CommandSpec {
+        command: "/fetch-params",
+        aliases: &[],
+        description: "Download shielded params",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd --fetch-params"),
+    },
+    CommandSpec {
+        command: "/tui",
+        aliases: &[],
+        description: "Launch TUI mode",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Start: fluxd --tui"),
+    },
+    CommandSpec {
+        command: "/tui-attach",
+        aliases: &[],
+        description: "Launch TUI attach mode",
+        category: "Configuration",
+        quick: false,
+        action: CommandAction::Hint("Start: fluxd --tui-attach http://HOST:PORT/stats"),
+    },
+    CommandSpec {
+        command: "/dashboard-addr",
+        aliases: &[],
+        description: "Dashboard HTTP bind address",
+        category: "RPC",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --dashboard-addr <host:port>"),
+    },
+    CommandSpec {
+        command: "/rpc-addr",
+        aliases: &[],
+        description: "RPC bind address",
+        category: "RPC",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --rpc-addr <host:port>"),
+    },
+    CommandSpec {
+        command: "/rpc-user",
+        aliases: &[],
+        description: "RPC username",
+        category: "RPC",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --rpc-user <user>"),
+    },
+    CommandSpec {
+        command: "/rpc-pass",
+        aliases: &[],
+        description: "RPC password",
+        category: "RPC",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --rpc-pass <pass>"),
+    },
+    CommandSpec {
+        command: "/rpc-allow-ip",
+        aliases: &[],
+        description: "RPC allowlist (CIDR)",
+        category: "RPC",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --rpc-allow-ip <cidr>"),
+    },
+    CommandSpec {
+        command: "/p2p-addr",
+        aliases: &[],
+        description: "P2P bind address",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --p2p-addr <host:port>"),
+    },
+    CommandSpec {
+        command: "/no-p2p-listen",
+        aliases: &[],
+        description: "Disable inbound P2P listener",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --no-p2p-listen"),
+    },
+    CommandSpec {
+        command: "/addnode",
+        aliases: &[],
+        description: "Add manual peer",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --addnode <host[:port]>"),
+    },
+    CommandSpec {
+        command: "/maxconnections",
+        aliases: &[],
+        description: "Max peer connections",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --maxconnections <n>"),
+    },
+    CommandSpec {
+        command: "/block-peers",
+        aliases: &[],
+        description: "Parallel block peers",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --block-peers <n>"),
+    },
+    CommandSpec {
+        command: "/header-peers",
+        aliases: &[],
+        description: "Header sync peers",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --header-peers <n>"),
+    },
+    CommandSpec {
+        command: "/header-peer",
+        aliases: &[],
+        description: "Pin header peer",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --header-peer <host[:port]>"),
+    },
+    CommandSpec {
+        command: "/header-lead",
+        aliases: &[],
+        description: "Target header lead",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --header-lead <n>"),
+    },
+    CommandSpec {
+        command: "/tx-peers",
+        aliases: &[],
+        description: "Relay peers for txs",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --tx-peers <n>"),
+    },
+    CommandSpec {
+        command: "/inflight-per-peer",
+        aliases: &[],
+        description: "Concurrent getdata per peer",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --inflight-per-peer <n>"),
+    },
+    CommandSpec {
+        command: "/getdata-batch",
+        aliases: &[],
+        description: "Blocks per getdata request",
+        category: "P2P",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --getdata-batch <n>"),
+    },
+    CommandSpec {
+        command: "/minrelaytxfee",
+        aliases: &[],
+        description: "Minimum relay fee-rate",
+        category: "Mempool",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --minrelaytxfee <zatoshi/kB>"),
+    },
+    CommandSpec {
+        command: "/limitfreerelay",
+        aliases: &[],
+        description: "Rate-limit free txs",
+        category: "Mempool",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --limitfreerelay <n>"),
+    },
+    CommandSpec {
+        command: "/accept-non-standard",
+        aliases: &[],
+        description: "Disable standardness checks",
+        category: "Mempool",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --accept-non-standard"),
+    },
+    CommandSpec {
+        command: "/require-standard",
+        aliases: &[],
+        description: "Force standardness on regtest",
+        category: "Mempool",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --require-standard"),
+    },
+    CommandSpec {
+        command: "/mempool-max-mb",
+        aliases: &[],
+        description: "Mempool size cap (MiB)",
+        category: "Mempool",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --mempool-max-mb <n>"),
+    },
+    CommandSpec {
+        command: "/mempool-persist-interval",
+        aliases: &[],
+        description: "Persist mempool every N seconds",
+        category: "Mempool",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --mempool-persist-interval <secs>"),
+    },
+    CommandSpec {
+        command: "/fee-estimates-persist-interval",
+        aliases: &[],
+        description: "Persist fee estimates",
+        category: "Mempool",
+        quick: false,
+        action: CommandAction::Hint(
+            "Restart required: fluxd --fee-estimates-persist-interval <secs>",
+        ),
+    },
+    CommandSpec {
+        command: "/db-cache-mb",
+        aliases: &[],
+        description: "Fjall cache size (MiB)",
+        category: "Storage",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --db-cache-mb <MiB>"),
+    },
+    CommandSpec {
+        command: "/db-write-buffer-mb",
+        aliases: &[],
+        description: "Fjall write buffer (MiB)",
+        category: "Storage",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --db-write-buffer-mb <MiB>"),
+    },
+    CommandSpec {
+        command: "/db-journal-mb",
+        aliases: &[],
+        description: "Fjall journal size (MiB)",
+        category: "Storage",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --db-journal-mb <MiB>"),
+    },
+    CommandSpec {
+        command: "/db-memtable-mb",
+        aliases: &[],
+        description: "Fjall memtable size (MiB)",
+        category: "Storage",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --db-memtable-mb <MiB>"),
+    },
+    CommandSpec {
+        command: "/db-flush-workers",
+        aliases: &[],
+        description: "Fjall flush worker threads",
+        category: "Storage",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --db-flush-workers <n>"),
+    },
+    CommandSpec {
+        command: "/db-compaction-workers",
+        aliases: &[],
+        description: "Fjall compaction workers",
+        category: "Storage",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --db-compaction-workers <n>"),
+    },
+    CommandSpec {
+        command: "/db-fsync-ms",
+        aliases: &[],
+        description: "Fjall async fsync interval",
+        category: "Storage",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --db-fsync-ms <ms>"),
+    },
+    CommandSpec {
+        command: "/utxo-cache-entries",
+        aliases: &[],
+        description: "In-memory UTXO cache entries",
+        category: "Storage",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --utxo-cache-entries <n>"),
+    },
+    CommandSpec {
+        command: "/header-verify-workers",
+        aliases: &[],
+        description: "Header POW verification threads",
+        category: "Performance",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --header-verify-workers <n>"),
+    },
+    CommandSpec {
+        command: "/verify-workers",
+        aliases: &[],
+        description: "Pre-validation worker threads",
+        category: "Performance",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --verify-workers <n>"),
+    },
+    CommandSpec {
+        command: "/verify-queue",
+        aliases: &[],
+        description: "Pre-validation queue depth",
+        category: "Performance",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --verify-queue <n>"),
+    },
+    CommandSpec {
+        command: "/shielded-workers",
+        aliases: &[],
+        description: "Shielded verification threads",
+        category: "Performance",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --shielded-workers <n>"),
+    },
+    CommandSpec {
+        command: "/txconfirmtarget",
+        aliases: &[],
+        description: "Fee estimation target blocks",
+        category: "Performance",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --txconfirmtarget <blocks>"),
+    },
+    CommandSpec {
+        command: "/status-interval",
+        aliases: &[],
+        description: "Status log interval seconds",
+        category: "Performance",
+        quick: false,
+        action: CommandAction::Hint("Restart required: fluxd --status-interval <secs>"),
+    },
+    CommandSpec {
+        command: "/reindex",
+        aliases: &[],
+        description: "Rebuild DB/indexes (offline)",
+        category: "Maintenance",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd --reindex"),
+    },
+    CommandSpec {
+        command: "/resync",
+        aliases: &[],
+        description: "Wipe data-dir and resync (danger)",
+        category: "Maintenance",
+        quick: false,
+        action: CommandAction::Hint("Danger: fluxd --resync (wipes data-dir)"),
+    },
+    CommandSpec {
+        command: "/reindex-txindex",
+        aliases: &[],
+        description: "Rebuild txindex",
+        category: "Maintenance",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd --reindex-txindex"),
+    },
+    CommandSpec {
+        command: "/reindex-spentindex",
+        aliases: &[],
+        description: "Rebuild spent index",
+        category: "Maintenance",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd --reindex-spentindex"),
+    },
+    CommandSpec {
+        command: "/reindex-addressindex",
+        aliases: &[],
+        description: "Rebuild address index",
+        category: "Maintenance",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd --reindex-addressindex"),
+    },
+    CommandSpec {
+        command: "/db-info",
+        aliases: &[],
+        description: "DB/flatfile size breakdown",
+        category: "Diagnostics",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd db-info"),
+    },
+    CommandSpec {
+        command: "/db-info-keys",
+        aliases: &[],
+        description: "DB key/byte counts (slow)",
+        category: "Diagnostics",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd db-info-keys"),
+    },
+    CommandSpec {
+        command: "/db-integrity",
+        aliases: &[],
+        description: "DB sanity + verify last 288 blocks",
+        category: "Diagnostics",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd db-integrity"),
+    },
+    CommandSpec {
+        command: "/scan-flatfiles",
+        aliases: &[],
+        description: "Scan flatfiles for mismatches",
+        category: "Diagnostics",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd scan-flatfiles"),
+    },
+    CommandSpec {
+        command: "/scan-supply",
+        aliases: &[],
+        description: "Scan supply from local DB",
+        category: "Diagnostics",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd scan-supply"),
+    },
+    CommandSpec {
+        command: "/scan-fluxnodes",
+        aliases: &[],
+        description: "Scan fluxnode records",
+        category: "Diagnostics",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd scan-fluxnodes"),
+    },
+    CommandSpec {
+        command: "/debug-fluxnode-payee-script",
+        aliases: &[],
+        description: "Find matching fluxnode payee script",
+        category: "Debug",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd --debug-fluxnode-payee-script <script-hex>"),
+    },
+    CommandSpec {
+        command: "/debug-fluxnode-payouts",
+        aliases: &[],
+        description: "Print deterministic fluxnode payouts",
+        category: "Debug",
+        quick: false,
+        action: CommandAction::Hint("Run once: fluxd --debug-fluxnode-payouts <height>"),
+    },
+    CommandSpec {
+        command: "/debug-fluxnode-payee-candidates",
+        aliases: &[],
+        description: "Print ordered payee candidates",
+        category: "Debug",
+        quick: false,
+        action: CommandAction::Hint(
+            "Run once: fluxd --debug-fluxnode-payee-candidates <tier> <height> <limit>",
+        ),
+    },
+    CommandSpec {
+        command: "/skip-script",
+        aliases: &[],
+        description: "Disable script validation (testing)",
+        category: "Debug",
+        quick: false,
+        action: CommandAction::Hint("Danger: fluxd --skip-script"),
+    },
+];
+
+fn command_query(input: &str) -> &str {
+    input.trim().split_whitespace().next().unwrap_or("")
+}
+
+fn normalize_command(value: &str) -> String {
+    value.trim().trim_start_matches('/').to_lowercase()
+}
+
+fn command_match_score(spec: &CommandSpec, query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let command = normalize_command(spec.command);
+    if command.starts_with(query) {
+        return Some(0);
+    }
+    if spec
+        .aliases
+        .iter()
+        .any(|alias| normalize_command(alias).starts_with(query))
+    {
+        return Some(1);
+    }
+    if command.contains(query) {
+        return Some(2);
+    }
+    if spec
+        .aliases
+        .iter()
+        .any(|alias| normalize_command(alias).contains(query))
+    {
+        return Some(3);
+    }
+    if spec.description.to_lowercase().contains(query) {
+        return Some(4);
+    }
+    if spec.category.to_lowercase().contains(query) {
+        return Some(5);
+    }
+    None
+}
+
+fn command_suggestions(input: &str) -> Vec<&'static CommandSpec> {
+    let raw_query = command_query(input);
+    let blank = raw_query.is_empty() || raw_query == "/";
+    let query = normalize_command(raw_query);
+    if blank {
+        return COMMANDS.iter().filter(|spec| spec.quick).collect();
+    }
+
+    let mut results: Vec<(u8, &CommandSpec)> = COMMANDS
+        .iter()
+        .filter_map(|spec| command_match_score(spec, &query).map(|score| (score, spec)))
+        .collect();
+    results.sort_by(|(score_a, spec_a), (score_b, spec_b)| {
+        score_a
+            .cmp(score_b)
+            .then_with(|| spec_a.command.cmp(spec_b.command))
+    });
+    results.into_iter().map(|(_, spec)| spec).collect()
+}
+
+fn find_command_spec(command: &str) -> Option<&'static CommandSpec> {
+    let needle = normalize_command(command);
+    if needle.is_empty() {
+        return None;
+    }
+    COMMANDS.iter().find(|spec| {
+        let command = normalize_command(spec.command);
+        if command == needle {
+            return true;
+        }
+        spec.aliases
+            .iter()
+            .any(|alias| normalize_command(alias) == needle)
+    })
+}
+
+fn parse_log_level(value: &str) -> Option<logging::Level> {
+    match value {
+        "trace" => Some(logging::Level::Trace),
+        "debug" => Some(logging::Level::Debug),
+        "info" => Some(logging::Level::Info),
+        "warn" | "warning" => Some(logging::Level::Warn),
+        "error" => Some(logging::Level::Error),
+        _ => None,
+    }
+}
+
+fn log_level_label(level: logging::Level) -> &'static str {
+    match level {
+        logging::Level::Trace => "trace",
+        logging::Level::Debug => "debug",
+        logging::Level::Info => "info",
+        logging::Level::Warn => "warn",
+        logging::Level::Error => "error",
+    }
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut index = 0;
+    while index < input.len() {
+        let b0 = input[index];
+        let b1 = input.get(index + 1).copied().unwrap_or(0);
+        let b2 = input.get(index + 2).copied().unwrap_or(0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        output.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        if index + 1 < input.len() {
+            output.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if index + 2 < input.len() {
+            output.push(TABLE[(n & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        index += 3;
+    }
+    output
+}
+
+fn osc52_copy(text: &str) -> Result<(), String> {
+    let payload = base64_encode(text.as_bytes());
+    let seq = format!("\u{1b}]52;c;{}\u{7}", payload);
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(seq.as_bytes())
+        .map_err(|err| err.to_string())?;
+    stdout.flush().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn is_wsl() -> bool {
+    if std::env::var("WSL_DISTRO_NAME").is_ok() || std::env::var("WSL_INTEROP").is_ok() {
+        return true;
+    }
+    fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|value| value.to_lowercase().contains("microsoft"))
+        .unwrap_or(false)
+}
+
+fn wsl_clipboard_copy(text: &str) -> Result<(), String> {
+    let mut child = Command::new("clip.exe")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|err| err.to_string())?;
+    }
+    let status = child.wait().map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("clip.exe failed".to_string())
+    }
+}
+
+fn clipboard_copy(text: &str) -> Result<(), String> {
+    if is_wsl() {
+        if wsl_clipboard_copy(text).is_ok() {
+            return Ok(());
+        }
+    }
+    osc52_copy(text)
+}
+
+fn ctrl_c_exit(state: &mut TuiState, shutdown_tx: &watch::Sender<bool>) -> Result<bool, String> {
+    let now = Instant::now();
+    if let Some(last) = state.last_ctrl_c {
+        if now.duration_since(last) <= CTRL_C_GRACE {
+            let _ = shutdown_tx.send(true);
+            return Ok(true);
+        }
+    }
+    state.last_ctrl_c = Some(now);
+    state.command_status = Some("Press Ctrl+C again to quit".to_string());
+    Ok(false)
+}
+
+fn explorer_tx_url(txid: &str) -> String {
+    format!("https://explorer.runonflux.io/tx/{txid}")
+}
+
+fn explorer_address_url(address: &str) -> String {
+    format!("https://explorer.runonflux.io/address/{address}")
+}
+
+fn open_url(url: &str) -> Result<(), String> {
+    let candidates: [(&str, &[&str]); 3] = [
+        ("xdg-open", &[url]),
+        ("open", &[url]),
+        ("explorer.exe", &[url]),
+    ];
+    for (cmd, args) in candidates {
+        if Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err("no URL opener available".to_string())
+}
+
+fn open_or_copy_url(url: &str) -> Option<&'static str> {
+    if open_url(url).is_ok() {
+        return Some("Explorer opened");
+    }
+    if clipboard_copy(url).is_ok() {
+        return Some("Explorer link copied");
+    }
+    None
+}
+
 fn header_line(state: &TuiState, active: Screen) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
-        "fluxd-rust",
+        " fluxd ",
         Style::default()
-            .fg(THEME.accent)
-            .bg(THEME.panel)
+            .fg(THEME.bg)
+            .bg(THEME.accent)
             .add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::raw("  "));
+    spans.push(Span::raw(" "));
 
     if state.is_remote {
         spans.push(Span::styled(
-            "REMOTE",
+            " REMOTE ",
             Style::default()
-                .fg(THEME.warning)
-                .bg(THEME.panel)
+                .fg(THEME.bg)
+                .bg(THEME.warning)
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw(" "));
     }
 
     for (screen, label) in [
         (Screen::Monitor, "Monitor"),
+        (Screen::Stats, "Stats"),
         (Screen::Peers, "Peers"),
         (Screen::Db, "DB"),
         (Screen::Mempool, "Mempool"),
@@ -186,7 +1222,7 @@ fn header_line(state: &TuiState, active: Screen) -> Line<'static> {
     ] {
         if screen == active {
             spans.push(Span::styled(
-                format!("[{label}] "),
+                format!(" {label} "),
                 Style::default()
                     .fg(THEME.accent_alt)
                     .bg(THEME.panel)
@@ -194,24 +1230,117 @@ fn header_line(state: &TuiState, active: Screen) -> Line<'static> {
             ));
         } else {
             spans.push(Span::styled(
-                format!("{label} "),
+                format!(" {label} "),
                 Style::default().fg(THEME.muted).bg(THEME.panel),
             ));
         }
     }
 
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled("Tab", style_key()));
-    spans.push(Span::raw("/"));
-    spans.push(Span::styled("Shift+Tab", style_key()));
-    spans.push(Span::raw(" views  "));
-    spans.push(Span::styled("?", style_key()));
-    spans.push(Span::raw(" help  "));
-    spans.push(Span::styled("a", style_key()));
-    spans.push(Span::raw(" advanced  "));
-    spans.push(Span::styled("q", style_key()));
-    spans.push(Span::raw(" quit"));
     Line::from(spans)
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn render_vertical_scrollbar(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    content_length: usize,
+    position: usize,
+    viewport_length: usize,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .style(Style::default().fg(THEME.muted).bg(THEME.panel));
+
+    let mut scrollbar_state = ScrollbarState::new(content_length)
+        .position(position)
+        .viewport_content_length(viewport_length);
+
+    frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+}
+
+fn layout_areas(state: &TuiState, area: Rect) -> (Rect, Rect, Rect, Rect) {
+    let command_height = if state.command_mode { 10 } else { 3 };
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(command_height),
+        ])
+        .split(area);
+
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(42)])
+        .split(vertical[1]);
+
+    (vertical[0], middle[0], middle[1], vertical[2])
+}
+
+fn header_tab_at(state: &TuiState, area: Rect, column: u16, row: u16) -> Option<Screen> {
+    if row != area.y || column < area.x || column >= area.x.saturating_add(area.width) {
+        return None;
+    }
+
+    let mut cursor = area.x;
+    cursor = cursor.saturating_add(" fluxd ".len() as u16);
+    cursor = cursor.saturating_add(1);
+    if state.is_remote {
+        cursor = cursor.saturating_add(" REMOTE ".len() as u16);
+        cursor = cursor.saturating_add(1);
+    }
+
+    for (screen, label) in [
+        (Screen::Monitor, "Monitor"),
+        (Screen::Stats, "Stats"),
+        (Screen::Peers, "Peers"),
+        (Screen::Db, "DB"),
+        (Screen::Mempool, "Mempool"),
+        (Screen::Wallet, "Wallet"),
+        (Screen::Logs, "Logs"),
+    ] {
+        let width = (label.len() + 2) as u16;
+        let end = cursor.saturating_add(width);
+        if column >= cursor && column < end {
+            return Some(screen);
+        }
+        cursor = end;
+    }
+
+    None
+}
+
+fn command_palette_areas(area: Rect) -> Option<(Rect, Rect)> {
+    if area.width < 3 || area.height < 3 {
+        return None;
+    }
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if inner.height < 2 {
+        return None;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    Some((chunks[0], chunks[1]))
+}
+
+fn wallet_qr_modal_area(area: Rect) -> Rect {
+    centered_rect(60, 75, area)
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -365,9 +1494,14 @@ struct WalletBalanceBucket {
 #[derive(Clone, Debug)]
 struct SetupWizard {
     data_dir: PathBuf,
+    active_data_dir: PathBuf,
     conf_path: PathBuf,
+    data_sets: Vec<PathBuf>,
+    data_set_index: usize,
+    delete_confirm: Option<(PathBuf, Instant)>,
     network: Network,
     profile: RunProfile,
+    header_lead: i32,
     rpc_user: String,
     rpc_pass: String,
     show_pass: bool,
@@ -375,19 +1509,26 @@ struct SetupWizard {
 }
 
 impl SetupWizard {
-    fn new(data_dir: PathBuf, network: Network) -> Self {
-        let conf_path = data_dir.join("flux.conf");
+    fn new(data_dir: PathBuf, conf_path: PathBuf, network: Network, header_lead: i32) -> Self {
         let mut wizard = Self {
-            data_dir,
+            data_dir: data_dir.clone(),
+            active_data_dir: data_dir,
             conf_path,
+            data_sets: Vec::new(),
+            data_set_index: 0,
+            delete_confirm: None,
             network,
             profile: RunProfile::Default,
+            header_lead: header_lead.max(0),
             rpc_user: String::new(),
             rpc_pass: String::new(),
             show_pass: false,
             status: None,
         };
-        wizard.regenerate_auth();
+        wizard.refresh_data_sets();
+        if wizard.rpc_user.is_empty() || wizard.rpc_pass.is_empty() {
+            wizard.regenerate_auth();
+        }
         wizard
     }
 
@@ -405,6 +1546,309 @@ impl SetupWizard {
             RunProfile::Default => RunProfile::High,
             RunProfile::High => RunProfile::Low,
         };
+    }
+
+    fn refresh_data_sets(&mut self) {
+        let normalize = |path: PathBuf| fs::canonicalize(&path).unwrap_or(path);
+
+        let canonical_active = normalize(self.active_data_dir.clone());
+        let canonical_selected = normalize(self.data_dir.clone());
+
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = canonical_active
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            roots.push(parent.to_path_buf());
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            for ancestor in exe.ancestors() {
+                if ancestor
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value == "target")
+                {
+                    if let Some(parent) = ancestor.parent() {
+                        roots.push(parent.to_path_buf());
+                    }
+                    break;
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
+
+        let mut root_set: HashSet<PathBuf> = HashSet::new();
+        let mut unique_roots: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            let root = normalize(root);
+            if root_set.insert(root.clone()) {
+                unique_roots.push(root);
+            }
+        }
+
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut sets: Vec<PathBuf> = Vec::new();
+        for root in unique_roots {
+            if let Ok(entries) = fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let name = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("");
+                    if !name.starts_with("data") {
+                        continue;
+                    }
+                    let path = normalize(path);
+                    if seen.insert(path.clone()) {
+                        sets.push(path);
+                    }
+                }
+            }
+        }
+
+        for extra in [canonical_active.clone(), canonical_selected.clone()] {
+            if seen.insert(extra.clone()) {
+                sets.push(extra);
+            }
+        }
+
+        sets.sort_by(|left, right| {
+            let left_name = left
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_string();
+            let right_name = right
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_string();
+            left_name
+                .cmp(&right_name)
+                .then_with(|| left.to_string_lossy().cmp(&right.to_string_lossy()))
+        });
+        self.data_sets = sets;
+        self.active_data_dir = canonical_active;
+        self.data_dir = canonical_selected;
+        self.conf_path = self.data_dir.join("flux.conf");
+
+        if let Some(index) = self
+            .data_sets
+            .iter()
+            .position(|path| path == &self.data_dir)
+        {
+            self.data_set_index = index;
+        } else if let Some(index) = self
+            .data_sets
+            .iter()
+            .position(|path| path == &self.active_data_dir)
+        {
+            self.data_set_index = index;
+        } else {
+            self.data_set_index = 0;
+        }
+
+        if let Some((user, pass)) = self.read_rpc_from_conf() {
+            self.rpc_user = user;
+            self.rpc_pass = pass;
+        }
+        self.delete_confirm = None;
+    }
+
+    fn read_rpc_from_conf(&self) -> Option<(String, String)> {
+        let Ok(Some(conf)) = crate::load_flux_conf(&self.conf_path) else {
+            return None;
+        };
+        let user = conf
+            .get("rpcuser")
+            .and_then(|values| values.last())
+            .cloned();
+        let pass = conf
+            .get("rpcpassword")
+            .and_then(|values| values.last())
+            .cloned();
+        match (user, pass) {
+            (Some(user), Some(pass)) => Some((user, pass)),
+            _ => None,
+        }
+    }
+
+    fn datadir_pointer_path(&self) -> PathBuf {
+        self.active_data_dir
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(crate::DATADIR_POINTER_FILE_NAME)
+    }
+
+    fn write_datadir_pointer(&self) -> Result<(), String> {
+        let pointer_path = self.datadir_pointer_path();
+        let contents = format!("{}\n", self.data_dir.display());
+        fs::write(&pointer_path, contents)
+            .map_err(|err| format!("failed to write {}: {err}", pointer_path.display()))?;
+        Ok(())
+    }
+
+    fn apply_selected_data_set(&mut self) -> Result<(), String> {
+        let Some(path) = self.data_sets.get(self.data_set_index).cloned() else {
+            return Ok(());
+        };
+        let path = fs::canonicalize(&path).unwrap_or(path);
+        self.data_dir = path;
+        self.conf_path = self.data_dir.join("flux.conf");
+        if let Some((user, pass)) = self.read_rpc_from_conf() {
+            self.rpc_user = user;
+            self.rpc_pass = pass;
+        }
+        self.write_datadir_pointer()?;
+        self.delete_confirm = None;
+        if self.data_dir == self.active_data_dir {
+            self.status = Some("Selected active data dir".to_string());
+        } else {
+            self.status = Some(format!(
+                "Default data dir set to {} (restart fluxd)",
+                self.data_dir.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn move_data_set(&mut self, delta: i32) {
+        if self.data_sets.is_empty() {
+            return;
+        }
+        let len = self.data_sets.len();
+        let current = self.data_set_index as i32;
+        let next = (current + delta).clamp(0, (len - 1) as i32) as usize;
+        if next != self.data_set_index {
+            self.data_set_index = next;
+            if let Some(path) = self.data_sets.get(next) {
+                self.status = Some(format!("Highlight {} (Enter to select)", path.display()));
+            }
+        }
+        self.delete_confirm = None;
+    }
+
+    fn write_config_for_data_dir(&mut self, data_dir: PathBuf) -> Result<(), String> {
+        let saved_data_dir = self.data_dir.clone();
+        let saved_conf_path = self.conf_path.clone();
+        let saved_status = self.status.clone();
+
+        self.data_dir = data_dir;
+        self.conf_path = self.data_dir.join("flux.conf");
+
+        let result = if self.conf_path.exists() {
+            Ok(())
+        } else {
+            self.write_config()
+        };
+
+        self.data_dir = saved_data_dir;
+        self.conf_path = saved_conf_path;
+        self.status = saved_status;
+        result
+    }
+
+    fn create_new_data_set(&mut self) -> Result<(), String> {
+        let root = self
+            .active_data_dir
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+
+        let base = "data-new";
+        let mut suffix = 0u32;
+        let target = loop {
+            let name = if suffix == 0 {
+                base.to_string()
+            } else {
+                format!("{base}{suffix}")
+            };
+            let candidate = root.join(name);
+            if !candidate.exists() {
+                break candidate;
+            }
+            suffix = suffix.saturating_add(1);
+            if suffix > 10_000 {
+                return Err("too many data-new* dirs exist".to_string());
+            }
+        };
+
+        fs::create_dir_all(&target)
+            .map_err(|err| format!("failed to create {}: {err}", target.display()))?;
+
+        let canonical_target = fs::canonicalize(&target).unwrap_or(target);
+        self.write_config_for_data_dir(canonical_target.clone())?;
+        self.refresh_data_sets();
+        if let Some(index) = self
+            .data_sets
+            .iter()
+            .position(|path| path == &canonical_target)
+        {
+            self.data_set_index = index;
+        }
+        self.status = Some(format!(
+            "Created {} with starter flux.conf (Enter to select)",
+            canonical_target.display()
+        ));
+        Ok(())
+    }
+
+    fn request_delete_selected(&mut self) -> Result<(), String> {
+        let Some(target) = self.data_sets.get(self.data_set_index).cloned() else {
+            return Ok(());
+        };
+        if target == self.active_data_dir {
+            self.status = Some("Cannot delete active data dir".to_string());
+            return Ok(());
+        }
+        let now = Instant::now();
+        if let Some((pending, since)) = self.delete_confirm.as_ref() {
+            if pending == &target && now.duration_since(*since) <= Duration::from_secs(5) {
+                fs::remove_dir_all(&target).map_err(|err| format!("delete failed: {err}"))?;
+                if target == self.data_dir {
+                    self.data_dir = self.active_data_dir.clone();
+                    self.conf_path = self.data_dir.join("flux.conf");
+                    if let Some((user, pass)) = self.read_rpc_from_conf() {
+                        self.rpc_user = user;
+                        self.rpc_pass = pass;
+                    }
+                    let _ = self.write_datadir_pointer();
+                }
+                self.status = Some(format!("Deleted {}", target.display()));
+                self.delete_confirm = None;
+                self.refresh_data_sets();
+                return Ok(());
+            }
+        }
+        self.delete_confirm = Some((target.clone(), now));
+        self.status = Some(format!("Press d again to delete {}", target.display()));
+        Ok(())
+    }
+
+    fn toggle_header_lead_unlimited(&mut self) {
+        if self.header_lead == 0 {
+            self.header_lead = crate::DEFAULT_HEADER_LEAD;
+        } else {
+            self.header_lead = 0;
+        }
+    }
+
+    fn adjust_header_lead(&mut self, delta: i32) {
+        if self.header_lead == 0 {
+            if delta <= 0 {
+                return;
+            }
+            self.header_lead = crate::DEFAULT_HEADER_LEAD;
+        }
+        let next = self.header_lead.saturating_add(delta);
+        self.header_lead = next.max(0);
     }
 
     fn regenerate_auth(&mut self) {
@@ -440,6 +1884,14 @@ impl SetupWizard {
     }
 
     fn write_config(&mut self) -> Result<(), String> {
+        if let Some(conf_dir) = self
+            .conf_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            fs::create_dir_all(conf_dir)
+                .map_err(|err| format!("failed to create conf dir: {err}"))?;
+        }
         fs::create_dir_all(&self.data_dir)
             .map_err(|err| format!("failed to create data dir: {err}"))?;
 
@@ -461,6 +1913,7 @@ impl SetupWizard {
                 writeln!(&mut contents, "regtest=1").ok();
             }
         }
+        writeln!(&mut contents, "headerlead={}", self.header_lead).ok();
         writeln!(&mut contents, "").ok();
         writeln!(&mut contents, "rpcuser={}", self.rpc_user).ok();
         writeln!(&mut contents, "rpcpassword={}", self.rpc_pass).ok();
@@ -477,7 +1930,12 @@ impl SetupWizard {
         if self.conf_path.exists() {
             let suffix = unix_seconds();
             let backup_name = format!("flux.conf.bak.{suffix}");
-            let backup_path = self.data_dir.join(backup_name);
+            let backup_dir = self
+                .conf_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(self.data_dir.as_path());
+            let backup_path = backup_dir.join(backup_name);
             if let Err(_err) = fs::rename(&self.conf_path, &backup_path) {
                 fs::copy(&self.conf_path, &backup_path)
                     .map_err(|err| format!("failed to backup existing flux.conf: {err}"))?;
@@ -535,22 +1993,6 @@ impl RateHistory {
         self.points.push_back(point);
     }
 
-    fn bounds(&self) -> (f64, f64) {
-        let Some(last) = self.points.back() else {
-            return (0.0, 1.0);
-        };
-        let min_t = self.points.front().map(|point| point.t).unwrap_or(last.t);
-        (min_t, last.t.max(min_t + 1.0))
-    }
-
-    fn max_y(&self) -> f64 {
-        self.points
-            .iter()
-            .map(|point| point.value)
-            .fold(0.0, f64::max)
-            .max(1.0)
-    }
-
     fn as_vec(&self) -> Vec<(f64, f64)> {
         self.points
             .iter()
@@ -568,6 +2010,7 @@ struct TuiState {
     last_snapshot: Option<StatsSnapshot>,
     last_rate_snapshot: Option<StatsSnapshot>,
     last_error: Option<String>,
+    startup_status: Option<String>,
     blocks_per_sec: Option<f64>,
     headers_per_sec: Option<f64>,
     orphan_count: Option<usize>,
@@ -597,6 +2040,7 @@ struct TuiState {
     wallet_addresses: Vec<WalletAddressRow>,
     wallet_selected_address: usize,
     wallet_show_qr: bool,
+    wallet_qr_expanded: bool,
     wallet_status: Option<String>,
     wallet_force_refresh: bool,
     wallet_select_after_refresh: Option<String>,
@@ -609,6 +2053,12 @@ struct TuiState {
     peers_scroll: u16,
     remote_peers: Vec<RemotePeerInfo>,
     remote_net_totals: Option<RemoteNetTotals>,
+    command_mode: bool,
+    command_input: String,
+    command_selected: usize,
+    command_status: Option<String>,
+    mouse_capture: bool,
+    last_ctrl_c: Option<Instant>,
 }
 
 impl TuiState {
@@ -622,6 +2072,7 @@ impl TuiState {
             last_snapshot: None,
             last_rate_snapshot: None,
             last_error: None,
+            startup_status: None,
             blocks_per_sec: None,
             headers_per_sec: None,
             orphan_count: None,
@@ -651,6 +2102,7 @@ impl TuiState {
             wallet_addresses: Vec::new(),
             wallet_selected_address: 0,
             wallet_show_qr: true,
+            wallet_qr_expanded: false,
             wallet_status: None,
             wallet_force_refresh: false,
             wallet_select_after_refresh: None,
@@ -663,6 +2115,12 @@ impl TuiState {
             peers_scroll: 0,
             remote_peers: Vec::new(),
             remote_net_totals: None,
+            command_mode: false,
+            command_input: String::new(),
+            command_selected: 0,
+            command_status: None,
+            mouse_capture: false,
+            last_ctrl_c: None,
         }
     }
 
@@ -686,13 +2144,17 @@ impl TuiState {
             other => {
                 self.setup_return = other;
                 self.screen = Screen::Setup;
+                if let Some(setup) = self.setup.as_mut() {
+                    setup.refresh_data_sets();
+                }
             }
-        }
+        };
     }
 
     fn cycle_screen(&mut self) {
         self.screen = match self.screen {
-            Screen::Monitor => Screen::Peers,
+            Screen::Monitor => Screen::Stats,
+            Screen::Stats => Screen::Peers,
             Screen::Peers => Screen::Db,
             Screen::Db => Screen::Mempool,
             Screen::Mempool => Screen::Wallet,
@@ -706,7 +2168,8 @@ impl TuiState {
     fn cycle_screen_reverse(&mut self) {
         self.screen = match self.screen {
             Screen::Monitor => Screen::Logs,
-            Screen::Peers => Screen::Monitor,
+            Screen::Stats => Screen::Monitor,
+            Screen::Peers => Screen::Stats,
             Screen::Db => Screen::Peers,
             Screen::Mempool => Screen::Db,
             Screen::Wallet => Screen::Mempool,
@@ -888,13 +2351,24 @@ impl TuiState {
     }
 }
 
+fn set_mouse_capture(enabled: bool) -> Result<(), String> {
+    let mut stdout = io::stdout();
+    if enabled {
+        execute!(stdout, EnableMouseCapture).map_err(|err| err.to_string())?;
+    } else {
+        execute!(stdout, DisableMouseCapture).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> Result<Self, String> {
         enable_raw_mode().map_err(|err| err.to_string())?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide).map_err(|err| err.to_string())?;
+        execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)
+            .map_err(|err| err.to_string())?;
         Ok(Self)
     }
 }
@@ -903,117 +2377,152 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        let _ = execute!(stdout, Show, LeaveAlternateScreen, DisableMouseCapture);
     }
 }
 
+pub struct TuiInit {
+    pub chainstate: Arc<ChainState<Store>>,
+    pub store: Arc<Store>,
+    pub sync_metrics: Arc<SyncMetrics>,
+    pub header_metrics: Arc<HeaderMetrics>,
+    pub validation_metrics: Arc<ValidationMetrics>,
+    pub connect_metrics: Arc<ConnectMetrics>,
+    pub mempool: Arc<Mutex<Mempool>>,
+    pub mempool_policy: Arc<MempoolPolicy>,
+    pub mempool_metrics: Arc<MempoolMetrics>,
+    pub fee_estimator: Arc<Mutex<FeeEstimator>>,
+    pub tx_confirm_target: u32,
+    pub mempool_flags_rx: Receiver<ValidationFlags>,
+    pub wallet: Arc<Mutex<Wallet>>,
+    pub tx_announce: broadcast::Sender<Hash256>,
+}
+
 pub fn run_tui(
-    chainstate: Arc<ChainState<Store>>,
-    store: Arc<Store>,
     data_dir: PathBuf,
-    sync_metrics: Arc<SyncMetrics>,
-    header_metrics: Arc<HeaderMetrics>,
-    validation_metrics: Arc<ValidationMetrics>,
-    connect_metrics: Arc<ConnectMetrics>,
-    mempool: Arc<Mutex<Mempool>>,
-    mempool_policy: Arc<MempoolPolicy>,
-    mempool_metrics: Arc<MempoolMetrics>,
-    fee_estimator: Arc<Mutex<FeeEstimator>>,
-    tx_confirm_target: u32,
-    mempool_flags: ValidationFlags,
-    wallet: Arc<Mutex<Wallet>>,
-    tx_announce: broadcast::Sender<Hash256>,
-    net_totals: Arc<NetTotals>,
+    conf_path: PathBuf,
+    start_in_setup: bool,
+    header_lead: i32,
     peer_registry: Arc<PeerRegistry>,
+    net_totals: Arc<NetTotals>,
     chain_params: Arc<ChainParams>,
     network: Network,
     storage_backend: Backend,
     start_time: Instant,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_tx: watch::Sender<bool>,
+    init_rx: Receiver<TuiInit>,
 ) -> Result<(), String> {
-    let _guard = TerminalGuard::enter()?;
+    logging::set_stderr_enabled(false);
+    let _guard = match TerminalGuard::enter() {
+        Ok(guard) => guard,
+        Err(err) => {
+            logging::set_stderr_enabled(true);
+            return Err(err);
+        }
+    };
     let stdout = io::stdout();
+
     let term_backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(term_backend).map_err(|err| err.to_string())?;
     terminal.clear().map_err(|err| err.to_string())?;
 
     let mut state = TuiState::new();
-    state.setup = Some(SetupWizard::new(data_dir, network));
+    state.setup = Some(SetupWizard::new(data_dir, conf_path, network, header_lead));
+    if start_in_setup {
+        state.screen = Screen::Setup;
+        state.setup_return = Screen::Monitor;
+    }
+    set_mouse_capture(state.mouse_capture)?;
     let mut next_sample = Instant::now();
     let mut next_wallet_refresh = Instant::now();
-    let wallet_ops = InProcessWalletOps {
-        chainstate: chainstate.as_ref(),
-        mempool: mempool.as_ref(),
-        mempool_policy: mempool_policy.as_ref(),
-        mempool_metrics: mempool_metrics.as_ref(),
-        fee_estimator: fee_estimator.as_ref(),
-        tx_confirm_target,
-        mempool_flags: &mempool_flags,
-        wallet: wallet.as_ref(),
-        chain_params: chain_params.as_ref(),
-        tx_announce: &tx_announce,
-    };
+    let mut runtime: Option<TuiInit> = None;
+    let mut mempool_flags: Option<ValidationFlags> = None;
+    state.startup_status = Some("Startup: opening database...".to_string());
 
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
+        if runtime.is_none() {
+            match init_rx.try_recv() {
+                Ok(init) => {
+                    runtime = Some(init);
+                    state.startup_status = Some("Startup: loading shielded params...".to_string());
+                }
+                Err(TryRecvError::Disconnected) => {
+                    state.update_error("Startup: init channel disconnected".to_string());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        if mempool_flags.is_none() {
+            if let Some(runtime) = runtime.as_ref() {
+                if let Ok(flags) = runtime.mempool_flags_rx.try_recv() {
+                    mempool_flags = Some(flags);
+                    state.startup_status = None;
+                }
+            }
+        }
+
         let now = Instant::now();
         if now >= next_sample {
-            match stats::snapshot_stats(
-                chainstate.as_ref(),
-                Some(store.as_ref()),
-                network,
-                storage_backend,
-                start_time,
-                Some(sync_metrics.as_ref()),
-                Some(header_metrics.as_ref()),
-                Some(validation_metrics.as_ref()),
-                Some(connect_metrics.as_ref()),
-                Some(mempool.as_ref()),
-                Some(mempool_metrics.as_ref()),
-            ) {
-                Ok(snapshot) => {
-                    state.update_snapshot(snapshot);
-                    let (orphan_count, orphan_bytes) = match mempool.lock() {
-                        Ok(guard) => (Some(guard.orphan_count()), Some(guard.orphan_bytes())),
-                        Err(_) => (None, None),
-                    };
-                    state.update_orphans(orphan_count, orphan_bytes);
-                    if matches!(state.screen, Screen::Mempool) && state.advanced {
-                        state.mempool_detail = compute_mempool_detail(mempool.as_ref());
-                    } else {
-                        state.mempool_detail = None;
-                    }
+            if let Some(runtime) = runtime.as_ref() {
+                match stats::snapshot_stats(
+                    runtime.chainstate.as_ref(),
+                    Some(runtime.store.as_ref()),
+                    network,
+                    storage_backend,
+                    start_time,
+                    Some(runtime.sync_metrics.as_ref()),
+                    Some(runtime.header_metrics.as_ref()),
+                    Some(runtime.validation_metrics.as_ref()),
+                    Some(runtime.connect_metrics.as_ref()),
+                    Some(runtime.mempool.as_ref()),
+                    Some(runtime.mempool_metrics.as_ref()),
+                ) {
+                    Ok(snapshot) => {
+                        state.update_snapshot(snapshot);
+                        let (orphan_count, orphan_bytes) = match runtime.mempool.lock() {
+                            Ok(guard) => (Some(guard.orphan_count()), Some(guard.orphan_bytes())),
+                            Err(_) => (None, None),
+                        };
+                        state.update_orphans(orphan_count, orphan_bytes);
+                        if matches!(state.screen, Screen::Mempool) && state.advanced {
+                            state.mempool_detail = compute_mempool_detail(runtime.mempool.as_ref());
+                        } else {
+                            state.mempool_detail = None;
+                        }
 
-                    let wallet_snapshot = match wallet.lock() {
-                        Ok(mut guard) => (
-                            Some(guard.is_encrypted()),
-                            Some(guard.unlocked_until()),
-                            Some(guard.key_count()),
-                            Some(guard.keypool_size()),
-                            Some(guard.tx_count()),
-                            Some(guard.pay_tx_fee_per_kb()),
-                            Some(guard.has_sapling_keys()),
-                        ),
-                        Err(_) => (None, None, None, None, None, None, None),
-                    };
-                    state.update_wallet(
-                        wallet_snapshot.0,
-                        wallet_snapshot.1,
-                        wallet_snapshot.2,
-                        wallet_snapshot.3,
-                        wallet_snapshot.4,
-                        wallet_snapshot.5,
-                        wallet_snapshot.6,
-                    );
-                }
-                Err(err) => {
-                    state.update_error(err);
-                    state.update_orphans(None, None);
-                    state.update_wallet(None, None, None, None, None, None, None);
+                        let wallet_snapshot = match runtime.wallet.lock() {
+                            Ok(mut guard) => (
+                                Some(guard.is_encrypted()),
+                                Some(guard.unlocked_until()),
+                                Some(guard.key_count()),
+                                Some(guard.keypool_size()),
+                                Some(guard.tx_count()),
+                                Some(guard.pay_tx_fee_per_kb()),
+                                Some(guard.has_sapling_keys()),
+                            ),
+                            Err(_) => (None, None, None, None, None, None, None),
+                        };
+                        state.update_wallet(
+                            wallet_snapshot.0,
+                            wallet_snapshot.1,
+                            wallet_snapshot.2,
+                            wallet_snapshot.3,
+                            wallet_snapshot.4,
+                            wallet_snapshot.5,
+                            wallet_snapshot.6,
+                        );
+                    }
+                    Err(err) => {
+                        state.update_error(err);
+                        state.update_orphans(None, None);
+                        state.update_wallet(None, None, None, None, None, None, None);
+                    }
                 }
             }
 
@@ -1027,36 +2536,41 @@ pub fn run_tui(
                     .last_snapshot
                     .as_ref()
                     .map(|snap| snap.best_block_height);
-                match refresh_wallet_details(
-                    chainstate.as_ref(),
-                    mempool.as_ref(),
-                    wallet.as_ref(),
-                    tip_height,
-                ) {
-                    Ok(details) => {
-                        state.wallet_transparent = Some(details.transparent_owned);
-                        state.wallet_transparent_watchonly = Some(details.transparent_watchonly);
-                        state.wallet_sapling_spendable = Some(details.sapling_spendable);
-                        state.wallet_sapling_watchonly = Some(details.sapling_watchonly);
-                        state.wallet_sapling_scan_height = Some(details.sapling_scan_height);
-                        state.wallet_sapling_note_count = Some(details.sapling_note_count);
-                        state.update_wallet_addresses(details.addresses);
-                        state.wallet_recent_txs = details.recent_txs;
-                        state.wallet_pending_ops = details.pending_ops;
-                        state.wallet_detail_error = None;
+                if let Some(runtime) = runtime.as_ref() {
+                    match refresh_wallet_details(
+                        runtime.chainstate.as_ref(),
+                        runtime.mempool.as_ref(),
+                        runtime.wallet.as_ref(),
+                        tip_height,
+                    ) {
+                        Ok(details) => {
+                            state.wallet_transparent = Some(details.transparent_owned);
+                            state.wallet_transparent_watchonly =
+                                Some(details.transparent_watchonly);
+                            state.wallet_sapling_spendable = Some(details.sapling_spendable);
+                            state.wallet_sapling_watchonly = Some(details.sapling_watchonly);
+                            state.wallet_sapling_scan_height = Some(details.sapling_scan_height);
+                            state.wallet_sapling_note_count = Some(details.sapling_note_count);
+                            state.update_wallet_addresses(details.addresses);
+                            state.wallet_recent_txs = details.recent_txs;
+                            state.wallet_pending_ops = details.pending_ops;
+                            state.wallet_detail_error = None;
+                        }
+                        Err(err) => {
+                            state.wallet_transparent = None;
+                            state.wallet_transparent_watchonly = None;
+                            state.wallet_sapling_spendable = None;
+                            state.wallet_sapling_watchonly = None;
+                            state.wallet_sapling_scan_height = None;
+                            state.wallet_sapling_note_count = None;
+                            state.wallet_addresses.clear();
+                            state.wallet_recent_txs.clear();
+                            state.wallet_pending_ops.clear();
+                            state.wallet_detail_error = Some(err);
+                        }
                     }
-                    Err(err) => {
-                        state.wallet_transparent = None;
-                        state.wallet_transparent_watchonly = None;
-                        state.wallet_sapling_spendable = None;
-                        state.wallet_sapling_watchonly = None;
-                        state.wallet_sapling_scan_height = None;
-                        state.wallet_sapling_note_count = None;
-                        state.wallet_addresses.clear();
-                        state.wallet_recent_txs.clear();
-                        state.wallet_pending_ops.clear();
-                        state.wallet_detail_error = Some(err);
-                    }
+                } else {
+                    state.wallet_detail_error = Some(wallet_ops_unavailable(state.is_remote));
                 }
                 state.wallet_force_refresh = false;
                 next_wallet_refresh = now + WALLET_REFRESH_INTERVAL;
@@ -1072,9 +2586,34 @@ pub fn run_tui(
             match event::read().map_err(|err| err.to_string())? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
-                        if handle_key(key, &mut state, &shutdown_tx, Some(&wallet_ops))? {
+                        let wallet_ops = if state.is_remote {
+                            None
+                        } else {
+                            runtime.as_ref().and_then(|runtime| {
+                                mempool_flags.as_ref().map(|flags| InProcessWalletOps {
+                                    chainstate: runtime.chainstate.as_ref(),
+                                    mempool: runtime.mempool.as_ref(),
+                                    mempool_policy: runtime.mempool_policy.as_ref(),
+                                    mempool_metrics: runtime.mempool_metrics.as_ref(),
+                                    fee_estimator: runtime.fee_estimator.as_ref(),
+                                    tx_confirm_target: runtime.tx_confirm_target,
+                                    mempool_flags: flags,
+                                    wallet: runtime.wallet.as_ref(),
+                                    chain_params: chain_params.as_ref(),
+                                    tx_announce: &runtime.tx_announce,
+                                })
+                            })
+                        };
+                        if handle_key(key, &mut state, &shutdown_tx, wallet_ops.as_ref())? {
                             break;
                         }
+                    }
+                }
+                Event::Mouse(event) => {
+                    let size = terminal.size().map_err(|err| err.to_string())?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    if handle_mouse(event, &mut state, area)? {
+                        break;
                     }
                 }
                 Event::Resize(_, _) => {
@@ -1086,6 +2625,7 @@ pub fn run_tui(
     }
 
     terminal.show_cursor().map_err(|err| err.to_string())?;
+    logging::set_stderr_enabled(true);
     Ok(())
 }
 
@@ -1095,6 +2635,7 @@ pub fn run_remote_tui(endpoint: String) -> Result<(), String> {
         return Err("missing --tui-attach endpoint".to_string());
     }
 
+    logging::set_stderr_enabled(false);
     let _guard = TerminalGuard::enter()?;
     let stdout = io::stdout();
     let term_backend = CrosstermBackend::new(stdout);
@@ -1159,6 +2700,13 @@ pub fn run_remote_tui(endpoint: String) -> Result<(), String> {
                         }
                     }
                 }
+                Event::Mouse(event) => {
+                    let size = terminal.size().map_err(|err| err.to_string())?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    if handle_mouse(event, &mut state, area)? {
+                        break;
+                    }
+                }
                 Event::Resize(_, _) => {
                     terminal.clear().map_err(|err| err.to_string())?;
                 }
@@ -1168,6 +2716,7 @@ pub fn run_remote_tui(endpoint: String) -> Result<(), String> {
     }
 
     terminal.show_cursor().map_err(|err| err.to_string())?;
+    logging::set_stderr_enabled(true);
     Ok(())
 }
 
@@ -1618,12 +3167,314 @@ struct InProcessWalletOps<'a> {
     tx_announce: &'a broadcast::Sender<Hash256>,
 }
 
+fn wallet_ops_unavailable(is_remote: bool) -> String {
+    if is_remote {
+        "Remote attach mode: wallet unavailable.".to_string()
+    } else {
+        "Wallet is initializing (loading shielded params)...".to_string()
+    }
+}
+
+fn wallet_send_unavailable(is_remote: bool) -> String {
+    if is_remote {
+        "Remote attach mode: wallet send unavailable.".to_string()
+    } else {
+        "Wallet send unavailable until shielded params finish loading.".to_string()
+    }
+}
+
 fn handle_key(
     key: KeyEvent,
     state: &mut TuiState,
     shutdown_tx: &watch::Sender<bool>,
     wallet_ops: Option<&InProcessWalletOps<'_>>,
 ) -> Result<bool, String> {
+    if state.command_mode {
+        let suggestions = command_suggestions(&state.command_input);
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                return ctrl_c_exit(state, shutdown_tx);
+            }
+            (KeyCode::Esc, _) => {
+                state.command_mode = false;
+                state.command_input.clear();
+                state.command_selected = 0;
+                return Ok(false);
+            }
+            (KeyCode::Enter, _) => {
+                let selected_index = state
+                    .command_selected
+                    .min(suggestions.len().saturating_sub(1));
+                let mut line = state.command_input.trim().to_string();
+                if line.is_empty() || line == "/" {
+                    if let Some(spec) = suggestions.get(selected_index) {
+                        line = spec.command.to_string();
+                    }
+                }
+                let mut parts = line.split_whitespace();
+                let raw_cmd = parts.next().unwrap_or("");
+                let arg = parts.next().map(|value| value.to_lowercase());
+                state.command_mode = false;
+                state.command_input.clear();
+                state.command_selected = 0;
+                state.command_status = None;
+
+                let spec = if raw_cmd.is_empty() {
+                    suggestions.get(selected_index).copied()
+                } else {
+                    find_command_spec(raw_cmd)
+                };
+
+                if let Some(spec) = spec {
+                    match spec.action {
+                        CommandAction::Navigate(screen) => state.screen = screen,
+                        CommandAction::ToggleHelp => state.toggle_help(),
+                        CommandAction::ToggleSetup => state.toggle_setup(),
+                        CommandAction::ToggleAdvanced => state.toggle_advanced(),
+                        CommandAction::ToggleMouseCapture => {
+                            state.mouse_capture = !state.mouse_capture;
+                            set_mouse_capture(state.mouse_capture)?;
+                            state.command_status = Some(if state.mouse_capture {
+                                "Mouse capture on".to_string()
+                            } else {
+                                "Mouse capture off (selection enabled)".to_string()
+                            });
+                        }
+                        CommandAction::Quit => {
+                            let _ = shutdown_tx.send(true);
+                            return Ok(true);
+                        }
+                        CommandAction::LogLevel(level) => match level {
+                            Some(level) => {
+                                state.logs_min_level = level;
+                                state.command_status =
+                                    Some(format!("Log level: {}", log_level_label(level)));
+                            }
+                            None => match arg.as_deref() {
+                                Some(value) => {
+                                    if let Some(level) = parse_log_level(value) {
+                                        state.logs_min_level = level;
+                                        state.command_status =
+                                            Some(format!("Log level: {}", log_level_label(level)));
+                                    } else {
+                                        state.command_status =
+                                            Some(format!("Unknown log level: {value}"));
+                                    }
+                                }
+                                None => {
+                                    state.command_status = Some("Usage: /log <level>".to_string());
+                                }
+                            },
+                        },
+                        CommandAction::LogsClear => {
+                            logging::clear_captured_logs();
+                            state.logs.clear();
+                            state.logs_scroll = 0;
+                            state.logs_follow = true;
+                            state.logs_paused = false;
+                            state.command_status = Some("Logs cleared".to_string());
+                        }
+                        CommandAction::LogsPause => {
+                            state.toggle_logs_pause();
+                            state.command_status = Some(if state.logs_paused {
+                                "Logs paused".to_string()
+                            } else {
+                                "Logs following".to_string()
+                            });
+                        }
+                        CommandAction::LogsFollow => {
+                            state.logs_follow = true;
+                            state.logs_paused = false;
+                            state.logs_scroll = 0;
+                            state.command_status = Some("Logs following".to_string());
+                        }
+                        CommandAction::WalletSend => {
+                            state.screen = Screen::Wallet;
+                            if state.is_remote {
+                                state.wallet_status = Some(
+                                    "Remote attach mode: wallet send unavailable.".to_string(),
+                                );
+                            } else {
+                                state.wallet_modal = Some(WalletModal::Send);
+                                state.wallet_send_form = WalletSendForm::default();
+                            }
+                        }
+                        CommandAction::WalletWatch => {
+                            state.screen = Screen::Wallet;
+                            if state.is_remote {
+                                state.wallet_status =
+                                    Some("Remote attach mode: wallet unavailable.".to_string());
+                            } else {
+                                state.wallet_modal = Some(WalletModal::ImportWatch);
+                                state.wallet_import_watch_form = WalletImportWatchForm::default();
+                            }
+                        }
+                        CommandAction::WalletNewTransparent => {
+                            state.screen = Screen::Wallet;
+                            if state.is_remote {
+                                state.wallet_status =
+                                    Some("Remote attach mode: wallet unavailable.".to_string());
+                            } else if let Some(ops) = wallet_ops {
+                                let address_res = {
+                                    let guard = ops
+                                        .wallet
+                                        .lock()
+                                        .map_err(|_| "wallet lock poisoned".to_string());
+                                    match guard {
+                                        Ok(mut g) => {
+                                            g.generate_new_address(true).map_err(|e| e.to_string())
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                };
+                                match address_res {
+                                    Ok(address) => {
+                                        state.wallet_status = Some(format!("Generated {address}"));
+                                        state.wallet_select_after_refresh = Some(address);
+                                        state.wallet_force_refresh = true;
+                                    }
+                                    Err(e) => state.command_status = Some(format!("Error: {e}")),
+                                }
+                            } else {
+                                state.wallet_status = Some(wallet_ops_unavailable(state.is_remote));
+                            }
+                        }
+                        CommandAction::WalletNewSapling => {
+                            state.screen = Screen::Wallet;
+                            if state.is_remote {
+                                state.wallet_status =
+                                    Some("Remote attach mode: wallet unavailable.".to_string());
+                            } else if let Some(ops) = wallet_ops {
+                                let res = {
+                                    let guard = ops
+                                        .wallet
+                                        .lock()
+                                        .map_err(|_| "wallet lock poisoned".to_string());
+                                    match guard {
+                                        Ok(mut g) => {
+                                            let had_keys = g.has_sapling_keys();
+                                            match g.generate_new_sapling_address_bytes() {
+                                                Ok(bytes) => {
+                                                    if !had_keys {
+                                                        if let Err(e) = g
+                                                            .ensure_sapling_scan_initialized_to_tip(
+                                                                ops.chainstate,
+                                                            )
+                                                        {
+                                                            Err(e.to_string())
+                                                        } else {
+                                                            Ok(bytes)
+                                                        }
+                                                    } else {
+                                                        Ok(bytes)
+                                                    }
+                                                }
+                                                Err(e) => Err(e.to_string()),
+                                            }
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                };
+                                match res {
+                                    Ok(bytes) => {
+                                        let hrp = match ops.chain_params.network {
+                                            Network::Mainnet => "za",
+                                            Network::Testnet => "ztestacadia",
+                                            Network::Regtest => "zregtestsapling",
+                                        };
+                                        match Hrp::parse(hrp) {
+                                            Ok(hrp) => match bech32::encode::<Bech32>(
+                                                hrp,
+                                                bytes.as_slice(),
+                                            ) {
+                                                Ok(address) => {
+                                                    state.wallet_status =
+                                                        Some(format!("Generated {address}"));
+                                                    state.wallet_select_after_refresh =
+                                                        Some(address);
+                                                    state.wallet_force_refresh = true;
+                                                }
+                                                Err(_) => {
+                                                    state.command_status = Some(
+                                                        "failed to encode sapling address"
+                                                            .to_string(),
+                                                    )
+                                                }
+                                            },
+                                            Err(_) => {
+                                                state.command_status =
+                                                    Some("invalid sapling address hrp".to_string())
+                                            }
+                                        }
+                                    }
+                                    Err(e) => state.command_status = Some(format!("Error: {e}")),
+                                }
+                            } else {
+                                state.wallet_status = Some(wallet_ops_unavailable(state.is_remote));
+                            }
+                        }
+                        CommandAction::WalletToggleQr => {
+                            state.screen = Screen::Wallet;
+                            if !state.wallet_show_qr {
+                                state.wallet_show_qr = true;
+                                state.wallet_qr_expanded = true;
+                            } else {
+                                state.wallet_qr_expanded = !state.wallet_qr_expanded;
+                            }
+                        }
+                        CommandAction::Hint(message) => {
+                            state.command_status = Some(message.to_string());
+                        }
+                    }
+                } else if !raw_cmd.is_empty() {
+                    state.command_status = Some(format!("Unknown command: {raw_cmd}"));
+                }
+                return Ok(false);
+            }
+            (KeyCode::Backspace, _) => {
+                state.command_input.pop();
+                state.command_selected = 0;
+                return Ok(false);
+            }
+            (KeyCode::Up, _) => {
+                if state.command_selected > 0 {
+                    state.command_selected -= 1;
+                }
+                return Ok(false);
+            }
+            (KeyCode::Down, _) => {
+                if state.command_selected + 1 < suggestions.len() {
+                    state.command_selected += 1;
+                }
+                return Ok(false);
+            }
+            (KeyCode::Tab, _) => {
+                if !suggestions.is_empty() {
+                    state.command_selected = (state.command_selected + 1) % suggestions.len();
+                }
+                return Ok(false);
+            }
+            (KeyCode::BackTab, _) => {
+                if !suggestions.is_empty() {
+                    if state.command_selected == 0 {
+                        state.command_selected = suggestions.len() - 1;
+                    } else {
+                        state.command_selected -= 1;
+                    }
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char(c), _) => {
+                if !c.is_control() && state.command_input.len() < 128 {
+                    state.command_input.push(c);
+                    state.command_selected = 0;
+                }
+                return Ok(false);
+            }
+            _ => return Ok(false),
+        }
+    }
+
     if matches!(state.screen, Screen::Setup) {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
@@ -1632,6 +3483,113 @@ fn handle_key(
             }
             (KeyCode::Char('s'), _) => {
                 state.toggle_setup();
+                return Ok(false);
+            }
+            (KeyCode::Up, _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.move_data_set(-1);
+                }
+                return Ok(false);
+            }
+            (KeyCode::Down, _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.move_data_set(1);
+                }
+                return Ok(false);
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    if let Err(err) = setup.apply_selected_data_set() {
+                        setup.status = Some(format!("Error: {err}"));
+                    }
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('r'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.refresh_data_sets();
+                    setup.status = Some("Data sets refreshed".to_string());
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('d'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    if let Err(err) = setup.request_delete_selected() {
+                        setup.status = Some(format!("Delete failed: {err}"));
+                    }
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('b'), _) => {
+                let is_remote = state.is_remote;
+                if let Some(setup) = state.setup.as_mut() {
+                    let target_dir = setup.data_dir.clone();
+                    let backup_path = target_dir.join(format!(
+                        "{}.bak.{}",
+                        crate::wallet::WALLET_FILE_NAME,
+                        unix_seconds()
+                    ));
+                    if target_dir == setup.active_data_dir {
+                        let Some(ops) = wallet_ops else {
+                            setup.status = Some(if is_remote {
+                                "Remote attach mode: wallet unavailable.".to_string()
+                            } else {
+                                "Wallet is initializing (loading shielded params)...".to_string()
+                            });
+                            return Ok(false);
+                        };
+
+                        match ops.wallet.lock() {
+                            Ok(mut guard) => match guard.backup_to(&backup_path) {
+                                Ok(()) => {
+                                    setup.status = Some(format!(
+                                        "Wallet backup saved to {}",
+                                        backup_path.display()
+                                    ));
+                                }
+                                Err(err) => {
+                                    setup.status = Some(format!("Backup failed: {err}"));
+                                }
+                            },
+                            Err(_) => {
+                                setup.status = Some("Wallet lock poisoned".to_string());
+                            }
+                        }
+                    } else {
+                        let source = target_dir.join(crate::wallet::WALLET_FILE_NAME);
+                        if !source.exists() {
+                            setup.status =
+                                Some("wallet.dat not found in selected data dir".to_string());
+                            return Ok(false);
+                        }
+                        match fs::copy(&source, &backup_path) {
+                            Ok(_) => {
+                                setup.status = Some(format!(
+                                    "Wallet backup saved to {}",
+                                    backup_path.display()
+                                ));
+                            }
+                            Err(err) => {
+                                setup.status = Some(format!("Backup failed: {err}"));
+                            }
+                        }
+                    }
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('N'), _) => {
+                if state.is_remote {
+                    if let Some(setup) = state.setup.as_mut() {
+                        setup.status =
+                            Some("Remote attach mode: cannot create data dirs".to_string());
+                    }
+                    return Ok(false);
+                }
+                if let Some(setup) = state.setup.as_mut() {
+                    if let Err(err) = setup.create_new_data_set() {
+                        setup.status = Some(format!("Create failed: {err}"));
+                    }
+                }
                 return Ok(false);
             }
             (KeyCode::Char('n'), _) => {
@@ -1643,6 +3601,24 @@ fn handle_key(
             (KeyCode::Char('p'), _) => {
                 if let Some(setup) = state.setup.as_mut() {
                     setup.cycle_profile();
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('l'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.toggle_header_lead_unlimited();
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char('['), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.adjust_header_lead(-HEADER_LEAD_STEP);
+                }
+                return Ok(false);
+            }
+            (KeyCode::Char(']'), _) => {
+                if let Some(setup) = state.setup.as_mut() {
+                    setup.adjust_header_lead(HEADER_LEAD_STEP);
                 }
                 return Ok(false);
             }
@@ -1682,8 +3658,7 @@ fn handle_key(
                     return Ok(true);
                 }
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    let _ = shutdown_tx.send(true);
-                    return Ok(true);
+                    return ctrl_c_exit(state, shutdown_tx);
                 }
                 (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
                     state.wallet_send_form.focus = match state.wallet_send_form.focus {
@@ -1706,8 +3681,7 @@ fn handle_key(
                 }
                 (KeyCode::Enter, _) => {
                     let Some(ops) = wallet_ops else {
-                        state.wallet_status =
-                            Some("Remote attach mode: wallet send unavailable.".to_string());
+                        state.wallet_status = Some(wallet_send_unavailable(state.is_remote));
                         return Ok(false);
                     };
                     let to = state.wallet_send_form.to.trim().to_string();
@@ -1792,8 +3766,7 @@ fn handle_key(
                     return Ok(true);
                 }
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    let _ = shutdown_tx.send(true);
-                    return Ok(true);
+                    return ctrl_c_exit(state, shutdown_tx);
                 }
                 (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
                     state.wallet_import_watch_form.focus =
@@ -1815,8 +3788,7 @@ fn handle_key(
                 }
                 (KeyCode::Enter, _) => {
                     let Some(ops) = wallet_ops else {
-                        state.wallet_status =
-                            Some("Remote attach mode: wallet unavailable.".to_string());
+                        state.wallet_status = Some(wallet_ops_unavailable(state.is_remote));
                         return Ok(false);
                     };
                     let address = state.wallet_import_watch_form.address.trim().to_string();
@@ -1895,15 +3867,25 @@ fn handle_key(
         }
     }
 
+    if state.wallet_qr_expanded && matches!(key.code, KeyCode::Esc) {
+        state.wallet_qr_expanded = false;
+        return Ok(false);
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
             let _ = shutdown_tx.send(true);
             Ok(true)
         }
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            let _ = shutdown_tx.send(true);
-            Ok(true)
+        (KeyCode::Char('/'), _) => {
+            state.command_mode = true;
+            state.command_input.clear();
+            state.command_input.push('/');
+            state.command_selected = 0;
+            state.command_status = None;
+            Ok(false)
         }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => ctrl_c_exit(state, shutdown_tx),
         (KeyCode::Char('?'), _) => {
             state.toggle_help();
             Ok(false)
@@ -1956,7 +3938,25 @@ fn handle_key(
         }
         (KeyCode::Enter, _) => {
             if matches!(state.screen, Screen::Wallet) {
-                state.wallet_show_qr = !state.wallet_show_qr;
+                if !state.wallet_show_qr {
+                    state.wallet_show_qr = true;
+                    state.wallet_qr_expanded = true;
+                } else {
+                    state.wallet_qr_expanded = !state.wallet_qr_expanded;
+                }
+            }
+            Ok(false)
+        }
+        (KeyCode::Char('o'), _) => {
+            if matches!(state.screen, Screen::Wallet) {
+                if let Some(selected) = state.wallet_addresses.get(state.wallet_selected_address) {
+                    let target = explorer_address_url(&selected.address);
+                    let status = open_or_copy_url(&target)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "Explorer open failed".to_string());
+                    state.command_status = Some(status.clone());
+                    state.wallet_status = Some(status);
+                }
             }
             Ok(false)
         }
@@ -1987,8 +3987,7 @@ fn handle_key(
         (KeyCode::Char('n'), _) => {
             if matches!(state.screen, Screen::Wallet) {
                 let Some(ops) = wallet_ops else {
-                    state.wallet_status =
-                        Some("Remote attach mode: wallet unavailable.".to_string());
+                    state.wallet_status = Some(wallet_ops_unavailable(state.is_remote));
                     return Ok(false);
                 };
                 let address = {
@@ -2009,8 +4008,7 @@ fn handle_key(
         (KeyCode::Char('N'), _) => {
             if matches!(state.screen, Screen::Wallet) {
                 let Some(ops) = wallet_ops else {
-                    state.wallet_status =
-                        Some("Remote attach mode: wallet unavailable.".to_string());
+                    state.wallet_status = Some(wallet_ops_unavailable(state.is_remote));
                     return Ok(false);
                 };
                 let address = {
@@ -2161,12 +4159,362 @@ fn handle_key(
             state.screen = Screen::Logs;
             Ok(false)
         }
+        (KeyCode::Char('7'), _) => {
+            state.screen = Screen::Stats;
+            Ok(false)
+        }
         (KeyCode::Char('h'), _) => {
             state.toggle_help();
             Ok(false)
         }
         _ => Ok(false),
     }
+}
+
+fn handle_mouse(event: MouseEvent, state: &mut TuiState, area: Rect) -> Result<bool, String> {
+    if !state.mouse_capture {
+        return Ok(false);
+    }
+
+    let (header_area, main_area, sidebar_area, cmd_area) = layout_areas(state, area);
+
+    match event.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let scroll_up = matches!(event.kind, MouseEventKind::ScrollUp);
+
+            if state.command_mode && rect_contains(cmd_area, event.column, event.row) {
+                if let Some((list_area, _)) = command_palette_areas(cmd_area) {
+                    if rect_contains(list_area, event.column, event.row) {
+                        let suggestions = command_suggestions(&state.command_input);
+                        if suggestions.is_empty() {
+                            return Ok(false);
+                        }
+                        let selected_index = state
+                            .command_selected
+                            .min(suggestions.len().saturating_sub(1));
+                        let next = if scroll_up {
+                            selected_index.saturating_sub(1)
+                        } else {
+                            (selected_index + 1).min(suggestions.len().saturating_sub(1))
+                        };
+                        state.command_selected = next;
+                        return Ok(false);
+                    }
+                }
+            }
+
+            match state.screen {
+                Screen::Logs => {
+                    if rect_contains(main_area, event.column, event.row) {
+                        state.logs_follow = false;
+                        if scroll_up {
+                            state.logs_scroll = state.logs_scroll.saturating_sub(MOUSE_WHEEL_STEP);
+                        } else {
+                            state.logs_scroll = state.logs_scroll.saturating_add(MOUSE_WHEEL_STEP);
+                        }
+                    }
+                }
+                Screen::Peers => {
+                    if rect_contains(main_area, event.column, event.row) {
+                        if scroll_up {
+                            state.peers_scroll =
+                                state.peers_scroll.saturating_sub(PEER_SCROLL_STEP);
+                        } else {
+                            state.peers_scroll =
+                                state.peers_scroll.saturating_add(PEER_SCROLL_STEP);
+                        }
+                    }
+                }
+                Screen::Wallet => {
+                    if rect_contains(main_area, event.column, event.row) {
+                        let chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Length(13), Constraint::Min(10)])
+                            .split(main_area);
+
+                        let lower_chunks = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                            .split(chunks[1]);
+
+                        let right_chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                            .split(lower_chunks[1]);
+
+                        let addr_area = right_chunks[0];
+                        if rect_contains(addr_area, event.column, event.row) {
+                            if scroll_up {
+                                state.wallet_move_selection(-1);
+                            } else {
+                                state.wallet_move_selection(1);
+                            }
+                        }
+                    }
+                }
+                Screen::Setup => {
+                    if rect_contains(main_area, event.column, event.row) {
+                        let sections = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Min(0), Constraint::Length(6)])
+                            .split(main_area);
+                        let columns = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                            .split(sections[0]);
+
+                        if rect_contains(columns[0], event.column, event.row) {
+                            if let Some(setup) = state.setup.as_mut() {
+                                setup.move_data_set(if scroll_up { -1 } else { 1 });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            return Ok(false);
+        }
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {}
+        _ => return Ok(false),
+    }
+
+    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+    let (allow_navigation, link_click) = match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => (true, ctrl),
+        MouseEventKind::Down(MouseButton::Right) => (false, true),
+        _ => return Ok(false),
+    };
+
+    if state.wallet_qr_expanded {
+        let modal_area = wallet_qr_modal_area(area);
+        if let Some(selected) = state.wallet_addresses.get(state.wallet_selected_address) {
+            let target = if link_click {
+                explorer_address_url(&selected.address)
+            } else {
+                selected.address.clone()
+            };
+            if rect_contains(modal_area, event.column, event.row) {
+                let status = if link_click {
+                    open_or_copy_url(&target).map(str::to_string)
+                } else if clipboard_copy(&target).is_ok() {
+                    Some("Address copied".to_string())
+                } else {
+                    None
+                };
+                if let Some(status) = status {
+                    state.command_status = Some(status);
+                }
+                return Ok(false);
+            }
+        }
+        state.wallet_qr_expanded = false;
+        return Ok(false);
+    }
+
+    if allow_navigation {
+        if let Some(screen) = header_tab_at(state, header_area, event.column, event.row) {
+            state.screen = screen;
+            return Ok(false);
+        }
+
+        if rect_contains(sidebar_area, event.column, event.row) {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(11),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                ])
+                .split(sidebar_area);
+
+            if rect_contains(chunks[0], event.column, event.row) {
+                state.screen = Screen::Monitor;
+                return Ok(false);
+            }
+            if rect_contains(chunks[2], event.column, event.row) {
+                state.screen = Screen::Mempool;
+                return Ok(false);
+            }
+            if rect_contains(chunks[3], event.column, event.row) {
+                state.toggle_help();
+                return Ok(false);
+            }
+        }
+    }
+
+    if matches!(state.screen, Screen::Wallet) && rect_contains(main_area, event.column, event.row) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(13), Constraint::Min(10)])
+            .split(main_area);
+
+        let lower_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(chunks[1]);
+
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(lower_chunks[0]);
+
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(lower_chunks[1]);
+
+        let tx_area = left_chunks[0];
+        if rect_contains(tx_area, event.column, event.row) {
+            let tx_inner = panel_block("").inner(tx_area);
+            let header_rows = 2u16;
+            if tx_inner.height > header_rows && event.row >= tx_inner.y + header_rows {
+                let row_index = (event.row - tx_inner.y - header_rows) as usize;
+                let max_rows = tx_inner.height.saturating_sub(header_rows) as usize;
+                if row_index < max_rows && row_index < state.wallet_recent_txs.len() {
+                    let entry = &state.wallet_recent_txs[row_index];
+                    let txid = stats::hash256_to_hex(&entry.txid);
+                    let target = if link_click {
+                        explorer_tx_url(&txid)
+                    } else {
+                        txid.clone()
+                    };
+                    let status = if link_click {
+                        open_or_copy_url(&target).map(str::to_string)
+                    } else if clipboard_copy(&target).is_ok() {
+                        Some("Txid copied".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(status) = status {
+                        state.command_status = Some(status.clone());
+                        state.wallet_status = Some(status);
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+
+        let addr_area = right_chunks[0];
+        if rect_contains(addr_area, event.column, event.row) {
+            let addr_inner = panel_block("").inner(addr_area);
+            let visible = state.wallet_visible_indices();
+            if !visible.is_empty() && addr_inner.width > 0 && addr_inner.height > 0 {
+                let layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(0), Constraint::Length(1)])
+                    .split(addr_inner);
+                let list_area = layout[0];
+
+                if rect_contains(list_area, event.column, event.row) {
+                    let selected_pos = visible
+                        .iter()
+                        .position(|idx| *idx == state.wallet_selected_address)
+                        .unwrap_or(0);
+                    let view_height = list_area.height.max(1) as usize;
+                    let max_start = visible.len().saturating_sub(view_height);
+                    let mut start = selected_pos.saturating_sub(view_height / 2);
+                    start = start.min(max_start);
+                    let end = (start + view_height).min(visible.len());
+
+                    let line_index = event.row.saturating_sub(list_area.y) as usize;
+                    let visible_count = end.saturating_sub(start);
+                    if line_index < visible_count {
+                        let idx = visible[start + line_index];
+                        state.wallet_selected_address = idx;
+                        let address = state.wallet_addresses[idx].address.clone();
+                        let target = if link_click {
+                            explorer_address_url(&address)
+                        } else {
+                            address.clone()
+                        };
+                        let status = if link_click {
+                            open_or_copy_url(&target).map(str::to_string)
+                        } else if clipboard_copy(&target).is_ok() {
+                            Some("Address copied".to_string())
+                        } else {
+                            None
+                        };
+                        if let Some(status) = status {
+                            state.command_status = Some(status.clone());
+                            state.wallet_status = Some(status);
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        let qr_area = right_chunks[1];
+        if rect_contains(qr_area, event.column, event.row) {
+            if !state.wallet_show_qr {
+                state.wallet_show_qr = true;
+                state.wallet_qr_expanded = true;
+            } else {
+                state.wallet_qr_expanded = !state.wallet_qr_expanded;
+            }
+            return Ok(false);
+        }
+    }
+
+    if !allow_navigation {
+        return Ok(false);
+    }
+
+    if rect_contains(cmd_area, event.column, event.row) {
+        if !state.command_mode {
+            state.command_mode = true;
+            state.command_input.clear();
+            state.command_input.push('/');
+            state.command_selected = 0;
+            state.command_status = None;
+            return Ok(false);
+        }
+
+        if let Some((list_area, input_area)) = command_palette_areas(cmd_area) {
+            if rect_contains(list_area, event.column, event.row) {
+                let list_layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(0), Constraint::Length(1)])
+                    .split(list_area);
+                let list_content_area = list_layout[0];
+
+                if !rect_contains(list_content_area, event.column, event.row) {
+                    return Ok(false);
+                }
+
+                let suggestions = command_suggestions(&state.command_input);
+                if suggestions.is_empty() {
+                    return Ok(false);
+                }
+
+                let max_rows = list_content_area.height.max(1) as usize;
+                let selected_index = state
+                    .command_selected
+                    .min(suggestions.len().saturating_sub(1));
+
+                let max_start = suggestions.len().saturating_sub(max_rows);
+                let start = selected_index.saturating_sub(max_rows / 2).min(max_start);
+
+                let row_offset = event.row.saturating_sub(list_content_area.y) as usize;
+                let idx = start.saturating_add(row_offset);
+                if idx < suggestions.len() && row_offset < max_rows {
+                    state.command_selected = idx;
+                }
+                return Ok(false);
+            }
+
+            if rect_contains(input_area, event.column, event.row) {
+                if state.command_input.is_empty() {
+                    state.command_input.push('/');
+                }
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 fn draw(
@@ -2177,23 +4525,305 @@ fn draw(
 ) {
     frame.render_widget(Clear, frame.area());
     frame.render_widget(Block::default().style(style_base()), frame.area());
+
+    let (header_area, main_area, sidebar_area, cmd_area) = layout_areas(state, frame.area());
+
+    draw_header(frame, state, header_area);
+    draw_sidebar(frame, state, sidebar_area);
+    draw_command_bar(frame, state, cmd_area);
+
     match state.screen {
-        Screen::Monitor => draw_monitor(frame, state),
-        Screen::Peers => draw_peers(frame, state, peer_registry, net_totals),
-        Screen::Db => draw_db(frame, state),
-        Screen::Mempool => draw_mempool(frame, state),
-        Screen::Wallet => draw_wallet(frame, state),
-        Screen::Logs => draw_logs(frame, state),
-        Screen::Setup => draw_setup(frame, state),
-        Screen::Help => draw_help(frame, state),
+        Screen::Monitor => draw_monitor(frame, state, main_area),
+        Screen::Stats => draw_stats(frame, state, main_area),
+        Screen::Peers => draw_peers(frame, state, peer_registry, net_totals, main_area),
+        Screen::Db => draw_db(frame, state, main_area),
+        Screen::Mempool => draw_mempool(frame, state, main_area),
+        Screen::Wallet => draw_wallet(frame, state, main_area),
+        Screen::Logs => draw_logs(frame, state, main_area),
+        Screen::Setup => draw_setup(frame, state, main_area),
+        Screen::Help => draw_help(frame, state, main_area),
     }
 }
 
-fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+fn draw_header(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
+    let header = header_line(state, state.screen);
+    let widget = Paragraph::new(header).style(style_panel());
+    frame.render_widget(widget, area);
+}
+
+fn draw_command_bar(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
+    let border_style = if state.command_mode {
+        Style::default().fg(THEME.accent)
+    } else {
+        style_border()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(border_style)
+        .style(Style::default().bg(THEME.panel));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    if state.command_mode {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+        let list_area = chunks[0];
+        let input_area = chunks[1];
+
+        let list_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(list_area);
+        let list_content_area = list_layout[0];
+        let list_scrollbar_area = list_layout[1];
+
+        let suggestions = command_suggestions(&state.command_input);
+        let max_rows = list_content_area.height.max(1) as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        if suggestions.is_empty() {
+            lines.push(Line::styled("No matches", style_muted()));
+        } else {
+            let selected_index = state
+                .command_selected
+                .min(suggestions.len().saturating_sub(1));
+
+            let max_start = suggestions.len().saturating_sub(max_rows);
+            let start = selected_index.saturating_sub(max_rows / 2).min(max_start);
+            let end = (start + max_rows).min(suggestions.len());
+
+            let cmd_width = 18usize;
+            let desc_width = list_content_area
+                .width
+                .saturating_sub(cmd_width as u16)
+                .saturating_sub(14)
+                .max(16) as usize;
+
+            for (row, spec) in suggestions[start..end].iter().enumerate() {
+                let idx = start + row;
+                let selected = idx == selected_index;
+                let base_style = if selected {
+                    Style::default().bg(THEME.accent).fg(THEME.bg)
+                } else {
+                    Style::default()
+                };
+
+                let cmd_style = if selected {
+                    base_style.add_modifier(Modifier::BOLD)
+                } else {
+                    style_command()
+                };
+
+                let meta_style = if selected { base_style } else { style_muted() };
+
+                let cmd_label = shorten(spec.command, cmd_width);
+                let cmd_padded = format!("{:<cmd_width$}", cmd_label, cmd_width = cmd_width);
+                let desc = shorten(spec.description, desc_width);
+
+                let line = Line::from(vec![
+                    Span::styled(cmd_padded, cmd_style),
+                    Span::styled(spec.category, meta_style),
+                    Span::styled(" · ", meta_style),
+                    Span::styled(desc, meta_style),
+                ])
+                .style(base_style);
+
+                lines.push(line);
+            }
+
+            render_vertical_scrollbar(
+                frame,
+                list_scrollbar_area,
+                suggestions.len(),
+                start,
+                max_rows,
+            );
+        }
+        let list = Paragraph::new(lines)
+            .style(style_panel())
+            .wrap(Wrap { trim: false });
+        frame.render_widget(list, list_content_area);
+
+        let input = if state.command_input.is_empty() {
+            "/".to_string()
+        } else {
+            state.command_input.clone()
+        };
+        let mut input_spans = vec![Span::styled(input, Style::default().fg(THEME.text))];
+        if state.command_input.len() <= 1 {
+            input_spans.push(Span::styled(
+                " Type to search · Tab/Shift+Tab select · Enter run",
+                style_muted(),
+            ));
+        }
+
+        let input_widget = Paragraph::new(Line::from(input_spans)).style(style_panel());
+        frame.render_widget(input_widget, input_area);
+
+        let cursor_x = input_area
+            .x
+            .saturating_add(state.command_input.len().max(1) as u16);
+        frame.set_cursor_position((
+            cursor_x.min(input_area.x + input_area.width.saturating_sub(1)),
+            input_area.y,
+        ));
+    } else {
+        let mut spans = vec![
+            Span::styled("/", style_key()),
+            Span::raw(" command  "),
+            Span::styled("Tab", style_key()),
+            Span::raw(" views  "),
+            Span::styled("?", style_key()),
+            Span::raw(" help  "),
+            Span::styled("q", style_key()),
+            Span::raw(" quit"),
+        ];
+        if let Some(status) = state.command_status.as_ref() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(status, style_warn()));
+        } else if let Some(err) = state.last_error.as_ref() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(format!("Error: {err}"), style_error()));
+        } else if let Some(status) = state.startup_status.as_ref() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(status, style_warn()));
+        }
+        let widget = Paragraph::new(Line::from(spans)).style(style_panel());
+        frame.render_widget(widget, inner);
+    }
+}
+
+fn draw_sidebar(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(11),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let mut summary = Vec::new();
+    if let Some(snapshot) = state.last_snapshot.as_ref() {
+        let hps = state
+            .headers_per_sec
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let bps = state
+            .blocks_per_sec
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+
+        summary.push(Line::from(vec![
+            Span::styled("Network:", style_muted()),
+            Span::raw(format!(" {}", snapshot.network)),
+        ]));
+        summary.push(Line::from(vec![
+            Span::styled("Backend:", style_muted()),
+            Span::raw(format!(" {}", snapshot.backend)),
+        ]));
+        summary.push(Line::from(vec![
+            Span::styled("Uptime:", style_muted()),
+            Span::raw(format!(" {}", format_hms(snapshot.uptime_secs))),
+        ]));
+        summary.push(Line::from(vec![
+            Span::styled("Sync:", style_muted()),
+            Span::raw(format!(" {}", snapshot.sync_state)),
+        ]));
+        summary.push(Line::raw(""));
+        summary.push(Line::from(vec![
+            Span::styled("Tip:", style_muted()),
+            Span::raw(format!(
+                " h{} b{}",
+                snapshot.best_header_height, snapshot.best_block_height
+            )),
+        ]));
+        summary.push(Line::from(vec![
+            Span::styled("Gap:", style_muted()),
+            Span::raw(format!(" {}", snapshot.header_gap)),
+        ]));
+        summary.push(Line::from(vec![
+            Span::styled("H/s:", style_muted()),
+            Span::styled(format!(" {hps}"), Style::default().fg(THEME.accent_alt)),
+            Span::raw("  "),
+            Span::styled("B/s:", style_muted()),
+            Span::styled(format!(" {bps}"), Style::default().fg(THEME.accent)),
+        ]));
+    } else {
+        summary.push(Line::raw("Waiting for stats..."));
+    }
+
+    let summary_widget = Paragraph::new(summary)
+        .block(panel_block("Status"))
+        .style(style_panel());
+    frame.render_widget(summary_widget, chunks[0]);
+
+    if let Some(snapshot) = state.last_snapshot.as_ref() {
+        let header_height = snapshot.best_header_height.max(0) as f64;
+        let block_height = snapshot.best_block_height.max(0) as f64;
+        let ratio = if header_height > 0.0 {
+            (block_height / header_height).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let indexing = Gauge::default()
+            .block(panel_block("Indexing"))
+            .ratio(ratio)
+            .label(Span::styled(
+                format!("{}%", (ratio * 100.0).round() as u64),
+                Style::default().fg(THEME.text),
+            ))
+            .style(style_panel())
+            .gauge_style(Style::default().fg(THEME.bg).bg(THEME.accent));
+        frame.render_widget(indexing, chunks[1]);
+
+        let mempool_ratio = if snapshot.mempool_max_bytes > 0 {
+            (snapshot.mempool_bytes as f64 / snapshot.mempool_max_bytes as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let mempool_mb = snapshot.mempool_bytes as f64 / (1024.0 * 1024.0);
+        let mempool_cap_mb = snapshot.mempool_max_bytes as f64 / (1024.0 * 1024.0);
+        let mempool = Gauge::default()
+            .block(panel_block("Mempool"))
+            .ratio(mempool_ratio)
+            .label(Span::styled(
+                format!("{mempool_mb:.1}/{mempool_cap_mb:.0} MiB"),
+                Style::default().fg(THEME.text),
+            ))
+            .style(style_panel())
+            .gauge_style(Style::default().fg(THEME.bg).bg(THEME.accent_alt));
+        frame.render_widget(mempool, chunks[2]);
+    }
+
+    let helper = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Commands:", style_muted()),
+            Span::raw(" /help /monitor /stats /peers /logs"),
+        ]),
+        Line::from(vec![
+            Span::styled("Keys:", style_muted()),
+            Span::raw(" Tab cycle · / command"),
+        ]),
+    ])
+    .block(panel_block("Hints"))
+    .style(style_panel())
+    .wrap(Wrap { trim: false });
+    frame.render_widget(helper, chunks[3]);
+}
+
+fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
     let lines = vec![
-        header_line(state, state.help_return),
         Line::raw(""),
         Line::raw("Keys:"),
+        Line::raw("  /           Command mode"),
         Line::raw("  q / Esc     Quit (requests daemon shutdown)"),
         Line::raw("  Tab         Cycle views"),
         Line::raw("  Shift+Tab   Cycle views backwards"),
@@ -2204,9 +4834,18 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Line::raw("  4 / t       Mempool view"),
         Line::raw("  5 / w       Wallet view"),
         Line::raw("  6 / l       Logs view"),
+        Line::raw("  7           Stats view"),
         Line::raw("  ? / h       Toggle help"),
         Line::raw("  s           Toggle setup wizard"),
         Line::raw("  a           Toggle advanced metrics"),
+        Line::raw(""),
+        Line::raw("Setup wizard:"),
+        Line::raw("  Up/Down     Highlight data dir"),
+        Line::raw("  Enter       Select data dir"),
+        Line::raw("  r           Rescan data dirs"),
+        Line::raw("  d           Delete data dir (confirm)"),
+        Line::raw("  b           Backup wallet.dat"),
+        Line::raw("  n/p/l/[ / ] Network/profile/lead"),
         Line::raw(""),
         Line::raw("Peers view:"),
         Line::raw("  Up/Down     Scroll"),
@@ -2222,7 +4861,8 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         Line::raw(""),
         Line::raw("Wallet view (in-process only):"),
         Line::raw("  Up/Down     Select address"),
-        Line::raw("  Enter       Toggle QR code"),
+        Line::raw("  Enter       Toggle QR view"),
+        Line::raw("  o           Open explorer for address"),
         Line::raw("  n           New receive address (t-addr)"),
         Line::raw("  N           New Sapling address (z-addr)"),
         Line::raw("  x           Send to address"),
@@ -2236,308 +4876,695 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     let paragraph = Paragraph::new(lines)
         .block(panel_block("Help"))
         .style(style_panel());
-    frame.render_widget(paragraph, frame.area());
+    frame.render_widget(paragraph, area);
 
-    if state.advanced {
-        // no-op for now; keeps the state meaningful on the help page.
-    }
+    if state.advanced {}
 }
 
-fn draw_setup(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(header_line(state, state.setup_return));
-    lines.push(Line::raw(""));
-    match state.setup.as_ref() {
-        Some(setup) => {
-            let network = match setup.network {
-                Network::Mainnet => "mainnet",
-                Network::Testnet => "testnet",
-                Network::Regtest => "regtest",
-            };
-            lines.push(Line::raw(
-                "Writes a starter `flux.conf` with RPC auth + basic settings.",
-            ));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled("Data dir:", style_muted()),
-                Span::raw(format!(" {}", setup.data_dir.display())),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("flux.conf:", style_muted()),
-                Span::raw(format!(" {}", setup.conf_path.display())),
-            ]));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled("Network:", style_muted()),
-                Span::raw(format!(" {network}")),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Profile:", style_muted()),
-                Span::raw(format!(" {}", setup.profile.as_str())),
-            ]));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled("rpcuser:", style_muted()),
-                Span::raw(format!(" {}", setup.rpc_user)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("rpcpassword:", style_muted()),
-                Span::raw(format!(" {}", setup.masked_pass())),
-            ]));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled("Keys:", style_muted()),
-                Span::raw(" n network  p profile  g regen auth  v show/hide pass  w write flux.conf  Esc back"),
-            ]));
+fn draw_setup(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
+    let Some(setup) = state.setup.as_ref() else {
+        let paragraph = Paragraph::new(vec![Line::raw(
+            "Setup wizard unavailable (remote attach mode).",
+        )])
+        .block(panel_block("Setup Wizard"))
+        .style(style_panel());
+        frame.render_widget(paragraph, area);
+        return;
+    };
 
-            if let Some(status) = setup.status.as_ref() {
-                lines.push(Line::raw(""));
+    let network = match setup.network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    };
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(6)])
+        .split(area);
+    let content_area = sections[0];
+    let footer_area = sections[1];
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(content_area);
+
+    {
+        let block = panel_block("Data Sets");
+        let inner = block.inner(columns[0]);
+        frame.render_widget(block, columns[0]);
+
+        if inner.width == 0 || inner.height == 0 {
+        } else {
+            let layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(inner);
+            let list_area = layout[0];
+            let scrollbar_area = layout[1];
+
+            let total = setup.data_sets.len();
+            let cursor = setup.data_set_index.min(total.saturating_sub(1));
+            let visible_rows = list_area.height.max(1) as usize;
+
+            let mut lines: Vec<Line> = Vec::new();
+            if total == 0 {
+                lines.push(Line::styled("No data dirs found", style_muted()));
+            } else {
+                let max_start = total.saturating_sub(visible_rows);
+                let mut start = cursor.saturating_sub(visible_rows / 2);
+                start = start.min(max_start);
+                let end = (start + visible_rows).min(total);
+
+                let name_width = list_area.width.saturating_sub(6).max(8) as usize;
+                for idx in start..end {
+                    let path = &setup.data_sets[idx];
+                    let label = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let label = shorten(&label, name_width);
+
+                    let is_cursor = idx == cursor;
+                    let is_active = path == &setup.active_data_dir;
+                    let is_selected = path == &setup.data_dir;
+
+                    let prefix = if is_cursor { "▶" } else { " " };
+                    let selected_marker = if is_selected { "✓" } else { " " };
+                    let active_marker = if is_active { "*" } else { " " };
+
+                    let style = if is_cursor {
+                        Style::default()
+                            .fg(THEME.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        style_panel()
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, style),
+                        Span::raw(" "),
+                        Span::styled(selected_marker, style_muted()),
+                        Span::styled(active_marker, style_muted()),
+                        Span::raw(" "),
+                        Span::styled(label, style),
+                    ]));
+                }
+
+                render_vertical_scrollbar(frame, scrollbar_area, total, start, visible_rows);
+            }
+
+            let list = Paragraph::new(lines)
+                .style(style_panel())
+                .wrap(Wrap { trim: false });
+            frame.render_widget(list, list_area);
+        }
+    }
+
+    {
+        let header_lead_label = if setup.header_lead == 0 {
+            "unlimited".to_string()
+        } else {
+            setup.header_lead.to_string()
+        };
+
+        let block = panel_block("Config");
+        let inner = block.inner(columns[1]);
+        frame.render_widget(block, columns[1]);
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::raw(
+            "Writes a starter `flux.conf` with RPC auth + basic settings.",
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("Selected:", style_muted()),
+            Span::raw(format!(
+                " {}",
+                shorten(&setup.data_dir.display().to_string(), 64)
+            )),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("flux.conf:", style_muted()),
+            Span::raw(format!(
+                " {}{}",
+                shorten(&setup.conf_path.display().to_string(), 64),
+                if setup.conf_path.exists() {
+                    ""
+                } else {
+                    " (missing)"
+                }
+            )),
+        ]));
+        if let Some(cursor) = setup.data_sets.get(setup.data_set_index) {
+            if cursor != &setup.data_dir {
                 lines.push(Line::from(vec![
-                    Span::styled("Status:", style_warn()),
-                    Span::raw(" "),
-                    Span::raw(status),
+                    Span::styled("Highlighted:", style_muted()),
+                    Span::raw(format!(" {}", shorten(&cursor.display().to_string(), 64))),
                 ]));
             }
         }
-        None => {
-            lines.push(Line::raw("Setup wizard unavailable (remote attach mode)."));
-        }
-    }
-
-    let paragraph = Paragraph::new(lines)
-        .block(panel_block("Setup Wizard"))
-        .style(style_panel());
-    frame.render_widget(paragraph, frame.area());
-}
-
-fn draw_monitor(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(10)])
-        .split(area);
-
-    let mut summary = Vec::new();
-    summary.push(header_line(state, Screen::Monitor));
-
-    if let Some(snapshot) = state.last_snapshot.as_ref() {
-        let hps = state
-            .headers_per_sec
-            .map(|value| format!("{value:.2}"))
-            .unwrap_or_else(|| "-".to_string());
-        let bps = state
-            .blocks_per_sec
-            .map(|value| format!("{value:.2}"))
-            .unwrap_or_else(|| "-".to_string());
-
-        summary.push(Line::from(vec![
-            Span::styled("Network:", style_muted()),
-            Span::raw(format!(" {}  ", snapshot.network)),
-            Span::styled("Backend:", style_muted()),
-            Span::raw(format!(" {}  ", snapshot.backend)),
-            Span::styled("Uptime:", style_muted()),
-            Span::raw(format!(" {}", format_hms(snapshot.uptime_secs))),
-            Span::raw("  "),
-            Span::styled("Sync:", style_muted()),
-            Span::raw(format!(" {}", snapshot.sync_state)),
-        ]));
-
-        summary.push(Line::from(vec![
-            Span::styled("Tip:", style_muted()),
-            Span::raw(format!(
-                " headers {}  blocks {}  gap {}  ",
-                snapshot.best_header_height, snapshot.best_block_height, snapshot.header_gap
-            )),
-            Span::styled("Rates:", style_muted()),
-            Span::styled(" h/s ", style_muted()),
-            Span::styled(hps, Style::default().fg(THEME.accent_alt).bg(THEME.panel)),
-            Span::styled("  b/s ", style_muted()),
-            Span::styled(bps, Style::default().fg(THEME.accent).bg(THEME.panel)),
-        ]));
-
-        let mempool_mb = snapshot.mempool_bytes as f64 / (1024.0 * 1024.0);
-        let mempool_cap_mb = snapshot.mempool_max_bytes as f64 / (1024.0 * 1024.0);
-        summary.push(Line::from(vec![
-            Span::styled("Mempool:", style_muted()),
-            Span::raw(format!(
-                " {} tx  {:.1}/{:.0} MiB",
-                snapshot.mempool_size, mempool_mb, mempool_cap_mb
-            )),
-        ]));
-
-        if state.advanced {
-            let writebuf_mb = snapshot
-                .db_write_buffer_bytes
-                .map(|bytes| bytes as f64 / (1024.0 * 1024.0))
-                .map(|value| format!("{value:.0}"))
-                .unwrap_or_else(|| "-".to_string());
-            let writebuf_max_mb = snapshot
-                .db_max_write_buffer_bytes
-                .map(|bytes| bytes as f64 / (1024.0 * 1024.0))
-                .map(|value| format!("{value:.0}"))
-                .unwrap_or_else(|| "-".to_string());
-            let compactions = snapshot
-                .db_active_compactions
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            summary.push(Line::from(vec![
-                Span::styled("DB:", style_muted()),
+        if setup.data_dir != setup.active_data_dir {
+            lines.push(Line::from(vec![
+                Span::styled("Active:", style_muted()),
                 Span::raw(format!(
-                    " writebuf {writebuf_mb}/{writebuf_max_mb} MiB  compactions {compactions}"
+                    " {}",
+                    shorten(&setup.active_data_dir.display().to_string(), 64)
                 )),
             ]));
         }
-    } else {
-        summary.push(Line::raw(""));
-        summary.push(Line::raw("Waiting for stats..."));
-    }
-
-    if let Some(err) = state.last_error.as_ref() {
-        summary.push(Line::from(vec![
-            Span::styled("Error:", style_error()),
-            Span::raw(" "),
-            Span::raw(err),
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("Network:", style_muted()),
+            Span::raw(format!(" {network}")),
         ]));
+        lines.push(Line::from(vec![
+            Span::styled("Profile:", style_muted()),
+            Span::raw(format!(" {}", setup.profile.as_str())),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Header lead:", style_muted()),
+            Span::raw(format!(" {header_lead_label}")),
+        ]));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("rpcuser:", style_muted()),
+            Span::raw(format!(" {}", setup.rpc_user)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("rpcpassword:", style_muted()),
+            Span::raw(format!(" {}", setup.masked_pass())),
+        ]));
+
+        let widget = Paragraph::new(lines)
+            .style(style_panel())
+            .wrap(Wrap { trim: false });
+        frame.render_widget(widget, inner);
     }
 
-    let summary_widget = Paragraph::new(summary)
-        .block(panel_block("Status"))
-        .style(style_panel());
-    frame.render_widget(summary_widget, chunks[0]);
+    {
+        let block = panel_block("Controls");
+        let inner = block.inner(footer_area);
+        frame.render_widget(block, footer_area);
 
-    let (x_min, x_max) = state.bps_history.bounds();
-    let y_max = state.bps_history.max_y().max(state.hps_history.max_y());
-    let y_max = (y_max * 1.1).ceil().max(1.0);
-    let y_mid = (y_max / 2.0).ceil().max(1.0);
-    let window = (x_max - x_min).max(1.0);
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Legend:", style_muted()),
+                Span::raw(" ✓ selected  * active  ▶ cursor"),
+            ]),
+            Line::from(vec![
+                Span::styled("Keys:", style_muted()),
+                Span::raw(" ↑/↓ highlight  Enter select  N new dataset  r rescan  d delete"),
+            ]),
+            Line::raw(" b backup wallet.dat  n network  p profile  l toggle lead  [/] adjust lead"),
+            Line::raw(" g regen auth  v show/hide pass  w write flux.conf  Esc back"),
+        ];
+        if let Some(status) = setup.status.as_ref() {
+            lines.push(Line::from(vec![
+                Span::styled("Status:", style_warn()),
+                Span::raw(" "),
+                Span::raw(shorten(status, inner.width.max(1) as usize)),
+            ]));
+        }
 
-    let bps_points = state.bps_history.as_vec();
-    let hps_points = state.hps_history.as_vec();
+        let widget = Paragraph::new(lines)
+            .style(style_panel())
+            .wrap(Wrap { trim: false });
+        frame.render_widget(widget, inner);
+    }
+}
 
-    let hps_now = state
-        .headers_per_sec
-        .map(|value| format!("{value:.1}"))
-        .unwrap_or_else(|| "-".to_string());
-    let bps_now = state
-        .blocks_per_sec
-        .map(|value| format!("{value:.1}"))
-        .unwrap_or_else(|| "-".to_string());
-
-    let datasets = vec![
-        Dataset::default()
-            .name("b/s")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .data(&bps_points)
-            .style(Style::default().fg(THEME.accent)),
-        Dataset::default()
-            .name("h/s")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .data(&hps_points)
-            .style(Style::default().fg(THEME.accent_alt)),
-    ];
-
-    let chart = Chart::new(datasets)
-        .block(panel_block(format!(
-            "Throughput (b/s {bps_now} · h/s {hps_now})"
-        )))
-        .style(style_panel())
-        .x_axis(
-            Axis::default()
-                .style(style_muted())
-                .labels(vec![
-                    Span::styled(format!("-{}", fmt_window(window)), style_muted()),
-                    Span::styled(format!("-{}", fmt_window(window / 2.0)), style_muted()),
-                    Span::styled("now", style_muted()),
-                ])
-                .bounds([x_min, x_max]),
-        )
-        .y_axis(
-            Axis::default()
-                .style(style_muted())
-                .labels(vec![
-                    Span::styled("0", style_muted()),
-                    Span::styled(format!("{y_mid:.0}"), style_muted()),
-                    Span::styled(format!("{y_max:.0}"), style_muted()),
-                ])
-                .bounds([0.0, y_max]),
-        );
-
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-        .split(chunks[1]);
-    frame.render_widget(chart, bottom[0]);
-
-    let side = Layout::default()
+fn draw_stats(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
+    let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Min(0),
         ])
-        .split(bottom[1]);
+        .split(area);
 
-    if let Some(snapshot) = state.last_snapshot.as_ref() {
-        let header_height = snapshot.best_header_height.max(0) as f64;
-        let block_height = snapshot.best_block_height.max(0) as f64;
-        let ratio = if header_height > 0.0 {
-            (block_height / header_height).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let indexing_label = format!(
-            "{} / {}",
-            snapshot.best_block_height, snapshot.best_header_height
-        );
-        let indexing = Gauge::default()
-            .block(panel_block("Indexing"))
-            .ratio(ratio)
-            .label(Span::styled(
-                indexing_label,
-                Style::default().fg(THEME.text),
-            ))
-            .style(style_panel())
-            .gauge_style(Style::default().fg(THEME.bg).bg(THEME.accent));
-        frame.render_widget(indexing, side[0]);
+    let snapshot = state.last_snapshot.as_ref();
+    let format_supply = |value: Option<i64>| -> String {
+        value
+            .map(|amount| crate::format_amount(amount as i128))
+            .unwrap_or_else(|| "-".to_string())
+    };
 
-        let mempool_ratio = if snapshot.mempool_max_bytes > 0 {
-            (snapshot.mempool_bytes as f64 / snapshot.mempool_max_bytes as f64).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let mempool_mb = snapshot.mempool_bytes as f64 / (1024.0 * 1024.0);
-        let mempool_cap_mb = snapshot.mempool_max_bytes as f64 / (1024.0 * 1024.0);
-        let mempool_label = format!("{:.1}/{:.0} MiB", mempool_mb, mempool_cap_mb);
-        let mempool = Gauge::default()
-            .block(panel_block("Mempool"))
-            .ratio(mempool_ratio)
-            .label(Span::styled(mempool_label, Style::default().fg(THEME.text)))
-            .style(style_panel())
-            .gauge_style(Style::default().fg(THEME.bg).bg(THEME.accent_alt));
-        frame.render_widget(mempool, side[1]);
-
-        let helper = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("Gap:", style_muted()),
-                Span::raw(" headers - blocks (indexing lag)"),
-            ]),
-            Line::from(vec![
-                Span::styled("Tip:", style_muted()),
-                Span::raw(" best known header height"),
-            ]),
-        ])
-        .block(panel_block("Help"))
-        .style(style_panel())
-        .wrap(Wrap { trim: false });
-        frame.render_widget(helper, side[2]);
+    let (total, transparent, shielded, sprout, sapling) = if let Some(snapshot) = snapshot {
+        (
+            format_supply(snapshot.supply_total_zat),
+            format_supply(snapshot.supply_transparent_zat),
+            format_supply(snapshot.supply_shielded_zat),
+            format_supply(snapshot.supply_sprout_zat),
+            format_supply(snapshot.supply_sapling_zat),
+        )
     } else {
-        let helper = Paragraph::new(vec![Line::raw("Waiting for stats...")])
-            .block(panel_block("Status"))
-            .style(style_panel());
-        frame.render_widget(helper, bottom[1]);
+        (
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+        )
+    };
+
+    let supply_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(layout[0]);
+
+    let total_lines = vec![
+        Line::styled("Total supply", style_muted()),
+        Line::styled(total, style_title()),
+    ];
+    let transparent_lines = vec![
+        Line::styled("Transparent", style_muted()),
+        Line::styled(transparent, Style::default().fg(THEME.accent)),
+    ];
+    let shielded_lines = vec![
+        Line::styled("Shielded", style_muted()),
+        Line::styled(shielded, Style::default().fg(THEME.accent_alt)),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(total_lines)
+            .block(panel_block("Network Supply"))
+            .style(style_panel()),
+        supply_columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(transparent_lines)
+            .block(panel_block("Transparent Pool"))
+            .style(style_panel()),
+        supply_columns[1],
+    );
+    frame.render_widget(
+        Paragraph::new(shielded_lines)
+            .block(panel_block("Shielded Pool"))
+            .style(style_panel()),
+        supply_columns[2],
+    );
+
+    let shielded_lines = vec![
+        Line::from(vec![
+            Span::styled("Sprout:", style_muted()),
+            Span::raw(format!(" {sprout}")),
+        ]),
+        Line::from(vec![
+            Span::styled("Sapling:", style_muted()),
+            Span::raw(format!(" {sapling}")),
+        ]),
+    ];
+    let shielded_panel = Paragraph::new(shielded_lines)
+        .block(panel_block("Shielded Pools"))
+        .style(style_panel());
+    frame.render_widget(shielded_panel, layout[1]);
+
+    let mut chain_lines = Vec::new();
+    if let Some(snapshot) = snapshot {
+        chain_lines.push(Line::from(vec![
+            Span::styled("Tip:", style_muted()),
+            Span::raw(format!(
+                " h{} b{}",
+                snapshot.best_header_height, snapshot.best_block_height
+            )),
+        ]));
+        chain_lines.push(Line::from(vec![
+            Span::styled("Gap:", style_muted()),
+            Span::raw(format!(" {}", snapshot.header_gap)),
+        ]));
+        chain_lines.push(Line::from(vec![
+            Span::styled("Sync:", style_muted()),
+            Span::raw(format!(" {}", snapshot.sync_state)),
+        ]));
+        chain_lines.push(Line::from(vec![
+            Span::styled("Uptime:", style_muted()),
+            Span::raw(format!(" {}s", snapshot.uptime_secs)),
+        ]));
+    } else {
+        chain_lines.push(Line::raw("Waiting for stats..."));
     }
+
+    let chain_panel = Paragraph::new(chain_lines)
+        .block(panel_block("Chain State"))
+        .style(style_panel());
+    frame.render_widget(chain_panel, layout[2]);
+}
+
+fn resample_window_max(
+    points: &[(f64, f64)],
+    window_start_t: f64,
+    window_secs: f64,
+    width: usize,
+) -> Vec<f64> {
+    let mut out = vec![0.0; width];
+    if width == 0 || points.is_empty() || !window_secs.is_finite() || window_secs <= 0.0 {
+        return out;
+    }
+
+    let window_start_idx = points
+        .iter()
+        .position(|(t, _)| *t >= window_start_t)
+        .unwrap_or(points.len());
+    if window_start_idx >= points.len() {
+        return out;
+    }
+
+    for (t, value) in points[window_start_idx..].iter() {
+        let rel = (*t - window_start_t) / window_secs;
+        if !rel.is_finite() {
+            continue;
+        }
+
+        let mut idx = (rel * width as f64).floor() as isize;
+        if idx < 0 {
+            idx = 0;
+        } else if idx as usize >= width {
+            idx = width as isize - 1;
+        }
+
+        let idx = idx as usize;
+        out[idx] = out[idx].max(value.max(0.0));
+    }
+
+    out
+}
+
+fn draw_monitor(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Length(1),
+            Constraint::Percentage(50),
+        ])
+        .split(area);
+
+    let format_rate = |value: f64| {
+        if value >= 1000.0 {
+            format!("{value:.0}")
+        } else {
+            format!("{value:.1}")
+        }
+    };
+
+    let format_rel = |seconds: f64| {
+        if !seconds.is_finite() {
+            return "∞".to_string();
+        }
+        let seconds = seconds.max(0.0);
+        if seconds >= 3600.0 {
+            format!("{:.1}h", seconds / 3600.0)
+        } else if seconds >= 60.0 {
+            let secs = seconds.round().max(0.0) as u64;
+            let mins = secs / 60;
+            let rem = secs % 60;
+            if rem == 0 {
+                format!("{mins}m")
+            } else {
+                format!("{mins}m{rem}s")
+            }
+        } else if seconds >= 1.0 {
+            format!("{:.0}s", seconds)
+        } else {
+            format!("{:.0}ms", seconds * 1000.0)
+        }
+    };
+
+    let format_interval = |rate: f64| {
+        if rate <= 0.0 {
+            "∞".to_string()
+        } else {
+            format_rel(1.0 / rate)
+        }
+    };
+
+    let draw_sparkline_panel = |f: &mut ratatui::Frame<'_>,
+                                area: Rect,
+                                title: &str,
+                                hist: &RateHistory,
+                                current: Option<f64>,
+                                color: Color,
+                                show_interval: bool| {
+        let points = hist.as_vec();
+        if points.is_empty() {
+            let widget = Paragraph::new(vec![Line::styled(
+                "Waiting for throughput...",
+                style_muted(),
+            )])
+            .block(panel_block(title))
+            .style(style_panel());
+            f.render_widget(widget, area);
+            return;
+        }
+
+        let values = points
+            .iter()
+            .map(|(_, value)| value.max(0.0))
+            .collect::<Vec<_>>();
+
+        let peak = values.iter().copied().fold(0.0_f64, f64::max);
+        let avg = if values.is_empty() {
+            0.0
+        } else {
+            values.iter().sum::<f64>() / values.len() as f64
+        };
+        let now = current.unwrap_or_else(|| values.last().copied().unwrap_or(0.0));
+
+        let now_interval = show_interval.then(|| format_interval(now));
+
+        let title_line = if area.width >= 90 {
+            if let Some(interval) = now_interval.as_ref() {
+                format!(
+                    "{title} │ now {now:.2}/s ({interval}/b) │ avg {avg:.2}/s │ peak {peak:.2}/s"
+                )
+            } else {
+                format!("{title} │ now {now:.1}/s │ avg {avg:.1}/s │ peak {peak:.1}/s")
+            }
+        } else if area.width >= 60 {
+            if let Some(interval) = now_interval.as_ref() {
+                format!("{title} │ {now:.2}/s ({interval}/b)")
+            } else {
+                format!("{title} │ {now:.1}/s")
+            }
+        } else {
+            format!("{title} │ {now:.1}/s")
+        };
+
+        let block = panel_block(title_line);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let show_y_axis = inner.width >= 34 && inner.height >= 3;
+        let show_x_axis = inner.width >= 34 && inner.height >= 4;
+        let axis_width = if show_y_axis { 10u16 } else { 0u16 };
+
+        let (chart_outer, x_axis_area) = if show_x_axis {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(inner);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (inner, None)
+        };
+
+        let (y_axis_area, chart_area) = if axis_width > 0 && chart_outer.width > axis_width + 2 {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(axis_width), Constraint::Min(0)])
+                .split(chart_outer);
+            (Some(chunks[0]), chunks[1])
+        } else {
+            (None, chart_outer)
+        };
+
+        if chart_area.width == 0 || chart_area.height == 0 {
+            return;
+        }
+
+        let width = chart_area.width as usize;
+
+        let now_t = points
+            .last()
+            .map(|(t, _)| *t)
+            .unwrap_or_else(|| values.last().copied().unwrap_or(0.0));
+        let window_secs = 6.0 * 60.0;
+        let window_start_t = now_t - window_secs;
+
+        let visible_values = resample_window_max(&points, window_start_t, window_secs, width);
+
+        let mut sorted = visible_values.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p90_idx = sorted.len().saturating_sub(1) * 90 / 100;
+        let p90 = sorted.get(p90_idx).copied().unwrap_or(0.0);
+        let display_max = p90.max(avg).max(now).max(1.0);
+        let display_max_u64 = display_max.ceil() as u64;
+
+        let mut bars = Vec::with_capacity(width);
+        for (i, value) in visible_values.iter().enumerate() {
+            let mut bar_value = value.round().max(0.0) as u64;
+            if *value > 0.0 && bar_value == 0 {
+                bar_value = 1;
+            }
+
+            let style = if i + 1 == width {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+
+            bars.push(SparklineBar::from(bar_value).style(style));
+        }
+
+        let sparkline = Sparkline::default()
+            .style(Style::default().fg(color).bg(THEME.panel))
+            .max(display_max_u64)
+            .data(bars)
+            .bar_set(symbols::bar::NINE_LEVELS);
+
+        f.render_widget(sparkline, chart_area);
+
+        let has_y_axis = y_axis_area.is_some();
+        if let Some(y_axis_area) = y_axis_area {
+            let height = chart_area.height.max(1) as usize;
+            let label_width = axis_width.saturating_sub(2).max(1) as usize;
+
+            let max_label = format_rate(display_max);
+            let mid_label = format_rate(display_max / 2.0);
+            let mut lines: Vec<Line> = Vec::with_capacity(height);
+
+            for row in 0..height {
+                let tick_top = row == 0;
+                let tick_mid = row == height / 2;
+                let tick_bottom = row + 1 == height;
+
+                let (label, marker) = if tick_top {
+                    (max_label.as_str(), symbols::line::VERTICAL_RIGHT)
+                } else if tick_mid {
+                    (mid_label.as_str(), symbols::line::VERTICAL_RIGHT)
+                } else if tick_bottom {
+                    ("0", symbols::line::VERTICAL_RIGHT)
+                } else {
+                    ("", symbols::line::VERTICAL)
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:>label_width$}", label, label_width = label_width),
+                        style_muted(),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(marker, style_muted()),
+                ]));
+            }
+
+            let widget = Paragraph::new(lines).style(style_panel());
+            f.render_widget(widget, y_axis_area);
+        }
+
+        if let Some(x_axis_area) = x_axis_area {
+            let total_width = x_axis_area.width.max(1) as usize;
+            let axis_offset = if has_y_axis { axis_width as usize } else { 0 };
+            let chart_width = total_width.saturating_sub(axis_offset);
+
+            if chart_width >= 10 {
+                let left = "6m ago";
+                let mid = "3m ago";
+                let right = "now";
+
+                let mut buf = vec![' '; total_width];
+                let horiz = symbols::line::HORIZONTAL.chars().next().unwrap_or('─');
+                let corner = symbols::line::BOTTOM_LEFT.chars().next().unwrap_or('└');
+
+                if axis_offset > 0 {
+                    if axis_offset <= total_width {
+                        buf[axis_offset - 1] = corner;
+                    }
+                    for idx in axis_offset..total_width {
+                        buf[idx] = horiz;
+                    }
+                } else {
+                    for idx in 0..total_width {
+                        buf[idx] = horiz;
+                    }
+                }
+
+                let write = |buf: &mut [char], start: usize, text: &str| {
+                    for (i, ch) in text.chars().enumerate() {
+                        if start + i < buf.len() {
+                            buf[start + i] = ch;
+                        }
+                    }
+                };
+
+                let left_pos = axis_offset.saturating_add(1);
+                if left_pos < total_width {
+                    write(&mut buf, left_pos, left);
+                }
+
+                let right_pos = total_width.saturating_sub(right.chars().count());
+                if right_pos >= axis_offset {
+                    write(&mut buf, right_pos, right);
+                }
+
+                let mid_len = mid.chars().count();
+                if mid_len < chart_width {
+                    let mid_center = axis_offset.saturating_add(chart_width / 2);
+                    let mid_pos = mid_center.saturating_sub(mid_len / 2);
+
+                    let left_limit = left_pos
+                        .saturating_add(left.chars().count())
+                        .saturating_add(1);
+                    let right_limit = right_pos.saturating_sub(1);
+                    let mid_end = mid_pos.saturating_add(mid_len);
+
+                    if mid_pos >= left_limit
+                        && mid_end <= right_limit
+                        && mid_pos >= axis_offset
+                        && mid_pos < total_width
+                    {
+                        write(&mut buf, mid_pos, mid);
+                    }
+                }
+
+                let line = buf.into_iter().collect::<String>();
+                let widget =
+                    Paragraph::new(vec![Line::styled(line, style_muted())]).style(style_panel());
+                f.render_widget(widget, x_axis_area);
+            }
+        }
+    };
+
+    draw_sparkline_panel(
+        frame,
+        sections[0],
+        "Block Throughput",
+        &state.bps_history,
+        state.blocks_per_sec,
+        THEME.accent,
+        true,
+    );
+    draw_sparkline_panel(
+        frame,
+        sections[2],
+        "Header Throughput",
+        &state.hps_history,
+        state.headers_per_sec,
+        THEME.accent_alt,
+        false,
+    );
 }
 
 fn draw_peers(
@@ -2545,11 +5572,11 @@ fn draw_peers(
     state: &TuiState,
     peer_registry: &PeerRegistry,
     net_totals: &NetTotals,
+    area: Rect,
 ) {
-    let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(10)])
+        .constraints([Constraint::Min(10)])
         .split(area);
 
     #[derive(Clone, Debug)]
@@ -2570,7 +5597,7 @@ fn draw_peers(
         _ => 3,
     };
 
-    let (bytes_recv, bytes_sent, connections, mut peers) = if state.is_remote {
+    let (_bytes_recv, _bytes_sent, _connections, mut peers) = if state.is_remote {
         let totals = state.remote_net_totals.as_ref();
         let peers = state
             .remote_peers
@@ -2614,30 +5641,6 @@ fn draw_peers(
         )
     };
 
-    let mut block_peers = 0usize;
-    let mut header_peers = 0usize;
-    let mut relay_peers = 0usize;
-    for peer in &peers {
-        match peer.kind.as_str() {
-            "block" => block_peers += 1,
-            "header" => header_peers += 1,
-            "relay" => relay_peers += 1,
-            _ => {}
-        }
-    }
-
-    let header = header_line(state, Screen::Peers);
-
-    let recv_mb = bytes_recv
-        .map(|value| format!("{:.1}", value as f64 / (1024.0 * 1024.0)))
-        .unwrap_or_else(|| "-".to_string());
-    let sent_mb = bytes_sent
-        .map(|value| format!("{:.1}", value as f64 / (1024.0 * 1024.0)))
-        .unwrap_or_else(|| "-".to_string());
-    let connections = connections
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_string());
-
     peers.sort_by(|a, b| {
         a.kind_sort
             .cmp(&b.kind_sort)
@@ -2645,49 +5648,26 @@ fn draw_peers(
             .then_with(|| a.addr.cmp(&b.addr))
     });
 
-    let max_rows = chunks[1].height.saturating_sub(3) as usize;
-    let max_scroll = peers.len().saturating_sub(max_rows);
-    let scroll = (state.peers_scroll as usize).min(max_scroll);
-    let shown_start = if peers.is_empty() {
-        0
-    } else {
-        scroll.saturating_add(1)
-    };
-    let shown_end = (scroll + max_rows).min(peers.len());
-    let mut summary = Vec::new();
-    summary.push(header);
-    summary.push(Line::from(vec![
-        Span::styled("Connections:", style_muted()),
-        Span::raw(format!(
-            " {}  (block {block_peers}  header {header_peers}  relay {relay_peers})",
-            connections
-        )),
-    ]));
-    summary.push(Line::from(vec![
-        Span::styled("Net totals:", style_muted()),
-        Span::raw(format!(" recv {recv_mb} MiB  sent {sent_mb} MiB")),
-    ]));
-    if let Some(snapshot) = state.last_snapshot.as_ref() {
-        summary.push(Line::from(vec![
-            Span::styled("Tip:", style_muted()),
-            Span::raw(format!(
-                " headers {}  blocks {}",
-                snapshot.best_header_height, snapshot.best_block_height
-            )),
-        ]));
-    }
-    summary.push(Line::from(vec![
-        Span::styled("Showing:", style_muted()),
-        Span::raw(format!(
-            " {shown_start}-{shown_end} of {}  (Up/Down, PgUp/PgDn)",
-            peers.len()
-        )),
-    ]));
+    let block = panel_block("Peer list");
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
 
-    let summary_widget = Paragraph::new(summary)
-        .block(panel_block("Network"))
-        .style(style_panel());
-    frame.render_widget(summary_widget, chunks[0]);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let table_area = layout[0];
+    let scrollbar_area = layout[1];
+
+    let header_overhead = 2u16;
+    let max_rows = table_area.height.saturating_sub(header_overhead).max(1) as usize;
+    let peer_count = peers.len();
+    let max_scroll = peer_count.saturating_sub(max_rows);
+    let scroll = (state.peers_scroll as usize).min(max_scroll);
 
     if peers.is_empty() {
         let mut lines = vec![
@@ -2697,10 +5677,8 @@ fn draw_peers(
         if state.is_remote {
             lines.push(Line::raw("Remote attach mode may be waiting on /peers."));
         }
-        let widget = Paragraph::new(lines)
-            .block(panel_block("Peer list"))
-            .style(style_panel());
-        frame.render_widget(widget, chunks[1]);
+        let widget = Paragraph::new(lines).style(style_panel());
+        frame.render_widget(widget, inner);
         return;
     }
 
@@ -2738,23 +5716,19 @@ fn draw_peers(
     ];
     let table = Table::new(table_rows, widths)
         .header(header_row)
-        .block(panel_block("Peer list"))
         .style(style_panel())
         .column_spacing(1);
-    frame.render_widget(table, chunks[1]);
+    frame.render_widget(table, table_area);
+    render_vertical_scrollbar(frame, scrollbar_area, peer_count, scroll, max_rows);
 }
 
-fn draw_db(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
-    let area = frame.area();
+fn draw_db(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(7), Constraint::Min(10)])
         .split(area);
 
-    let header = header_line(state, Screen::Db);
-
     let mut summary = Vec::new();
-    summary.push(header);
     match state.last_snapshot.as_ref() {
         Some(snapshot) => {
             let writebuf = fmt_opt_mib(snapshot.db_write_buffer_bytes);
@@ -2870,11 +5844,8 @@ fn draw_db(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     frame.render_widget(table, chunks[1]);
 }
 
-fn draw_mempool(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
-    let header = header_line(state, Screen::Mempool);
-
+fn draw_mempool(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
     let mut lines = Vec::new();
-    lines.push(header);
 
     match state.last_snapshot.as_ref() {
         Some(snapshot) => {
@@ -2997,20 +5968,16 @@ fn draw_mempool(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     let widget = Paragraph::new(lines)
         .block(panel_block("Pool"))
         .style(style_panel());
-    frame.render_widget(widget, frame.area());
+    frame.render_widget(widget, area);
 }
 
-fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
-    let area = frame.area();
+fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(13), Constraint::Min(10)])
         .split(area);
 
-    let header = header_line(state, Screen::Wallet);
-
     let mut lines = Vec::new();
-    lines.push(header);
 
     let now = unix_seconds();
     let encrypted = state.wallet_encrypted;
@@ -3170,7 +6137,7 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
             Span::styled("Keys:", style_muted()),
             Span::raw(" Up/Down select  "),
             Span::styled("Enter", style_key()),
-            Span::raw(" QR  "),
+            Span::raw(" QR view  "),
             Span::styled("n", style_key()),
             Span::raw(" new t-addr  "),
             Span::styled("N", style_key()),
@@ -3221,14 +6188,17 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     let tx_header = Row::new(vec![Cell::from("age"), Cell::from("txid")])
         .style(style_title())
         .bottom_margin(1);
+    let tx_inner = panel_block("Recent wallet transactions").inner(left_chunks[0]);
+    let txid_width = tx_inner.width.saturating_sub(12).max(12) as usize;
     let tx_rows = state.wallet_recent_txs.iter().map(|entry| {
         let age = unix_seconds().saturating_sub(entry.received_at);
+        let txid = stats::hash256_to_hex(&entry.txid);
         Row::new(vec![
             Cell::from(format_age(age)),
-            Cell::from(shorten_suffix(&stats::hash256_to_hex(&entry.txid), 40)),
+            Cell::from(shorten(&txid, txid_width)),
         ])
     });
-    let tx_table = Table::new(tx_rows, [Constraint::Length(10), Constraint::Min(10)])
+    let tx_table = Table::new(tx_rows, [Constraint::Length(10), Constraint::Min(32)])
         .header(tx_header)
         .block(panel_block("Recent wallet transactions"))
         .style(style_panel())
@@ -3303,107 +6273,135 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     }
 
     let visible = state.wallet_visible_indices();
-    let mut addr_lines: Vec<Line> = Vec::new();
-    if state.is_remote {
-        addr_lines.push(Line::raw("Remote attach mode: wallet unavailable."));
-    } else if visible.is_empty() {
-        addr_lines.push(Line::raw("No wallet addresses yet."));
-        addr_lines.push(Line::raw("Press n to generate a new receive address."));
-    } else {
-        let selected_pos = visible
-            .iter()
-            .position(|idx| *idx == state.wallet_selected_address)
-            .unwrap_or(0);
-        let view_height = right_chunks[0].height.saturating_sub(2) as usize;
-        let view_height = view_height.max(1);
-        let max_start = visible.len().saturating_sub(view_height);
-        let mut start = selected_pos.saturating_sub(view_height / 2);
-        start = start.min(max_start);
-        let end = (start + view_height).min(visible.len());
+    let addr_block = panel_block("Addresses");
+    let addr_inner = addr_block.inner(right_chunks[0]);
+    frame.render_widget(addr_block, right_chunks[0]);
 
-        if start > 0 {
-            addr_lines.push(Line::styled("↑ more…", style_muted()));
-        }
+    if addr_inner.width > 0 && addr_inner.height > 0 {
+        let layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(addr_inner);
+        let list_area = layout[0];
+        let scrollbar_area = layout[1];
 
-        let max_addr = right_chunks[0].width.saturating_sub(28).max(16) as usize;
-        for pos in start..end {
-            let idx = visible[pos];
-            let row = &state.wallet_addresses[idx];
-            let selected = pos == selected_pos;
-            let prefix = if selected { "▶" } else { " " };
-            let kind = row.kind.label();
-            let addr = shorten_suffix(&row.address, max_addr);
-            let balance_total = row
-                .transparent_balance
-                .as_ref()
-                .map(|b| {
-                    b.confirmed
-                        .saturating_add(b.unconfirmed)
-                        .saturating_add(b.immature)
-                })
+        let mut addr_lines: Vec<Line> = Vec::new();
+        if state.is_remote {
+            addr_lines.push(Line::raw("Remote attach mode: wallet unavailable."));
+        } else if visible.is_empty() {
+            addr_lines.push(Line::raw("No wallet addresses yet."));
+            addr_lines.push(Line::raw("Press n to generate a new receive address."));
+        } else {
+            let selected_pos = visible
+                .iter()
+                .position(|idx| *idx == state.wallet_selected_address)
                 .unwrap_or(0);
-            let show_balance = matches!(
-                row.kind,
-                WalletAddressKind::TransparentReceive
-                    | WalletAddressKind::TransparentChange
-                    | WalletAddressKind::TransparentWatch
-            ) && (balance_total != 0 || selected);
-            let balance = if show_balance {
-                format!(" {}", crate::format_amount(balance_total as i128))
-            } else {
-                String::new()
-            };
-            let label = row
-                .label
-                .as_ref()
-                .map(|value| shorten(value, 16))
-                .filter(|value| !value.is_empty());
-            let label = label
-                .as_ref()
-                .map(|value| format!(" ({value})"))
-                .unwrap_or_default();
-            let style = if selected {
-                Style::default()
-                    .fg(THEME.accent)
-                    .bg(THEME.panel)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                style_panel()
-            };
-            addr_lines.push(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::raw(" "),
-                Span::styled(kind, style_muted()),
-                Span::raw(" "),
-                Span::styled(addr, style),
-                Span::styled(label, style_muted()),
-                Span::styled(balance, style_muted()),
-            ]));
+
+            let view_height = list_area.height.max(1) as usize;
+            let max_start = visible.len().saturating_sub(view_height);
+            let mut start = selected_pos.saturating_sub(view_height / 2);
+            start = start.min(max_start);
+            let end = (start + view_height).min(visible.len());
+
+            let available_width = list_area.width.max(1) as usize;
+            for pos in start..end {
+                let idx = visible[pos];
+                let row = &state.wallet_addresses[idx];
+                let selected = idx == state.wallet_selected_address;
+                let prefix = if selected { "▶" } else { " " };
+                let kind = row.kind.label();
+                let balance_total = row
+                    .transparent_balance
+                    .as_ref()
+                    .map(|b| {
+                        b.confirmed
+                            .saturating_add(b.unconfirmed)
+                            .saturating_add(b.immature)
+                    })
+                    .unwrap_or(0);
+                let show_balance = matches!(
+                    row.kind,
+                    WalletAddressKind::TransparentReceive
+                        | WalletAddressKind::TransparentChange
+                        | WalletAddressKind::TransparentWatch
+                ) && (balance_total != 0 || selected);
+                let balance = if show_balance {
+                    format!(" {}", crate::format_amount(balance_total as i128))
+                } else {
+                    String::new()
+                };
+                let balance_width = balance.chars().count();
+                let prefix_width = 2usize;
+                let kind_width = kind.len() + 1;
+                let mut label = String::new();
+                if let Some(value) = row.label.as_ref() {
+                    let max_label = available_width
+                        .saturating_sub(prefix_width + kind_width + balance_width + 20)
+                        .min(12);
+                    if max_label > 0 {
+                        let shortened = shorten(value, max_label);
+                        if !shortened.is_empty() {
+                            label = format!(" ({shortened})");
+                        }
+                    }
+                }
+                let mut label_width = label.chars().count();
+                let min_addr = 12usize;
+                let fixed = prefix_width + kind_width + balance_width + label_width + min_addr;
+                if fixed > available_width && !label.is_empty() {
+                    label.clear();
+                    label_width = 0;
+                }
+                let max_addr = available_width
+                    .saturating_sub(prefix_width + kind_width + balance_width + label_width)
+                    .max(min_addr);
+                let addr = shorten(&row.address, max_addr);
+                let style = if selected {
+                    Style::default()
+                        .fg(THEME.accent)
+                        .bg(THEME.panel)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    style_panel()
+                };
+                addr_lines.push(Line::from(vec![
+                    Span::styled(prefix, style),
+                    Span::raw(" "),
+                    Span::styled(kind, style_muted()),
+                    Span::raw(" "),
+                    Span::styled(addr, style),
+                    Span::styled(label, style_muted()),
+                    Span::styled(balance, style_muted()),
+                ]));
+            }
+
+            render_vertical_scrollbar(frame, scrollbar_area, visible.len(), start, view_height);
         }
 
-        if end < visible.len() {
-            addr_lines.push(Line::styled("↓ more…", style_muted()));
-        }
+        let addr_widget = Paragraph::new(addr_lines).style(style_panel());
+        frame.render_widget(addr_widget, list_area);
     }
 
-    let addr_widget = Paragraph::new(addr_lines)
-        .block(panel_block("Addresses"))
-        .style(style_panel());
-    frame.render_widget(addr_widget, right_chunks[0]);
-
-    let qr_inner_width = right_chunks[1].width.saturating_sub(2) as usize;
-    let qr_inner_height = right_chunks[1].height.saturating_sub(2) as usize;
+    let qr_inner = panel_block("Receive QR").inner(right_chunks[1]);
+    let qr_inner_width = qr_inner.width as usize;
+    let qr_inner_height = qr_inner.height as usize;
+    let qr_can_render = qr_inner_width >= 22 && qr_inner_height >= 12;
 
     let mut qr_lines: Vec<Line> = Vec::new();
     if state.is_remote {
         qr_lines.push(Line::raw("Remote attach mode: wallet unavailable."));
     } else if !state.wallet_show_qr {
-        qr_lines.push(Line::raw("QR hidden. Press Enter to show."));
+        qr_lines.push(Line::raw("QR hidden. Press Enter to open."));
     } else if let Some(selected) = state.wallet_addresses.get(state.wallet_selected_address) {
+        let addr_width = qr_inner_width.saturating_sub(10).max(24);
         qr_lines.push(Line::from(vec![
             Span::styled("Selected:", style_muted()),
             Span::raw(" "),
-            Span::raw(shorten_suffix(&selected.address, 64)),
+            Span::raw(shorten(&selected.address, addr_width)),
+        ]));
+        qr_lines.push(Line::from(vec![
+            Span::styled("Actions:", style_muted()),
+            Span::raw(" Enter expand  Click copy  Right-click / o open"),
         ]));
         if let Some(bal) = selected.transparent_balance.as_ref() {
             qr_lines.push(Line::from(vec![
@@ -3417,41 +6415,21 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
             ]));
         }
         qr_lines.push(Line::raw(""));
-        let reserved = qr_lines.len();
-        let qr_budget_height = qr_inner_height.saturating_sub(reserved).max(1);
-        match QrCode::new(selected.address.as_bytes()) {
-            Ok(code) => {
-                let qr = code.render::<unicode::Dense1x2>().quiet_zone(false).build();
-                let qr_height = qr.lines().count();
-                let qr_width = qr
-                    .lines()
-                    .map(|line| line.chars().count())
-                    .max()
-                    .unwrap_or(0);
-                if qr_width > qr_inner_width || qr_height > qr_budget_height {
-                    qr_lines.push(Line::from(vec![
-                        Span::styled("Terminal too small for QR.", style_warn()),
-                        Span::raw(" "),
-                        Span::styled("Enter", style_key()),
-                        Span::raw(" hide."),
-                    ]));
-                    qr_lines.push(Line::from(vec![
-                        Span::styled("Need:", style_muted()),
-                        Span::raw(format!(" {qr_width}x{qr_height}")),
-                        Span::raw("  "),
-                        Span::styled("Have:", style_muted()),
-                        Span::raw(format!(" {qr_inner_width}x{qr_inner_height}")),
-                    ]));
-                } else {
-                    for line in qr.lines().take(qr_budget_height) {
-                        qr_lines.push(Line::styled(
-                            line.to_string(),
-                            Style::default().fg(THEME.accent).bg(THEME.panel),
-                        ));
-                    }
-                }
+        if qr_can_render {
+            let reserved = qr_lines.len();
+            let qr_budget_height = qr_inner_height.saturating_sub(reserved).max(1);
+            let qr_lines_rendered =
+                build_qr_lines(&selected.address, qr_inner_width, qr_budget_height);
+            if qr_lines_rendered.is_empty() {
+                qr_lines.push(Line::styled("QR unavailable for this size.", style_warn()));
+            } else {
+                qr_lines.extend(qr_lines_rendered);
             }
-            Err(_) => qr_lines.push(Line::raw("Failed to render QR.")),
+        } else {
+            qr_lines.push(Line::styled(
+                "QR preview collapsed. Press Enter to expand.",
+                style_muted(),
+            ));
         }
     } else {
         qr_lines.push(Line::raw("No wallet addresses yet."));
@@ -3467,6 +6445,108 @@ fn draw_wallet(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     } else if state.wallet_modal == Some(WalletModal::ImportWatch) {
         draw_wallet_import_watch_modal(frame, state);
     }
+
+    if state.wallet_qr_expanded {
+        draw_wallet_qr_modal(frame, state);
+    }
+}
+
+fn build_qr_lines(address: &str, max_width: usize, max_height: usize) -> Vec<Line<'static>> {
+    if max_width == 0 || max_height == 0 {
+        return Vec::new();
+    }
+
+    let code = match QrCode::new(address.as_bytes()) {
+        Ok(code) => code,
+        Err(_) => return vec![Line::raw("Failed to render QR.")],
+    };
+
+    let max_dim = max_width.min(max_height).max(1).min(QR_MAX_DIM) as u32;
+    let qr = code
+        .render::<unicode::Dense1x2>()
+        .quiet_zone(false)
+        .max_dimensions(max_dim, max_dim)
+        .build();
+
+    let mut raw_lines = qr.lines().map(str::to_string).collect::<Vec<_>>();
+    if raw_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let content_width = raw_lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(max_width);
+
+    let mut centered: Vec<Line<'static>> = Vec::new();
+    let top_padding = max_height.saturating_sub(raw_lines.len()) / 2;
+    for _ in 0..top_padding {
+        centered.push(Line::raw(""));
+    }
+
+    for line in raw_lines.drain(..) {
+        if line.chars().count() > max_width {
+            return Vec::new();
+        }
+        let pad = max_width.saturating_sub(content_width) / 2;
+        let padded = if pad == 0 {
+            line
+        } else {
+            format!("{:<pad$}{}", "", line, pad = pad)
+        };
+        centered.push(Line::styled(
+            padded,
+            Style::default().fg(THEME.accent).bg(THEME.panel),
+        ));
+    }
+
+    centered
+}
+
+fn draw_wallet_qr_modal(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let area = wallet_qr_modal_area(frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel_block("Receive QR");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    if state.is_remote {
+        lines.push(Line::raw("Remote attach mode: wallet unavailable."));
+    } else if let Some(selected) = state.wallet_addresses.get(state.wallet_selected_address) {
+        let address_width = inner.width.saturating_sub(10).max(24) as usize;
+        lines.push(Line::from(vec![
+            Span::styled("Address:", style_muted()),
+            Span::raw(" "),
+            Span::raw(shorten(selected.address.as_str(), address_width)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Actions:", style_muted()),
+            Span::raw(" Click copy  Right-click / o open  Enter close"),
+        ]));
+        lines.push(Line::raw(""));
+        let reserved = lines.len();
+        let qr_budget_height = inner.height.saturating_sub(reserved as u16) as usize;
+        let qr_lines = build_qr_lines(
+            selected.address.as_str(),
+            inner.width as usize,
+            qr_budget_height,
+        );
+        if qr_lines.is_empty() {
+            lines.push(Line::styled("QR unavailable for this size.", style_warn()));
+        } else {
+            lines.extend(qr_lines);
+        }
+    } else {
+        lines.push(Line::raw("No wallet addresses yet."));
+    }
+
+    let widget = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .style(style_panel());
+    frame.render_widget(widget, inner);
 }
 
 fn draw_wallet_send_modal(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
@@ -3651,14 +6731,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     horizontal[1]
 }
 
-fn draw_logs(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
-    let area = frame.area();
+fn draw_logs(frame: &mut ratatui::Frame<'_>, state: &TuiState, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(6), Constraint::Min(10)])
         .split(area);
-
-    let header = header_line(state, Screen::Logs);
 
     let paused = if state.logs_paused { "yes" } else { "no" };
     let follow = if state.logs_follow { "yes" } else { "no" };
@@ -3666,7 +6743,6 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     let total = state.logs.len();
 
     let mut summary = Vec::new();
-    summary.push(header);
     summary.push(Line::from(vec![
         Span::styled("Filter:", style_muted()),
         Span::raw(format!(" <= {min_level}  ")),
@@ -3753,8 +6829,24 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         }
     }
 
-    let view_height = chunks[1].height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(view_height);
+    let block = panel_block("Log lines");
+    let inner = block.inner(chunks[1]);
+    frame.render_widget(block, chunks[1]);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let content_area = layout[0];
+    let scrollbar_area = layout[1];
+
+    let view_height = content_area.height.max(1) as usize;
+    let content_len = lines.len();
+    let max_scroll = content_len.saturating_sub(view_height);
     let scroll = if state.logs_follow {
         max_scroll
     } else {
@@ -3764,9 +6856,10 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
 
     let widget = Paragraph::new(lines)
         .scroll((scroll_u16, 0))
-        .block(panel_block("Log lines"))
+        .wrap(Wrap { trim: false })
         .style(style_panel());
-    frame.render_widget(widget, chunks[1]);
+    frame.render_widget(widget, content_area);
+    render_vertical_scrollbar(frame, scrollbar_area, content_len, scroll, view_height);
 }
 
 fn wallet_address_kind_sort_key(kind: WalletAddressKind) -> u8 {
@@ -3883,28 +6976,6 @@ fn fmt_opt_mib(value: Option<u64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn fmt_window(window_secs: f64) -> String {
-    let secs = window_secs.round().max(0.0) as u64;
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    if secs < 3600 {
-        let mins = secs / 60;
-        let rem = secs % 60;
-        if rem == 0 {
-            return format!("{mins}m");
-        }
-        return format!("{mins}m{rem:02}s");
-    }
-    let hours = secs / 3600;
-    let mins = (secs % 3600) / 60;
-    if mins == 0 {
-        format!("{hours}h")
-    } else {
-        format!("{hours}h{mins}m")
-    }
-}
-
 fn unix_seconds() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3982,4 +7053,116 @@ fn format_hms(secs: u64) -> String {
     let mins = (secs % 3600) / 60;
     let secs = secs % 60;
     format!("{hours:02}:{mins:02}:{secs:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("fluxd-rust-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn setup_create_new_dataset_writes_starter_config() {
+        let root = unique_temp_dir("tui-setup");
+        fs::create_dir_all(&root).expect("create root");
+        let active = root.join("data-active");
+        fs::create_dir_all(&active).expect("create active");
+
+        let mut setup = SetupWizard {
+            data_dir: active.clone(),
+            active_data_dir: active,
+            conf_path: root.join("data-active").join("flux.conf"),
+            data_sets: Vec::new(),
+            data_set_index: 0,
+            delete_confirm: None,
+            network: Network::Mainnet,
+            profile: RunProfile::High,
+            header_lead: 123,
+            rpc_user: "rpcuser".to_string(),
+            rpc_pass: "rpcpass".to_string(),
+            show_pass: false,
+            status: None,
+        };
+
+        setup.create_new_data_set().expect("create dataset");
+
+        let conf_path = root.join("data-new").join("flux.conf");
+        let contents = fs::read_to_string(&conf_path).expect("read config");
+        assert!(contents.contains("profile=high"));
+        assert!(contents.contains("rpcuser=rpcuser"));
+        assert!(contents.contains("rpcpassword=rpcpass"));
+        assert!(contents.contains("headerlead=123"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn setup_write_config_for_data_dir_is_noop_when_config_exists() {
+        let root = unique_temp_dir("tui-setup-existing");
+        fs::create_dir_all(&root).expect("create root");
+        let active = root.join("data-active");
+        fs::create_dir_all(&active).expect("create active");
+        let existing = root.join("data-existing");
+        fs::create_dir_all(&existing).expect("create existing");
+
+        let existing_conf = existing.join("flux.conf");
+        fs::write(&existing_conf, "sentinel=1\n").expect("write sentinel");
+
+        let mut setup = SetupWizard {
+            data_dir: active.clone(),
+            active_data_dir: active,
+            conf_path: root.join("data-active").join("flux.conf"),
+            data_sets: Vec::new(),
+            data_set_index: 0,
+            delete_confirm: None,
+            network: Network::Mainnet,
+            profile: RunProfile::High,
+            header_lead: 0,
+            rpc_user: "rpcuser".to_string(),
+            rpc_pass: "rpcpass".to_string(),
+            show_pass: false,
+            status: None,
+        };
+
+        setup
+            .write_config_for_data_dir(existing.clone())
+            .expect("write_config_for_data_dir");
+
+        let contents = fs::read_to_string(&existing_conf).expect("read config");
+        assert_eq!(contents, "sentinel=1\n");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn monitor_resample_window_max_maps_full_six_minutes() {
+        let width = 180;
+        let window_secs = 6.0 * 60.0;
+        let now_t = window_secs;
+        let window_start_t = now_t - window_secs;
+
+        let mut points = Vec::new();
+        for t in 1..=window_secs as u64 {
+            let value = if t % 30 == 0 { 1.0 } else { 0.0 };
+            points.push((t as f64, value));
+        }
+
+        let buckets = resample_window_max(&points, window_start_t, window_secs, width);
+        assert_eq!(buckets.len(), width);
+        assert_eq!(buckets[width - 1], 1.0);
+
+        let spike_count = buckets.iter().filter(|v| **v > 0.0).count();
+        assert_eq!(spike_count, 12);
+
+        let mid = width / 2;
+        assert_eq!(buckets[mid], 1.0);
+    }
 }

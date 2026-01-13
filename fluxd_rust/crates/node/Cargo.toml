@@ -5,6 +5,17 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[lib]
+path = "src/main.rs"
+
+[[bin]]
+name = "fluxd"
+path = "src/fluxd.rs"
+
+[[bin]]
+name = "fluxd-cli"
+path = "src/fluxd_cli.rs"
+
 [dependencies]
 fluxd-chainstate = { path = "../chainstate" }
 fluxd-consensus = { path = "../consensus" }

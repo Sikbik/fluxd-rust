@@ -41,6 +41,11 @@ pub struct StatsSnapshot {
     pub mempool_load_reject: u64,
     pub mempool_persisted_writes: u64,
     pub mempool_persisted_bytes: u64,
+    pub supply_transparent_zat: Option<i64>,
+    pub supply_sprout_zat: Option<i64>,
+    pub supply_sapling_zat: Option<i64>,
+    pub supply_shielded_zat: Option<i64>,
+    pub supply_total_zat: Option<i64>,
     pub download_us: u64,
     pub download_blocks: u64,
     pub verify_us: u64,
@@ -181,6 +186,16 @@ impl StatsSnapshot {
         json.push_str(&self.mempool_persisted_writes.to_string());
         json.push_str(",\"mempool_persisted_bytes\":");
         json.push_str(&self.mempool_persisted_bytes.to_string());
+        json.push_str(",\"supply_transparent_zat\":");
+        json.push_str(&json_i64_opt(self.supply_transparent_zat));
+        json.push_str(",\"supply_sprout_zat\":");
+        json.push_str(&json_i64_opt(self.supply_sprout_zat));
+        json.push_str(",\"supply_sapling_zat\":");
+        json.push_str(&json_i64_opt(self.supply_sapling_zat));
+        json.push_str(",\"supply_shielded_zat\":");
+        json.push_str(&json_i64_opt(self.supply_shielded_zat));
+        json.push_str(",\"supply_total_zat\":");
+        json.push_str(&json_i64_opt(self.supply_total_zat));
         json.push_str(",\"download_us\":");
         json.push_str(&self.download_us.to_string());
         json.push_str(",\"download_blocks\":");
@@ -808,6 +823,31 @@ pub fn snapshot_stats<S: KeyValueStore>(
         .map(MempoolMetrics::snapshot)
         .unwrap_or_default();
 
+    let (
+        supply_transparent_zat,
+        supply_sprout_zat,
+        supply_sapling_zat,
+        supply_shielded_zat,
+        supply_total_zat,
+    ) = match (
+        chainstate.utxo_stats().ok().flatten(),
+        chainstate.value_pools().ok().flatten(),
+    ) {
+        (Some(utxo_stats), Some(value_pools)) => {
+            let shielded_total = value_pools.sprout.checked_add(value_pools.sapling);
+            let total =
+                shielded_total.and_then(|shielded| utxo_stats.total_amount.checked_add(shielded));
+            (
+                Some(utxo_stats.total_amount),
+                Some(value_pools.sprout),
+                Some(value_pools.sapling),
+                shielded_total,
+                total,
+            )
+        }
+        _ => (None, None, None, None, None),
+    };
+
     Ok(StatsSnapshot {
         network: format!("{network:?}"),
         backend: format!("{backend:?}"),
@@ -834,6 +874,11 @@ pub fn snapshot_stats<S: KeyValueStore>(
         mempool_load_reject: mempool_metrics_snapshot.load_reject,
         mempool_persisted_writes: mempool_metrics_snapshot.persisted_writes,
         mempool_persisted_bytes: mempool_metrics_snapshot.persisted_bytes,
+        supply_transparent_zat,
+        supply_sprout_zat,
+        supply_sapling_zat,
+        supply_shielded_zat,
+        supply_total_zat,
         download_us: metrics.download_us,
         download_blocks: metrics.download_blocks,
         verify_us: metrics.verify_us,
@@ -947,4 +992,10 @@ fn json_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn json_i64_opt(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
 }

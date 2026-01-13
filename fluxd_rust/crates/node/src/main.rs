@@ -87,7 +87,8 @@ use fluxd_primitives::outpoint::OutPoint;
 use fluxd_primitives::transaction::{Transaction, TxIn, TxOut};
 use fluxd_primitives::{address_to_script_pubkey, AddressError};
 use fluxd_shielded::{
-    default_params_dir, fetch_params, load_params, verify_transaction, ShieldedParams,
+    default_params_dir, fetch_params, load_params, verify_transaction, ShieldedError,
+    ShieldedParams,
 };
 use fluxd_storage::fjall::{FjallOptions, FjallStore};
 use fluxd_storage::memory::MemoryStore;
@@ -105,6 +106,7 @@ use crate::peer_book::HeaderPeerBook;
 use crate::stats::{hash256_to_hex, snapshot_stats, HeaderMetrics, SyncMetrics};
 
 const DEFAULT_DATA_DIR: &str = "data";
+const DATADIR_POINTER_FILE_NAME: &str = "fluxd.datadir";
 const DEFAULT_MAX_FLATFILE_SIZE: u64 = 128 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 8;
@@ -251,6 +253,7 @@ impl RunProfile {
 struct Config {
     backend: Backend,
     data_dir: PathBuf,
+    conf_path: PathBuf,
     network: Network,
     params_dir: PathBuf,
     fetch_params: bool,
@@ -297,6 +300,7 @@ struct Config {
     fee_estimates_persist_interval_secs: u64,
     status_interval_secs: u64,
     tui: bool,
+    tui_start_in_setup: bool,
     dashboard_addr: Option<SocketAddr>,
     db_cache_bytes: Option<u64>,
     db_write_buffer_bytes: Option<u64>,
@@ -905,16 +909,32 @@ impl KeyValueStore for Store {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    if let Err(err) = run().await {
-        log_error!("{err}");
-        std::process::exit(1);
+struct DataDirLock {
+    _file: File,
+}
+
+struct TuiThreadGuard {
+    shutdown_tx: watch::Sender<bool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TuiThreadGuard {
+    fn new(shutdown_tx: watch::Sender<bool>) -> Self {
+        Self {
+            shutdown_tx,
+            handle: None,
+        }
     }
 }
 
-struct DataDirLock {
-    _file: File,
+impl Drop for TuiThreadGuard {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _ = self.shutdown_tx.send(true);
+        let _ = handle.join();
+    }
 }
 
 fn lock_data_dir(data_dir: &Path) -> Result<DataDirLock, String> {
@@ -962,8 +982,8 @@ fn lock_data_dir(data_dir: &Path) -> Result<DataDirLock, String> {
     }
 }
 
-async fn run() -> Result<(), String> {
-    let cli = parse_args()?;
+pub async fn run_entry(default_tui: bool) -> Result<(), String> {
+    let cli = parse_args(default_tui)?;
     match cli {
         CliAction::PrintHelp => {
             println!("{}", usage());
@@ -990,9 +1010,31 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         format: config.log_format,
         timestamps: config.log_timestamps,
     });
-    if config.tui {
+
+    let spawn_tui = config.tui
+        && !config.db_info
+        && !config.db_info_keys
+        && !config.db_integrity
+        && !config.scan_flatfiles
+        && !config.scan_supply
+        && !config.scan_fluxnodes
+        && config.debug_fluxnode_payee_script.is_none()
+        && config.debug_fluxnode_payout_height.is_none()
+        && config.debug_fluxnode_payee_candidates.is_none();
+
+    if spawn_tui {
         logging::enable_capture(4096);
     }
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    log_info!(
+        "Startup: begin (tui={}, backend={:?}, network={:?}, data_dir={})",
+        config.tui,
+        config.backend,
+        config.network,
+        config.data_dir.display()
+    );
     let params = Arc::new(chain_params(config.network));
     let network = config.network;
     let backend = config.backend;
@@ -1011,6 +1053,55 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
 
     fs::create_dir_all(data_dir).map_err(|err| err.to_string())?;
     let _data_dir_lock = lock_data_dir(data_dir)?;
+
+    let net_totals = Arc::new(NetTotals::default());
+    let peer_registry = Arc::new(PeerRegistry::default());
+
+    let mut tui_thread = TuiThreadGuard::new(shutdown_tx.clone());
+    let mut tui_init_tx: Option<crossbeam_channel::Sender<tui::TuiInit>> = None;
+    let mut mempool_flags_tx: Option<crossbeam_channel::Sender<ValidationFlags>> = None;
+    let mut mempool_flags_rx: Option<crossbeam_channel::Receiver<ValidationFlags>> = None;
+
+    if spawn_tui {
+        log_info!(
+            "Startup: spawning TUI bootstrap at {}ms",
+            start_time.elapsed().as_millis()
+        );
+        let (init_tx, init_rx) = bounded::<tui::TuiInit>(1);
+        let (flags_tx, flags_rx) = bounded::<ValidationFlags>(1);
+        tui_init_tx = Some(init_tx);
+        mempool_flags_tx = Some(flags_tx);
+        mempool_flags_rx = Some(flags_rx);
+
+        let tui_data_dir = config.data_dir.clone();
+        let tui_conf_path = config.conf_path.clone();
+        let tui_start_in_setup = config.tui_start_in_setup;
+        let header_lead = config.header_lead;
+        let peer_registry = Arc::clone(&peer_registry);
+        let net_totals = Arc::clone(&net_totals);
+        let chain_params = Arc::clone(&params);
+        let shutdown_rx = shutdown_rx.clone();
+        let shutdown_tx = shutdown_tx.clone();
+        tui_thread.handle = Some(thread::spawn(move || {
+            if let Err(err) = tui::run_tui(
+                tui_data_dir,
+                tui_conf_path,
+                tui_start_in_setup,
+                header_lead,
+                peer_registry,
+                net_totals,
+                chain_params,
+                network,
+                backend,
+                start_time,
+                shutdown_rx,
+                shutdown_tx,
+                init_rx,
+            ) {
+                log_error!("{err}");
+            }
+        }));
+    }
 
     let mut reindex_from_flatfiles = false;
     if config.resync {
@@ -1104,10 +1195,21 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         log_warn!("Selective reindex flags are only meaningful for --backend fjall; ignoring for memory backend");
     }
 
+    let open_store_start = Instant::now();
     let store = open_store(config.backend, &db_path, &config)?;
+    log_info!(
+        "Startup: opened store in {}ms",
+        open_store_start.elapsed().as_millis()
+    );
     let store = Arc::new(store);
+
+    let schema_start = Instant::now();
     let _db_schema_version = ensure_db_schema_version(store.as_ref())?;
     ensure_secondary_index_versions(store.as_ref())?;
+    log_info!(
+        "Startup: ensured schemas in {}ms",
+        schema_start.elapsed().as_millis()
+    );
 
     let blocks = FlatFileStore::new(&blocks_path, DEFAULT_MAX_FLATFILE_SIZE)
         .map_err(|err| err.to_string())?;
@@ -1133,8 +1235,6 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         println!("{json}");
         return Ok(());
     }
-    let net_totals = Arc::new(NetTotals::default());
-    let peer_registry = Arc::new(PeerRegistry::default());
     let header_peer_book = Arc::new(HeaderPeerBook::default());
     let addr_book = Arc::new(AddrBook::default());
     let added_nodes = Arc::new(Mutex::new(HashSet::<String>::new()));
@@ -1284,7 +1384,6 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         rpc::load_or_create_auth(config.rpc_user.clone(), config.rpc_pass.clone(), data_dir)?;
     let rpc_allowlist =
         rpc::RpcAllowList::from_allow_ips(&config.rpc_allow_ips).map_err(|err| err.to_string())?;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     {
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
@@ -1322,19 +1421,102 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         );
     }
 
-    if config.fetch_params {
-        fetch_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
-    }
-    let shielded_params =
-        load_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
     let validation_metrics = Arc::new(ValidationMetrics::default());
     let connect_metrics = Arc::new(ConnectMetrics::default());
     let write_lock = Arc::new(Mutex::new(()));
+    let sync_metrics = Arc::new(SyncMetrics::default());
+    let header_metrics = Arc::new(HeaderMetrics::default());
+
+    let mempool = Arc::new(Mutex::new(mempool::Mempool::new(config.mempool_max_bytes)));
+    let mut mempool_policy =
+        mempool::MempoolPolicy::standard(config.min_relay_fee_per_kb, config.require_standard);
+    mempool_policy.limit_free_relay_kb_per_minute = config.limit_free_relay_kb_per_minute;
+    let mempool_policy = Arc::new(mempool_policy);
+    let mempool_metrics = Arc::new(stats::MempoolMetrics::default());
+
+    let fee_estimates_path = data_dir.join(FEE_ESTIMATES_FILE_NAME);
+    let fee_estimator =
+        match fee_estimator::FeeEstimator::load(&fee_estimates_path, config.min_relay_fee_per_kb) {
+            Ok(estimator) => estimator,
+            Err(err) => {
+                log_warn!(
+                    "failed to load fee estimates from {}: {err}",
+                    fee_estimates_path.display()
+                );
+                fee_estimator::FeeEstimator::new(config.min_relay_fee_per_kb)
+            }
+        };
+    let fee_estimator = Arc::new(Mutex::new(fee_estimator));
+
+    let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
+
+    let wallet_start = Instant::now();
+    let wallet =
+        wallet::Wallet::load_or_create(data_dir, config.network).map_err(|err| err.to_string())?;
+    log_info!(
+        "Startup: loaded wallet in {}ms",
+        wallet_start.elapsed().as_millis()
+    );
+    let wallet = Arc::new(Mutex::new(wallet));
+
+    if spawn_tui {
+        if let (Some(tui_init_tx), Some(mempool_flags_rx)) =
+            (tui_init_tx.as_ref(), mempool_flags_rx.take())
+        {
+            let _ = tui_init_tx.send(tui::TuiInit {
+                chainstate: Arc::clone(&chainstate),
+                store: Arc::clone(&store),
+                sync_metrics: Arc::clone(&sync_metrics),
+                header_metrics: Arc::clone(&header_metrics),
+                validation_metrics: Arc::clone(&validation_metrics),
+                connect_metrics: Arc::clone(&connect_metrics),
+                mempool: Arc::clone(&mempool),
+                mempool_policy: Arc::clone(&mempool_policy),
+                mempool_metrics: Arc::clone(&mempool_metrics),
+                fee_estimator: Arc::clone(&fee_estimator),
+                tx_confirm_target: config.tx_confirm_target,
+                mempool_flags_rx,
+                wallet: Arc::clone(&wallet),
+                tx_announce: tx_announce.clone(),
+            });
+        }
+    }
+
+    let params_start = Instant::now();
+    if config.fetch_params {
+        log_info!("Startup: --fetch-params enabled; downloading shielded params");
+        fetch_params(&config.params_dir, config.network).map_err(|err| err.to_string())?;
+    }
+    let shielded_params = match load_params(&config.params_dir, config.network) {
+        Ok(params) => params,
+        Err(err) => {
+            if config.tui && !config.fetch_params {
+                if matches!(err, ShieldedError::MissingParams(_)) {
+                    log_info!("Startup: shielded params missing; fetching (TUI auto-fetch)");
+                    fetch_params(&config.params_dir, config.network)
+                        .map_err(|err| err.to_string())?;
+                    load_params(&config.params_dir, config.network)
+                        .map_err(|err| err.to_string())?
+                } else {
+                    return Err(err.to_string());
+                }
+            } else {
+                return Err(err.to_string());
+            }
+        }
+    };
+    log_info!(
+        "Startup: loaded shielded params in {}ms",
+        params_start.elapsed().as_millis()
+    );
     let flags = validation_flags(
         Arc::new(shielded_params),
         config.check_script,
         Some(Arc::clone(&validation_metrics)),
     );
+    if let Some(tx) = mempool_flags_tx.as_ref() {
+        let _ = tx.send(flags.clone());
+    }
 
     if reindex_from_flatfiles {
         reindex_blocks_from_flatfiles(
@@ -1358,31 +1540,6 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         }
     }
 
-    let mempool = Arc::new(Mutex::new(mempool::Mempool::new(config.mempool_max_bytes)));
-    let mut mempool_policy =
-        mempool::MempoolPolicy::standard(config.min_relay_fee_per_kb, config.require_standard);
-    mempool_policy.limit_free_relay_kb_per_minute = config.limit_free_relay_kb_per_minute;
-    let mempool_policy = Arc::new(mempool_policy);
-    let mempool_metrics = Arc::new(stats::MempoolMetrics::default());
-    let fee_estimates_path = data_dir.join(FEE_ESTIMATES_FILE_NAME);
-    let fee_estimator =
-        match fee_estimator::FeeEstimator::load(&fee_estimates_path, config.min_relay_fee_per_kb) {
-            Ok(estimator) => estimator,
-            Err(err) => {
-                log_warn!(
-                    "failed to load fee estimates from {}: {err}",
-                    fee_estimates_path.display()
-                );
-                fee_estimator::FeeEstimator::new(config.min_relay_fee_per_kb)
-            }
-        };
-    let fee_estimator = Arc::new(Mutex::new(fee_estimator));
-    let (tx_announce, _) = broadcast::channel::<Hash256>(TX_ANNOUNCE_QUEUE);
-    let wallet =
-        wallet::Wallet::load_or_create(data_dir, config.network).map_err(|err| err.to_string())?;
-    let wallet = Arc::new(Mutex::new(wallet));
-    let sync_metrics = Arc::new(SyncMetrics::default());
-    let header_metrics = Arc::new(HeaderMetrics::default());
     {
         let chainstate = Arc::clone(&chainstate);
         let store = Arc::clone(&store);
@@ -1667,57 +1824,6 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         status_interval_secs,
     );
 
-    if config.tui {
-        let chainstate = Arc::clone(&chainstate);
-        let store = Arc::clone(&store);
-        let tui_data_dir = config.data_dir.clone();
-        let sync_metrics = Arc::clone(&sync_metrics);
-        let header_metrics = Arc::clone(&header_metrics);
-        let validation_metrics = Arc::clone(&validation_metrics);
-        let connect_metrics = Arc::clone(&connect_metrics);
-        let mempool = Arc::clone(&mempool);
-        let mempool_policy = Arc::clone(&mempool_policy);
-        let mempool_metrics = Arc::clone(&mempool_metrics);
-        let fee_estimator = Arc::clone(&fee_estimator);
-        let tx_confirm_target = config.tx_confirm_target;
-        let mempool_flags = flags.clone();
-        let wallet = Arc::clone(&wallet);
-        let tx_announce = tx_announce.clone();
-        let net_totals = Arc::clone(&net_totals);
-        let peer_registry = Arc::clone(&peer_registry);
-        let chain_params = Arc::clone(&params);
-        let shutdown_rx = shutdown_rx.clone();
-        let shutdown_tx = shutdown_tx.clone();
-        thread::spawn(move || {
-            if let Err(err) = tui::run_tui(
-                chainstate,
-                store,
-                tui_data_dir,
-                sync_metrics,
-                header_metrics,
-                validation_metrics,
-                connect_metrics,
-                mempool,
-                mempool_policy,
-                mempool_metrics,
-                fee_estimator,
-                tx_confirm_target,
-                mempool_flags,
-                wallet,
-                tx_announce,
-                net_totals,
-                peer_registry,
-                chain_params,
-                network,
-                backend,
-                start_time,
-                shutdown_rx,
-                shutdown_tx,
-            ) {
-                log_warn!("TUI exited: {err}");
-            }
-        });
-    }
     if let Some(addr) = dashboard_addr {
         let chainstate = Arc::clone(&chainstate);
         let store = Arc::clone(&store);
@@ -7656,11 +7762,58 @@ async fn handle_aux_message(peer: &mut Peer, command: &str, payload: &[u8]) -> R
     Ok(())
 }
 
-fn parse_args() -> Result<CliAction, String> {
-    parse_args_from(std::env::args().skip(1))
+fn parse_args(default_tui: bool) -> Result<CliAction, String> {
+    parse_args_from(std::env::args().skip(1), default_tui)
 }
 
-fn parse_args_from<I>(raw_args: I) -> Result<CliAction, String>
+fn project_root_from_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    for ancestor in exe.ancestors() {
+        if ancestor.file_name().and_then(|value| value.to_str()) == Some("target") {
+            return ancestor.parent().map(|path| path.to_path_buf());
+        }
+    }
+    None
+}
+
+fn read_datadir_pointer(pointer: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(pointer).ok()?;
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let candidate = PathBuf::from(line);
+        if candidate.is_absolute() {
+            return Some(candidate);
+        }
+        let base = pointer.parent()?;
+        return Some(base.join(candidate));
+    }
+    None
+}
+
+fn resolve_default_data_dir() -> PathBuf {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(DATADIR_POINTER_FILE_NAME));
+    }
+    if let Some(root) = project_root_from_exe() {
+        candidates.push(root.join(DATADIR_POINTER_FILE_NAME));
+    }
+    for candidate in candidates {
+        if let Some(dir) = read_datadir_pointer(&candidate) {
+            return dir;
+        }
+    }
+
+    if let Some(root) = project_root_from_exe() {
+        return root.join(DEFAULT_DATA_DIR);
+    }
+    PathBuf::from(DEFAULT_DATA_DIR)
+}
+
+fn parse_args_from<I>(raw_args: I, default_tui: bool) -> Result<CliAction, String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -7739,7 +7892,7 @@ where
     let mut fee_estimates_persist_interval_set = false;
     let mut status_interval_secs: u64 = 15;
     let mut status_interval_set = false;
-    let mut tui = false;
+    let mut tui = default_tui;
     let mut tui_attach: Option<String> = None;
     let mut dashboard_addr: Option<SocketAddr> = None;
     let mut db_cache_mb: u64 = DEFAULT_DB_CACHE_MB;
@@ -8355,8 +8508,9 @@ where
         return Ok(CliAction::TuiAttach { endpoint });
     }
 
-    let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+    let data_dir = data_dir.unwrap_or_else(resolve_default_data_dir);
     let conf_file = conf_path.unwrap_or_else(|| data_dir.join("flux.conf"));
+    let conf_exists = conf_file.exists();
     let mut unsupported_conf_keys: Vec<String> = Vec::new();
     if let Some(conf) = load_flux_conf(&conf_file)? {
         if !network_set {
@@ -8609,6 +8763,23 @@ where
             }
         }
 
+        if !header_lead_set {
+            if let Some(values) = conf.get("headerlead") {
+                if let Some(raw) = values.last() {
+                    header_lead = raw.parse::<i32>().map_err(|_| {
+                        format!("invalid headerlead '{raw}' in {}", conf_file.display())
+                    })?;
+                    if header_lead < 0 {
+                        return Err(format!(
+                            "invalid headerlead '{raw}' in {}",
+                            conf_file.display()
+                        ));
+                    }
+                    header_lead_set = true;
+                }
+            }
+        }
+
         if let Some(values) = conf.get("addnode") {
             for raw in values {
                 let node = raw.trim().to_string();
@@ -8622,6 +8793,7 @@ where
             "addnode",
             "bind",
             "dbcache",
+            "headerlead",
             "limitfreerelay",
             "logformat",
             "loglevel",
@@ -8712,7 +8884,7 @@ where
             RunProfile::High => {
                 set_default!(getdata_batch, getdata_batch_set, 256);
                 set_default!(block_peers, block_peers_set, 6);
-                set_default!(header_peers, header_peers_set, 8);
+                set_default!(header_peers, header_peers_set, 16);
                 set_default!(tx_peers, tx_peers_set, 4);
                 set_default!(inflight_per_peer, inflight_per_peer_set, 2);
                 set_default!(header_lead, header_lead_set, DEFAULT_HEADER_LEAD);
@@ -8814,9 +8986,12 @@ where
         }
     }
 
+    let tui_start_in_setup = tui && !conf_exists;
+
     Ok(CliAction::Run(Config {
         backend,
         data_dir,
+        conf_path: conf_file,
         network,
         params_dir: params_dir.unwrap_or_else(default_params_dir),
         fetch_params,
@@ -8863,6 +9038,7 @@ where
         fee_estimates_persist_interval_secs,
         status_interval_secs,
         tui,
+        tui_start_in_setup,
         dashboard_addr,
         db_cache_bytes,
         db_write_buffer_bytes,
@@ -9146,6 +9322,8 @@ fn usage() -> String {
         "Usage:",
         "  fluxd [options]",
         "  fluxd <command> [options]",
+        "  fluxd-cli [options]",
+        "  fluxd-cli <command> [options]",
         "",
         "Commands:",
         "  help            Print this help and exit",
@@ -9211,7 +9389,7 @@ fn usage() -> String {
         "  --mempool-persist-interval  Persist mempool to disk every N seconds (0 disables, default: 60)",
         "  --fee-estimates-persist-interval  Persist fee estimates every N seconds (0 disables, default: 300)",
         "  --status-interval  Status log interval in seconds (default: 15, 0 disables)",
-        "  --tui  Launch terminal UI monitor (press q to quit; lowers default log noise)",
+        "  --tui  Launch terminal UI monitor (default for fluxd; use fluxd-cli for headless)",
         "  --tui-attach  Launch TUI monitor in remote attach mode via http://HOST[:PORT]/stats (default port: 8080)",
         "  --db-cache-mb  Fjall block cache size in MiB (default: 256)",
         "  --db-write-buffer-mb  Fjall max write buffer in MiB (default: 2048)",

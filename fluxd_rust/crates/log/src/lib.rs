@@ -65,6 +65,7 @@ pub struct LogConfig {
 static LOG_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static LOG_FORMAT: AtomicU8 = AtomicU8::new(Format::Text as u8);
 static LOG_TIMESTAMPS: AtomicBool = AtomicBool::new(true);
+static LOG_STDERR_ENABLED: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Debug)]
 pub struct CapturedLog {
@@ -107,6 +108,10 @@ pub fn clear_captured_logs() {
     if let Ok(mut guard) = buf.lock() {
         guard.clear();
     }
+}
+
+pub fn set_stderr_enabled(enabled: bool) {
+    LOG_STDERR_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 pub fn capture_snapshot(limit: usize) -> Vec<CapturedLog> {
@@ -153,29 +158,31 @@ pub fn log(
         None
     };
 
-    let mut out = io::stderr().lock();
-    match format {
-        Format::Text => {
-            if timestamps {
-                let ts = Timestamp {
-                    unix_seconds: now.as_secs(),
-                    millis: now.subsec_millis(),
-                };
-                let _ = write!(out, "{ts} ");
+    if LOG_STDERR_ENABLED.load(Ordering::Relaxed) {
+        let mut out = io::stderr().lock();
+        match format {
+            Format::Text => {
+                if timestamps {
+                    let ts = Timestamp {
+                        unix_seconds: now.as_secs(),
+                        millis: now.subsec_millis(),
+                    };
+                    let _ = write!(out, "{ts} ");
+                }
+                let _ = write!(out, "{} {}: ", level.as_str(), target);
+                let _ = writeln!(out, "{args}");
             }
-            let _ = write!(out, "{} {}: ", level.as_str(), target);
-            let _ = writeln!(out, "{args}");
-        }
-        Format::Json => {
-            let line = json!({
-                "ts_ms": ts_ms,
-                "level": level.as_str(),
-                "target": target,
-                "file": file,
-                "line": line,
-                "msg": msg.as_deref().unwrap_or_default(),
-            });
-            let _ = writeln!(out, "{line}");
+            Format::Json => {
+                let line = json!({
+                    "ts_ms": ts_ms,
+                    "level": level.as_str(),
+                    "target": target,
+                    "file": file,
+                    "line": line,
+                    "msg": msg.as_deref().unwrap_or_default(),
+                });
+                let _ = writeln!(out, "{line}");
+            }
         }
     }
 

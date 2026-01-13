@@ -12,23 +12,26 @@
 ## Navigation
 
 - `q` / `Esc`: quit (requests shutdown in in-process mode)
-- `Tab`: cycle views (Monitor → Peers → DB → Mempool → Wallet → Logs)
+- `Tab`: cycle views (Monitor → Stats → Peers → DB → Mempool → Wallet → Logs)
 - `Shift+Tab`: cycle views backwards
 - `←/→`: cycle views
 - `1-6`: jump to view (Monitor/Peers/DB/Mempool/Wallet/Logs)
+- `7`: jump to Stats view
 - `?` / `h`: toggle help
 - `a`: toggle advanced metrics
 - `s`: toggle setup wizard
+- Shielded params: in-process TUI auto-downloads missing params (same as `--fetch-params`).
 
 ## Views
 
 - **Monitor**: sync state + historical blocks/sec and headers/sec chart.
+- **Stats**: coin supply breakdown (transparent + shielded pools) and chain state.
 - **Peers**: connection counts and peer list.
 - **DB**: Fjall telemetry (write buffer, journals, compactions, per-partition segments/flushes).
 - **Mempool**: size and recent accept/reject/orphan counters.
   - With `a` (advanced), shows fee/age/version breakdown.
 - **Wallet**: key/encryption state, transparent + Sapling balance summaries, addresses + receive QR, recent wallet txs, and async ops.
-  - Keys (in-process only): `Up/Down` select address, `Enter` toggle QR, `n` new t-addr, `N` new z-addr, `x` open send modal, `i` watch address.
+  - Keys (in-process only): `Up/Down` select address, `Enter` toggle QR, `o` open explorer, `n` new t-addr, `N` new z-addr, `x` open send modal, `i` watch address.
   - Notes:
     - `Transparent (watch-only)` tracks imported addresses/scripts you don’t control (visible but not spendable).
       - Add via the TUI (`i`) or via RPC `importaddress`.
@@ -36,6 +39,8 @@
     - The `Async ops` panel is for shielded RPC operations that run asynchronously (e.g. `z_sendmany`, `z_shieldcoinbase`); normal transparent sends/receives won’t show up there.
 - **Logs**: in-TUI ring buffer with filter + scroll.
   - Keys: `f` filter, `Space` pause/follow, `c` clear, `Up/Down/PageUp/PageDown/Home/End` scroll.
+- **Setup**: writes `flux.conf` and configures RPC/auth defaults.
+  - Keys: `↑/↓` highlight data dir, `Enter` select, `r` rescan, `d` delete (confirm), `b` backup wallet.dat, `n/p` cycle network/profile, `l` toggle lead, `[`/`]` adjust lead, `w` write config.
 
 ## Screenshot (example)
 
@@ -57,6 +62,8 @@ The setup wizard writes a starter `flux.conf` into the active `--data-dir` and i
 - Keys:
   - `n`: cycle network (`mainnet` → `testnet` → `regtest`)
   - `p`: cycle profile (`low` → `default` → `high`)
+  - `l`: toggle header lead (`20000` ↔ `unlimited`)
+  - `[` / `]`: decrease/increase header lead by 5000
   - `g`: generate new RPC username/password
   - `v`: show/hide RPC password
   - `w`: write `flux.conf` (backs up any existing `flux.conf` as `flux.conf.bak.<unix_ts>`)

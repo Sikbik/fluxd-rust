@@ -29,6 +29,7 @@ Owner format: `owner: <name>` or `owner: TBD`.
 - [x] [P1] RPC: `verifychain` checklevel=4 spent-index consistency (owner: TBD)
 - [x] [P2] CLI: `--db-integrity` runs `verifychain` at checklevel=5 (owner: TBD)
 - [x] [P2] RPC: `verifychain` checklevel=5 address index consistency (owner: TBD)
+- [ ] [P1] Testing: document + run ignored shielded vectors suite on VPS (`scripts/run_shielded_tests.sh`) (owner: TBD)
 
 ## Completed (core)
 
