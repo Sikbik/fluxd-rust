@@ -236,8 +236,20 @@ Run them locally from `fluxd_rust/`:
 ./scripts/run_shielded_tests.sh
 ```
 
+Run them on the VPS (recommended; CPU heavy):
+
+```bash
+ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd /srv/fluxd_rust && ./scripts/run_shielded_tests.sh\"'"
+```
+
 Override the params location:
 
 ```bash
 ./scripts/run_shielded_tests.sh --params-dir /path/to/zcash-params
+```
+
+If params are already staged on the VPS, you can skip downloads:
+
+```bash
+ssh <vps-user>@<vps-host> "su - dev -c 'bash -lc \"cd /srv/fluxd_rust && ./scripts/run_shielded_tests.sh --no-fetch\"'"
 ```
