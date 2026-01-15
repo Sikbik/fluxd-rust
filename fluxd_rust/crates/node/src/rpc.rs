@@ -20889,17 +20889,17 @@ mod tests {
         rpc_importaddress(
             &chainstate,
             &wallet,
-            vec![json!(p2sh_address.clone()), json!("multisig-label"), json!(false)],
+            vec![
+                json!(p2sh_address.clone()),
+                json!("multisig-label"),
+                json!(false),
+            ],
             &params,
         )
         .expect("rpc");
 
-        let ok = rpc_validateaddress(
-            &wallet,
-            vec![Value::String(p2sh_address)],
-            &params,
-        )
-        .expect("rpc");
+        let ok =
+            rpc_validateaddress(&wallet, vec![Value::String(p2sh_address)], &params).expect("rpc");
         let obj = ok.as_object().expect("object");
         assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
         assert_eq!(
