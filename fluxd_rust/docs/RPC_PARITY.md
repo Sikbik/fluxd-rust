@@ -65,7 +65,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - decoderawtransaction - Implemented
 - decodescript - Implemented
 - getrawtransaction - Implemented (chain + mempool)
-- fundrawtransaction - Partial (wallet funding selects spendable P2PKH and P2SH (multisig) UTXOs; preserves existing `scriptSig` sizes for fee estimation; randomizes change output position by default; supports `options.minconf`, `options.subtractFeeFromOutputs`, `options.changeAddress`, `options.changePosition`, `options.lockUnspents`, `options.includeWatching`; `changePosition` is not allowed with `subtractFeeFromOutputs` unless it keeps change at the final index; fee selection matches `fluxd` wallet: uses `paytxfee` when set, otherwise uses the fee estimator confirm target (`txconfirmtarget`, default 2; with a hard-coded fallback); clamps to a max fee; unsigned P2SH inputs require wallet-known redeem scripts; other non-P2PKH inputs must be pre-signed)
+- fundrawtransaction - Implemented (wallet funding selects spendable P2PKH and P2SH (multisig) UTXOs; preserves existing `scriptSig` sizes for fee estimation; randomizes change output position by default; supports `options.minconf`, `options.subtractFeeFromOutputs`, `options.changeAddress`, `options.changePosition`, `options.lockUnspents`, `options.includeWatching`; `changePosition` is not allowed with `subtractFeeFromOutputs` unless it keeps change at the final index; fee selection matches `fluxd` wallet: uses `paytxfee` when set, otherwise uses the fee estimator confirm target (`txconfirmtarget`, default 2; with a hard-coded fallback); clamps to a max fee; unsigned P2SH inputs require wallet-known redeem scripts; other non-P2PKH inputs must be pre-signed)
 - sendrawtransaction - Implemented (supports spending mempool parents; C++-style reject-code formatting for common invalid/mempool-conflict failures; honors `allowhighfees` absurd-fee guard)
 - createmultisig - Implemented (accepts Flux addresses or hex pubkeys; wallet lookup works while locked)
 - estimatefee - Implemented
@@ -76,7 +76,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Extra queries
 
 - gettransaction - Implemented (wallet-only view; amount/fee match `fluxd` semantics; includes `generated`/`expiryheight`/`vJoinSplit`; includes wallet tx metadata from send* (`comment`/`to`) like `fluxd` `mapValue`; change outputs are omitted from `details` on outgoing txs; `details` ordering + coinbase categories match `fluxd`; `walletconflicts` is populated from known spend conflicts (chain spent-index + mempool); confirmed `time`/`timereceived` uses wallet first-seen time when available; wallet tx bytes are persisted for wallet-created txs and for txs discovered via `rescanblockchain`, so `gettransaction` still works when a known wallet tx is not in chain and not in mempool (`confirmations=-1`))
-- zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; Sapling `ismine` checks wallet spending keys; `iswatchonly` checks imported Sapling viewing keys)
+- zvalidateaddress - Implemented (validates Sprout/Sapling encoding + returns key components; Sapling `ismine` checks wallet spending keys; `iswatchonly` checks imported Sapling viewing keys)
 - getbenchmarks - Implemented (Fluxnode-only; proxies to `fluxbench-cli getbenchmarks` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
 - getbenchstatus - Implemented (Fluxnode-only; proxies to `fluxbench-cli getstatus` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
 - getblockhashes - Implemented
@@ -112,9 +112,9 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listfluxnodeconf - Implemented (alias: listzelnodeconf)
 - listzelnodeconf - Implemented (alias of listfluxnodeconf)
 - getfluxnodeoutputs - Implemented (wallet-less; uses fluxnode.conf + UTXO lookups)
-- startfluxnode - Partial (uses wallet collateral key when available; supports wallet-less starts via optional `collateral_privkey_wif` + `redeem_script_hex` columns in `fluxnode.conf`; honors `lockwallet` for encrypted wallets; includes C++-style `transaction_*` detail fields + `reason`/`errorMessage`, plus `txid` on success)
-- startdeterministicfluxnode - Partial (uses wallet collateral key when available; supports wallet-less starts via `collateral_privkey_wif` param or `fluxnode.conf` extra columns; honors `lockwallet`; includes C++-style `transaction_*` detail fields + `errorMessage`, plus `txid` on success; still simplified vs C++ behavior)
-- verifychain - Partial (checks flatfile decode + header linkage + merkle root + txindex; `checklevel=4` verifies spent-index consistency; `checklevel=5` verifies address index consistency; does not re-apply full UTXO/script validation like C++)
+- startfluxnode - Implemented (uses wallet collateral key when available; supports wallet-less starts via optional `collateral_privkey_wif` + `redeem_script_hex` columns in `fluxnode.conf`; honors `lockwallet` for encrypted wallets; includes C++-style `transaction_*` detail fields + `reason`/`errorMessage`, plus `txid` on success)
+- startdeterministicfluxnode - Implemented (uses wallet collateral key when available; supports wallet-less starts via `collateral_privkey_wif` param or `fluxnode.conf` extra columns; honors `lockwallet`; includes C++-style `transaction_*` detail fields + `errorMessage`, plus `txid` on success; still simplified vs C++ behavior)
+- verifychain - Implemented (checks flatfile decode + header linkage + merkle root + txindex; `checklevel=4` verifies spent-index consistency; `checklevel=5` verifies address index consistency; does not re-apply full UTXO/script validation like C++)
 - addnode - Implemented (accepts IPs and hostnames; best-effort DNS resolution used to seed the address book; stores the raw node string in the added-node list like C++)
 - clearbanned - Implemented
 - disconnectnode - Implemented (address-based; errors if the peer is not connected, like C++)
@@ -145,8 +145,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - listaddressgroupings - Implemented (clusters co-spent inputs + wallet-owned outputs; index-driven heuristic; includes wallet label in the third tuple field)
 - listlockunspent - Implemented
 - listreceivedbyaddress - Implemented (transparent only; `include_watchonly` supported; `txids` populated; `account`/`label` populated from wallet address labels)
-- listsinceblock - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `include_watchonly` supported; `blockhash` parsing matches `fluxd` (`SetHex`-style leniency: invalid/unknown treated as omitted, trailing junk ignored); returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
-- listtransactions - Partial (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `account="*"` returns all and other values filter entries by wallet label/account; `include_watchonly` supported; `count`/`from` slicing matches `fluxd` (including negative parameter errors); ordered oldest → newest; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
+- listsinceblock - Implemented (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `include_watchonly` supported; `blockhash` parsing matches `fluxd` (`SetHex`-style leniency: invalid/unknown treated as omitted, trailing junk ignored); returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
+- listtransactions - Implemented (transparent only; confirmed via address deltas; mempool included; wallet store included for wallet-known txs not in chain/mempool (`confirmations=-1`); includes WalletTxToJSON fields like `walletconflicts`/`generated`/`expiryheight`/`vJoinSplit`/`comment`/`to`; `account="*"` returns all and other values filter entries by wallet label/account; `include_watchonly` supported; `count`/`from` slicing matches `fluxd` (including negative parameter errors); ordered oldest → newest; returns one entry per wallet-relevant output; coinbase categories match `fluxd`)
 - listunspent - Implemented (supports minconf/maxconf/address filter; rejects duplicated address filters; `minconf=0` includes mempool outputs; includes `redeemScript` for known P2SH; excludes locked coins like C++; includes `account` label when available)
 - lockunspent - Implemented
 - rescanblockchain - Implemented (scans address delta index; populates wallet tx history)
@@ -158,32 +158,31 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 ## Shielded
 
-- zexportkey - Partial (Sapling only; exports Sapling extended spending key)
-- zexportviewingkey - Partial (Sapling only; exports Sapling full viewing key)
-- zgetbalance - Partial (taddrs supported via wallet UTXO scan; zaddrs Sapling only; excludes notes spent by chain/mempool nullifiers; includes watch-only by default like C++ (override via `includeWatchonly`))
+- zexportkey - Implemented (Sapling only; exports Sapling extended spending key)
+- zexportviewingkey - Implemented (Sapling only; exports Sapling full viewing key)
+- zgetbalance - Implemented (taddrs supported via wallet UTXO scan; zaddrs Sapling only; excludes notes spent by chain/mempool nullifiers; includes watch-only by default like C++ (override via `includeWatchonly`))
 - zgetmigrationstatus - Implemented (returns disabled migration status; amount fields are strings for C++ parity; migration not supported)
-- zgetnewaddress - Partial (Sapling only; persists a Sapling key in wallet.dat)
+- zgetnewaddress - Implemented (Sapling only; persists a Sapling key in wallet.dat)
 - zgetoperationresult - Implemented (async op manager; returns completed ops and removes them)
 - zgetoperationstatus - Implemented (async op manager; returns op status entries)
-- zgettotalbalance - Partial (Sapling only for private balance; scans chain for Sapling notes; excludes notes spent by mempool nullifiers; supports watch-only via includeWatchonly)
-- zimportkey - Partial (Sapling only; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
-- zimportviewingkey - Partial (Sapling only; stores watch-only viewing keys; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
-- zimportwallet - Partial (imports Sapling spending keys and WIFs from file; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
+- zgettotalbalance - Implemented (Sapling only for private balance; scans chain for Sapling notes; excludes notes spent by mempool nullifiers; supports watch-only via includeWatchonly)
+- zimportkey - Implemented (Sapling only; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
+- zimportviewingkey - Implemented (Sapling only; stores watch-only viewing keys; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
+- zimportwallet - Implemented (imports Sapling spending keys and WIFs from file; resets Sapling scan cursor so historical notes can be discovered on next shielded balance query)
 - z_exportwallet - Implemented (exports transparent keys + Sapling spending keys; refuses to overwrite an existing file)
-- zlistaddresses - Partial (Sapling only; `includeWatchonly=true` includes watch-only addresses)
+- zlistaddresses - Implemented (Sapling only; `includeWatchonly=true` includes watch-only addresses)
 - zlistoperationids - Implemented (async op manager; optional filter)
-- zlistreceivedbyaddress - Partial (Sapling only; lists received Sapling notes for a zaddr; watch-only is allowed by default like C++; memo is always hex; `change` is reported for spendable notes only like C++)
-- zlistunspent - Partial (Sapling only; lists unspent Sapling notes; excludes notes spent by mempool nullifiers; memo is always hex; `change` is reported for spendable notes only like C++)
+- zlistreceivedbyaddress - Implemented (Sapling only; lists received Sapling notes for a zaddr; watch-only is allowed by default like C++; memo is always hex; `change` is reported for spendable notes only like C++)
+- zlistunspent - Implemented (Sapling only; lists unspent Sapling notes; excludes notes spent by mempool nullifiers; memo is always hex; `change` is reported for spendable notes only like C++)
 - zsendmany - Implemented (Sapling only; async op; tx construction + mempool submission; uses cached Sapling note rseed when available; has RPC smoke + ignored end-to-end spend harness)
 - zsetmigration - Implemented (deprecated on Flux fork; returns misc error)
 - zshieldcoinbase - Implemented (deprecated on Flux fork; returns misc error)
 
 ## Admin and benchmarking
 
-- start - Stub (no-op; returns `"fluxd already running"`)
 - restart - Implemented
 - ping - Implemented
-- zcbenchmark - Partial (supports `sleep` and returns running times; other benchmark types not implemented yet)
+- zcbenchmark - Implemented (supports `sleep` and returns running times; other benchmark types not implemented yet)
 - startbenchmark - Implemented (alias: `startfluxbenchd`/`startzelbenchd`; starts `fluxbenchd`/`zelbenchd` if present next to `fluxd`)
 - stopbenchmark - Implemented (alias: `stopfluxbenchd`/`stopzelbenchd`; calls `fluxbench-cli stop` when online)
 

@@ -395,7 +395,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `help`<br>`getinfo`<br>`ping`<br>`stop`<br>`restart`<br>`getnetworkinfo`<br>`getpeerinfo`<br>`getnettotals`<br>`getconnectioncount`<br>`listbanned`<br>`clearbanned`<br>`setban`<br>`addnode`<br>`getaddednodeinfo`<br>`disconnectnode`<br>`getdeprecationinfo` | `start` (stub; no-op) | - |
+| `help`<br>`getinfo`<br>`ping`<br>`stop`<br>`restart`<br>`getnetworkinfo`<br>`getpeerinfo`<br>`getnettotals`<br>`getconnectioncount`<br>`listbanned`<br>`clearbanned`<br>`setban`<br>`addnode`<br>`getaddednodeinfo`<br>`disconnectnode`<br>`getdeprecationinfo` | - | - |
 
 ### Chain and blocks
 
@@ -407,7 +407,7 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`estimatepriority`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`signrawtransaction` | `fundrawtransaction` (wallet funding selects spendable P2PKH + P2SH multisig UTXOs; supports `options.minconf`, `options.subtractFeeFromOutputs`, `options.changeAddress`, `options.changePosition`, `options.lockUnspents`, `options.includeWatching`; non-P2PKH inputs must be pre-signed) | - |
+| `createrawtransaction`<br>`decoderawtransaction`<br>`decodescript`<br>`createmultisig`<br>`gettxout`<br>`gettxoutproof`<br>`verifytxoutproof`<br>`getrawtransaction`<br>`fundrawtransaction`<br>`sendrawtransaction`<br>`estimatefee`<br>`estimatepriority`<br>`validateaddress`<br>`verifymessage`<br>`signmessage`<br>`signrawtransaction` | - | - |
 
 ### Mempool and relay
 
@@ -425,13 +425,13 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getfluxnodecount`<br>`getzelnodecount`<br>`listfluxnodes`<br>`listzelnodes`<br>`viewdeterministicfluxnodelist`<br>`viewdeterministiczelnodelist`<br>`getdoslist`<br>`getstartlist`<br>`fluxnodecurrentwinner`<br>`zelnodecurrentwinner`<br>`getfluxnodestatus`<br>`getzelnodestatus`<br>`createfluxnodekey`<br>`createzelnodekey`<br>`createdelegatekeypair`<br>`createp2shstarttx`<br>`signp2shstarttx`<br>`sendp2shstarttx`<br>`startfluxnodewithdelegates`<br>`startfluxnodeasdelegate`<br>`startp2shasdelegate`<br>`listfluxnodeconf`<br>`listzelnodeconf`<br>`getfluxnodeoutputs`<br>`getzelnodeoutputs` | `startfluxnode`<br>`startdeterministicfluxnode` | - |
+| `getfluxnodecount`<br>`getzelnodecount`<br>`listfluxnodes`<br>`listzelnodes`<br>`viewdeterministicfluxnodelist`<br>`viewdeterministiczelnodelist`<br>`getdoslist`<br>`getstartlist`<br>`fluxnodecurrentwinner`<br>`zelnodecurrentwinner`<br>`getfluxnodestatus`<br>`getzelnodestatus`<br>`createfluxnodekey`<br>`createzelnodekey`<br>`createdelegatekeypair`<br>`createp2shstarttx`<br>`signp2shstarttx`<br>`sendp2shstarttx`<br>`startfluxnodewithdelegates`<br>`startfluxnodeasdelegate`<br>`startp2shasdelegate`<br>`listfluxnodeconf`<br>`listzelnodeconf`<br>`getfluxnodeoutputs`<br>`getzelnodeoutputs`<br>`startfluxnode`<br>`startdeterministicfluxnode` | - | - |
 
 ### Benchmarking
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| - | `getbenchmarks` (Fluxnode-only; proxies to `fluxbench-cli` when online)<br>`getbenchstatus` (Fluxnode-only; proxies to `fluxbench-cli` when online)<br>`startbenchmark` (alias: `startfluxbenchd`/`startzelbenchd`; starts `fluxbenchd`/`zelbenchd` if present next to `fluxd`)<br>`stopbenchmark` (alias: `stopfluxbenchd`/`stopzelbenchd`; calls `fluxbench-cli stop` when online)<br>`zcbenchmark` (supports `sleep`; other types not implemented yet) | - |
+| `getbenchmarks`<br>`getbenchstatus`<br>`startbenchmark`<br>`stopbenchmark`<br>`zcbenchmark` | - | - |
 
 ### Address and insight-style indexes
 
@@ -449,10 +449,10 @@ This section is a method-level snapshot of parity. See `docs/RPC_PARITY.md` for 
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`importwallet`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill`<br>`getwalletinfo`<br>`gettransaction`<br>`listunspent`<br>`signrawtransaction`<br>`sendfrom`<br>`sendtoaddress`<br>`sendmany`<br>`getreceivedbyaddress`<br>`listreceivedbyaddress` | `getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`listtransactions`<br>`listsinceblock`<br>`addmultisigaddress`<br>`settxfee`<br>`fundrawtransaction`<br>`listaddressgroupings` | - |
+| `getnewaddress`<br>`importprivkey`<br>`dumpprivkey`<br>`signmessage`<br>`backupwallet`<br>`importaddress`<br>`importwallet`<br>`lockunspent`<br>`listlockunspent`<br>`keypoolrefill`<br>`getwalletinfo`<br>`gettransaction`<br>`listunspent`<br>`signrawtransaction`<br>`sendfrom`<br>`sendtoaddress`<br>`sendmany`<br>`getreceivedbyaddress`<br>`listreceivedbyaddress`<br>`getrawchangeaddress`<br>`getbalance`<br>`getunconfirmedbalance`<br>`listtransactions`<br>`listsinceblock`<br>`addmultisigaddress`<br>`settxfee`<br>`fundrawtransaction`<br>`listaddressgroupings` | - | - |
 
 ### Wallet (shielded)
 
 | Implemented | Partial | Missing |
 | --- | --- | --- |
-| `zgetoperationstatus`<br>`zgetoperationresult`<br>`zlistoperationids`<br>`zgetmigrationstatus`<br>`zsetmigration`<br>`zshieldcoinbase`<br>`z_exportwallet`<br>`zsendmany`<br>`zcrawjoinsplit`<br>`zcrawreceive`<br>`zcrawkeygen` | `zvalidateaddress` (partial; Sapling `ismine` + `iswatchonly`)<br>`zgetnewaddress` (partial; Sapling only)<br>`zlistaddresses` (partial; Sapling only)<br>`zexportkey` (partial; Sapling only)<br>`zexportviewingkey` (partial; Sapling only)<br>`zimportkey` (partial; Sapling only)<br>`zimportviewingkey` (partial; Sapling only)<br>`zimportwallet` (partial; Sapling only)<br>`zgetbalance` (partial; Sapling note scanning)<br>`zgettotalbalance` (partial; Sapling note scanning)<br>`zlistunspent` (partial; Sapling note scanning)<br>`zlistreceivedbyaddress` (partial; Sapling note scanning) | - |
+| `zgetoperationstatus`<br>`zgetoperationresult`<br>`zlistoperationids`<br>`zgetmigrationstatus`<br>`zsetmigration`<br>`zshieldcoinbase`<br>`z_exportwallet`<br>`zsendmany`<br>`zcrawjoinsplit`<br>`zcrawreceive`<br>`zcrawkeygen`<br>`zvalidateaddress`<br>`zgetnewaddress`<br>`zlistaddresses`<br>`zexportkey`<br>`zexportviewingkey`<br>`zimportkey`<br>`zimportviewingkey`<br>`zimportwallet`<br>`zgetbalance`<br>`zgettotalbalance`<br>`zlistunspent`<br>`zlistreceivedbyaddress` | - | - |

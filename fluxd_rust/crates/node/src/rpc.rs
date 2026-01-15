@@ -113,7 +113,6 @@ const RPC_METHODS: &[&str] = &[
     "help",
     "getinfo",
     "ping",
-    "start",
     "stop",
     "restart",
     "reindex",
@@ -1337,7 +1336,6 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
             mempool_policy,
         ),
         "ping" => rpc_ping(params),
-        "start" => rpc_start(params),
         "stop" => rpc_stop(params, shutdown_tx),
         "restart" => rpc_restart(params, shutdown_tx),
         "reindex" => rpc_reindex(params, data_dir, shutdown_tx),
@@ -1675,11 +1673,6 @@ fn dispatch_method<S: fluxd_storage::KeyValueStore + 'static>(
 fn rpc_ping(params: Vec<Value>) -> Result<Value, RpcError> {
     ensure_no_params(&params)?;
     Ok(Value::Null)
-}
-
-fn rpc_start(params: Vec<Value>) -> Result<Value, RpcError> {
-    ensure_no_params(&params)?;
-    Ok(Value::String("fluxd already running".to_string()))
 }
 
 fn rpc_zlistoperationids(params: Vec<Value>) -> Result<Value, RpcError> {
@@ -20869,7 +20862,7 @@ mod tests {
 
     #[test]
     fn validateaddress_reports_account_for_labeled_multisig_script() {
-        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let (chainstate, params, data_dir) = setup_regtest_chainstate();
         let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
 
         let addr_a = rpc_getnewaddress(&wallet, Vec::new())
@@ -20885,7 +20878,7 @@ mod tests {
 
         let p2sh_address = rpc_addmultisigaddress(
             &wallet,
-            vec![json!(2), json!([addr_a, addr_b]), json!("multisig-label")],
+            vec![json!(2), json!([addr_a, addr_b]), json!("")],
             &params,
         )
         .expect("rpc")
@@ -20893,8 +20886,20 @@ mod tests {
         .expect("p2sh address")
         .to_string();
 
-        let ok =
-            rpc_validateaddress(&wallet, vec![Value::String(p2sh_address)], &params).expect("rpc");
+        rpc_importaddress(
+            &chainstate,
+            &wallet,
+            vec![json!(p2sh_address.clone()), json!("multisig-label"), json!(false)],
+            &params,
+        )
+        .expect("rpc");
+
+        let ok = rpc_validateaddress(
+            &wallet,
+            vec![Value::String(p2sh_address)],
+            &params,
+        )
+        .expect("rpc");
         let obj = ok.as_object().expect("object");
         assert_eq!(obj.get("isvalid").and_then(Value::as_bool), Some(true));
         assert_eq!(
@@ -29756,18 +29761,6 @@ mod tests {
     #[test]
     fn ping_rejects_params() {
         let err = rpc_ping(vec![json!(1)]).unwrap_err();
-        assert_eq!(err.code, RPC_INVALID_PARAMETER);
-    }
-
-    #[test]
-    fn start_returns_string() {
-        let value = rpc_start(Vec::new()).expect("rpc");
-        assert_eq!(value, Value::String("fluxd already running".to_string()));
-    }
-
-    #[test]
-    fn start_rejects_params() {
-        let err = rpc_start(vec![json!(1)]).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_PARAMETER);
     }
 

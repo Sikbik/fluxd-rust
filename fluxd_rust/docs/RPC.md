@@ -80,7 +80,6 @@ Type notes:
 - `help [method]`
 - `getinfo`
 - `ping`
-- `start` (stub; no-op)
 - `stop`
 - `restart`
 - `reindex`
@@ -119,26 +118,26 @@ Type notes:
 - `decodescript <hex>`
 - `createmultisig <nrequired> <keys>`
 - `getrawtransaction <txid> [verbose]`
-- `fundrawtransaction <hexstring>` (partial)
+- `fundrawtransaction <hexstring>`
 - `signrawtransaction <hexstring> [prevtxs] [privkeys] [sighashtype] [branchid]`
 - `sendrawtransaction <hexstring> [allowhighfees]`
 - `gettxout <txid> <vout> [include_mempool]`
 - `gettxoutsetinfo`
 - `validateaddress <fluxaddress>`
-- `zvalidateaddress <zaddr>` (partial; validates Sprout/Sapling encoding; reports Sapling wallet ownership)
+- `zvalidateaddress <zaddr>` (validates Sprout/Sapling encoding; reports Sapling wallet ownership)
 - `verifymessage <fluxaddress> <signature> <message>`
 
 ### Wallet (transparent)
 
 Wallet state is stored at `--data-dir/wallet.dat`.
 
-- `getwalletinfo` (partial)
+- `getwalletinfo`
 - `gettransaction <txid> [include_watchonly]`
-- `listtransactions [account] [count] [from] [include_watchonly]` (partial)
-- `listsinceblock [blockhash] [target_confirmations] [include_watchonly]` (partial)
-- `addmultisigaddress <nrequired> <keys> [account]` (partial; adds a P2SH redeem script + watch script; stores optional `account` label)
+- `listtransactions [account] [count] [from] [include_watchonly]`
+- `listsinceblock [blockhash] [target_confirmations] [include_watchonly]`
+- `addmultisigaddress <nrequired> <keys> [account]` (adds a P2SH redeem script + watch script; `account` must be empty string)
 - `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]`
-- `keypoolrefill [newsize]` (partial)
+- `keypoolrefill [newsize]`
 - `settxfee <amount>`
 - `getnewaddress [label]` (label stored as legacy `account`)
 - `getrawchangeaddress` (returns a new internal change address)
@@ -153,12 +152,12 @@ Wallet state is stored at `--data-dir/wallet.dat`.
 - `walletpassphrasechange <oldpassphrase> <newpassphrase>`
 - `walletlock`
 - `signmessage <address> <message>`
-- `getbalance [account] [minconf] [include_watchonly]` (partial)
+- `getbalance [account] [minconf] [include_watchonly]`
 - `getunconfirmedbalance`
 - `getreceivedbyaddress <address> [minconf]`
-- `listunspent [minconf] [maxconf] [addresses]` (partial)
-- `sendtoaddress <address> <amount> [comment] [comment_to] [subtractfeefromamount] ...` (partial)
-- `sendmany <fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]` (partial)
+- `listunspent [minconf] [maxconf] [addresses]`
+- `sendtoaddress <address> <amount> [comment] [comment_to] [subtractfeefromamount] ...`
+- `sendmany <fromaccount> <amounts> [minconf] [comment] [subtractfeefrom]`
 
 ### Wallet (shielded) (WIP)
 
@@ -215,7 +214,7 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 - `getrawmempool [verbose]`
 - `getmininginfo`
 - `getblocktemplate` (includes deterministic fluxnode payouts + priority/fee mempool tx selection)
-- `submitblock <hexdata>` (partial)
+- `submitblock <hexdata>`
 - `getnetworkhashps [blocks] [height]` (implemented; chainwork/time estimate)
 - `getnetworksolps [blocks] [height]` (implemented; chainwork/time estimate)
 - `getlocalsolps` (reports local POW header validation throughput; returns 0.0 when idle)
@@ -232,8 +231,8 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 - `sendp2shstarttx <rawtransactionhex>`
 - `listfluxnodeconf [filter]` / `listzelnodeconf [filter]`
 - `getfluxnodeoutputs` / `getzelnodeoutputs`
-- `startfluxnode <all|alias> <lockwallet> [alias]` / `startzelnode ...` (partial; wallet-less)
-- `startdeterministicfluxnode <alias> <lockwallet> [collateral_privkey_wif] [redeem_script_hex]` / `startdeterministiczelnode ...` (partial; wallet-less)
+- `startfluxnode <all|alias> <lockwallet> [alias]` / `startzelnode ...` (wallet-less supported)
+- `startdeterministicfluxnode <alias> <lockwallet> [collateral_privkey_wif] [redeem_script_hex]` / `startdeterministiczelnode ...` (wallet-less supported)
 - `startfluxnodewithdelegates <alias> <delegates> <lockwallet>`
 - `startfluxnodeasdelegate <txid> <outputindex> <delegatekey_wif> <vpspubkey_hex>`
 - `startp2shasdelegate <redeemscript_hex> <txid> <outputindex> <delegatekey_wif> <vpspubkey_hex>`
@@ -241,14 +240,14 @@ Joinsplit helper RPCs are implemented for Sprout parity (deprecated on Flux main
 - `listfluxnodes` / `listzelnodes`
 - `viewdeterministicfluxnodelist [filter]` / `viewdeterministiczelnodelist [filter]`
 - `fluxnodecurrentwinner` / `zelnodecurrentwinner`
-- `getfluxnodestatus [alias|txid:vout]` / `getzelnodestatus ...` (partial; uses `--data-dir/fluxnode.conf` when called with no params)
+- `getfluxnodestatus [alias|txid:vout]` / `getzelnodestatus ...` (uses `--data-dir/fluxnode.conf` when called with no params)
 - `getdoslist`
 - `getstartlist`
-- `getbenchmarks` (stub; Fluxnode-only)
-- `getbenchstatus` (stub; Fluxnode-only)
-- `startbenchmark` / `startfluxbenchd` / `startzelbenchd` (stub; Fluxnode-only)
-- `stopbenchmark` / `stopfluxbenchd` / `stopzelbenchd` (stub; Fluxnode-only)
-- `zcbenchmark` (stub; returns error)
+- `getbenchmarks` (Fluxnode-only)
+- `getbenchstatus` (Fluxnode-only)
+- `startbenchmark` / `startfluxbenchd` / `startzelbenchd` (Fluxnode-only)
+- `stopbenchmark` / `stopfluxbenchd` / `stopzelbenchd` (Fluxnode-only)
+- `zcbenchmark` (supports `sleep`)
 
 ### Indexer endpoints (insight-style)
 
@@ -294,13 +293,6 @@ Fields:
 ### ping
 
 - Result: `null`
-
-### start
-
-Not a standard `fluxd` RPC. Provided for compatibility with existing Flux infra.
-
-- Params: none
-- Result: string (`"fluxd already running"`)
 
 ### stop
 
@@ -423,7 +415,7 @@ Notes:
 
 ### getbalance
 
-- Params: `[account] [minconf] [include_watchonly]` (partial; `account` must be `""` or `"*"` like `fluxd`; `minconf` is enforced).
+- Params: `[account] [minconf] [include_watchonly]` (`account` must be `""` or `"*"` like `fluxd`; `minconf` is enforced).
 - Result: wallet balance (mature + not spent by mempool).
 
 Notes:
@@ -463,7 +455,7 @@ Notes:
 
 ### listtransactions
 
-- Params: `[account] [count] [from] [include_watchonly]` (partial; `account="*"` returns all, otherwise filters entries by wallet label/account; `include_watchonly` is honored).
+- Params: `[account] [count] [from] [include_watchonly]` (`account="*"` returns all, otherwise filters entries by wallet label/account; `include_watchonly` is honored).
 - Result: array of wallet transaction entries (ordered oldest → newest; unconfirmed entries appear last). Each entry corresponds to a wallet-relevant output (send/receive/generate/etc), similar to `fluxd`.
 
 Notes:
@@ -478,7 +470,7 @@ Notes:
 
 ### listsinceblock
 
-- Params: `[blockhash] [target_confirmations] [include_watchonly]` (partial; `include_watchonly` is honored).
+- Params: `[blockhash] [target_confirmations] [include_watchonly]` (`include_watchonly` is honored).
 - Result: object `{ "transactions": array, "lastblock": string }`.
 
 Notes:
@@ -512,7 +504,7 @@ Notes:
 
 ### keypoolrefill
 
-- Params: `[newsize]` (partial).
+- Params: `[newsize]`.
 - Result: `null`
 
 Notes:
@@ -1393,7 +1385,7 @@ Fluxnode-only benchmark daemon control.
 
 ### zcbenchmark
 
-Zcash benchmark RPC (partial).
+Zcash benchmark RPC (supports `sleep`; other benchmark types return an error).
 
 - Params:
   - `benchmarktype` (string)
