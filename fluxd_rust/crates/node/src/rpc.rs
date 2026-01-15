@@ -9097,10 +9097,15 @@ fn rpc_addmultisigaddress(
 
     let label = match params.get(2) {
         None | Some(Value::Null) => String::new(),
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "account must be a string"))?
-            .to_string(),
+        Some(value) => {
+            let account = value
+                .as_str()
+                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "account must be a string"))?;
+            if !account.is_empty() {
+                return Err(RpcError::new(RPC_INVALID_PARAMETER, "account must be \"\""));
+            }
+            String::new()
+        }
     };
 
     let mut wallet_guard = wallet
@@ -23373,6 +23378,36 @@ mod tests {
             row.get("redeemScript").and_then(Value::as_str).is_some(),
             "P2SH outputs should include redeemScript when known"
         );
+    }
+
+    #[test]
+    fn addmultisigaddress_rejects_nonempty_account_param() {
+        let (_chainstate, params, data_dir) = setup_regtest_chainstate();
+        let wallet = Mutex::new(Wallet::load_or_create(&data_dir, params.network).expect("wallet"));
+
+        let addr_a = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+        let addr_b = rpc_getnewaddress(&wallet, Vec::new())
+            .expect("rpc")
+            .as_str()
+            .expect("address string")
+            .to_string();
+
+        let err = rpc_addmultisigaddress(
+            &wallet,
+            vec![
+                json!(2),
+                Value::Array(vec![Value::String(addr_a), Value::String(addr_b)]),
+                json!("label"),
+            ],
+            &params,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RPC_INVALID_PARAMETER);
+        assert_eq!(err.message, "account must be \"\"");
     }
 
     #[test]

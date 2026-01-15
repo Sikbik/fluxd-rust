@@ -124,7 +124,7 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 ## Wallet
 
 - signrawtransaction - Implemented (supports P2PKH and P2SH (multisig and P2PKH redeem scripts); supports optional `prevtxs[].redeemScript`, optional `branchid`, and optional WIF override list; wallet fallback still applies when `privkeys` is provided)
-- addmultisigaddress - Partial (adds P2SH redeem script + watch script to the wallet; stores optional `account` label; P2SH outputs are marked spendable when enough keys are present)
+- addmultisigaddress - Implemented (adds P2SH redeem script + watch script to the wallet; `account` must be empty string; P2SH outputs are marked spendable when enough keys are present)
 - backupwallet - Implemented
 - dumpwallet - Implemented (exports transparent keys; includes `label=` with C++-style percent encoding; refuses to overwrite an existing file)
 - encryptwallet - Implemented (encrypts wallet private keys in wallet.dat; wallet starts locked)
