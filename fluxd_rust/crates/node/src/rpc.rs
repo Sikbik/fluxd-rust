@@ -16713,6 +16713,7 @@ fn rpc_startbenchmark(
         )
     })?;
 
+    std::thread::sleep(Duration::from_secs(4));
     Ok(Value::String("Starting process".to_string()))
 }
 

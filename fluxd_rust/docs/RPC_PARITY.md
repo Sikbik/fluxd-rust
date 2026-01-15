@@ -77,8 +77,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 
 - gettransaction - Implemented (wallet-only view; amount/fee match `fluxd` semantics; includes `generated`/`expiryheight`/`vJoinSplit`; includes wallet tx metadata from send* (`comment`/`to`) like `fluxd` `mapValue`; change outputs are omitted from `details` on outgoing txs; `details` ordering + coinbase categories match `fluxd`; `walletconflicts` is populated from known spend conflicts (chain spent-index + mempool); confirmed `time`/`timereceived` uses wallet first-seen time when available; wallet tx bytes are persisted for wallet-created txs and for txs discovered via `rescanblockchain`, so `gettransaction` still works when a known wallet tx is not in chain and not in mempool (`confirmations=-1`))
 - zvalidateaddress - Partial (validates Sprout/Sapling encoding + returns key components; Sapling `ismine` checks wallet spending keys; `iswatchonly` checks imported Sapling viewing keys)
-- getbenchmarks - Partial (Fluxnode-only; proxies to `fluxbench-cli getbenchmarks` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
-- getbenchstatus - Partial (Fluxnode-only; proxies to `fluxbench-cli getstatus` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
+- getbenchmarks - Implemented (Fluxnode-only; proxies to `fluxbench-cli getbenchmarks` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
+- getbenchstatus - Implemented (Fluxnode-only; proxies to `fluxbench-cli getstatus` when fluxbenchd reports `status=online`; otherwise returns `"Benchmark not running"`)
 - getblockhashes - Implemented
 
 ## Address index (insight)
@@ -184,8 +184,8 @@ This file tracks parity targets with the C++ `fluxd` RPC surface. Statuses:
 - restart - Implemented
 - ping - Implemented
 - zcbenchmark - Partial (supports `sleep` and returns running times; other benchmark types not implemented yet)
-- startbenchmark - Partial (alias: `startfluxbenchd`/`startzelbenchd`; starts `fluxbenchd`/`zelbenchd` if present next to `fluxd`)
-- stopbenchmark - Partial (alias: `stopfluxbenchd`/`stopzelbenchd`; calls `fluxbench-cli stop` when online)
+- startbenchmark - Implemented (alias: `startfluxbenchd`/`startzelbenchd`; starts `fluxbenchd`/`zelbenchd` if present next to `fluxd`)
+- stopbenchmark - Implemented (alias: `stopfluxbenchd`/`stopzelbenchd`; calls `fluxbench-cli stop` when online)
 
 ## fluxd-rust extensions
 
