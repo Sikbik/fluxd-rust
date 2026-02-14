@@ -34,6 +34,23 @@ impl FileLocation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locate_active_file_uses_highest_id_with_holes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("data00000.dat"), vec![0u8; 10]).expect("write 0");
+        std::fs::write(dir.path().join("data00002.dat"), vec![0u8; 20]).expect("write 2");
+
+        let store = FlatFileStore::new(dir.path(), 1_000_000).expect("flatfiles");
+        let loc = store.append(b"hello").expect("append");
+        assert_eq!(loc.file_id, 2);
+        assert_eq!(loc.offset, 20);
+    }
+}
+
 #[derive(Debug)]
 pub enum FlatFileError {
     Io(std::io::Error),
@@ -141,32 +158,44 @@ impl FlatFileStore {
         self.dir.join(format!("{}{file_id:05}.dat", self.prefix))
     }
 
+    pub fn remove_file(&self, file_id: u32) -> Result<(), FlatFileError> {
+        let path = self.file_path(file_id);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
     fn locate_active_file(
         dir: &Path,
         prefix: &str,
         max_file_size: u64,
     ) -> Result<(u32, u64), FlatFileError> {
-        let mut file_id = 0u32;
         let mut last_existing: Option<(u32, u64)> = None;
-        loop {
-            let path = dir.join(format!("{prefix}{file_id:05}.dat"));
-            if !path.exists() {
-                break;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                continue;
             }
-            let metadata = std::fs::metadata(&path)?;
-            let len = metadata.len();
-            last_existing = Some((file_id, len));
-            file_id += 1;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.starts_with(prefix) || !name.ends_with(".dat") {
+                continue;
+            }
+            let id_part = &name[prefix.len()..name.len().saturating_sub(4)];
+            let Ok(file_id) = id_part.parse::<u32>() else {
+                continue;
+            };
+            let len = entry.metadata()?.len();
+            match last_existing {
+                Some((current, _)) if file_id <= current => {}
+                _ => last_existing = Some((file_id, len)),
+            }
         }
 
         match last_existing {
-            Some((last_id, len)) => {
-                if len >= max_file_size {
-                    Ok((last_id + 1, 0))
-                } else {
-                    Ok((last_id, len))
-                }
-            }
+            Some((last_id, len)) if len >= max_file_size => Ok((last_id + 1, 0)),
+            Some((last_id, len)) => Ok((last_id, len)),
             None => Ok((0, 0)),
         }
     }

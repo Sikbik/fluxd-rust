@@ -8,6 +8,12 @@ and how they affect behavior.
 - `--backend fjall|memory`
   - `fjall` is the default persistent store.
   - `memory` is non-persistent and only intended for testing.
+- `--node-mode full|lite`
+  - `full` (default) stores full block/undo flatfiles and maintains all secondary indexes.
+  - `lite` enables aggressive pruning of on-disk flatfiles (blocks + undo) and disables
+    disk-heavy secondary indexes (txindex/spentindex/address/timestamp + stored headers).
+  - `lite` mode is intended for transaction relay and tip-focused operation; historical RPCs will
+    be limited and peers may receive `notfound` for pruned blocks.
 - `--data-dir PATH`
   - Base data directory (default: `./data`).
   - Layout:

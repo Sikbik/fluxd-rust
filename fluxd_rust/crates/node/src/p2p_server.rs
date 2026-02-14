@@ -679,6 +679,7 @@ async fn handle_getdata<S: KeyValueStore>(
 ) -> Result<(), String> {
     let invs = parse_inv(payload)?;
     let mut processed = 0usize;
+    let mut missing_blocks: Vec<Hash256> = Vec::new();
     let mut missing_txs: Vec<Hash256> = Vec::new();
     for inv in invs {
         if processed >= MAX_INBOUND_GETDATA {
@@ -692,11 +693,21 @@ async fn handle_getdata<S: KeyValueStore>(
                     .map_err(|err| err.to_string())?
                 {
                     Some(location) => location,
-                    None => continue,
+                    None => {
+                        missing_blocks.push(inv.hash);
+                        continue;
+                    }
                 };
-                let block_bytes = chainstate
-                    .read_block(location)
-                    .map_err(|err| err.to_string())?;
+                let block_bytes = match chainstate.read_block(location) {
+                    Ok(bytes) => bytes,
+                    Err(fluxd_chainstate::state::ChainStateError::FlatFile(
+                        fluxd_chainstate::flatfiles::FlatFileError::Io(err),
+                    )) if err.kind() == std::io::ErrorKind::NotFound => {
+                        missing_blocks.push(inv.hash);
+                        continue;
+                    }
+                    Err(err) => return Err(err.to_string()),
+                };
                 send_message_limited(peer, limiter, "block", &block_bytes).await?;
             }
             MSG_TX => {
@@ -716,6 +727,10 @@ async fn handle_getdata<S: KeyValueStore>(
         }
     }
 
+    if !missing_blocks.is_empty() {
+        let payload = build_inv_payload(&missing_blocks, MSG_BLOCK);
+        send_message_limited(peer, limiter, "notfound", &payload).await?;
+    }
     if !missing_txs.is_empty() {
         let payload = build_inv_payload(&missing_txs, MSG_TX);
         send_message_limited(peer, limiter, "notfound", &payload).await?;

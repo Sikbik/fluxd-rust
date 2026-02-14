@@ -156,9 +156,14 @@ Undo entries are pruned as the chain advances to retain only the most recent
 
 ## Index lifecycle
 
-Indexes are maintained during block connect. There are no runtime flags to
-disable txindex, spent index, address index, or timestamp index in the Rust daemon yet.
-For a full rebuild of indexes, perform a fresh sync by clearing the data dir.
+Indexes are maintained during block connect.
+
+`fluxd` supports a lightweight mode via `--node-mode lite` which disables disk-heavy secondary
+indexes (txindex/spent index/address outpoints+deltas/timestamp index + stored headers) to reduce
+disk usage. In `--node-mode full` (default), all indexes are maintained.
+
+For a full rebuild of indexes, perform a fresh sync by clearing the data dir (or use selective
+`--reindex-*` flags for supported indexes).
 
 Note: `BlockUndo` is also generated during block connect. If undo/reorg support
 was introduced after an existing database was created, a clean resync is required.

@@ -68,7 +68,7 @@ use crossbeam_channel::{bounded, unbounded};
 use fluxd_chainstate::flatfiles::{FileLocation, FlatFileStore};
 use fluxd_chainstate::index::HeaderEntry;
 use fluxd_chainstate::metrics::ConnectMetrics;
-use fluxd_chainstate::state::{ChainState, HeaderValidationCache};
+use fluxd_chainstate::state::{ChainState, ChainStateOptions, HeaderValidationCache};
 use fluxd_chainstate::validation::{
     validate_block_with_txids_and_size, ValidationFlags, ValidationMetrics,
 };
@@ -250,10 +250,34 @@ impl RunProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeMode {
+    Full,
+    Lite,
+}
+
+impl NodeMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full" => Some(Self::Full),
+            "lite" => Some(Self::Lite),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Lite => "lite",
+        }
+    }
+}
+
 struct Config {
     backend: Backend,
     data_dir: PathBuf,
     conf_path: PathBuf,
+    node_mode: NodeMode,
     network: Network,
     params_dir: PathBuf,
     fetch_params: bool,
@@ -1029,10 +1053,11 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     log_info!(
-        "Startup: begin (tui={}, backend={:?}, network={:?}, data_dir={})",
+        "Startup: begin (tui={}, backend={:?}, network={:?}, mode={}, data_dir={})",
         config.tui,
         config.backend,
         config.network,
+        config.node_mode.as_str(),
         config.data_dir.display()
     );
     let params = Arc::new(chain_params(config.network));
@@ -1215,11 +1240,16 @@ async fn run_with_config(start_time: Instant, config: Config) -> Result<(), Stri
         .map_err(|err| err.to_string())?;
     let undo = FlatFileStore::new_with_prefix(&blocks_path, "undo", DEFAULT_MAX_FLATFILE_SIZE)
         .map_err(|err| err.to_string())?;
-    let chainstate = Arc::new(ChainState::new_with_utxo_cache_capacity(
+    let chainstate_options = match config.node_mode {
+        NodeMode::Full => ChainStateOptions::full(),
+        NodeMode::Lite => ChainStateOptions::lite(),
+    };
+    let chainstate = Arc::new(ChainState::new_with_utxo_cache_capacity_and_options(
         Arc::clone(&store),
         blocks,
         undo,
         config.utxo_cache_entries,
+        chainstate_options,
     ));
 
     if config.db_info {
@@ -7818,6 +7848,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut backend = Backend::Fjall;
+    let mut node_mode = NodeMode::Full;
     let mut profile: Option<RunProfile> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut conf_path: Option<PathBuf> = None;
@@ -7961,6 +7992,20 @@ where
                     .ok_or_else(|| format!("missing value for --backend\n{}", usage()))?;
                 backend = Backend::parse(&value)
                     .ok_or_else(|| format!("invalid backend '{value}'\n{}", usage()))?;
+            }
+            "--node-mode" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for --node-mode\n{}", usage()))?;
+                node_mode = NodeMode::parse(&value).ok_or_else(|| {
+                    format!(
+                        "invalid node mode '{value}' (expected full|lite)\n{}",
+                        usage()
+                    )
+                })?;
+            }
+            "--lite" => {
+                node_mode = NodeMode::Lite;
             }
             "--data-dir" => {
                 let value = args
@@ -8992,6 +9037,7 @@ where
         backend,
         data_dir,
         conf_path: conf_file,
+        node_mode,
         network,
         params_dir: params_dir.unwrap_or_else(default_params_dir),
         fetch_params,
@@ -9339,6 +9385,8 @@ fn usage() -> String {
         "  --help, -h  Print this help and exit",
         "  --version, -V  Print version and exit",
         "  --backend   Storage backend to use (default: fjall)",
+        "  --node-mode  Node mode (full|lite) (default: full)",
+        "  --lite  Shorthand for --node-mode lite (pruned, minimal indexes)",
         "  --data-dir  Base data directory (default: ./data)",
         "  --conf  Config file path (default: <data-dir>/flux.conf)",
         "  --params-dir    Shielded params directory (default: ~/.zcash-params)",

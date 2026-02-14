@@ -4,9 +4,13 @@ pub const META_BLOCK_FILES_LAST_FILE_KEY: &[u8] = b"flatfiles:blocks:last_file";
 pub const META_BLOCK_FILES_LAST_LEN_KEY: &[u8] = b"flatfiles:blocks:last_len";
 pub const META_UNDO_FILES_LAST_FILE_KEY: &[u8] = b"flatfiles:undo:last_file";
 pub const META_UNDO_FILES_LAST_LEN_KEY: &[u8] = b"flatfiles:undo:last_len";
+pub const META_BLOCK_FILES_PRUNED_FILE_KEY: &[u8] = b"flatfiles:blocks:pruned_file";
+pub const META_UNDO_FILES_PRUNED_FILE_KEY: &[u8] = b"flatfiles:undo:pruned_file";
 
 const META_BLOCK_FILE_INFO_PREFIX: &[u8] = b"flatfiles:blocks:file:";
 const META_UNDO_FILE_INFO_PREFIX: &[u8] = b"flatfiles:undo:file:";
+
+pub const FLATFILE_INFO_FLAG_PRUNED: u32 = 1 << 0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FlatFileInfo {

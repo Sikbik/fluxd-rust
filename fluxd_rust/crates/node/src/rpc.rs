@@ -1963,7 +1963,9 @@ fn rpc_rescanblockchain<S: fluxd_storage::KeyValueStore>(
             offset,
             len,
         };
-        let bytes = chainstate.read_block(location).map_err(map_internal)?;
+        let bytes = chainstate
+            .read_block(location)
+            .map_err(map_read_block_error)?;
         let block = Block::consensus_decode(&bytes).map_err(map_internal)?;
         for (txid, tx_index) in entries {
             let Some(tx) = block.transactions.get(tx_index as usize) else {
@@ -5788,7 +5790,9 @@ fn rpc_getblock<S: fluxd_storage::KeyValueStore>(
         .block_location(&hash)
         .map_err(map_internal)?
         .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "block not found"))?;
-    let bytes = chainstate.read_block(location).map_err(map_internal)?;
+    let bytes = chainstate
+        .read_block(location)
+        .map_err(map_read_block_error)?;
     let block = fluxd_primitives::block::Block::consensus_decode(&bytes).map_err(map_internal)?;
 
     if verbosity == 0 {
@@ -11886,7 +11890,9 @@ fn rpc_gettxoutproof<S: fluxd_storage::KeyValueStore>(
         tx_location.block
     };
 
-    let bytes = chainstate.read_block(location).map_err(map_internal)?;
+    let bytes = chainstate
+        .read_block(location)
+        .map_err(map_read_block_error)?;
     let block = Block::consensus_decode(&bytes).map_err(map_internal)?;
 
     let mut txids = Vec::with_capacity(block.transactions.len());
@@ -12123,7 +12129,9 @@ fn rpc_getblockdeltas<S: fluxd_storage::KeyValueStore>(
         .block_location(&hash)
         .map_err(map_internal)?
         .ok_or_else(|| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
-    let bytes = chainstate.read_block(location).map_err(map_internal)?;
+    let bytes = chainstate
+        .read_block(location)
+        .map_err(map_read_block_error)?;
     let block = fluxd_primitives::block::Block::consensus_decode(&bytes).map_err(map_internal)?;
 
     let mut deltas = Vec::with_capacity(block.transactions.len());
@@ -12243,6 +12251,8 @@ fn rpc_getspentinfo<S: fluxd_storage::KeyValueStore>(
     chainstate: &ChainState<S>,
     params: Vec<Value>,
 ) -> Result<Value, RpcError> {
+    require_spent_index(chainstate)?;
+
     let (txid, index) = match params.as_slice() {
         [Value::Object(map)] => {
             let txid_value = map
@@ -12280,6 +12290,8 @@ fn rpc_getaddressutxos<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
+    require_address_index(chainstate)?;
+
     if params.len() != 1 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
@@ -12364,6 +12376,8 @@ fn rpc_getaddressbalance<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
+    require_address_index(chainstate)?;
+
     if params.len() != 1 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
@@ -12403,6 +12417,8 @@ fn rpc_getaddressdeltas<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
+    require_address_index(chainstate)?;
+
     if params.len() != 1 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
@@ -12515,6 +12531,8 @@ fn rpc_getaddresstxids<S: fluxd_storage::KeyValueStore>(
     params: Vec<Value>,
     chain_params: &ChainParams,
 ) -> Result<Value, RpcError> {
+    require_address_index(chainstate)?;
+
     if params.len() != 1 {
         return Err(RpcError::new(
             RPC_INVALID_PARAMETER,
@@ -31279,6 +31297,44 @@ fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 fn map_internal(err: impl ToString) -> RpcError {
     RpcError::new(RPC_INTERNAL_ERROR, err.to_string())
+}
+
+fn map_read_block_error(err: fluxd_chainstate::state::ChainStateError) -> RpcError {
+    match err {
+        fluxd_chainstate::state::ChainStateError::FlatFile(
+            fluxd_chainstate::flatfiles::FlatFileError::Io(err),
+        ) if err.kind() == std::io::ErrorKind::NotFound => RpcError::new(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Block data not available (pruned)",
+        ),
+        other => map_internal(other),
+    }
+}
+
+fn require_address_index<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+) -> Result<(), RpcError> {
+    if chainstate.options().index_address {
+        Ok(())
+    } else {
+        Err(RpcError::new(
+            RPC_MISC_ERROR,
+            "Address index disabled (run with --node-mode full)",
+        ))
+    }
+}
+
+fn require_spent_index<S: fluxd_storage::KeyValueStore>(
+    chainstate: &ChainState<S>,
+) -> Result<(), RpcError> {
+    if chainstate.options().index_spent {
+        Ok(())
+    } else {
+        Err(RpcError::new(
+            RPC_MISC_ERROR,
+            "Spent index disabled (run with --node-mode full)",
+        ))
+    }
 }
 
 fn write_cookie(path: &Path, user: &str, pass: &str) -> Result<(), String> {

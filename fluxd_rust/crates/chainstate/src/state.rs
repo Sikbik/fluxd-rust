@@ -38,8 +38,9 @@ use crate::anchors::{AnchorSet, NullifierSet};
 use crate::blockindex::{BlockIndexEntry, STATUS_HAVE_DATA, STATUS_HAVE_UNDO};
 use crate::filemeta::{
     block_file_info_key, parse_block_file_info_key, parse_undo_file_info_key, undo_file_info_key,
-    FlatFileInfo, META_BLOCK_FILES_LAST_FILE_KEY, META_BLOCK_FILES_LAST_LEN_KEY,
-    META_UNDO_FILES_LAST_FILE_KEY, META_UNDO_FILES_LAST_LEN_KEY,
+    FlatFileInfo, FLATFILE_INFO_FLAG_PRUNED, META_BLOCK_FILES_LAST_FILE_KEY,
+    META_BLOCK_FILES_LAST_LEN_KEY, META_BLOCK_FILES_PRUNED_FILE_KEY, META_UNDO_FILES_LAST_FILE_KEY,
+    META_UNDO_FILES_LAST_LEN_KEY, META_UNDO_FILES_PRUNED_FILE_KEY,
 };
 use crate::flatfiles::{FileLocation, FlatFileError, FlatFileStore};
 use crate::index::{
@@ -623,6 +624,49 @@ impl MtpWindow {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ChainStateOptions {
+    pub store_block_headers: bool,
+    pub index_tx: bool,
+    pub index_spent: bool,
+    pub index_address: bool,
+    pub index_timestamp: bool,
+    pub prune_blocks: bool,
+    pub prune_undo: bool,
+}
+
+impl ChainStateOptions {
+    pub const fn full() -> Self {
+        Self {
+            store_block_headers: true,
+            index_tx: true,
+            index_spent: true,
+            index_address: true,
+            index_timestamp: true,
+            prune_blocks: false,
+            prune_undo: false,
+        }
+    }
+
+    pub const fn lite() -> Self {
+        Self {
+            store_block_headers: false,
+            index_tx: false,
+            index_spent: false,
+            index_address: false,
+            index_timestamp: false,
+            prune_blocks: true,
+            prune_undo: true,
+        }
+    }
+}
+
+impl Default for ChainStateOptions {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
 pub struct ChainState<S> {
     store: Arc<S>,
     utxos: UtxoSet<Arc<S>>,
@@ -643,11 +687,18 @@ pub struct ChainState<S> {
     shielded_cache: Mutex<Option<ShieldedTreesCache>>,
     file_meta: Mutex<FlatFileMetaCache>,
     fluxnode_payments: Mutex<FluxnodePaymentsCache>,
+    options: ChainStateOptions,
 }
 
 impl<S: KeyValueStore> ChainState<S> {
     pub fn new(store: Arc<S>, blocks: FlatFileStore, undo: FlatFileStore) -> Self {
-        Self::new_with_utxo_cache_capacity(store, blocks, undo, UTXO_CACHE_CAPACITY)
+        Self::new_with_utxo_cache_capacity_and_options(
+            store,
+            blocks,
+            undo,
+            UTXO_CACHE_CAPACITY,
+            ChainStateOptions::default(),
+        )
     }
 
     pub fn new_with_utxo_cache_capacity(
@@ -655,6 +706,22 @@ impl<S: KeyValueStore> ChainState<S> {
         blocks: FlatFileStore,
         undo: FlatFileStore,
         utxo_cache_capacity: usize,
+    ) -> Self {
+        Self::new_with_utxo_cache_capacity_and_options(
+            store,
+            blocks,
+            undo,
+            utxo_cache_capacity,
+            ChainStateOptions::default(),
+        )
+    }
+
+    pub fn new_with_utxo_cache_capacity_and_options(
+        store: Arc<S>,
+        blocks: FlatFileStore,
+        undo: FlatFileStore,
+        utxo_cache_capacity: usize,
+        options: ChainStateOptions,
     ) -> Self {
         Self {
             utxos: UtxoSet::new(Arc::clone(&store)),
@@ -676,6 +743,7 @@ impl<S: KeyValueStore> ChainState<S> {
             shielded_cache: Mutex::new(None),
             file_meta: Mutex::new(FlatFileMetaCache::default()),
             fluxnode_payments: Mutex::new(FluxnodePaymentsCache::new()),
+            options,
         }
     }
 
@@ -685,6 +753,10 @@ impl<S: KeyValueStore> ChainState<S> {
 
     pub fn best_block(&self) -> Result<Option<ChainTip>, ChainStateError> {
         Ok(self.index.best_block()?)
+    }
+
+    pub fn options(&self) -> ChainStateOptions {
+        self.options
     }
 
     pub fn header_entry(
@@ -878,11 +950,13 @@ impl<S: KeyValueStore> ChainState<S> {
             return Ok(existing.clone());
         }
         if let Some(existing) = self.index.get_header(&hash)? {
-            batch.put(
-                Column::BlockHeader,
-                hash.to_vec(),
-                header.consensus_encode(),
-            );
+            if self.options.store_block_headers {
+                batch.put(
+                    Column::BlockHeader,
+                    hash.to_vec(),
+                    header.consensus_encode(),
+                );
+            }
             if header.is_pon() {
                 let prev_hash = header.prev_block;
                 let is_genesis = prev_hash == [0u8; 32] && hash == params.hash_genesis_block;
@@ -1100,11 +1174,13 @@ impl<S: KeyValueStore> ChainState<S> {
         };
 
         self.index.put_header(batch, &hash, &entry);
-        batch.put(
-            Column::BlockHeader,
-            hash.to_vec(),
-            header.consensus_encode(),
-        );
+        if self.options.store_block_headers {
+            batch.put(
+                Column::BlockHeader,
+                hash.to_vec(),
+                header.consensus_encode(),
+            );
+        }
         pending.insert(hash, entry.clone());
         if let Ok(mut cache) = self.header_cache.lock() {
             cache.insert(hash, entry.clone());
@@ -2540,22 +2616,24 @@ impl<S: KeyValueStore> ChainState<S> {
                             }
                         }
                     };
-                    spent_index_ops = spent_index_ops.saturating_add(1);
-                    let (address_type, address_hash) = spent_address_info(&entry.script_pubkey);
-                    self.spent_index.insert(
-                        &mut batch,
-                        &input.prevout,
-                        SpentIndexValue {
-                            txid,
-                            input_index: input_index as u32,
-                            block_height: height as u32,
-                            details: Some(SpentIndexDetails {
-                                satoshis: entry.value,
-                                address_type,
-                                address_hash,
-                            }),
-                        },
-                    );
+                    if self.options.index_spent {
+                        spent_index_ops = spent_index_ops.saturating_add(1);
+                        let (address_type, address_hash) = spent_address_info(&entry.script_pubkey);
+                        self.spent_index.insert(
+                            &mut batch,
+                            &input.prevout,
+                            SpentIndexValue {
+                                txid,
+                                input_index: input_index as u32,
+                                block_height: height as u32,
+                                details: Some(SpentIndexDetails {
+                                    satoshis: entry.value,
+                                    address_type,
+                                    address_hash,
+                                }),
+                            },
+                        );
+                    }
                     let spent_delta = entry
                         .value
                         .checked_neg()
@@ -2605,26 +2683,28 @@ impl<S: KeyValueStore> ChainState<S> {
                         utxo_delete_ops = utxo_delete_ops.saturating_add(1);
                         utxo_delete_us = utxo_delete_us.saturating_add(elapsed.as_micros() as u64);
                     }
-                    let index_start = Instant::now();
-                    if let Some(key) = address_key.as_ref() {
-                        if !created_in_block {
-                            address_index_deletes = address_index_deletes.saturating_add(1);
-                            self.address_index
-                                .delete_with_script_hash(&mut batch, key, &prevout);
+                    if self.options.index_address {
+                        let index_start = Instant::now();
+                        if let Some(key) = address_key.as_ref() {
+                            if !created_in_block {
+                                address_index_deletes = address_index_deletes.saturating_add(1);
+                                self.address_index
+                                    .delete_with_script_hash(&mut batch, key, &prevout);
+                            }
+                            address_delta_inserts = address_delta_inserts.saturating_add(1);
+                            self.address_deltas.insert_with_prefix(
+                                &mut batch,
+                                key,
+                                height as u32,
+                                index as u32,
+                                &txid,
+                                input_index as u32,
+                                true,
+                                spent_delta,
+                            );
                         }
-                        address_delta_inserts = address_delta_inserts.saturating_add(1);
-                        self.address_deltas.insert_with_prefix(
-                            &mut batch,
-                            key,
-                            height as u32,
-                            index as u32,
-                            &txid,
-                            input_index as u32,
-                            true,
-                            spent_delta,
-                        );
+                        index_time += index_start.elapsed();
                     }
-                    index_time += index_start.elapsed();
                     undo.spent.push(SpentOutput {
                         outpoint: prevout,
                         entry,
@@ -2718,7 +2798,11 @@ impl<S: KeyValueStore> ChainState<S> {
                     hash: txid,
                     index: out_index as u32,
                 };
-                let address_key = crate::address_index::script_hash(&output.script_pubkey);
+                let address_key = if self.options.index_address {
+                    crate::address_index::script_hash(&output.script_pubkey)
+                } else {
+                    None
+                };
                 let entry = UtxoEntry {
                     value: output.value,
                     script_pubkey: output.script_pubkey.clone(),
@@ -2731,21 +2815,23 @@ impl<S: KeyValueStore> ChainState<S> {
                 value_created = value_created
                     .checked_add(output.value)
                     .ok_or(ChainStateError::ValueOutOfRange)?;
-                let index_start = Instant::now();
-                if let Some(key) = address_key.as_ref() {
-                    address_delta_inserts = address_delta_inserts.saturating_add(1);
-                    self.address_deltas.insert_with_prefix(
-                        &mut batch,
-                        key,
-                        height as u32,
-                        index as u32,
-                        &txid,
-                        out_index as u32,
-                        false,
-                        output.value,
-                    );
+                if self.options.index_address {
+                    let index_start = Instant::now();
+                    if let Some(key) = address_key.as_ref() {
+                        address_delta_inserts = address_delta_inserts.saturating_add(1);
+                        self.address_deltas.insert_with_prefix(
+                            &mut batch,
+                            key,
+                            height as u32,
+                            index as u32,
+                            &txid,
+                            out_index as u32,
+                            false,
+                            output.value,
+                        );
+                    }
+                    index_time += index_start.elapsed();
                 }
-                index_time += index_start.elapsed();
 
                 created_utxos.insert(
                     outpoint_key_bytes(&outpoint),
@@ -2767,12 +2853,14 @@ impl<S: KeyValueStore> ChainState<S> {
             utxo_put_ops = utxo_put_ops.saturating_add(1);
             utxo_put_us = utxo_put_us.saturating_add(elapsed.as_micros() as u64);
 
-            if let Some(key) = created.address_key.as_ref() {
-                let index_start = Instant::now();
-                address_index_inserts = address_index_inserts.saturating_add(1);
-                self.address_index
-                    .insert_with_script_hash(&mut batch, key, &created.outpoint);
-                index_time += index_start.elapsed();
+            if self.options.index_address {
+                if let Some(key) = created.address_key.as_ref() {
+                    let index_start = Instant::now();
+                    address_index_inserts = address_index_inserts.saturating_add(1);
+                    self.address_index
+                        .insert_with_script_hash(&mut batch, key, &created.outpoint);
+                    index_time += index_start.elapsed();
+                }
             }
         }
 
@@ -2970,51 +3058,57 @@ impl<S: KeyValueStore> ChainState<S> {
             block.header.time,
         )?;
         let block_hash = block.header.hash();
-        let mut logical_ts = block.header.time;
-        if block.header.prev_block != [0u8; 32] {
-            match self.block_logical_time(&block.header.prev_block) {
-                Ok(Some(prev_ts)) => {
-                    if logical_ts <= prev_ts {
-                        logical_ts = prev_ts.saturating_add(1);
+        if self.options.index_timestamp {
+            let mut logical_ts = block.header.time;
+            if block.header.prev_block != [0u8; 32] {
+                match self.block_logical_time(&block.header.prev_block) {
+                    Ok(Some(prev_ts)) => {
+                        if logical_ts <= prev_ts {
+                            logical_ts = prev_ts.saturating_add(1);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        fluxd_log::log_warn!(
+                            "failed to read previous block logical timestamp: {}",
+                            err
+                        );
                     }
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    fluxd_log::log_warn!(
-                        "failed to read previous block logical timestamp: {}",
-                        err
-                    );
-                }
             }
+            let mut ts_key = Vec::with_capacity(36);
+            ts_key.extend_from_slice(&logical_ts.to_be_bytes());
+            ts_key.extend_from_slice(&block_hash);
+            timestamp_index_ops = timestamp_index_ops.saturating_add(1);
+            batch.put(Column::TimestampIndex, ts_key, Vec::new());
+            timestamp_index_ops = timestamp_index_ops.saturating_add(1);
+            batch.put(
+                Column::BlockTimestamp,
+                block_hash.to_vec(),
+                logical_ts.to_be_bytes().to_vec(),
+            );
         }
-        let mut ts_key = Vec::with_capacity(36);
-        ts_key.extend_from_slice(&logical_ts.to_be_bytes());
-        ts_key.extend_from_slice(&block_hash);
-        timestamp_index_ops = timestamp_index_ops.saturating_add(1);
-        batch.put(Column::TimestampIndex, ts_key, Vec::new());
-        timestamp_index_ops = timestamp_index_ops.saturating_add(1);
-        batch.put(
-            Column::BlockTimestamp,
-            block_hash.to_vec(),
-            logical_ts.to_be_bytes().to_vec(),
-        );
-        timestamp_index_ops = timestamp_index_ops.saturating_add(1);
-        batch.put(
-            Column::BlockHeader,
-            block_hash.to_vec(),
-            block.header.consensus_encode(),
-        );
+        if self.options.store_block_headers {
+            timestamp_index_ops = timestamp_index_ops.saturating_add(1);
+            batch.put(
+                Column::BlockHeader,
+                block_hash.to_vec(),
+                block.header.consensus_encode(),
+            );
+        }
 
-        let index_start = Instant::now();
-        for (index, txid) in txids.iter().enumerate() {
-            let tx_location = TxLocation {
-                block: location,
-                index: index as u32,
-            };
-            tx_index_ops = tx_index_ops.saturating_add(1);
-            self.tx_index.insert(&mut batch, txid, tx_location);
+        if self.options.index_tx {
+            let index_start = Instant::now();
+            for (index, txid) in txids.iter().enumerate() {
+                let tx_location = TxLocation {
+                    block: location,
+                    index: index as u32,
+                };
+                tx_index_ops = tx_index_ops.saturating_add(1);
+                self.tx_index.insert(&mut batch, txid, tx_location);
+            }
+            index_time += index_start.elapsed();
         }
-        index_time += index_start.elapsed();
 
         let mut entry = header_entry;
         entry.status = status_with_block(entry.status);
@@ -3220,17 +3314,19 @@ impl<S: KeyValueStore> ChainState<S> {
                     index: output_index as u32,
                 };
                 self.utxos.delete(&mut batch, &outpoint);
-                self.address_index
-                    .delete(&mut batch, &output.script_pubkey, &outpoint);
-                self.address_deltas.delete(
-                    &mut batch,
-                    &output.script_pubkey,
-                    height_u32,
-                    tx_index as u32,
-                    &txid,
-                    output_index as u32,
-                    false,
-                );
+                if self.options.index_address {
+                    self.address_index
+                        .delete(&mut batch, &output.script_pubkey, &outpoint);
+                    self.address_deltas.delete(
+                        &mut batch,
+                        &output.script_pubkey,
+                        height_u32,
+                        tx_index as u32,
+                        &txid,
+                        output_index as u32,
+                        false,
+                    );
+                }
                 utxos_removed = utxos_removed
                     .checked_add(1)
                     .ok_or(ChainStateError::ValueOutOfRange)?;
@@ -3238,7 +3334,9 @@ impl<S: KeyValueStore> ChainState<S> {
                     .checked_add(output.value)
                     .ok_or(ChainStateError::ValueOutOfRange)?;
             }
-            self.tx_index.delete(&mut batch, &txid);
+            if self.options.index_tx {
+                self.tx_index.delete(&mut batch, &txid);
+            }
 
             if tx_index != 0 {
                 for (input_index, input) in tx.vin.iter().enumerate().rev() {
@@ -3251,22 +3349,28 @@ impl<S: KeyValueStore> ChainState<S> {
                             "block undo outpoint mismatch",
                         ));
                     }
-                    self.spent_index.delete(&mut batch, &spent.outpoint);
-                    self.address_deltas.delete(
-                        &mut batch,
-                        &spent.entry.script_pubkey,
-                        height_u32,
-                        tx_index as u32,
-                        &txid,
-                        input_index as u32,
-                        true,
-                    );
+                    if self.options.index_spent {
+                        self.spent_index.delete(&mut batch, &spent.outpoint);
+                    }
+                    if self.options.index_address {
+                        self.address_deltas.delete(
+                            &mut batch,
+                            &spent.entry.script_pubkey,
+                            height_u32,
+                            tx_index as u32,
+                            &txid,
+                            input_index as u32,
+                            true,
+                        );
+                    }
                     self.utxos.put(&mut batch, &spent.outpoint, &spent.entry);
-                    self.address_index.insert(
-                        &mut batch,
-                        &spent.entry.script_pubkey,
-                        &spent.outpoint,
-                    );
+                    if self.options.index_address {
+                        self.address_index.insert(
+                            &mut batch,
+                            &spent.entry.script_pubkey,
+                            &spent.outpoint,
+                        );
+                    }
                     utxos_restored = utxos_restored
                         .checked_add(1)
                         .ok_or(ChainStateError::ValueOutOfRange)?;
@@ -3559,6 +3663,114 @@ impl<S: KeyValueStore> ChainState<S> {
                 }
             }
         }
+        if self.options.prune_blocks || self.options.prune_undo {
+            if let Err(err) = self.prune_flatfiles() {
+                fluxd_log::log_warn!("flatfile prune failed: {}", err);
+            }
+        }
+        Ok(())
+    }
+
+    fn meta_u32_le(&self, key: &[u8]) -> Result<Option<u32>, ChainStateError> {
+        match self.store.get(Column::Meta, key)? {
+            Some(bytes) => Ok(bytes.as_slice().try_into().ok().map(u32::from_le_bytes)),
+            None => Ok(None),
+        }
+    }
+
+    fn prune_flatfiles(&self) -> Result<(), ChainStateError> {
+        let Some(tip) = self.best_block()? else {
+            return Ok(());
+        };
+        if tip.height < 0 {
+            return Ok(());
+        }
+        let tip_height = i64::from(tip.height);
+        let max_depth = max_reorg_depth(tip_height) as i64;
+        let prune_height = tip_height - (max_depth + 1);
+        if prune_height < 0 {
+            return Ok(());
+        }
+        let prune_height =
+            i32::try_from(prune_height).map_err(|_| ChainStateError::ValueOutOfRange)?;
+
+        if self.options.prune_blocks {
+            self.prune_flatfiles_kind(FlatFileKind::Blocks, prune_height)?;
+        }
+        if self.options.prune_undo {
+            self.prune_flatfiles_kind(FlatFileKind::Undo, prune_height)?;
+        }
+
+        Ok(())
+    }
+
+    fn prune_flatfiles_kind(
+        &self,
+        kind: FlatFileKind,
+        prune_height: i32,
+    ) -> Result<(), ChainStateError> {
+        let pruned_key = match kind {
+            FlatFileKind::Blocks => META_BLOCK_FILES_PRUNED_FILE_KEY,
+            FlatFileKind::Undo => META_UNDO_FILES_PRUNED_FILE_KEY,
+        };
+        let mut next_file_id = self.meta_u32_le(pruned_key)?.unwrap_or(0);
+
+        let mut batch = WriteBatch::new();
+        let mut pruned_any = false;
+        loop {
+            let info_key = match kind {
+                FlatFileKind::Blocks => block_file_info_key(next_file_id).to_vec(),
+                FlatFileKind::Undo => undo_file_info_key(next_file_id).to_vec(),
+            };
+            let Some(bytes) = self.store.get(Column::Meta, &info_key)? else {
+                break;
+            };
+            let mut info = FlatFileInfo::decode(&bytes)
+                .ok_or(ChainStateError::CorruptIndex("invalid flatfile info entry"))?;
+            if info.blocks == 0 {
+                break;
+            }
+            if info.height_last > prune_height {
+                break;
+            }
+
+            let remove_result = match kind {
+                FlatFileKind::Blocks => self.blocks.remove_file(next_file_id),
+                FlatFileKind::Undo => self.undo.remove_file(next_file_id),
+            };
+            match remove_result {
+                Ok(()) => {}
+                Err(FlatFileError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(ChainStateError::FlatFile(err)),
+            }
+
+            if (info.flags & FLATFILE_INFO_FLAG_PRUNED) == 0 {
+                info.flags |= FLATFILE_INFO_FLAG_PRUNED;
+                batch.put(Column::Meta, info_key, info.encode());
+            }
+
+            next_file_id = next_file_id.saturating_add(1);
+            pruned_any = true;
+        }
+
+        if !pruned_any {
+            return Ok(());
+        }
+
+        batch.put(
+            Column::Meta,
+            pruned_key,
+            next_file_id.to_le_bytes().to_vec(),
+        );
+        self.store.write_batch(&batch)?;
+
+        if let Ok(mut meta_cache) = self.file_meta.lock() {
+            match kind {
+                FlatFileKind::Blocks => meta_cache.blocks = None,
+                FlatFileKind::Undo => meta_cache.undo = None,
+            }
+        }
+
         Ok(())
     }
 
@@ -3669,14 +3881,19 @@ impl<S: KeyValueStore> ChainState<S> {
         if info.blocks == 0 {
             info.height_first = height;
             info.time_first = time;
+            info.height_last = height;
+            info.time_last = time;
+        } else {
+            info.height_first = info.height_first.min(height);
+            info.height_last = info.height_last.max(height);
+            info.time_first = info.time_first.min(time);
+            info.time_last = info.time_last.max(time);
         }
         info.blocks = info
             .blocks
             .checked_add(1)
             .ok_or(ChainStateError::ValueOutOfRange)?;
         info.size = file_len;
-        info.height_last = height;
-        info.time_last = time;
 
         match kind {
             FlatFileKind::Blocks => {
