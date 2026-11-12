@@ -1,4 +1,4 @@
-use core2::io;
+use std::io;
 
 use fluxd_consensus::params::hash256_from_hex;
 use incrementalmerkletree::{
@@ -32,13 +32,13 @@ impl Hashable for SproutNode {
 }
 
 impl HashSer for SproutNode {
-    fn read<R: core2::io::Read>(mut reader: R) -> io::Result<Self> {
+    fn read<R: io::Read>(mut reader: R) -> io::Result<Self> {
         let mut bytes = [0u8; 32];
         reader.read_exact(&mut bytes)?;
         Ok(SproutNode(bytes))
     }
 
-    fn write<W: core2::io::Write>(&self, mut writer: W) -> io::Result<()> {
+    fn write<W: io::Write>(&self, mut writer: W) -> io::Result<()> {
         writer.write_all(&self.0)
     }
 }

@@ -14,7 +14,6 @@ fluxd-pow = { path = "../pow" }
 fluxd-pon = { path = "../pon" }
 fluxd-fluxnode = { path = "../fluxnode" }
 fluxd-shielded = { path = "../shielded" }
-core2 = "0.4"
 fluxd-storage = { path = "../storage" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 primitive-types = "0.14"
